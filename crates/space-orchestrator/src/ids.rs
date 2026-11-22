@@ -324,6 +324,30 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[derive(Debug)]
+    struct FailingSink;
+
+    impl CounterSink for FailingSink {
+        fn persist(&mut self, _next: u64) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    #[test]
+    fn reserve_bumps_past_the_id_ignores_none_and_surfaces_persist_failure() {
+        let mut ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        ids.reserve(ShardId::new(100)).expect("reserve");
+        assert_eq!(ids.peek(), 101);
+        ids.reserve(ShardId::new(5)).expect("lower id is a no-op");
+        assert_eq!(ids.peek(), 101, "the counter never moves down");
+        ids.reserve(ShardId::NONE).expect("NONE is ignored");
+        assert_eq!(ids.peek(), 101);
+
+        let mut failing = PersistentShardIdAllocator::with_sink(100, Box::new(FailingSink));
+        assert!(failing.reserve(ShardId::new(100)).is_err());
+    }
+
     #[test]
     fn the_reserved_none_id_is_never_handed_out() {
         // The inner allocator panics at the id-space limit rather than wrapping
