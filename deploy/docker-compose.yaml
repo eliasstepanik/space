@@ -31,6 +31,14 @@
 # restarts it re-advertises the same address, which the orchestrator recognises
 # as the same shard and answers with the same id. The orchestrator runs
 # `--launcher local`: `--launcher docker` is deferred.
+#
+# The streaming client is OPT-IN so a plain `up` stays orchestrator + shard:
+#
+#   docker compose -f deploy/docker-compose.yaml --profile stream up --build
+#
+# It publishes the ws:// stream on host TCP 8099. The wasm viewer is served
+# separately by any static file server (see deploy/README.md), e.g. open
+# index.html?ws=ws://127.0.0.1:8099.
 
 x-cluster: &cluster
   SPACE_CLUSTER: space-local
