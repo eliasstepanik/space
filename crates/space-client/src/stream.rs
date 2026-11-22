@@ -426,7 +426,7 @@ mod tests {
         let size = 64;
         let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), size, size);
         let out = ctx
-            .render_offscreen(&scene, size, size, &demo_options(QualityPreset::Ci))
+            .render_offscreen(&scene, size, size, &demo_options(space_render::QualityPreset::Ci))
             .expect("galaxy render");
         let lit = out
             .pixels
