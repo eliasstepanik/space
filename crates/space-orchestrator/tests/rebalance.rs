@@ -381,27 +381,21 @@ impl Cluster {
     ///
     /// Acks leave a member through the real `ShardNet::flush` path and are
     /// forwarded by a task, so they are not synchronously available the instant
-    /// the beat ends. Yield until the queue is drained rather than sleeping: the
-    /// epoch protocol still commits exactly when the last required ack lands, and
-    /// a beat where nothing is in flight costs nothing.
+    /// the beat ends. Wait on the channel with a bounded wall-clock timeout
+    /// (not a fixed number of scheduler yields, which a CPU-saturated host can
+    /// exhaust before the forwarding task runs): keep handling acks until none
+    /// arrives within the window or the channel closes.
     async fn drain_acks(&mut self) {
-        for _ in 0..64 {
-            let mut got = false;
-            loop {
-                match self.ack_rx.lock().await.try_recv() {
-                    Ok(Message::EpochAck(ack)) => {
-                        got = true;
-                        self.orch.handle_epoch_ack_message(&ack);
-                    }
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-            if !got {
-                tokio::task::yield_now().await;
-            } else {
-                // One more pass in case two acks were in flight.
-                continue;
+        const ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let next = {
+                let mut rx = self.ack_rx.lock().await;
+                tokio::time::timeout(ACK_WAIT, rx.recv()).await
+            };
+            match next {
+                Ok(Some(Message::EpochAck(ack))) => self.orch.handle_epoch_ack_message(&ack),
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
             }
         }
     }
