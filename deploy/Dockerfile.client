@@ -1,0 +1,51 @@
+# Space streaming-client image: builds `space-client` (release) and runs it in
+# `--stream` mode: it renders headlessly (software Vulkan, lavapipe), JPEG-encodes
+# each frame and serves it to browser viewers over plain ws://, optionally playing
+# on a shard (`--server`).
+#
+# Build from the REPOSITORY ROOT (the workspace is the build context):
+#   docker build -f deploy/Dockerfile.client -t space/client .
+#
+# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
+# inspection only (deploy/README.md says what is and is not verified).
+#
+# The wasm viewer (crates/space-viewer) is NOT served by this image: the client's
+# `--stream` port speaks WebSocket only and has no `--http-static` mode. Serve
+# crates/space-viewer/{index.html,pkg/} from any static file server and point the
+# page at this container with `index.html?ws=ws://<host>:<published-port>`.
+
+# ---- build stage ----------------------------------------------------------
+FROM rust:1.100-bookworm AS build
+WORKDIR /src
+ENV RUSTUP_TOOLCHAIN=1.100.0
+COPY . .
+RUN cargo build --release --locked -p space-client --bin space-client
+
+# ---- runtime stage --------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+# The renderer loads libvulkan.so.1 at run time (ash `loaded`), so the image needs
+# the loader plus an ICD. `mesa-vulkan-drivers` ships lavapipe (CPU Vulkan), which
+# is what a GPU-less container uses. bookworm's Mesa 22.3 lavapipe has no
+# VK_KHR_ray_query, so the renderer logs "GI will be disabled" and runs without
+# ray-query GI; use Mesa >= 25 (bookworm-backports) or pass a real GPU
+# (/dev/dri) through for the full path.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 10001 client
+COPY --from=build /src/target/release/space-client /usr/local/bin/space-client
+USER client
+
+# STREAM_BIND  wildcard ws:// listen address inside the container (viewers dial it).
+# SPACE_SERVER optional `host:port` of the shard to play on (`--server`; resolved,
+#              but compose uses the fixed shard IP). Unset = offline, no server.
+# CLIENT_ARGS  optional extra flags, word-split, e.g. "--galaxy --size 1280x720
+#              --quality medium".
+# No TLS: ws:// only (wss:// is deferred, see docs/security-notes.md).
+ENV STREAM_BIND=0.0.0.0:8099
+EXPOSE 8099/tcp
+
+ENTRYPOINT ["/bin/sh", "-c", "exec space-client \
+  --stream \"$STREAM_BIND\" \
+  ${SPACE_SERVER:+--server \"$SPACE_SERVER\"} \
+  $CLIENT_ARGS", "space-client"]
