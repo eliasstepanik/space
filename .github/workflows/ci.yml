@@ -9,6 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # GitHub rejects a whole workflow whose YAML is invalid (it then shows up as a
+  # missing run, not a red one). Parse every workflow and deploy compose file.
+  lint:
+    name: Workflow YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
+      - name: Parse .github/workflows and deploy YAML
+        run: python3 .github/scripts/check_yaml.py
+
   linux:
     name: Linux
     runs-on: ubuntu-latest
