@@ -215,20 +215,23 @@ impl PersistentShardIdAllocator {
 
     /// Allocate the next id, persisting the counter **before** returning it.
     ///
+    /// # Errors
+    ///
+    /// [`IdSpaceExhausted`] when the id space is used up (ids are never reused);
+    /// nothing is persisted or handed out then.
+    ///
     /// # Panics
     ///
-    /// Panics like the inner allocator when the id space is exhausted (ids are
-    /// never reused, so the world cannot continue), and when persistence fails
-    /// (an un-persisted id is the one way an id could be reused after a crash).
-    #[must_use]
-    pub fn allocate(&mut self) -> ShardId {
-        let id = self.inner.allocate();
+    /// Panics when persistence fails (an un-persisted id is the one way an id
+    /// could be reused after a crash).
+    pub fn allocate(&mut self) -> Result<ShardId, IdSpaceExhausted> {
+        let id = self.inner.allocate()?;
         // Persist-then-return: if this fails the process must not hand the id
         // to a launcher, so a failed write is a panic, not a swallowed error.
         self.sink.persist(self.inner.peek()).expect(
             "allocate: persisting the counter failed; refusing to hand out an unpersisted id",
         );
-        id
+        Ok(id)
     }
 
     /// The id the next [`allocate`](Self::allocate) call returns.
