@@ -13,17 +13,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  client:
-    name: Client (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - os: ubuntu-latest
-            binary: space-client
-          - os: windows-latest
-            binary: space-client.exe
+  # Linux jobs run on the self-hosted `space-ci` runner (proxy host) inside a
+  # rust container; the Windows job stays on GitHub-hosted `windows-latest`
+  # (assumption: Windows cannot run on the Linux self-hosted runner).
+  client-linux:
+    name: Client (linux)
+    runs-on: [self-hosted, linux, x64, space-ci]
+    container: rust:1.100-bookworm
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (rust-toolchain.toml)
@@ -32,13 +28,29 @@ jobs:
         run: cargo build --release --locked -p space-client
       - uses: actions/upload-artifact@v4
         with:
-          name: client-${{ matrix.os }}
-          path: target/release/${{ matrix.binary }}
+          name: client-linux
+          path: target/release/space-client
+          if-no-files-found: error
+
+  client-windows:
+    name: Client (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build space-client
+        run: cargo build --release --locked -p space-client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-windows
+          path: target/release/space-client.exe
           if-no-files-found: error
 
   viewer:
     name: Wasm viewer bundle
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, space-ci]
+    container: rust:1.100-bookworm
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (rust-toolchain.toml)
@@ -48,6 +60,7 @@ jobs:
       - name: Build space-viewer for wasm32-unknown-unknown
         run: cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer
       # Must match the wasm-bindgen version in Cargo.lock (see crates/space-viewer/README.md).
+      # Slow from source, but the bare container has no prebuilt binary.
       - name: Install wasm-bindgen-cli
         run: cargo install --locked wasm-bindgen-cli --version 0.2.130
       - name: Generate JS glue
@@ -55,6 +68,9 @@ jobs:
           wasm-bindgen --target web --out-dir space-viewer/pkg \
             target/wasm32-unknown-unknown/release/space_viewer.wasm
           cp crates/space-viewer/index.html space-viewer/index.html
+      # The rust image does not ship zip.
+      - name: Install zip
+        run: apt-get update && apt-get install -y --no-install-recommends zip
       - name: Zip bundle
         run: zip -r space-viewer.zip space-viewer
       - uses: actions/upload-artifact@v4
@@ -65,8 +81,8 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [client, viewer]
-    runs-on: ubuntu-latest
+    needs: [client-linux, client-windows, viewer]
+    runs-on: [self-hosted, linux, x64, space-ci]
     permissions:
       contents: write
     steps:
