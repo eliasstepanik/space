@@ -329,10 +329,10 @@ impl ShardNet {
         for out in outbox {
             match out.dest {
                 Destination::Shard(shard_id) => {
-                    // An endpoint registered by hand wins; otherwise the peer is
-                    // dialled at the address the shard's own map names for it, so
-                    // a shard that appears through an epoch change is reachable
-                    // without any extra wiring.
+                    // The peer is dialled at the address the shard's own map
+                    // names for it, so a shard that appears or migrates through
+                    // an epoch change is reachable without any extra wiring; an
+                    // endpoint registered by hand is only the fallback.
                     let from_map = shard.lock().await.peer_endpoint(shard_id);
                     self.send_to_peer(local, shard_id, from_map, out.message)
                         .await;
