@@ -103,7 +103,7 @@ impl Renderer for RenderContext {
     }
 }
 
-/// A deterministic one-sphere test scene, centred `distance` metres in front of
+/// A deterministic test scene (one sphere plus one cube), centred `distance` metres in front of
 /// a camera looking down `-Z`. Shared by the GPU tests and the client's
 /// `--demo` mode so both exercise the same pixels.
 #[must_use]
@@ -118,7 +118,7 @@ pub fn demo_scene(width: u32, height: u32) -> Scene {
         near: 0.05,
         far: 1.0e5,
     };
-    Scene::from_instances(
+    let mut scene = Scene::from_instances(
         camera,
         vec![GpuInstance {
             center: [0.0, 0.0, -distance, 1.0],
@@ -129,8 +129,11 @@ pub fn demo_scene(width: u32, height: u32) -> Scene {
             transmission: 0.0,
             _pad1: 0.0,
         }],
-    )
-    .with_lights(vec![SceneLight {
+    );
+    // A magenta cube just ahead and to the left of the sphere, so a player at
+    // spawn sees a solid box as well as the sphere.
+    scene.push_box([-1.5, 0.0, -4.0], 0.6, [1.0, 0.05, 0.8]);
+    scene.with_lights(vec![SceneLight {
         position: space_world::WorldPos::from_f64_metres_around(
             space_world::WorldPos::ZERO,
             [2.0, 2.0, -2.0],
