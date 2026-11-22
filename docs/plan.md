@@ -26,6 +26,7 @@
 - Phase 2 — headless multiplayer + H1–H8
   - Scale targets: ~100 players/shard, ~1k entities in interest range (U9).
 - Phase 3 — orchestrator + H9–H15
+  - Status: **complete** — `space-orchestrator` (epoch-versioned shard map, split/merge autoscaler, monotonic persisted ShardId counter) and shard handoff H9–H15. The `bollard`-backed `--launcher docker` is deferred (`--launcher local` only); see `docs/plan-phase3.md`.
   - Load metric `max(players/100, tick p95/33.3 ms)`; split at ≥0.8 for 10 s, merge at ≤0.35 for 60 s (U12).
   - ShardId allocation: ids are **monotonic and never reused** (FIX 9). Guid
     uniqueness `(shard, serial)` requires it — a recycled id would alias two
@@ -35,7 +36,9 @@
 - Phase 4 — renderer core
   - WGSL→SPIR-V via naga at build time (P2).
 - Phase 5 — ray-query GI/SSR/fog/refraction
+  - Status: **complete** — DDGI probe GI via `VK_KHR_ray_query` (optional: devices without it render with GI off), SSR, fog and refraction, selected by `--quality high|medium|low|ci`; validated on lavapipe and RADV.
 - Phase 6 — streaming
+  - Status: **complete** — `space-stream` (JPEG frames + input wire format, `ws://` only), `space-client --stream ADDR [--server ADDR]`, and the `space-viewer` wasm page. H.264 stays deferred.
   - Latency budget ≤80 ms p95 (JPEG 720p60), measured capture-to-on-screen (P10).
   - Codec: **JPEG only** in v1. Vulkan H.264 encode is an **optional fast path**,
     gated on an **end-to-end encode probe** (encode one IDR and read back a
@@ -43,4 +46,6 @@
     deferred after the GFX1151 VCN encode hang found in spike 0.5.
   - wasm thin viewer for QA (QA).
 - Phase 7 — MCP
+  - Status: **complete** — `space-mcp` (hand-rolled JSON-RPC, stdio + Streamable HTTP), `space-mcp-server` (drive a shard) and `space-mcp-client` (play and capture frames).
 - Phase 8 — packaging + skill
+  - Status: **complete** — `Dockerfile.client` + compose `stream` profile, top-level CI build `Dockerfile`, wasm and Docker-build CI jobs, the `space-dev` agent skill (`skills/space-dev/SKILL.md`), workspace version 0.1.0. The Dockerfiles are correct-by-inspection only (`deploy/README.md`).
