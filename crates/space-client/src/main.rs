@@ -476,7 +476,12 @@ impl ApplicationHandler for App {
                 }
             };
         let (sw, sh) = swapchain.extent();
-        self.scene = Some(scene_for(Mode::Window, sw, sh));
+        // Joined: the scene is rebuilt from replica state every frame; offline
+        // it stays the static demo scene.
+        self.scene = Some(match &self.live {
+            Some(live) => live.scene(sw, sh),
+            None => scene_for(Mode::Window, sw, sh),
+        });
         self.swapchain = Some(swapchain);
         self.window = Some(window);
     }
