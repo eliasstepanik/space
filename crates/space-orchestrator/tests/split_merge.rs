@@ -303,7 +303,13 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
     let _accept = Arc::clone(&server).spawn_accept();
 
     // A minimal responder: answer each hello from a control plane.
-    let responder_plane = std::sync::Arc::new(std::sync::Mutex::new(plane_with_root(shard(1))));
+    let responder_plane = std::sync::Arc::new(std::sync::Mutex::new({
+        // The binary reserves the root owner at startup; the first anonymous
+        // shard adopts it rather than being allocated a fresh id.
+        let mut plane = plane_with_root(shard(1));
+        plane.set_unclaimed_root_owner(shard(1));
+        plane
+    }));
     {
         let server = Arc::clone(&server);
         let plane = Arc::clone(&responder_plane);
