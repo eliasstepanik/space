@@ -61,11 +61,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # Userspace Vulkan stack for the GPU-ish checks below. The job container
-      # runs as root on Debian bookworm, so apt works directly (no sudo). (The
+      # Userspace Vulkan stack for the GPU-ish checks below. The bare runner
+      # runs as root on Ubuntu jammy, so apt works directly (no sudo). (The
       # agent sandbox has a read-only /var/lib/apt, where `cargo xtask
       # gpu-setup` unpacks pinned .debs instead.) python3 is for the
-      # ray_query report script; the rust image does not ship it.
+      # ray_query report script.
       - name: Install Vulkan drivers, validation layer and tools
         run: |
           apt-get update
