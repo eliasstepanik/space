@@ -613,6 +613,10 @@ impl RenderContext {
             frame.gi_params.write(params::as_bytes(&gi))?;
         }
         frame.tone_params.write(params::as_bytes(&tone_params))?;
+        if let Some(post) = &frame.post {
+            let post_params = build_post_params(&forward_params, width, height, &options);
+            post.params.write(params::as_bytes(&post_params))?;
+        }
         if options.ray_probe {
             let rq = rq_uniforms(scene, width, height);
             frame.rq_params.write(params::as_bytes(&rq))?;
@@ -784,6 +788,35 @@ fn build_uniforms(
         _pad1: [0.0; 2],
     };
     (forward, gi, tone)
+}
+
+/// Index-of-refraction ratio for light entering glass from air (1 / 1.5).
+const REFRACT_ETA: f32 = 1.0 / 1.5;
+
+/// Metres the refracted ray travels behind a transmissive surface before the
+/// post pass looks the scene up (the screen-space "thickness" of the glass).
+const REFRACT_DISTANCE_M: f32 = 1.0;
+
+/// The [`params::PostParams`] for the SSR / refraction post pass: the same
+/// camera matrices as the forward pass, so the pass reconstructs positions and
+/// projects rays in exactly the forward pass's depth/projection convention.
+fn build_post_params(
+    forward: &params::ForwardParams,
+    width: u32,
+    height: u32,
+    options: &RenderOptions,
+) -> params::PostParams {
+    let features = options.preset.features();
+    params::PostParams {
+        camera: forward.camera,
+        features: features.flags(),
+        ssr_steps: features.ssr_steps,
+        image_size: [width, height],
+        ssr_max_roughness: features.ssr_max_roughness,
+        refract_distance: REFRACT_DISTANCE_M,
+        refract_eta: REFRACT_ETA,
+        _pad: 0.0,
+    }
 }
 
 /// The [`params::RqParams`] for a raw ray-query probe frame: a bright magenta
