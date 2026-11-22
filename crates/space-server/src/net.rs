@@ -364,8 +364,11 @@ impl ShardNet {
         from_map: Option<SocketAddr>,
         message: Message,
     ) {
+        // The shard map is current; a hand-registered endpoint is only a fallback
+        // for a peer the map does not (yet) name, so it can never shadow a
+        // migrated shard's new address.
         let registered = self.shard_endpoints.lock().await.get(&shard_id).copied();
-        let Some(addr) = registered.or(from_map) else {
+        let Some(addr) = from_map.or(registered) else {
             self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
             eprintln!("space-server: no endpoint known for peer shard {shard_id}; message dropped");
             return;
