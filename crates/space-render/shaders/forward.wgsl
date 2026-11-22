@@ -2,7 +2,6 @@
 // level) with a metallic-roughness BRDF (Cook-Torrance GGX + Smith visibility),
 // analytic point lights, 1-bounce probe GI as indirect diffuse, HDR output.
 // Depth test is provided by the render pass depth attachment.
-<<<<<<< HEAD
 //
 // Outputs (opaque pass, `fs_main`): location 0 = HDR colour (alpha 1),
 // location 1 = material channel `rg8unorm` (r = metallic, g = roughness) read
@@ -10,8 +9,6 @@
 // > 0) are skipped here and drawn by the glass pass (`vs_glass`/`fs_glass`)
 // into a separate attachment (rgb = lit colour, a = transmission), so the
 // opaque scene behind the glass survives in the HDR target for refraction.
-=======
->>>>>>> refs/remotes/origin/main
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -36,7 +33,6 @@ struct Params {
     gi_grid_size_x: u32,
     gi_grid_size_y: u32,
     _pad1: f32,
-<<<<<<< HEAD
     fog: vec4<f32>, // rgb linear fog colour, w = exp-squared density (1/m)
     features: u32,  // FEATURE_* bitmask (mirrors src/quality.rs)
     _pad2: u32,
@@ -47,10 +43,6 @@ struct Params {
 const FEATURE_FOG: u32 = 1u;
 const FEATURE_REFRACT: u32 = 4u;
 
-=======
-}
-
->>>>>>> refs/remotes/origin/main
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
 @group(0) @binding(2) var gi_tex: texture_2d<f32>;
@@ -63,15 +55,12 @@ struct VsOut {
     @location(2) albedo: vec3<f32>,
     @location(3) material: vec2<f32>, // x = metallic, y = roughness
     @location(4) emissive: vec3<f32>,
-<<<<<<< HEAD
     @location(5) @interpolate(flat) transmission: f32,
 }
 
 struct FsOut {
     @location(0) color: vec4<f32>,
     @location(1) material: vec2<f32>, // r = metallic, g = roughness
-=======
->>>>>>> refs/remotes/origin/main
 }
 
 // Unit icosphere: 12 vertices, 20 triangles (60 indices). Positions are
@@ -129,7 +118,6 @@ fn box_normal(index: u32) -> vec3<f32> {
     return n[(index / 6u) % 6u];
 }
 
-<<<<<<< HEAD
 // `glass_pass` selects which instances this draw keeps: the opaque pass drops
 // transmissive instances when refraction is on, the glass pass keeps only
 // those. A dropped instance collapses to one point (zero-area triangles
@@ -149,12 +137,6 @@ fn vertex_body(vi: u32, ii: u32, glass_pass: bool) -> VsOut {
         out.pos = vec4(0.0, 0.0, 0.0, 1.0);
         return out;
     }
-=======
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    var out: VsOut;
-    let inst = instances[ii];
->>>>>>> refs/remotes/origin/main
     var local: vec3<f32>;
     var normal: vec3<f32>;
     if inst.shape == 0u {
@@ -171,15 +153,11 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     out.albedo = inst.albedo.rgb;
     out.material = vec2(inst.albedo.w, inst.roughness);
     out.emissive = inst.emissive.rgb;
-<<<<<<< HEAD
     out.transmission = clamp(inst.transmission, 0.0, 1.0);
-=======
->>>>>>> refs/remotes/origin/main
     out.pos = params.camera.view_proj * vec4(world, 1.0);
     return out;
 }
 
-<<<<<<< HEAD
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     return vertex_body(vi, ii, false);
@@ -190,8 +168,6 @@ fn vs_glass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     return vertex_body(vi, ii, true);
 }
 
-=======
->>>>>>> refs/remotes/origin/main
 const PI: f32 = 3.14159265359;
 
 // Cook-Torrance microfacet specular: GGX normal distribution.
@@ -260,13 +236,8 @@ fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
 }
 
-<<<<<<< HEAD
 // Lit (and fogged) colour of one surface point.
 fn shade(in: VsOut) -> vec3<f32> {
-=======
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
->>>>>>> refs/remotes/origin/main
     let n = normalize(in.normal);
     let v = normalize(params.camera.position.xyz - in.world);
     let metallic = in.material.x;
@@ -282,7 +253,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let gi = probe_radiance(in.world, n);
         color = color + gi * in.albedo * (1.0 - metallic) / PI;
     }
-<<<<<<< HEAD
     if (params.features & FEATURE_FOG) != 0u {
         // Exponential-squared fog on camera distance, after lighting and
         // before the tone map: f = 1 - exp(-(d * density)^2).
@@ -304,7 +274,4 @@ fn fs_main(in: VsOut) -> FsOut {
 @fragment
 fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(shade(in), in.transmission);
-=======
-    return vec4(max(color, vec3(0.0)), 1.0);
->>>>>>> refs/remotes/origin/main
 }

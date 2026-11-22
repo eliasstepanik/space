@@ -187,7 +187,6 @@ mod tests {
         assert_eq!(launcher.poll(ShardId::new(2)).await.unwrap(), Poll::Dead);
     }
 
-<<<<<<< HEAD
     /// The liveness branch: a shard still *registered* whose tick loop has died
     /// (a panic, or an abort that did not go through `kill`) is reported dead.
     /// The entry stays in the map, so this is not the "unknown shard" path.
@@ -230,8 +229,6 @@ mod tests {
         }
     }
 
-=======
->>>>>>> refs/remotes/origin/main
     #[tokio::test]
     async fn poll_on_an_unknown_shard_is_dead() {
         let launcher = LocalLauncher::new();

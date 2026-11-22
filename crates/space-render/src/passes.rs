@@ -6,27 +6,19 @@
 //!
 //! A. build BLAS (device-side) + zero the probe texture
 //! B. build TLAS (device-side)
-<<<<<<< HEAD
 //! C. GI probe compute -> forward render pass (HDR + material) -> [glass
 //!    render pass] -> [post compute: SSR + refraction] -> tone map -> readback
 //!
 //! The bracketed passes only exist when the quality preset enables SSR or
 //! refraction (`RenderFeatures::needs_post`); otherwise the frame is exactly
 //! the pre-Phase-5b one.
-=======
-//! C. GI probe compute -> forward render pass (HDR) -> tone map -> readback
->>>>>>> refs/remotes/origin/main
 
 use ash::vk;
 
 use crate::alloc::{Buffer, Image, SharedAllocator};
 use crate::gpu::{RenderError, RenderOptions};
-<<<<<<< HEAD
 use crate::params::{self, ForwardParams, GiParams, PostParams, RqParams, ToneParams};
 use crate::quality::FEATURE_REFRACT;
-=======
-use crate::params::{self, ForwardParams, GiParams, RqParams, ToneParams};
->>>>>>> refs/remotes/origin/main
 use crate::scene::Scene;
 
 /// SPIR-V modules compiled by `build.rs` (naga >= 30).
@@ -36,12 +28,9 @@ pub(crate) struct Shaders {
     pub tonemap: Vec<u32>,
     pub forward_vs: Vec<u32>,
     pub forward_fs: Vec<u32>,
-<<<<<<< HEAD
     pub forward_glass_vs: Vec<u32>,
     pub forward_glass_fs: Vec<u32>,
     pub post: Vec<u32>,
-=======
->>>>>>> refs/remotes/origin/main
 }
 
 impl Shaders {
@@ -61,7 +50,6 @@ impl Shaders {
             tonemap: words(include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.spv"))),
             forward_vs: words(include_bytes!(concat!(env!("OUT_DIR"), "/forward_vs.spv"))),
             forward_fs: words(include_bytes!(concat!(env!("OUT_DIR"), "/forward_fs.spv"))),
-<<<<<<< HEAD
             forward_glass_vs: words(include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/forward_glass_vs.spv"
@@ -71,8 +59,6 @@ impl Shaders {
                 "/forward_glass_fs.spv"
             ))),
             post: words(include_bytes!(concat!(env!("OUT_DIR"), "/post.spv"))),
-=======
->>>>>>> refs/remotes/origin/main
         }
     }
 }
@@ -116,7 +102,6 @@ pub(crate) struct Pipelines {
     pub tone_set_layout: vk::DescriptorSetLayout,
     pub rq_layout: vk::PipelineLayout,
     pub rq_set_layout: vk::DescriptorSetLayout,
-<<<<<<< HEAD
     pub post_layout: vk::PipelineLayout,
     pub post_set_layout: vk::DescriptorSetLayout,
     /// Opaque pass: HDR colour + material (rg8) + depth.
@@ -129,13 +114,6 @@ pub(crate) struct Pipelines {
     pub tone_pipeline: vk::Pipeline,
     pub rq_pipeline: vk::Pipeline,
     pub post_pipeline: vk::Pipeline,
-=======
-    pub render_pass: vk::RenderPass,
-    pub graphics: vk::Pipeline,
-    pub gi_pipeline: vk::Pipeline,
-    pub tone_pipeline: vk::Pipeline,
-    pub rq_pipeline: vk::Pipeline,
->>>>>>> refs/remotes/origin/main
     pub sampler: vk::Sampler,
 }
 
@@ -178,7 +156,6 @@ impl<'a> Created<'a> {
     }
 }
 
-<<<<<<< HEAD
 impl Created<'_> {
     /// The forward graphics pipeline (no vertex input, dynamic viewport/scissor,
     /// depth test + write) with `colour_attachments` identical blend-off targets.
@@ -264,8 +241,6 @@ impl Created<'_> {
     }
 }
 
-=======
->>>>>>> refs/remotes/origin/main
 fn binding(
     binding: u32,
     ty: vk::DescriptorType,
@@ -292,14 +267,10 @@ impl Pipelines {
         let m_tone = c.module(&shaders.tonemap, "tonemap")?;
         let m_vs = c.module(&shaders.forward_vs, "forward_vs")?;
         let m_fs = c.module(&shaders.forward_fs, "forward_fs")?;
-<<<<<<< HEAD
         let m_gvs = c.module(&shaders.forward_glass_vs, "forward_glass_vs")?;
         let m_gfs = c.module(&shaders.forward_glass_fs, "forward_glass_fs")?;
         let m_post = c.module(&shaders.post, "post")?;
         modules.extend_from_slice(&[m_rq, m_gi, m_tone, m_vs, m_fs, m_gvs, m_gfs, m_post]);
-=======
-        modules.extend_from_slice(&[m_rq, m_gi, m_tone, m_vs, m_fs]);
->>>>>>> refs/remotes/origin/main
 
         // ---- descriptor set layouts ------------------------------------------
         let forward_set_layout = unsafe {
@@ -429,7 +400,6 @@ impl Pipelines {
                 .map_err(|e| RenderError::new(format!("rq set layout: {e}")))?
         };
 
-<<<<<<< HEAD
         // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out
         let post_set_layout = unsafe {
             let sampled = |b| {
@@ -464,14 +434,6 @@ impl Pipelines {
                 )
                 .map_err(|e| RenderError::new(format!("post set layout: {e}")))?
         };
-=======
-        let layouts = [
-            forward_set_layout,
-            gi_set_layout,
-            tone_set_layout,
-            rq_set_layout,
-        ];
->>>>>>> refs/remotes/origin/main
         let pl = |layout: &vk::PipelineLayoutCreateInfo<'_>, name: &str| unsafe {
             device
                 .create_pipeline_layout(layout, None)
@@ -497,7 +459,6 @@ impl Pipelines {
                 .set_layouts(std::slice::from_ref(&rq_set_layout)),
             "rq pipeline layout",
         )?;
-<<<<<<< HEAD
         let post_layout = pl(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(std::slice::from_ref(&post_set_layout)),
@@ -537,32 +498,20 @@ impl Pipelines {
             let depth_ref = vk::AttachmentReference::default()
                 .attachment(2)
                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-=======
-        let _ = layouts;
-
-        // ---- render pass: HDR colour + depth ---------------------------------
-        let render_pass = unsafe {
->>>>>>> refs/remotes/origin/main
             device
                 .create_render_pass(
                     &vk::RenderPassCreateInfo::default()
                         .attachments(&[
-<<<<<<< HEAD
                             color_attachment(vk::Format::R16G16B16A16_SFLOAT),
                             color_attachment(vk::Format::R8G8_UNORM),
                             vk::AttachmentDescription::default()
                                 .format(vk::Format::D32_SFLOAT)
-=======
-                            vk::AttachmentDescription::default()
-                                .format(vk::Format::R16G16B16A16_SFLOAT)
->>>>>>> refs/remotes/origin/main
                                 .samples(vk::SampleCountFlags::TYPE_1)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
                                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                                 .initial_layout(vk::ImageLayout::UNDEFINED)
-<<<<<<< HEAD
                                 // `separateDepthStencilLayouts` is not enabled,
                                 // so the combined layouts are the only legal ones.
                                 .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL),
@@ -588,46 +537,10 @@ impl Pipelines {
                                 .dst_stage_mask(vk::PipelineStageFlags::COMPUTE_SHADER)
                                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
                         ]),
-=======
-                                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                            vk::AttachmentDescription::default()
-                                .format(vk::Format::D32_SFLOAT)
-                                .samples(vk::SampleCountFlags::TYPE_1)
-                                .load_op(vk::AttachmentLoadOp::CLEAR)
-                                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                                .initial_layout(vk::ImageLayout::UNDEFINED)
-                                // `separateDepthStencilLayouts` is not enabled,
-                                // so the combined layout is the only legal one.
-                                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-                        ])
-                        .subpasses(&[vk::SubpassDescription::default()
-                            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                            .color_attachments(&[vk::AttachmentReference::default()
-                                .attachment(0)
-                                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)])
-                            .depth_stencil_attachment(
-                                &vk::AttachmentReference::default()
-                                    .attachment(1)
-                                    .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-                            )])
-                        .dependencies(&[vk::SubpassDependency::default()
-                            .src_subpass(vk::SUBPASS_EXTERNAL)
-                            .dst_subpass(0)
-                            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                            .src_access_mask(vk::AccessFlags::empty())
-                            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                            .dst_access_mask(
-                                vk::AccessFlags::COLOR_ATTACHMENT_READ
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                            )]),
->>>>>>> refs/remotes/origin/main
                     None,
                 )
                 .map_err(|e| RenderError::new(format!("render pass: {e}")))?
         };
-<<<<<<< HEAD
         // Glass pass: attachment 0 = glass colour (rgb lit, a = transmission),
         // 1 = the opaque pass's depth, LOADed so glass is occluded by opaque
         // geometry and writes its own depth where it is nearest.
@@ -696,81 +609,6 @@ impl Pipelines {
         let tone_pipeline = c.compute_pipeline(m_tone, tone_layout, "tone pipeline")?;
         let rq_pipeline = c.compute_pipeline(m_rq, rq_layout, "rq pipeline")?;
         let post_pipeline = c.compute_pipeline(m_post, post_layout, "post pipeline")?;
-=======
-
-        // ---- graphics pipeline -------------------------------------------------
-        let graphics = unsafe {
-            device
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&[
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::VERTEX)
-                                .module(m_vs)
-                                .name(c"vs_main"),
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::FRAGMENT)
-                                .module(m_fs)
-                                .name(c"fs_main"),
-                        ])
-                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                        .input_assembly_state(
-                            &vk::PipelineInputAssemblyStateCreateInfo::default()
-                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-                        )
-                        .viewport_state(
-                            &vk::PipelineViewportStateCreateInfo::default()
-                                .viewport_count(1)
-                                .scissor_count(1),
-                        )
-                        .rasterization_state(
-                            &vk::PipelineRasterizationStateCreateInfo::default()
-                                .depth_clamp_enable(false)
-                                .rasterizer_discard_enable(false)
-                                .polygon_mode(vk::PolygonMode::FILL)
-                                .cull_mode(vk::CullModeFlags::NONE)
-                                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                                .depth_bias_enable(false)
-                                .line_width(1.0),
-                        )
-                        .multisample_state(
-                            &vk::PipelineMultisampleStateCreateInfo::default()
-                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                        )
-                        .depth_stencil_state(
-                            &vk::PipelineDepthStencilStateCreateInfo::default()
-                                .depth_test_enable(true)
-                                .depth_write_enable(true)
-                                .depth_compare_op(vk::CompareOp::LESS),
-                        )
-                        .color_blend_state(
-                            &vk::PipelineColorBlendStateCreateInfo::default()
-                                .logic_op_enable(false)
-                                .logic_op(vk::LogicOp::COPY)
-                                .attachments(&[vk::PipelineColorBlendAttachmentState::default()
-                                    .blend_enable(false)
-                                    .color_write_mask(vk::ColorComponentFlags::RGBA)]),
-                        )
-                        .dynamic_state(
-                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
-                                vk::DynamicState::VIEWPORT,
-                                vk::DynamicState::SCISSOR,
-                            ]),
-                        )
-                        .layout(forward_layout)
-                        .render_pass(render_pass)
-                        .subpass(0)],
-                    None,
-                )
-                .map(|mut v| v.remove(0))
-                .map_err(|(_, e)| RenderError::new(format!("graphics pipeline: {e}")))?
-        };
-
-        let gi_pipeline = c.compute_pipeline(m_gi, gi_layout, "gi pipeline")?;
-        let tone_pipeline = c.compute_pipeline(m_tone, tone_layout, "tone pipeline")?;
-        let rq_pipeline = c.compute_pipeline(m_rq, rq_layout, "rq pipeline")?;
->>>>>>> refs/remotes/origin/main
 
         let sampler = unsafe {
             device
@@ -797,7 +635,6 @@ impl Pipelines {
             tone_set_layout,
             rq_layout,
             rq_set_layout,
-<<<<<<< HEAD
             post_layout,
             post_set_layout,
             render_pass,
@@ -808,13 +645,6 @@ impl Pipelines {
             tone_pipeline,
             rq_pipeline,
             post_pipeline,
-=======
-            render_pass,
-            graphics,
-            gi_pipeline,
-            tone_pipeline,
-            rq_pipeline,
->>>>>>> refs/remotes/origin/main
             sampler,
         })
     }
@@ -1072,24 +902,17 @@ impl Pipelines {
         device.destroy_pipeline_layout(self.gi_layout, None);
         device.destroy_pipeline_layout(self.tone_layout, None);
         device.destroy_pipeline_layout(self.rq_layout, None);
-<<<<<<< HEAD
         device.destroy_pipeline_layout(self.post_layout, None);
         device.destroy_descriptor_set_layout(self.post_set_layout, None);
-=======
->>>>>>> refs/remotes/origin/main
         device.destroy_descriptor_set_layout(self.forward_set_layout, None);
         device.destroy_descriptor_set_layout(self.gi_set_layout, None);
         device.destroy_descriptor_set_layout(self.tone_set_layout, None);
         device.destroy_descriptor_set_layout(self.rq_set_layout, None);
         device.destroy_render_pass(self.render_pass, None);
-<<<<<<< HEAD
         device.destroy_render_pass(self.render_pass_glass, None);
         device.destroy_pipeline(self.graphics, None);
         device.destroy_pipeline(self.graphics_glass, None);
         device.destroy_pipeline(self.post_pipeline, None);
-=======
-        device.destroy_pipeline(self.graphics, None);
->>>>>>> refs/remotes/origin/main
         device.destroy_pipeline(self.gi_pipeline, None);
         device.destroy_pipeline(self.tone_pipeline, None);
         device.destroy_pipeline(self.rq_pipeline, None);
@@ -1144,15 +967,12 @@ pub struct FrameGpu {
     #[allow(dead_code)]
     pub(crate) depth: Image,
     pub(crate) depth_view: vk::ImageView,
-<<<<<<< HEAD
     /// Material channel: `rg8unorm`, r = metallic, g = roughness.
     #[allow(dead_code)]
     pub(crate) material: Image,
     pub(crate) material_view: vk::ImageView,
     /// SSR / refraction resources; `None` when the preset needs no post pass.
     pub(crate) post: Option<PostGpu>,
-=======
->>>>>>> refs/remotes/origin/main
     pub(crate) out: Image,
     pub(crate) out_view: vk::ImageView,
     pub(crate) framebuffer: vk::Framebuffer,
@@ -1177,7 +997,6 @@ pub struct FrameGpu {
     pub(crate) device: ash::Device,
 }
 
-<<<<<<< HEAD
 /// Per-frame resources that exist only when the post pass runs.
 pub(crate) struct PostGpu {
     /// Composited HDR colour the tone map reads instead of the raw HDR target.
@@ -1193,8 +1012,6 @@ pub(crate) struct PostGpu {
     pub set: vk::DescriptorSet,
 }
 
-=======
->>>>>>> refs/remotes/origin/main
 fn aspect_for(format: vk::Format) -> vk::ImageAspectFlags {
     match format {
         vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::X8_D24_UNORM_PACK32 => {
@@ -1299,7 +1116,6 @@ pub(crate) fn create_frame(
         width,
         height,
         depth_format,
-<<<<<<< HEAD
         vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         "depth-image",
     )?;
@@ -1312,11 +1128,6 @@ pub(crate) fn create_frame(
         vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         "material-image",
     )?;
-=======
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-        "depth-image",
-    )?;
->>>>>>> refs/remotes/origin/main
     let (out, out_view) = make_image(
         device,
         allocator,
@@ -1331,11 +1142,7 @@ pub(crate) fn create_frame(
             .create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
                     .render_pass(pipelines.render_pass)
-<<<<<<< HEAD
                     .attachments(&[hdr_view, material_view, depth_view])
-=======
-                    .attachments(&[hdr_view, depth_view])
->>>>>>> refs/remotes/origin/main
                     .width(width)
                     .height(height)
                     .layers(1),
@@ -1344,7 +1151,6 @@ pub(crate) fn create_frame(
             .map_err(|e| RenderError::new(format!("framebuffer: {e}")))?
     };
 
-<<<<<<< HEAD
     // Post pass resources (SSR + refraction): only when the preset needs them
     // (and never for the raw ray-query probe frame).
     let features = options.preset.features();
@@ -1392,8 +1198,6 @@ pub(crate) fn create_frame(
         None
     };
 
-=======
->>>>>>> refs/remotes/origin/main
     // GI probe texture: grid x (grid*6) rgba16f, plus a 1x1 dummy used when
     // GI is disabled so the forward descriptor is always complete.
     let gi_tex = if options.gi_enabled {
@@ -1482,7 +1286,6 @@ pub(crate) fn create_frame(
         gpu_allocator::MemoryLocation::CpuToGpu,
         "rq-params",
     )?;
-<<<<<<< HEAD
     let post_params = if want_post {
         Some(Buffer::new(
             device,
@@ -1495,27 +1298,17 @@ pub(crate) fn create_frame(
     } else {
         None
     };
-=======
->>>>>>> refs/remotes/origin/main
 
     // ---- descriptors -----------------------------------------------------------
     let pool = unsafe {
         device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-<<<<<<< HEAD
                     .max_sets(5)
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::UNIFORM_BUFFER,
                             descriptor_count: 5,
-=======
-                    .max_sets(4)
-                    .pool_sizes(&[
-                        vk::DescriptorPoolSize {
-                            ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            descriptor_count: 4,
->>>>>>> refs/remotes/origin/main
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1523,11 +1316,7 @@ pub(crate) fn create_frame(
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::SAMPLED_IMAGE,
-<<<<<<< HEAD
                             descriptor_count: 6,
-=======
-                            descriptor_count: 2,
->>>>>>> refs/remotes/origin/main
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::SAMPLER,
@@ -1535,11 +1324,7 @@ pub(crate) fn create_frame(
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-<<<<<<< HEAD
                             descriptor_count: 4,
-=======
-                            descriptor_count: 3,
->>>>>>> refs/remotes/origin/main
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -1648,12 +1433,8 @@ pub(crate) fn create_frame(
                     .dst_binding(0)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                     .image_info(&[img_info(
-<<<<<<< HEAD
                         // With the post pass the tone map reads its output.
                         post_images.as_ref().map_or(hdr_view, |(_, v, _)| *v),
-=======
-                        hdr_view,
->>>>>>> refs/remotes/origin/main
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     )]),
                 vk::WriteDescriptorSet::default()
@@ -1694,7 +1475,6 @@ pub(crate) fn create_frame(
         );
     }
 
-<<<<<<< HEAD
     let post = match (post_images, post_params) {
         (Some((out_img, out_view_p, glass)), Some(params_buf)) => {
             let set = alloc_set(pipelines.post_set_layout)?;
@@ -1770,8 +1550,6 @@ pub(crate) fn create_frame(
         _ => None,
     };
 
-=======
->>>>>>> refs/remotes/origin/main
     let cmds = unsafe {
         device
             .allocate_command_buffers(
@@ -1800,12 +1578,9 @@ pub(crate) fn create_frame(
         hdr_view,
         depth,
         depth_view,
-<<<<<<< HEAD
         material,
         material_view,
         post,
-=======
->>>>>>> refs/remotes/origin/main
         out,
         out_view,
         framebuffer,
@@ -2015,7 +1790,6 @@ impl FrameGpu {
         Self::end(self.cmd_build_tlas, device)
     }
 
-<<<<<<< HEAD
     /// Bind `pipeline`, set the full-frame viewport/scissor and draw every
     /// instance (inside an active render pass).
     fn draw_scene(
@@ -2072,8 +1846,6 @@ impl FrameGpu {
         }
     }
 
-=======
->>>>>>> refs/remotes/origin/main
     /// Submission C: GI probe compute (optional), the forward render pass,
     /// the tone map and the readback copy.
     #[allow(clippy::too_many_arguments)]
@@ -2089,7 +1861,6 @@ impl FrameGpu {
         unsafe {
             // 0. The `out` image is written as a storage image (by the tone map
             //    or by the ray-query probe), so move it out of UNDEFINED first.
-<<<<<<< HEAD
             let mut initial_barriers = Vec::new();
             if let Some(post) = &self.post {
                 // The post pass writes this as a storage image.
@@ -2121,8 +1892,6 @@ impl FrameGpu {
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .subresource_range(color_range()),
             ]);
-=======
->>>>>>> refs/remotes/origin/main
             device.cmd_pipeline_barrier(
                 self.cmd_frame,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -2130,28 +1899,7 @@ impl FrameGpu {
                 vk::DependencyFlags::default(),
                 &[],
                 &[],
-<<<<<<< HEAD
                 &initial_barriers,
-=======
-                &[
-                    vk::ImageMemoryBarrier::default()
-                        .image(self.out.handle)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .subresource_range(color_range()),
-                    // The GI dummy (bound when GI is off) is sampled by the
-                    // forward pass; it never sees another layout transition.
-                    vk::ImageMemoryBarrier::default()
-                        .image(self.dummy_tex.0.handle)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .subresource_range(color_range()),
-                ],
->>>>>>> refs/remotes/origin/main
             );
 
             // 1. GI probe pass: probe texture TRANSFER_DST -> GENERAL, dispatch.
@@ -2309,15 +2057,12 @@ impl FrameGpu {
                                 float32: [0.0, 0.0, 0.0, 1.0],
                             },
                         },
-<<<<<<< HEAD
                         // Material channel: zero = "no surface / not metallic".
                         vk::ClearValue {
                             color: vk::ClearColorValue {
                                 float32: [0.0, 0.0, 0.0, 0.0],
                             },
                         },
-=======
->>>>>>> refs/remotes/origin/main
                         vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
                                 depth: 1.0,
@@ -2328,7 +2073,6 @@ impl FrameGpu {
                 vk::SubpassContents::INLINE,
             );
             if !options.mutate_skip_forward_draw {
-<<<<<<< HEAD
                 self.draw_scene(device, pipelines, pipelines.graphics, scene);
             }
             device.cmd_end_render_pass(self.cmd_frame);
@@ -2373,58 +2117,6 @@ impl FrameGpu {
                 }
             }
 
-=======
-                device.cmd_bind_pipeline(
-                    self.cmd_frame,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.graphics,
-                );
-                device.cmd_set_viewport(
-                    self.cmd_frame,
-                    0,
-                    // Positive height: the projection already flips Y
-                    // (`mat4_perspective` negates its y row), so no negative
-                    // viewport is needed — and a negative viewport height is
-                    // not portable without VK_KHR_maintenance5.
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: self.width as f32,
-                        height: self.height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
-                );
-                device.cmd_set_scissor(
-                    self.cmd_frame,
-                    0,
-                    &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D {
-                            width: self.width,
-                            height: self.height,
-                        },
-                    }],
-                );
-                device.cmd_bind_descriptor_sets(
-                    self.cmd_frame,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.forward_layout,
-                    0,
-                    std::slice::from_ref(&self.forward_set),
-                    &[],
-                );
-                device.cmd_draw(
-                    self.cmd_frame,
-                    scene.mesh_vertex_count,
-                    scene.instance_count,
-                    0,
-                    0,
-                );
-            }
-            device.cmd_end_render_pass(self.cmd_frame);
-
->>>>>>> refs/remotes/origin/main
             // 3. Tone map. The render pass already transitioned the HDR
             //    attachment to SHADER_READ_ONLY_OPTIMAL as its final layout,
             //    and the end-of-render-pass dependency makes the colour
@@ -2440,7 +2132,6 @@ impl FrameGpu {
                 &[],
                 &[],
             );
-<<<<<<< HEAD
             // 3a. Post pass (SSR + refraction): skipped entirely — nothing is
             //     recorded — unless the preset enabled a post feature.
             if let Some(post) = &self.post {
@@ -2480,8 +2171,6 @@ impl FrameGpu {
                         .subresource_range(color_range())],
                 );
             }
-=======
->>>>>>> refs/remotes/origin/main
             device.cmd_bind_pipeline(
                 self.cmd_frame,
                 vk::PipelineBindPoint::COMPUTE,
@@ -2570,7 +2259,6 @@ unsafe fn device_destroy_views(device: &ash::Device, frame: &mut FrameGpu) {
     device.destroy_image_view(frame.hdr_view, None);
     device.destroy_image_view(frame.depth_view, None);
     device.destroy_image_view(frame.out_view, None);
-<<<<<<< HEAD
     device.destroy_image_view(frame.material_view, None);
     if let Some(post) = &frame.post {
         device.destroy_image_view(post.out_view, None);
@@ -2581,8 +2269,6 @@ unsafe fn device_destroy_views(device: &ash::Device, frame: &mut FrameGpu) {
             device.destroy_framebuffer(fb, None);
         }
     }
-=======
->>>>>>> refs/remotes/origin/main
     if let Some((_, view)) = &frame.gi_tex {
         device.destroy_image_view(*view, None);
     }

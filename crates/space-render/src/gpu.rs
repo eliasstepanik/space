@@ -15,10 +15,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use crate::alloc::SharedAllocator;
 use crate::params;
-<<<<<<< HEAD
 use crate::quality::{self, QualityPreset};
-=======
->>>>>>> refs/remotes/origin/main
 use crate::scene::Scene;
 
 /// Validation layer name (NUL-terminated for the Vulkan API).
@@ -112,14 +109,11 @@ pub struct RenderOptions {
     /// Run the ray-query probe GI pass and feed it into the forward pass.
     pub gi_enabled: bool,
     pub quality: Quality,
-<<<<<<< HEAD
     /// Quality tier driving the optional render features (fog, ...); see
     /// [`crate::quality`]. `RenderOptions::default()` uses
     /// [`QualityPreset::Ci`] (all optional features off) so headless/golden
     /// callers stay deterministic; the client opts in to its own preset.
     pub preset: QualityPreset,
-=======
->>>>>>> refs/remotes/origin/main
     pub exposure: f32,
     /// MUTATION SWITCH: skip the forward draw entirely (the render pass is
     /// still begun and ended, so only the draw is removed). Any pixel test
@@ -144,10 +138,7 @@ impl Default for RenderOptions {
         Self {
             gi_enabled: true,
             quality: Quality::DEFAULT,
-<<<<<<< HEAD
             preset: QualityPreset::Ci,
-=======
->>>>>>> refs/remotes/origin/main
             exposure: 1.0,
             mutate_skip_forward_draw: false,
             mutate_skip_gi_dispatch: false,
@@ -622,13 +613,10 @@ impl RenderContext {
             frame.gi_params.write(params::as_bytes(&gi))?;
         }
         frame.tone_params.write(params::as_bytes(&tone_params))?;
-<<<<<<< HEAD
         if let Some(post) = &frame.post {
             let post_params = build_post_params(&forward_params, width, height, &options);
             post.params.write(params::as_bytes(&post_params))?;
         }
-=======
->>>>>>> refs/remotes/origin/main
         if options.ray_probe {
             let rq = rq_uniforms(scene, width, height);
             frame.rq_params.write(params::as_bytes(&rq))?;
@@ -731,10 +719,7 @@ fn build_uniforms(
     let view_proj = scene.view_proj();
     let inv_view_proj = scene.inv_view_proj().unwrap_or(view_proj);
     let tan_half_fov = (cam.fov_y * 0.5).tan();
-<<<<<<< HEAD
     let features = options.preset.features();
-=======
->>>>>>> refs/remotes/origin/main
 
     let mut forward = params::ForwardParams {
         camera: params::Camera {
@@ -757,7 +742,6 @@ fn build_uniforms(
         gi_grid_size_x: options.quality.grid,
         gi_grid_size_y: options.quality.grid,
         _pad1: 0.0,
-<<<<<<< HEAD
         fog: [
             quality::FOG_COLOR[0],
             quality::FOG_COLOR[1],
@@ -766,8 +750,6 @@ fn build_uniforms(
         ],
         features: features.flags(),
         _pad2: [0; 3],
-=======
->>>>>>> refs/remotes/origin/main
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {
         // World-space light -> camera-relative f32 offset.
@@ -808,7 +790,6 @@ fn build_uniforms(
     (forward, gi, tone)
 }
 
-<<<<<<< HEAD
 /// Index-of-refraction ratio for light entering glass from air (1 / 1.5).
 const REFRACT_ETA: f32 = 1.0 / 1.5;
 
@@ -838,8 +819,6 @@ fn build_post_params(
     }
 }
 
-=======
->>>>>>> refs/remotes/origin/main
 /// The [`params::RqParams`] for a raw ray-query probe frame: a bright magenta
 /// hit colour and a dark blue miss colour so a test can tell hit, miss and
 /// "nothing was written" apart, and a camera ray setup that matches the

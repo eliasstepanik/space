@@ -38,12 +38,9 @@ describes current behaviour, not intent.
    or client redirects. This is mitigated today only by the loopback-default
    control bind; exposing the control port on a non-loopback address removes
    that mitigation.
-<<<<<<< HEAD
 
 ## Known limitations (Phase 3 close-out)
 
 * The H13 frame-gap test relies on lockstepped harness ticks; production continuity rests on the separately-tested commit-gate machinery.
 * The Dockerfiles and compose files are correct-by-inspection only (no Docker daemon in CI).
 * The Phase-4 present path (swapchain) is validated by build + clippy only (no window system in CI).
-=======
->>>>>>> refs/remotes/origin/main
