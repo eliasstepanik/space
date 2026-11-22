@@ -85,7 +85,6 @@ services:
         ipv4_address: 172.29.0.12
     # Client needs a ray-tracing-capable GPU (VK_KHR_acceleration_structure); not auto-restarted so it doesn't churn sessions on hosts without one.
     restart: "no"
-<<<<<<< HEAD
 
   # Serves the static web client (index.html + pkg/*.wasm/*.js) from
   # ./viewer/space-viewer. The browser connects to the stream proxy (client
