@@ -248,6 +248,20 @@ mod tests {
     }
 
     #[test]
+    fn blur_releases_every_held_key() {
+        let held = ["KeyA".to_string(), "Space".to_string()];
+        let msgs = release_messages(&held);
+        assert_eq!(msgs.len(), 2);
+        for m in msgs {
+            assert!(matches!(
+                ViewerInput::decode(&m),
+                Ok(ViewerInput::Key { down: false, .. })
+            ));
+        }
+        assert!(release_messages(&[]).is_empty());
+    }
+
+    #[test]
     fn viewer_messages_decode_with_the_server_decoder() {
         let msg = key_message("Space", true).unwrap();
         assert_eq!(
