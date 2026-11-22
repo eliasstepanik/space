@@ -1,25 +1,25 @@
 # Proxy deployment bundle
 
-Production stack for the proxy host: orchestrator + `shard-a` (+ optional
-pixel-stream client) from prebuilt `ghcr.io/eliasstepanik/space-*` images.
+Production stack for the proxy host: orchestrator + `shard-a` + the ws://
+pixel-stream client from prebuilt `ghcr.io/eliasstepanik/space-*` images,
+auto-redeployed by Watchtower.
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client` (profile `stream`); `restart: unless-stopped`; named volume for orchestrator state |
-| `.env.example` | copy to `.env`: cluster name, host ports, image tag, profiles |
-| `redeploy.sh` | flock-serialized: `compose --profile '*' pull --quiet`, `up -d --remove-orphans`, `docker image prune -f`; logs to stdout |
-| `check-updates.sh` | compares remote vs local digests of the 3 images; runs `redeploy.sh` if any differ. Exit 0 no change, 10 redeployed, 20 error |
-| `space-redeploy.nix` | NixOS module: oneshot service + 5-minute timer running `check-updates.sh` |
+| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped`; orchestrator state in `./state` |
+| `.env.example` | copy to `.env`: cluster name, host ports, image tag |
+| `redeploy.sh` | manual path only (used by `.github/workflows/deploy.yml`): `compose pull`, `up -d`, image prune |
 
 ## Install (one-time, on the host)
 
+The stack lives in `/home/proxy/stacks/space/` (no sudo needed):
+
 ```sh
-sudo mkdir -p /opt/space && sudo cp docker-compose.yaml redeploy.sh check-updates.sh /opt/space/
-sudo cp .env.example /opt/space/.env     # then edit
-sudo chmod +x /opt/space/redeploy.sh /opt/space/check-updates.sh
-/opt/space/redeploy.sh
-# then install the poll timer (see below), e.g. on NixOS:
-#   cp space-redeploy.nix /etc/nixos/ and add it to `imports`, then nixos-rebuild switch
+mkdir -p /home/proxy/stacks/space/state
+cp docker-compose.yaml /home/proxy/stacks/space/
+cp .env.example /home/proxy/stacks/space/.env     # then edit
+chmod a+rwx /home/proxy/stacks/space/state        # orchestrator runs as uid 10001
+cd /home/proxy/stacks/space && docker compose up -d
 ```
 
 ## How updates reach the host
@@ -28,49 +28,27 @@ sudo chmod +x /opt/space/redeploy.sh /opt/space/check-updates.sh
    runs `.github/workflows/release-images.yml`, which pushes
    `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` tagged `latest` and
    `sha-<shortsha>`.
-2. **Primary path (poll timer on the host):** a systemd timer runs
-   `/opt/space/check-updates.sh` every 5 minutes. It compares the remote digest
-   (`docker buildx imagetools inspect`) of `space-{shard,orchestrator,client}`
-   with the local `RepoDigests`; if any differ it runs `redeploy.sh`. Images
-   that are not found / denied / 401 / 404 (not yet public) count as "no
-   change", quietly. Exit codes: `0` no change, `10` redeployed, `20` error.
-   Needs no inbound access and no secrets in GitHub.
+2. **Primary path (Watchtower):** the Watchtower container already running on
+   the host polls every 60s. It only touches containers that opt in with the
+   label `com.centurylinklabs.watchtower.enable: "true"` (set on `orchestrator`,
+   `shard-a` and `client`). When the `:latest` digest changes it pulls the new
+   image and recreates the container with the same configuration. Nothing to
+   install or schedule per stack.
 3. **Manual path:** `.github/workflows/deploy.yml` (`workflow_dispatch`, or
-   `repository_dispatch` with `event_type: redeploy`) SSHes to the host and
-   runs `/opt/space/redeploy.sh`. `redeploy.sh` takes a flock on
-   `/var/lock/space-redeploy.lock`, so a manual run and the timer never overlap.
+   `repository_dispatch` with `event_type: redeploy`) SSHes to the host and runs
+   `redeploy.sh`. It is no longer the primary path.
 
-### Poll timer unit spec
+Watchtower only follows the tag the container runs. Rollback: set
+`SPACE_TAG=sha-<shortsha>` in `.env` and run `docker compose up -d`; set it back
+to `latest` to resume auto-updates.
 
-On the proxy host (NixOS) this is `space-redeploy.nix` (in this directory). The
-equivalent systemd units:
+## Client configuration
 
-```ini
-# space-redeploy.service
-[Unit]
-Description=Check ghcr for new space images and redeploy
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-SuccessExitStatus=10
-ExecStart=/opt/space/check-updates.sh
-
-# space-redeploy.timer
-[Unit]
-Description=Poll for new space images every 5 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-
-[Install]
-WantedBy=timers.target
-```
-
-`SuccessExitStatus=10` keeps "redeployed" from showing up as a failed unit.
-Logs: `journalctl -u space-redeploy`.
+The client image's ENTRYPOINT is a shell wrapper that runs
+`space-client --stream "$STREAM_BIND" [--server "$SPACE_SERVER"] $CLIENT_ARGS`,
+so the compose file sets those env vars (`STREAM_BIND=0.0.0.0:8099`,
+`SPACE_SERVER=172.29.0.11:7870`, `CLIENT_ARGS=--galaxy`) instead of a
+`command:` (which the wrapper would ignore).
 
 ## Network subnet
 
@@ -79,21 +57,17 @@ client `.12`). `deploy/docker-compose.yaml` uses `172.31.0.0/24`, which collides
 with an existing docker network on the proxy host, hence the different subnet
 here.
 
-Rollback: set `SPACE_TAG=sha-<shortsha>` in `.env` and run `redeploy.sh`.
+## Images must be public
 
-## Make the images public (one-time, repo owner)
-
-Packages pushed with `GITHUB_TOKEN` start private. After the first push, for
-each of `space-shard`, `space-orchestrator`, `space-client`: GitHub > your
-profile > Packages > the package > Package settings > Change visibility >
-Public. Then the host pulls anonymously (no `docker login`). If you keep them
-private instead, run `docker login ghcr.io` on the host with a PAT that has
-`read:packages`.
+The three ghcr packages (`space-shard`, `space-orchestrator`, `space-client`)
+are public, so both the host and Watchtower pull anonymously (no `docker login`).
+New packages pushed with `GITHUB_TOKEN` start private: make them public under
+Packages > the package > Package settings > Change visibility.
 
 ## GitHub secrets for the manual path
 
-These do **not exist yet**; add them in Settings > Secrets and variables >
-Actions before using `deploy.yml`:
+Needed only for `deploy.yml`; add them in Settings > Secrets and variables >
+Actions:
 
 - `DEPLOY_SSH_HOST` host name or IP of the proxy
 - `DEPLOY_SSH_USER` login user (must be allowed to run `docker`)
@@ -102,6 +76,6 @@ Actions before using `deploy.yml`:
 
 ## Verification status
 
-Compose and workflows are validated as YAML only; the scripts are checked with
+Compose and workflows are validated as YAML only; scripts are checked with
 `bash -n`. Nothing here has been run in the authoring sandbox (no Docker daemon,
 no access to the host).

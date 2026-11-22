@@ -79,7 +79,7 @@ Do not run GPU tests in parallel (`--test-threads=1`).
 - **Pipeline** (details: `deploy/README.md`, `deploy/proxy/README.md`): merge to `main` -> `release-images.yml`
   pushes `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` as `:latest` + `:sha-<short>`; tag `v*` ->
   `release.yml` attaches `space-client`, `space-client.exe`, `space-viewer.zip` to a GitHub Release; the proxy host
-  polls (systemd timer, 5 min, set up on the host) and runs `/opt/space/redeploy.sh`; `deploy.yml` is the manual SSH path
+  runs Watchtower (label opt-in, 60s poll, stack in `/home/proxy/stacks/space`); `deploy.yml` is the manual SSH path (`redeploy.sh`)
   (secrets `DEPLOY_SSH_HOST/USER/KEY`). ci.yml's `lint` job parses all workflow YAML (`.github/scripts/check_yaml.py`):
   keep heredoc/script bodies out of `run: |` blocks (use `.github/scripts/`) and re-run that check after any workflow edit.
 

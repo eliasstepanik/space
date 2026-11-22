@@ -1,6 +1,12 @@
 # PRODUCTION compose for the proxy host: pulls the prebuilt ghcr.io images pushed
-# by .github/workflows/release-images.yml (no build section). Installed as
-# /opt/space/docker-compose.yaml next to .env and redeploy.sh.
+# by .github/workflows/release-images.yml (no build section). Installed in
+# /home/proxy/stacks/space/ next to .env (and a ./state directory).
+#
+# Auto-redeploy: the already-running Watchtower container (polls every 60s) only
+# updates containers that opt in with the label
+# `com.centurylinklabs.watchtower.enable: "true"`; orchestrator, shard-a and client
+# carry it, so a new image on ghcr is pulled and the container recreated within
+# ~60s of the push. The images are public (anonymous pull, no docker login).
 #
 # NOT EXECUTED: no Docker daemon in the authoring sandbox; correct by inspection
 # and YAML-parse only. Topology and addressing match deploy/docker-compose.yaml
@@ -8,9 +14,15 @@
 # Subnet is 172.29.0.0/24 (NOT 172.31.0.0/24 as in deploy/docker-compose.yaml):
 # 172.31.0.0/24 collides with an existing docker network on the proxy host.
 #
-#   docker compose up -d                          # orchestrator + shard-a
-#   docker compose --profile stream up -d         # + ws:// pixel-stream client
-#   (or set COMPOSE_PROFILES=stream in .env)
+# Configuration is by ENVIRONMENT variables, not `command:`: each image's
+# ENTRYPOINT is `/bin/sh -c 'exec <bin> --flags "$ENV"...'` (see deploy/Dockerfile.*),
+# so a compose `command:` would only become ignored positional args to that
+# script. Env vars verified against the Dockerfiles:
+#   orchestrator: ORCHESTRATOR_BIND, ORCHESTRATOR_CONTROL_ADDR (required), SPACE_CLUSTER
+#   shard:        ORCHESTRATOR_ADDR (required), SHARD_BIND, SHARD_ADVERTISE (required), SPACE_CLUSTER
+#   client:       STREAM_BIND (-> --stream), SPACE_SERVER (-> --server), CLIENT_ARGS (extra flags)
+#
+#   docker compose up -d        # orchestrator + shard-a + client
 
 x-cluster: &cluster
   SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
@@ -19,12 +31,14 @@ services:
   orchestrator:
     image: ghcr.io/eliasstepanik/space-orchestrator:${SPACE_TAG:-latest}
     container_name: space-orchestrator
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     environment:
       <<: *cluster
       ORCHESTRATOR_BIND: 0.0.0.0:7900
       ORCHESTRATOR_CONTROL_ADDR: 172.29.0.10:7900
     volumes:
-      - orchestrator-state:/var/lib/space
+      - ./state:/var/lib/space
     ports:
       - "${ORCHESTRATOR_PORT:-7900}:7900/udp"
     networks:
@@ -35,6 +49,8 @@ services:
   shard-a:
     image: ghcr.io/eliasstepanik/space-shard:${SPACE_TAG:-latest}
     container_name: space-shard-a
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     depends_on:
       - orchestrator
     environment:
@@ -43,31 +59,31 @@ services:
       SHARD_BIND: 0.0.0.0:7870
       SHARD_ADVERTISE: 172.29.0.11:7870
     ports:
-      - "${SHARD_PORT:-7871}:7870/udp"
+      - "${SHARD_PORT:-7870}:7870/udp"
     networks:
       space:
         ipv4_address: 172.29.0.11
     restart: unless-stopped
 
   client:
-    profiles: ["stream"]
     image: ghcr.io/eliasstepanik/space-client:${SPACE_TAG:-latest}
     container_name: space-client
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     depends_on:
       - shard-a
+    # Image ENTRYPOINT runs: space-client --stream "$STREAM_BIND"
+    # [--server "$SPACE_SERVER"] $CLIENT_ARGS  (no `command:` on purpose).
     environment:
       STREAM_BIND: 0.0.0.0:8099
       SPACE_SERVER: 172.29.0.11:7870
       CLIENT_ARGS: "--galaxy"
     ports:
-      - "${STREAM_PORT:-8099}:8099/tcp"
+      - "${CLIENT_PORT:-8099}:8099/tcp"
     networks:
       space:
         ipv4_address: 172.29.0.12
     restart: unless-stopped
-
-volumes:
-  orchestrator-state:
 
 networks:
   space:
