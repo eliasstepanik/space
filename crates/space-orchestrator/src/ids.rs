@@ -222,6 +222,23 @@ impl PersistentShardIdAllocator {
     pub fn peek(&self) -> u64 {
         self.inner.peek()
     }
+
+    /// Mark `id` as in use so it is never allocated later. When this moves the
+    /// counter, the new value is persisted **before** returning (same rule as
+    /// [`allocate`](Self::allocate)).
+    ///
+    /// # Panics
+    ///
+    /// Panics when persistence fails, like [`allocate`](Self::allocate).
+    pub fn reserve(&mut self, id: ShardId) {
+        let before = self.inner.peek();
+        self.inner.reserve(id);
+        if self.inner.peek() != before {
+            self.sink.persist(self.inner.peek()).expect(
+                "reserve: persisting the counter failed; refusing to proceed with an unpersisted id",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
