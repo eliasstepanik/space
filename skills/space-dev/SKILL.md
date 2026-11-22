@@ -76,6 +76,12 @@ Do not run GPU tests in parallel (`--test-threads=1`).
   (`handshake` only). `wss://` would need `ring`; use a TLS proxy. Peer auth gaps are in `docs/security-notes.md`.
 - naga must resolve >= 30 (`space-render/build.rs` asserts it). ShardIds are monotonic, never reused.
 - Docker files are **not** built in the sandbox (no daemon): correct-by-inspection, say so.
+- **Pipeline** (details: `deploy/README.md`, `deploy/proxy/README.md`): merge to `main` -> `release-images.yml`
+  pushes `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` as `:latest` + `:sha-<short>`; tag `v*` ->
+  `release.yml` attaches `space-client`, `space-client.exe`, `space-viewer.zip` to a GitHub Release; the proxy host
+  polls (systemd timer, 5 min, set up on the host) and runs `/opt/space/redeploy.sh`; `deploy.yml` is the manual SSH path
+  (secrets `DEPLOY_SSH_HOST/USER/KEY`). ci.yml's `lint` job parses all workflow YAML (`.github/scripts/check_yaml.py`):
+  keep heredoc/script bodies out of `run: |` blocks (use `.github/scripts/`) and re-run that check after any workflow edit.
 
 ## Phase map
 0 risk-gate spikes (`spikes/`); 1 world/ecs/protocol/sim; 2 QUIC netcode, headless multiplayer, handoff H1-H8;
