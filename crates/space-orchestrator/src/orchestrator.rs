@@ -401,7 +401,8 @@ impl<L: Launcher> Orchestrator<L> {
                                         "space-orchestrator: rejected hello from {}: {reason}",
                                         hello.endpoint
                                     );
-                                    let _ = std::future::ready(()); let _unused = (Message::Reject(space_protocol::Reject {
+                                    let _ = reply
+                                        .send(Message::Reject(space_protocol::Reject {
                                             reason: space_protocol::RejectReason::Other(reason),
                                         }))
                                         .await;
