@@ -534,10 +534,18 @@ mod tests {
         let spec = orch.take_pending_spawn().pop().expect("a child is staged");
         orch.handle_shard_hello(&hello(spec.shard, 9_002, Some(spec.region.clone())))
             .expect("child registers");
-        let recipients: Vec<ShardId> = orch.drain_outbox().into_iter().map(|(to, _)| to).collect();
+        let outbox = orch.drain_outbox();
+        let epoch = outbox
+            .iter()
+            .find_map(|(_, m)| match m {
+                Message::EpochPrepare(p) => Some(p.epoch),
+                _ => None,
+            })
+            .expect("the prepare went out");
+        let recipients: Vec<ShardId> = outbox.into_iter().map(|(to, _)| to).collect();
         assert!(!recipients.is_empty(), "the prepare went out");
         for shard in recipients {
-            orch.handle_epoch_ack(shard);
+            orch.handle_epoch_ack(shard, epoch);
         }
 
         let out = orch.drain_outbox();
