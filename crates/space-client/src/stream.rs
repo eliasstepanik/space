@@ -427,7 +427,6 @@ mod tests {
                 return;
             }
         };
-<<<<<<< HEAD
         let (w, h) = (128u32, 96u32);
         let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), w, h);
         let out = ctx
@@ -456,27 +455,6 @@ mod tests {
             lit * 100 > (w * h) as usize * 2,
             "too few lit pixels ({lit}) for a frame-filling galaxy"
         );
-=======
-        let size = 64;
-        let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), size, size);
-        let out = ctx
-            .render_offscreen(
-                &scene,
-                size,
-                size,
-                &demo_options(space_render::QualityPreset::Ci),
-            )
-            .expect("galaxy render");
-        let lit = out
-            .pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
-            .count();
-        eprintln!("galaxy stream view: {lit} lit pixels of {}", size * size);
-        assert!(lit > 0, "the default galaxy stream view is black");
->>>>>>> refs/remotes/origin/main
     }
 
     #[test]
