@@ -323,6 +323,8 @@ struct App {
     scene: Option<Scene>,
     options: RenderOptions,
     failed: bool,
+    /// Frames presented so far (logged so a hang is visible).
+    frames: u64,
 }
 
 impl App {
