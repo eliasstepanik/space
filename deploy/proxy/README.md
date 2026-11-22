@@ -55,8 +55,6 @@ Note: the `client` service requires a GPU with `VK_KHR_acceleration_structure`
 exits, and it is set to `restart: "no"` so it is not restarted (a crash loop
 would churn a new backend session each time). `orchestrator` and `shard-a` stay
 at `restart: unless-stopped`.
-=======
->>>>>>> refs/remotes/origin/main
 
 ## Network subnet
 
