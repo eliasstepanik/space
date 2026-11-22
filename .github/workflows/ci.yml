@@ -71,7 +71,15 @@ PY
       # `RenderContext::new` request the layer, and every render test asserts
       # `validation_messages == 0`, so a layout or barrier regression fails here
       # rather than shipping. The exact-pixel tests must pass on lavapipe.
+      #
+      # `continue-on-error: true` on purpose: this has never been run on a stock
+      # ubuntu-latest runner (the authoring sandbox is not one), and both the
+      # lavapipe ICD file name below and the layer path depend on the runner's
+      # Mesa packaging. With SPACE_RENDER_VALIDATION=1 a missing layer is a hard
+      # failure, so until a green run on a hosted runner proves the environment,
+      # this step reports but does not gate. Flip it to false once it has.
       - name: GPU tests (lavapipe + validation layer)
+        continue-on-error: true
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_LAYER_PATH: /usr/share/vulkan/explicit_layer.d
@@ -96,3 +104,38 @@ PY
           tool: cargo-nextest
       - name: cargo xtask ci
         run: cargo xtask ci
+
+  # The browser viewer is a wasm cdylib; `cargo xtask ci` only checks it as a
+  # native rlib, so build it for the real target too. Build only: there is no
+  # browser in this job (wasm-bindgen glue is a manual step, see
+  # crates/space-viewer/README.md).
+  wasm:
+    name: Wasm viewer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Build space-viewer for wasm32-unknown-unknown
+        run: cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer
+
+  # Build every image to prove the Dockerfiles parse and compile; nothing is
+  # pushed or run. (The container *runtime* behaviour is not exercised here.)
+  docker:
+    name: Docker build (${{ matrix.file }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file:
+          - Dockerfile
+          - deploy/Dockerfile.shard
+          - deploy/Dockerfile.orchestrator
+          - deploy/Dockerfile.client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: docker buildx build (no push)
+        run: docker buildx build --file ${{ matrix.file }} --tag space-ci/test:latest .
