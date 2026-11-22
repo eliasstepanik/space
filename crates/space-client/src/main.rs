@@ -175,11 +175,12 @@ fn galaxy_scene(width: u32, height: u32) -> Scene {
 
 /// The galaxy scene's base camera.
 fn galaxy_camera(width: u32, height: u32) -> CameraPose {
-    // Same camera as the `lod_galaxy_renders` GPU test: pulled back along -Z so
-    // the LOD selector refines a dense band of the octree around the camera.
+    // Same camera as the `lod_galaxy_renders` GPU test: pulled back along -Z and
+    // looking back (+Z) at the galaxy's centre at the origin, so the LOD selector
+    // refines a dense band of the octree around the camera.
     CameraPose {
         position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [0.0, 0.0, -5.0e4]),
-        forward: [0.0, 0.0, -1.0],
+        forward: [0.0, 0.0, 1.0],
         up: [0.0, 1.0, 0.0],
         fov_y: std::f32::consts::FRAC_PI_3,
         aspect: width as f32 / height as f32,
