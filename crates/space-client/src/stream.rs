@@ -211,7 +211,7 @@ pub fn stream_loop(
         3.0
     };
     let options = demo_options(config.quality);
-    let mut input = InputState::default();
+    let mut input = initial_input(config.mode);
     let mut last = Instant::now();
     let mut streamed = 0u64;
     while !stop.load(Ordering::Relaxed) && max_frames.is_none_or(|m| streamed < m) {
