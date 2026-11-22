@@ -2211,3 +2211,874 @@ fn an_epoch_commit_mid_handoff_aborts_with_epoch_changed_and_reoffers() {
         "guarantee 6: A keeps simulating the ship after the abort"
     );
 }
+
+// ================================================================ audit fixes
+//
+// One regression test per fix from the shard/transport audit. As above, each
+// names the mutation that makes it fail.
+
+/// The frames one shard queued for `session`, draining its whole outbox.
+fn frames_of(shard: &mut Shard, session: u64) -> Vec<Message> {
+    shard
+        .take_outbox()
+        .into_iter()
+        .filter(|o| o.dest == Destination::Client(session))
+        .map(|o| o.message)
+        .collect()
+}
+
+/// The tick a replication frame describes.
+fn frame_tick(message: &Message) -> Option<u64> {
+    match message {
+        Message::Snapshot(s) => Some(s.tick),
+        Message::Delta(d) => Some(d.tick),
+        _ => None,
+    }
+}
+
+/// The guids a replication frame carries.
+fn frame_entities(message: &Message) -> Vec<EntityGuid> {
+    match message {
+        Message::Snapshot(s) => s.entities.iter().map(|e| e.guid).collect(),
+        Message::Delta(d) => d.entities.iter().map(|e| e.guid).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// An input batch for `ship`, tagged `tick`, acknowledging `ack_tick`.
+fn input(ship: EntityGuid, tick: u64, thrust: [f32; 3], ack_tick: u64) -> InputTick {
+    InputTick {
+        tick,
+        seq: tick,
+        inputs: vec![PlayerInput {
+            entity: ship,
+            thrust,
+            torque: [0.0; 3],
+            tick,
+        }],
+        ack_tick,
+    }
+}
+
+/// A one-shard world: a single region, nobody to hand anything to.
+fn lone_shard() -> Shard {
+    Shard::new(ShardConfig::new(ShardId::new(1), addr(), region(0)))
+}
+
+/// A client whose ship is at rest is still sent a frame on every tick, and the
+/// frame names the tick.
+///
+/// Mutation this catches: returning "nothing to say" from
+/// `replicate::build_frame` when no entity changed — the resting client then
+/// receives nothing at all after its snapshot.
+#[test]
+fn a_client_at_rest_is_sent_a_frame_every_tick() {
+    let mut shard = lone_shard();
+    let (session, ship) = join(&mut shard, "player");
+
+    let mut last_tick = 0;
+    for step in 0..30 {
+        // The client acknowledges what it applied (and sends no input: the ship
+        // stays at rest and nothing lands that could stamp it).
+        if last_tick > 0 {
+            shard.apply_input(
+                session,
+                &InputTick {
+                    tick: last_tick + 3,
+                    seq: last_tick,
+                    inputs: Vec::new(),
+                    ack_tick: last_tick,
+                },
+            );
+        }
+        let tick = shard.tick();
+        let frames = frames_of(&mut shard, session);
+        assert_eq!(frames.len(), 1, "tick {tick}: exactly one frame per tick");
+        assert_eq!(
+            frame_tick(&frames[0]),
+            Some(tick),
+            "the frame names its tick"
+        );
+        match &frames[0] {
+            Message::Snapshot(s) => {
+                assert_eq!(step, 0, "only the first frame is a snapshot");
+                assert!(s.entities.iter().any(|e| e.guid == ship));
+            }
+            Message::Delta(d) => {
+                assert!(step > 0, "the first frame is the snapshot");
+                assert_eq!(d.base_tick, tick - 1, "it follows the previous frame");
+                assert!(
+                    d.entities.is_empty() && d.removed.is_empty(),
+                    "nothing changed, so the delta is empty: {d:?}"
+                );
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+        last_tick = tick;
+    }
+}
+
+/// Until a client has acknowledged a frame, every frame names its own ship —
+/// for a bounded time.
+///
+/// The snapshot that tells a client which ship is its own rides a reliable
+/// stream; the next tick's delta rides a datagram and can arrive first, and a
+/// client that applies the newer frame discards the older one. A client that
+/// does not know its ship sends no input and therefore no acknowledgement, so
+/// nothing would ever reveal the loss. Whichever frame arrives first has to be
+/// enough.
+///
+/// Mutation this catches: dropping the "own ship while unacknowledged"
+/// candidate from `replicate::build_frame` (the deltas before the first
+/// acknowledgement are then empty), or dropping its bound (the last loop then
+/// still finds the ship).
+#[test]
+fn until_a_client_acknowledges_every_frame_names_its_ship() {
+    let mut shard = lone_shard();
+    let (session, ship) = join(&mut shard, "player");
+
+    // Before any acknowledgement: the snapshot, then deltas that repeat the ship.
+    let mut last_tick = 0;
+    for step in 0..5 {
+        last_tick = shard.tick();
+        let frames = frames_of(&mut shard, session);
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frame_entities(&frames[0]).contains(&ship),
+            "frame {step} must name the client's ship: {:?}",
+            frames[0]
+        );
+    }
+
+    // The first acknowledgement ends it.
+    shard.apply_input(
+        session,
+        &InputTick {
+            tick: last_tick + 3,
+            seq: 1,
+            inputs: Vec::new(),
+            ack_tick: last_tick,
+        },
+    );
+    shard.tick();
+    let frames = frames_of(&mut shard, session);
+    assert!(
+        frame_entities(&frames[0]).is_empty(),
+        "an acknowledged client is not sent its parked ship again: {:?}",
+        frames[0]
+    );
+
+    // A client that never acknowledges is not sent its parked ship forever.
+    let mut shard = lone_shard();
+    let (session, ship) = join(&mut shard, "silent");
+    shard.tick_n(space_server::replicate::UNACKNOWLEDGED_SHIP_TICKS + 2);
+    shard.take_outbox();
+    for _ in 0..5 {
+        shard.tick();
+        let frames = frames_of(&mut shard, session);
+        assert_eq!(frames.len(), 1, "it still gets its frame every tick");
+        assert!(
+            !frame_entities(&frames[0]).contains(&ship),
+            "the repetition is bounded: {:?}",
+            frames[0]
+        );
+    }
+}
+
+/// A client that sat still — and lost a frame while it did — can still start
+/// moving.
+///
+/// The client here does exactly what the stock client does: it has no clock of
+/// its own, so it tags every input `last frame tick + 3`. While its ship was at
+/// rest the shard used to send it a frame only when one of those inputs landed,
+/// which made the two a ping-pong: lose one frame and the client keeps tagging
+/// the same tick, the shard moves past it, every later input is dropped as
+/// stale, nothing changes, and the shard never speaks again. Three consecutive
+/// ticks of frames are dropped below, then the player pushes the stick.
+///
+/// Mutation this catches: the same as
+/// [`a_client_at_rest_is_sent_a_frame_every_tick`] — without a frame every tick
+/// the clock never recovers and the ship never moves.
+#[test]
+fn a_client_that_sat_still_can_start_moving() {
+    const INPUT_LEAD: u64 = 3;
+    let mut shard = lone_shard();
+    let (session, ship) = join(&mut shard, "player");
+    let start = shard.sim().ship_state(ship).expect("alive").pos;
+
+    let mut last_frame_tick = 0u64;
+    for step in 0..200u64 {
+        // The client only speaks once a frame has told it which ship is its own.
+        if last_frame_tick > 0 {
+            let thrust = if step >= 100 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.0; 3]
+            };
+            shard.apply_input(
+                session,
+                &input(ship, last_frame_tick + INPUT_LEAD, thrust, last_frame_tick),
+            );
+        }
+        shard.tick();
+        let frames = frames_of(&mut shard, session);
+        if (40..43).contains(&step) {
+            continue; // these frames never arrive
+        }
+        for frame in &frames {
+            if let Some(tick) = frame_tick(frame) {
+                last_frame_tick = last_frame_tick.max(tick);
+            }
+        }
+    }
+
+    let end = shard.sim().ship_state(ship).expect("alive");
+    assert!(
+        end.vel[0] > 0.0 && WorldPos::distance(start, end.pos) > 1.0,
+        "the ship must answer the stick after sitting still: {end:?}"
+    );
+}
+
+/// A frame the client never acknowledged is sent again — an entity and a
+/// removal both.
+///
+/// Deltas ride unreliable datagrams and the front end drops a frame when a
+/// client's queue is full, so "built" is not "delivered". The client reports the
+/// highest tick it applied; a frame older than that which was never itself
+/// acknowledged is presumed lost.
+///
+/// Mutation this catches: `ClientReplica::acknowledge` settling every frame at
+/// or below the acknowledged tick as delivered (or `apply_input` not calling it
+/// at all) — the lost snapshot's ship and the lost removal are then never sent
+/// again.
+#[test]
+fn a_frame_the_client_never_acknowledged_is_sent_again() {
+    let mut shard = lone_shard();
+    let (watcher, watcher_ship) = join(&mut shard, "watcher");
+    let (leaver, leaver_ship) = join(&mut shard, "leaver");
+
+    // The snapshot goes out and is lost; two more frames follow, and the second
+    // of them arrives.
+    let snapshot_tick = shard.tick();
+    let lost = frames_of(&mut shard, watcher);
+    assert!(matches!(lost.first(), Some(Message::Snapshot(_))));
+    shard.tick();
+    shard.take_outbox();
+    let heard = shard.tick();
+    let mut received: Vec<EntityGuid> = frames_of(&mut shard, watcher)
+        .iter()
+        .flat_map(frame_entities)
+        .collect();
+    assert!(
+        !received.contains(&leaver_ship),
+        "precondition: only the lost snapshot carried the other ship"
+    );
+
+    // The client applied the frame for `heard` and never the snapshot.
+    assert!(heard > snapshot_tick);
+    shard.apply_input(
+        watcher,
+        &InputTick {
+            tick: heard + 3,
+            seq: 1,
+            inputs: Vec::new(),
+            ack_tick: heard,
+        },
+    );
+    let resend_tick = shard.tick();
+    let resent = frames_of(&mut shard, watcher);
+    let carried: Vec<EntityGuid> = resent.iter().flat_map(frame_entities).collect();
+    assert!(
+        carried.contains(&leaver_ship),
+        "what only the lost snapshot carried must be sent again, got {carried:?}"
+    );
+    received.extend(carried);
+    assert!(
+        received.contains(&watcher_ship) && received.contains(&leaver_ship),
+        "between them, the frames that arrived cover the lost snapshot: {received:?}"
+    );
+
+    // That frame *is* acknowledged, exactly: nothing more is owed.
+    shard.apply_input(
+        watcher,
+        &InputTick {
+            tick: resend_tick + 3,
+            seq: 2,
+            inputs: Vec::new(),
+            ack_tick: resend_tick,
+        },
+    );
+    shard.tick();
+    let quiet = frames_of(&mut shard, watcher);
+    assert!(
+        quiet.iter().flat_map(frame_entities).next().is_none(),
+        "an acknowledged frame is not repeated: {quiet:?}"
+    );
+
+    // The other ship leaves; the delta that says so is lost.
+    shard.leave(leaver);
+    let removal_tick = shard.tick();
+    let removal = frames_of(&mut shard, watcher);
+    assert!(
+        matches!(removal.first(), Some(Message::Delta(d)) if d.removed.contains(&leaver_ship)),
+        "the watcher is told the ship left: {removal:?}"
+    );
+    let later = shard.tick();
+    shard.take_outbox();
+    assert!(later > removal_tick);
+    shard.apply_input(
+        watcher,
+        &InputTick {
+            tick: later + 3,
+            seq: 3,
+            inputs: Vec::new(),
+            ack_tick: later,
+        },
+    );
+    shard.tick();
+    let again = frames_of(&mut shard, watcher);
+    assert!(
+        matches!(again.first(), Some(Message::Delta(d)) if d.removed.contains(&leaver_ship)),
+        "a removal that was never acknowledged must be said again: {again:?}"
+    );
+}
+
+/// An entity that is at rest when it comes into a client's interest is sent.
+///
+/// The change scan only ever finds rows written since the client was last
+/// examined, and a parked ship is never written. Coming into range has to be a
+/// reason to send it in its own right.
+///
+/// Mutation this catches: dropping the "entered interest" candidates from
+/// `replicate::build_frame` — the parked ship is then invisible to the player
+/// flying up to it, however close they get.
+#[test]
+fn a_parked_ship_is_sent_when_a_client_flies_into_range() {
+    let mut config = ShardConfig::new(ShardId::new(1), addr(), region(0));
+    config.interest_radius = 150.0;
+    let mut shard = Shard::new(config);
+
+    // Parked 400 m along +x of where players spawn: well outside interest.
+    let parked_at = region_center(0).offset([400.0, 0.0, 0.0]);
+    let parked = shard.spawn_ship_for(0, parked_at);
+    shard.tick_n(5);
+    shard.take_outbox();
+
+    let (session, ship) = join(&mut shard, "player");
+    let mut saw_parked = false;
+    let mut first_frame = true;
+    for _ in 0..900 {
+        let tick = shard.sim().tick() + 1;
+        shard.apply_input(session, &input(ship, tick, [1.0, 0.0, 0.0], 0));
+        shard.tick();
+        for frame in frames_of(&mut shard, session) {
+            let carried = frame_entities(&frame);
+            if first_frame {
+                assert!(
+                    !carried.contains(&parked),
+                    "precondition: the parked ship starts outside interest"
+                );
+                first_frame = false;
+            }
+            saw_parked = saw_parked || carried.contains(&parked);
+        }
+        if saw_parked {
+            break;
+        }
+    }
+    let gap = WorldPos::distance(shard.sim().ship_state(ship).expect("alive").pos, parked_at);
+    assert!(
+        saw_parked,
+        "the parked ship never reached the client, which is now {gap:.0} m from it"
+    );
+    assert!(
+        gap > 100.0,
+        "it must be sent on entering the 150 m sphere, not on arrival ({gap:.0} m)"
+    );
+    assert_eq!(
+        shard.sim().ship_state(parked).expect("alive").pos,
+        parked_at,
+        "the parked ship itself never moved"
+    );
+}
+
+/// Drive A's player ship out of A's region until A offers it, hand the offer to
+/// B and B's accept back to A. Returns A's session and the ship.
+fn offer_and_accept(pair: &mut Pair, token: &str) -> (u64, EntityGuid) {
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (session_a, guid) = join(&mut pair.a, token);
+    let mut offered = false;
+    for _ in 0..600 {
+        pair.thrust(id_a, session_a, 0, 1.0);
+        pair.a.tick();
+        let out = pair.a.take_outbox();
+        if out
+            .iter()
+            .any(|o| matches!(o.message, Message::HandoffOffer(_)))
+        {
+            offered = true;
+            for o in out {
+                if matches!(o.dest, Destination::Shard(_)) {
+                    pair.b.peer_message(id_a, o.message);
+                }
+            }
+            break;
+        }
+    }
+    assert!(offered, "A must have offered the ship");
+    let mut accepted = false;
+    for o in pair.b.take_outbox() {
+        if matches!(o.dest, Destination::Shard(_)) {
+            accepted = accepted || matches!(o.message, Message::HandoffAccept(_));
+            pair.a.peer_message(id_b, o.message);
+        }
+    }
+    assert!(accepted, "B must have accepted and staged the ship");
+    (session_a, guid)
+}
+
+/// A peer that refuses an offer is not asked again on the very next tick.
+///
+/// B is full, so every offer is answered with `TargetFull`. The ship is still
+/// across the boundary a tick later, and A used to offer it again at once: an
+/// offer, a refusal and a `Redirect` to every watcher, at tick rate, for as long
+/// as B stayed full. A new shard map ends the pause, because the refusal was
+/// about the old one.
+///
+/// Mutation this catches: `Shard::on_abort` not recording the refusal (or
+/// `handoff_pass` not consulting it) — A then offers on every tick.
+#[test]
+fn a_refused_offer_is_not_repeated_every_tick() {
+    use space_server::config::REOFFER_BACKOFF_TICKS;
+
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (session_a, guid) = join(&mut pair.a, "player");
+    for i in 0..space_server::shard::MAX_PLAYERS_PER_SHARD {
+        pair.b
+            .join(&space_net::hello(format!("filler-{i}")))
+            .expect("filler joins");
+    }
+    pair.b.take_outbox();
+
+    let mut offers = 0u64;
+    let mut redirects = 0u64;
+    let mut first_offer_at = None;
+    for _ in 0..1_200 {
+        pair.thrust(id_a, session_a, 0, 1.0);
+        let tick = pair.a.tick();
+        for o in pair.a.take_outbox() {
+            match o.dest {
+                Destination::Shard(_) => {
+                    if matches!(o.message, Message::HandoffOffer(_)) {
+                        offers += 1;
+                        first_offer_at.get_or_insert(tick);
+                    }
+                    pair.b.peer_message(id_a, o.message);
+                }
+                Destination::Client(_) => {
+                    if matches!(o.message, Message::Redirect(_)) {
+                        redirects += 1;
+                    }
+                }
+                Destination::Orchestrator => {}
+            }
+        }
+        // B answers on arrival; it does not need to tick to refuse.
+        for o in pair.b.take_outbox() {
+            if matches!(o.dest, Destination::Shard(_)) {
+                pair.a.peer_message(id_b, o.message);
+            }
+        }
+        if first_offer_at.is_some_and(|first| tick >= first + 4 * REOFFER_BACKOFF_TICKS) {
+            break;
+        }
+    }
+    assert!(first_offer_at.is_some(), "A must have offered the ship");
+    assert!(
+        (2..=6).contains(&offers),
+        "over four back-off periods a refused ship is offered about once per period, \
+         not once per tick: {offers} offers"
+    );
+    assert_eq!(
+        redirects, offers,
+        "one redirect per offer, to the one client"
+    );
+    assert!(pair.a.sim().ship_state(guid).is_some(), "A keeps the ship");
+
+    // A new map is a new question: the pause ends with it.
+    let newer = ShardMap::new(
+        2,
+        vec![
+            ShardRegion::new(region(0), id_a, addr()),
+            ShardRegion::new(region(1), id_b, addr()),
+        ],
+    );
+    pair.a.set_shard_map(newer);
+    pair.a.take_outbox();
+    pair.thrust(id_a, session_a, 0, 1.0);
+    pair.a.tick();
+    let messages: Vec<Message> = pair
+        .a
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    assert!(
+        offer_in(&messages).is_some(),
+        "after a map change the ship is offered again without waiting"
+    );
+}
+
+/// An entity whose commit has arrived and is waiting for its install tick
+/// cannot be offered (and so committed) a second time.
+///
+/// Between the commit and the install the entity is in neither the ledger nor
+/// the world, so the old busy check let a second offer through. Two installs of
+/// one guid is a panic inside `SimWorld::spawn_ship`, inside `Shard::tick` —
+/// which kills the tick loop while the shard goes on accepting players.
+///
+/// Mutation this catches: dropping the `pending_commits` clause from
+/// `Shard::on_offer`'s busy check *and* the "already alive" guard in
+/// `install_pending_commits` — the loop below then panics.
+#[test]
+fn an_entity_awaiting_install_cannot_be_offered_again() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let guid = EntityGuid::new(id_a, 77);
+    let offer = space_protocol::HandoffOffer {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        state: Box::new(offer_state(guid, "player")),
+        activation_tick: space_server::handoff::HANDOFF_LEAD,
+    };
+    let commit = space_protocol::HandoffCommit {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        activation_tick: space_server::handoff::HANDOFF_LEAD,
+        state: Box::new(offer_state(guid, "player")),
+    };
+
+    pair.b
+        .peer_message(id_a, Message::HandoffOffer(offer.clone()));
+    assert!(pair
+        .b
+        .take_outbox()
+        .iter()
+        .any(|o| matches!(o.message, Message::HandoffAccept(_))));
+    pair.b
+        .peer_message(id_a, Message::HandoffCommit(commit.clone()));
+    assert!(
+        pair.b.sim().ship_state(guid).is_none(),
+        "precondition: the commit waits for B's own install tick"
+    );
+
+    // The same exchange again, while the first commit is still waiting.
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    let messages: Vec<Message> = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| matches!(m, Message::HandoffAccept(_))),
+        "an entity awaiting install must not be staged a second time"
+    );
+    assert!(
+        abort_in(&messages).is_some_and(|a| a.entity == guid),
+        "the second offer is refused"
+    );
+    pair.b.peer_message(id_a, Message::HandoffCommit(commit));
+
+    for _ in 0..space_server::handoff::HANDOFF_LEAD + 5 {
+        pair.b.tick();
+    }
+    assert!(
+        pair.b.sim().ship_state(guid).is_some(),
+        "the first commit installs"
+    );
+    assert_eq!(pair.b.stats().received, 1, "exactly once");
+    assert_eq!(pair.b.stats().ships, 1);
+}
+
+/// Only the player a staged entity belongs to can call its handoff off.
+///
+/// `NeighbourStatus { connected: true }` was already gated on the hello token
+/// the offer carried; `connected: false` was not, so any client could cancel any
+/// other player's inbound handoff by naming its (guessable) guid — and the
+/// abort it produced carried a shard id straight out of the client's message.
+///
+/// Mutation this catches: aborting the staged transfer in
+/// `Shard::client_status` without the `claim_is_authorized` test.
+#[test]
+fn only_the_owner_can_call_off_a_staged_handoff() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = offer_and_accept(&mut pair, "owner-token");
+
+    let stranger = pair
+        .b
+        .join(&space_net::hello("someone-else"))
+        .expect("join B")
+        .session;
+    pair.b.take_outbox();
+    pair.b.client_status(
+        stranger,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: false,
+        },
+    );
+    let messages: Vec<Message> = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    assert!(
+        abort_in(&messages).is_none(),
+        "a client that does not own the ship must not be able to cancel its handoff"
+    );
+    assert_eq!(pair.b.stats().aborted, 0);
+
+    // The owner really cannot reach B: the transfer is called off, and the
+    // abort names B — not the shard id the client wrote into its status.
+    let owner = pair
+        .b
+        .join(&space_net::hello("owner-token"))
+        .expect("join B")
+        .session;
+    pair.b.take_outbox();
+    pair.b.client_status(
+        owner,
+        NeighbourStatus {
+            entity: guid,
+            shard: ShardId::new(999),
+            connected: false,
+        },
+    );
+    let messages: Vec<Message> = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    let abort = abort_in(&messages).expect("the owner can call the handoff off");
+    assert_eq!(abort.entity, guid);
+    assert_eq!(abort.from, id_a);
+    assert_eq!(abort.to, id_b, "the abort names the shard that staged it");
+    assert_eq!(
+        abort.reason,
+        space_protocol::HandoffReason::ClientNotConnected
+    );
+    assert_eq!(pair.b.stats().aborted, 1);
+}
+
+/// A player who adopts a staged ship and then leaves does not leave the ship
+/// behind — neither while it is still staged nor once its commit is waiting to
+/// be installed.
+///
+/// In both states the ship is not in B's world yet, so the despawn `leave` does
+/// found nothing, the transfer stayed where it was, and the commit later
+/// installed a ship owned by a session that no longer existed. Nothing ever
+/// removed it.
+///
+/// Mutation this catches: `Shard::leave` not aborting the staged transfer bound
+/// to the session (first half) and not dropping the session's pending commit
+/// (second half).
+#[test]
+fn a_player_who_leaves_before_the_install_leaves_no_ship_behind() {
+    // --- left while the ship is still staged
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = offer_and_accept(&mut pair, "player");
+    let session_b = pair
+        .b
+        .join(&space_net::hello("player"))
+        .expect("join B")
+        .session;
+    pair.b.client_status(
+        session_b,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: true,
+        },
+    );
+    assert_eq!(pair.b.ship_of(session_b), Some(guid), "adopted");
+    pair.b.take_outbox();
+
+    pair.b.leave(session_b);
+    let messages: Vec<Message> = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    let abort = abort_in(&messages).expect("B hands the staged ship back to A");
+    assert_eq!(abort.entity, guid);
+    assert_eq!(abort.from, id_a);
+    assert_eq!(
+        abort.reason,
+        space_protocol::HandoffReason::ClientNotConnected
+    );
+    // A commit that crossed the abort finds nothing to install.
+    let commit = space_protocol::HandoffCommit {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        activation_tick: pair.a.sim().tick(),
+        state: Box::new(offer_state(guid, "player")),
+    };
+    pair.b
+        .peer_message(id_a, Message::HandoffCommit(commit.clone()));
+    pair.b.tick_n(space_server::handoff::HANDOFF_LEAD + 5);
+    assert!(pair.b.sim().ship_state(guid).is_none());
+    assert_eq!(pair.b.stats().ships, 0, "no ship without a player");
+
+    // --- left after the commit arrived, before its install tick
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = offer_and_accept(&mut pair, "player");
+    let session_b = pair
+        .b
+        .join(&space_net::hello("player"))
+        .expect("join B")
+        .session;
+    pair.b.client_status(
+        session_b,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: true,
+        },
+    );
+    let commit = space_protocol::HandoffCommit {
+        entity: guid,
+        ..commit
+    };
+    pair.b.peer_message(id_a, Message::HandoffCommit(commit));
+    assert!(
+        pair.b.sim().ship_state(guid).is_none(),
+        "precondition: the commit waits for B's own install tick"
+    );
+    pair.b.leave(session_b);
+    pair.b.tick_n(space_server::handoff::HANDOFF_LEAD + 5);
+    assert!(
+        pair.b.sim().ship_state(guid).is_none(),
+        "a commit for a player who has left must not be installed"
+    );
+    assert_eq!(pair.b.stats().ships, 0);
+    assert_eq!(pair.b.stats().received, 0);
+}
+
+/// A handoff state that does not decode is refused when it is offered, and a
+/// commit whose state does not decode installs the state its offer staged —
+/// never a default.
+///
+/// The old fallback for an undecodable commit state was `ShipState::IDENTITY`:
+/// the ship silently reappeared at the world origin. Refusing at the offer is
+/// the one point where a bad state costs nothing, because the offering shard is
+/// still simulating the entity.
+///
+/// Mutation this catches: accepting an offer without decoding its state (first
+/// half), and falling back to `ShipState::IDENTITY` on an undecodable commit
+/// (second half — the ship would be at the origin, not where it was offered).
+#[test]
+fn an_undecodable_handoff_state_is_never_installed_as_a_default() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let guid = EntityGuid::new(id_a, 5);
+    let garbage = space_protocol::EntitySnapshot::new(
+        guid,
+        vec![(
+            <ShipState as space_ecs::ComponentDef>::ID,
+            vec![0xFF; 7], // not a ShipState
+        )],
+    );
+
+    // (a) An offer nobody could install is refused, and nothing is staged.
+    let bad_offer = space_protocol::HandoffOffer {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        state: Box::new(garbage.clone()),
+        activation_tick: space_server::handoff::HANDOFF_LEAD,
+    };
+    pair.b.peer_message(id_a, Message::HandoffOffer(bad_offer));
+    let messages: Vec<Message> = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .map(|o| o.message)
+        .collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| matches!(m, Message::HandoffAccept(_))),
+        "an undecodable state must not be accepted"
+    );
+    assert!(abort_in(&messages).is_some_and(|a| a.entity == guid));
+
+    // (b) A good offer, then a commit whose state is garbage: B installs the
+    // state the offer staged.
+    let offered_at = region_center(1).offset([10.0, 20.0, 30.0]);
+    let staged = space_protocol::EntitySnapshot::new(
+        guid,
+        vec![(
+            <ShipState as space_ecs::ComponentDef>::ID,
+            space_sim::wire::encode_ship_state(&ShipState::at_rest(offered_at)),
+        )],
+    );
+    let offer = space_protocol::HandoffOffer {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        state: Box::new(staged),
+        activation_tick: space_server::handoff::HANDOFF_LEAD,
+    };
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    assert!(pair
+        .b
+        .take_outbox()
+        .iter()
+        .any(|o| matches!(o.message, Message::HandoffAccept(_))));
+    let commit = space_protocol::HandoffCommit {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        activation_tick: space_server::handoff::HANDOFF_LEAD,
+        state: Box::new(garbage),
+    };
+    pair.b.peer_message(id_a, Message::HandoffCommit(commit));
+    pair.b.tick_n(space_server::handoff::HANDOFF_LEAD + 5);
+    let installed = pair
+        .b
+        .sim()
+        .ship_state(guid)
+        .expect("the transfer still completes, with the staged state");
+    assert_eq!(
+        installed.pos, offered_at,
+        "the ship is where its offer put it, not at the world origin"
+    );
+    assert_ne!(installed.pos, ShipState::IDENTITY.pos);
+}

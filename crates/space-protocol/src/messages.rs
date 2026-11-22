@@ -51,10 +51,16 @@ pub struct InputTick {
     pub seq: u64,
     /// The inputs, in client order.
     pub inputs: Vec<PlayerInput>,
-    /// The client's last-applied snapshot/delta tick (0 = none applied yet).
+    /// The tick of the newest snapshot/delta the client has **actually applied**
+    /// (0 = none applied yet).
     ///
-    /// The server uses it as the `base_tick` of the next delta: everything up to
-    /// and including `ack_tick` is confirmed on the client.
+    /// The server acts on it: the frame for exactly this tick is taken as
+    /// delivered, and an older frame that was never acknowledged itself is
+    /// presumed lost and its contents are sent again. It must therefore be the
+    /// tick of a frame that really arrived — never a locally advanced estimate
+    /// of the server's clock, which would vouch for a frame still in flight. A
+    /// batch may carry an empty `inputs` list just to deliver this
+    /// acknowledgement.
     pub ack_tick: u64,
 }
 
@@ -82,11 +88,33 @@ impl EntitySnapshot {
 
     /// Encoded size of this snapshot under the pinned config, including its
     /// length prefix inside a `Vec`.
+    ///
+    /// Computed, not measured: the pinned config is fixed-width (see
+    /// [`crate::codec`]), so the size is a plain sum — a guid, the component
+    /// count, and per component its id, its payload length and its payload.
+    /// The replication pass asks for this once per entity per client per tick,
+    /// and encoding the entity into a throwaway buffer just to read its length
+    /// was the single largest allocation in that loop. The
+    /// `entity_snapshot_encoded_len_is_exact` test pins the sum to the bytes the
+    /// codec actually writes.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
-        crate::codec::encoded_len(self)
+        ENTITY_GUID_WIRE_LEN
+            + LENGTH_PREFIX_WIRE_LEN
+            + self
+                .components
+                .iter()
+                .map(|(_, payload)| COMPONENT_ID_WIRE_LEN + LENGTH_PREFIX_WIRE_LEN + payload.len())
+                .sum::<usize>()
     }
 }
+
+/// Encoded size of an [`EntityGuid`]: `shard u32 (4) + serial u64 (8)`.
+pub(crate) const ENTITY_GUID_WIRE_LEN: usize = 12;
+/// Encoded size of a container length prefix (a fixed-width `u64`).
+pub(crate) const LENGTH_PREFIX_WIRE_LEN: usize = 8;
+/// Encoded size of a [`ComponentId`] (`u16`).
+const COMPONENT_ID_WIRE_LEN: usize = 2;
 
 /// A full state dump for a shard at one tick.
 ///

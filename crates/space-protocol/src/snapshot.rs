@@ -14,9 +14,9 @@
 //! are about: the fixed overhead of the enclosing `Snapshot` is reserved up
 //! front, so a finished snapshot always encodes within [`SnapshotBuilder::budget`].
 
-use crate::codec::{encoded_len, MAX_FRAME_SIZE};
+use crate::codec::MAX_FRAME_SIZE;
 use crate::guid::EntityGuid;
-use crate::messages::{Delta, EntitySnapshot, Message, Snapshot};
+use crate::messages::{Delta, EntitySnapshot, Snapshot, ENTITY_GUID_WIRE_LEN};
 use crate::shard::ShardId;
 
 /// Default per-frame payload budget, in bytes (64 KiB).
@@ -45,7 +45,25 @@ pub struct SnapshotBuilder {
 
 /// Encoded size of one [`EntityGuid`] under the pinned config: `shard u32 (4) +
 /// serial u64 (8)` = 12 bytes (fixed-width, big endian).
-const GUID_WIRE_LEN: usize = 12;
+const GUID_WIRE_LEN: usize = ENTITY_GUID_WIRE_LEN;
+
+/// Bytes the enclosing message costs with an empty entity list: the **larger**
+/// of the empty `Snapshot` and the empty `Delta` (a `Delta` carries `base_tick`
+/// and `removed`, so it costs more).
+///
+/// ```text
+/// Delta: tag u32 (4) + tick (8) + base_tick (8) + shard (4) + epoch (8)
+///        + entities len (8) + removed len (8) + input_ack (8) = 56
+/// ```
+///
+/// A constant, not a measurement: the pinned config is fixed-width, so the
+/// overhead does not depend on the tick, shard or epoch being stamped. It used
+/// to be measured by encoding two empty messages every time a builder was
+/// created — once per client per tick. Budgeting against one message shape only
+/// (as an earlier revision did in `set_tick`) let a `finish_delta` overrun the
+/// budget by the Snapshot/Delta difference; the `message_overhead_is_exact`
+/// test pins this value to both shapes.
+pub(crate) const MESSAGE_OVERHEAD: usize = 56;
 
 impl SnapshotBuilder {
     /// A builder for `shard` at `tick`/`epoch` with the default budget.
@@ -65,7 +83,7 @@ impl SnapshotBuilder {
         // never make the entity budget negative.
         Self {
             budget,
-            overhead: Self::overhead(tick, shard, epoch).min(budget / 2),
+            overhead: MESSAGE_OVERHEAD.min(budget / 2),
             removed_reserve: 0,
             tick,
             shard,
@@ -84,20 +102,6 @@ impl SnapshotBuilder {
     /// delta still encodes within [`SnapshotBuilder::budget`].
     pub fn reserve_removed(&mut self, n: usize) {
         self.removed_reserve = n.saturating_mul(GUID_WIRE_LEN);
-    }
-
-    /// Bytes the enclosing message costs with an empty entity list.
-    ///
-    /// One helper, used by both [`SnapshotBuilder::with_budget`] and
-    /// [`SnapshotBuilder::set_tick`], and defined as the **larger** of the empty
-    /// `Snapshot` and the empty `Delta` (a `Delta` carries `base_tick`,
-    /// `removed` and so costs more). Computing the overhead from one message
-    /// shape only — as an earlier revision did in `set_tick` — let a
-    /// `finish_delta` after `set_tick` overrun the budget by the difference.
-    fn overhead(tick: u64, shard: ShardId, epoch: u64) -> usize {
-        encoded_len(&Message::Snapshot(empty_snapshot(tick, shard, epoch))).max(encoded_len(
-            &Message::Delta(empty_delta(tick, shard, epoch)),
-        ))
     }
 
     /// The payload budget in force.
@@ -217,7 +221,6 @@ impl SnapshotBuilder {
     pub fn set_tick(&mut self, tick: u64, epoch: u64) {
         self.tick = tick;
         self.epoch = epoch;
-        self.overhead = Self::overhead(tick, self.shard, epoch).min(self.budget / 2);
     }
 
     /// Bytes available for entity payloads.
@@ -227,28 +230,6 @@ impl SnapshotBuilder {
         self.budget
             .saturating_sub(self.overhead)
             .saturating_sub(self.removed_reserve)
-    }
-}
-
-fn empty_snapshot(tick: u64, shard: ShardId, epoch: u64) -> Snapshot {
-    Snapshot {
-        tick,
-        shard,
-        epoch,
-        entities: Vec::new(),
-        input_ack: 0,
-    }
-}
-
-fn empty_delta(tick: u64, shard: ShardId, epoch: u64) -> Delta {
-    Delta {
-        tick,
-        base_tick: tick,
-        shard,
-        epoch,
-        entities: Vec::new(),
-        removed: Vec::new(),
-        input_ack: 0,
     }
 }
 
@@ -265,5 +246,75 @@ pub fn entity_snapshot<T: serde::Serialize>(
             .iter()
             .map(|(id, value)| (*id, crate::codec::encode_raw(value)))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::encoded_len;
+    use crate::messages::Message;
+
+    /// The constant overhead is what the codec really writes for an empty frame
+    /// of either shape, whatever tick, shard and epoch it is stamped with.
+    ///
+    /// Mutation this catches: a field added to `Snapshot`/`Delta` (or a config
+    /// change away from fixed-width integers) without updating
+    /// [`MESSAGE_OVERHEAD`] — the builder would then overrun its budget.
+    #[test]
+    fn message_overhead_is_exact() {
+        for (tick, shard, epoch) in [
+            (0u64, ShardId::new(0), 0u64),
+            (1, ShardId::new(7), 3),
+            (u64::MAX, ShardId::NONE, u64::MAX),
+        ] {
+            let snapshot = Message::Snapshot(Snapshot {
+                tick,
+                shard,
+                epoch,
+                entities: Vec::new(),
+                input_ack: tick,
+            });
+            let delta = Message::Delta(Delta {
+                tick,
+                base_tick: tick,
+                shard,
+                epoch,
+                entities: Vec::new(),
+                removed: Vec::new(),
+                input_ack: tick,
+            });
+            assert_eq!(
+                encoded_len(&snapshot).max(encoded_len(&delta)),
+                MESSAGE_OVERHEAD,
+                "empty frame at tick {tick}"
+            );
+        }
+    }
+
+    /// The computed entity size is the size the codec writes, for every shape a
+    /// replication pass produces (no components, empty payloads, large ones).
+    ///
+    /// Mutation this catches: dropping the per-component length prefix from
+    /// `EntitySnapshot::encoded_len` — the builder would then pack more entities
+    /// than the budget allows.
+    #[test]
+    fn entity_snapshot_encoded_len_is_exact() {
+        let guid = EntityGuid::new(ShardId::new(3), 0x0123_4567_89ab_cdef);
+        let shapes: Vec<Vec<(u16, Vec<u8>)>> = vec![
+            Vec::new(),
+            vec![(0, Vec::new())],
+            vec![(0, vec![1; 76]), (1, vec![2; 24]), (2, vec![3; 8])],
+            vec![(u16::MAX, vec![9; 4096]), (7, vec![0; 1])],
+        ];
+        for components in shapes {
+            let entity = EntitySnapshot::new(guid, components);
+            assert_eq!(
+                entity.encoded_len(),
+                encoded_len(&entity),
+                "{} component(s)",
+                entity.components.len()
+            );
+        }
     }
 }

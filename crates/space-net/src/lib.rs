@@ -4,10 +4,11 @@
 //! crates above it ([`space_server`](https://example.invalid) and the client)
 //! only ever see [`space_protocol::Message`]s:
 //!
-//! * **Endpoints** — [`server_endpoint`] and [`client_endpoint`] build a QUIC
-//!   endpoint with rustls TLS ([`rustls`] + [`rcgen`] self-signed certificate; no
-//!   C bindings this repository maintains — see [`crypto`]'s module docs for the
-//!   exact statement, per `docs/plan.md`).
+//! * **Endpoints** — [`server_endpoint`] and [`client_endpoint_for`] build a
+//!   QUIC endpoint with rustls TLS ([`rustls`] + [`rcgen`] self-signed
+//!   certificate; no C bindings this repository maintains — see [`crypto`]'s
+//!   module docs for the exact statement, per `docs/plan.md`). A client endpoint
+//!   is bound in the address family of the address it will dial.
 //! * **Handshake** — [`accept_connection`] / [`connect`] perform the
 //!   [`space_protocol::Hello`] exchange and enforce
 //!   [`PROTOCOL_VERSION`](space_protocol::PROTOCOL_VERSION) through
@@ -15,7 +16,12 @@
 //!   [`space_protocol::Reject`] carrying
 //!   [`RejectReason::VersionMismatch`](space_protocol::RejectReason::VersionMismatch)
 //!   and surfaced as [`NetError::VersionMismatch`], so the client learns *why*
-//!   it was turned away.
+//!   it was turned away; [`Conn::reject`] does the same for a refusal the server
+//!   decides itself (a full shard). Both sides of the handshake are bounded by
+//!   [`HANDSHAKE_TIMEOUT`].
+//! * **Liveness** — every connection pings each [`KEEP_ALIVE_INTERVAL`] and is
+//!   declared dead after [`IDLE_TIMEOUT`] of silence, so a link with nothing to
+//!   say stays up and a peer that is gone is still noticed.
 //! * **Message classes** — [`send_message`] routes by message class, exactly as
 //!   `docs/plan.md` P9 requires: player inputs and small deltas ride unreliable
 //!   **datagrams** (small, idempotent, gap-detectable), snapshots and large
@@ -52,8 +58,9 @@ pub mod framed;
 
 pub use crypto::{make_server_config, make_tls_client_config, make_tls_server_config, CertPair};
 pub use endpoint::{
-    accept_connection, accept_incoming, client_endpoint, client_endpoint_on, connect, hello,
-    server_endpoint, transport_config, Conn, NetError,
+    accept_connection, accept_incoming, accept_incoming_within, client_endpoint,
+    client_endpoint_for, client_endpoint_on, connect, connect_within, hello, server_endpoint,
+    transport_config, Conn, NetError, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, KEEP_ALIVE_INTERVAL,
 };
 pub use framed::{
     read_frame, recv_datagram, send_datagram, send_message, send_on_stream, MessageClass,

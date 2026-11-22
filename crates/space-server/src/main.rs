@@ -41,8 +41,10 @@ use space_server::ShardConfig;
 struct Options {
     /// This shard's id.
     shard: ShardId,
-    /// Where to listen. Defaults to `127.0.0.1:7777` standalone and to
-    /// `127.0.0.1:0` when orchestrated; `0.0.0.0:<port>` is for containers.
+    /// Where to listen. Defaults to `127.0.0.1:7777`, standalone and
+    /// orchestrated alike (a restarted shard must come back on the endpoint the
+    /// orchestrator knows it by); `0.0.0.0:<port>` is for containers, and
+    /// `--bind 127.0.0.1:0` asks for an ephemeral port.
     bind: SocketAddr,
     /// The address reported in `ShardHello` (`--advertise`), or `None` for
     /// "whatever address the socket actually bound". Only meaningful with
@@ -55,7 +57,7 @@ struct Options {
     regions: Vec<ShardRegion>,
     /// The orchestrator's control address, if this shard registers with one.
     ///
-    /// With it the shard binds port 0, asks the orchestrator for its id +
+    /// With it the shard asks the orchestrator for its id +
     /// region + map (closing Phase-2 MAJOR 3: the orchestrator owns allocation),
     /// and thereafter follows pushed maps. Without it, the static `--shard` path
     /// is unchanged (regression safety for Phase 2's tests and docs).
@@ -158,10 +160,14 @@ impl Options {
         if advertise.is_some() && !orchestrated {
             return Err(format!("--advertise requires --orchestrator\n{USAGE}"));
         }
-        // Standalone listens on the well-known port; orchestrated binds port 0
-        // (the orchestrator learns the real endpoint from `ShardHello`).
-        let default_port = if orchestrated { 0 } else { DEFAULT_PORT };
-        let bind = bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_port)));
+        // Both modes listen on the well-known port unless told otherwise. An
+        // orchestrated shard used to default to port 0, so a restart with the
+        // same command line came back on a *different* port — and the
+        // orchestrator, which still had the region registered at the old
+        // endpoint, refused it ("region already owned"). A stable default makes
+        // a plain restart re-register the same endpoint. Several shards on one
+        // host each need their own `--bind`, exactly as in standalone mode.
+        let bind = bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)));
         // Our own region belongs in the map, last: `ShardMap::lookup` walks the
         // regions in order and keeps the deepest match, so a peer entry that
         // overlaps ours at equal depth loses to ours deterministically.
@@ -258,7 +264,7 @@ fn main() -> Result<(), String> {
 
 /// Serve until the process is interrupted.
 async fn run(options: Options) -> Result<(), String> {
-    // Orchestrated launch: bind port 0, ask the orchestrator for id + region +
+    // Orchestrated launch: bind, ask the orchestrator for id + region +
     // map (closing Phase-2 MAJOR 3: the orchestrator owns allocation), then run
     // on what it says. The static `--shard` path below is unchanged.
     if let Some(orch_addr) = options.orchestrator {
@@ -318,11 +324,11 @@ async fn run(options: Options) -> Result<(), String> {
         }
     });
 
-    // `serve` returns only when the endpoint is closed, so in practice this
-    // future is never ready and the process runs until it is killed.
-    serve.await.map_err(|e| e.to_string())?;
-    ticking.abort();
-    Ok(())
+    // `serve` returns only when the endpoint is closed, so in practice the
+    // process runs until it is killed. The tick loop is watched too: if it ever
+    // ends (it has no exit, so that is a panic) the process stops with an error
+    // instead of going on welcoming clients into a world that no longer moves.
+    space_server::net::supervise(serve, ticking).await
 }
 
 /// Serve as an orchestrated shard: register with the orchestrator, adopt the id,
@@ -415,11 +421,28 @@ mod tests {
         );
     }
 
+    /// An orchestrated shard defaults to the same fixed port as a standalone
+    /// one, so restarting it with the same command line re-registers the same
+    /// endpoint.
+    ///
+    /// Mutation this catches: defaulting the orchestrated bind to port 0 again —
+    /// a restarted shard then comes back on a new port and the orchestrator
+    /// refuses it, because the region is still registered at the old one.
     #[test]
-    fn an_orchestrated_shard_binds_loopback_port_zero_by_default() {
+    fn an_orchestrated_shard_binds_the_fixed_default_port() {
         let options = parse(&["--orchestrator", "127.0.0.1:7900"]).expect("parses");
-        assert_eq!(options.bind, "127.0.0.1:0".parse().unwrap());
+        assert_eq!(
+            options.bind,
+            SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT))
+        );
         assert!(options.advertise.is_none());
+        // Two launches with the same flags name the same endpoint.
+        let again = parse(&["--orchestrator", "127.0.0.1:7900"]).expect("parses");
+        assert_eq!(options.bind, again.bind);
+        // An ephemeral port is still available on request.
+        let ephemeral =
+            parse(&["--orchestrator", "127.0.0.1:7900", "--bind", "127.0.0.1:0"]).expect("parses");
+        assert_eq!(ephemeral.bind.port(), 0);
     }
 
     #[test]

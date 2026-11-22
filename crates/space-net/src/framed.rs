@@ -86,7 +86,9 @@ pub async fn send_message(conn: &Connection, message: &Message) -> io::Result<()
     let payload_len = frame.len() - FRAME_HEADER_LEN;
     let fits_datagram = datagram_frame_budget(conn).is_some_and(|budget| payload_len <= budget);
     match MessageClass::of(message) {
-        MessageClass::Datagram if fits_datagram => send_datagram(conn, &frame),
+        // The frame buffer is handed to quinn as it is: `Bytes::from(Vec)` takes
+        // the allocation over, where `send_datagram(&frame)` would copy it.
+        MessageClass::Datagram if fits_datagram => send_datagram_owned(conn, frame.into()),
         // A datagram-class message that outgrew one packet is promoted here.
         _ => send_on_stream(conn, &frame).await,
     }
@@ -100,21 +102,23 @@ pub async fn send_message(conn: &Connection, message: &Message) -> io::Result<()
 /// (the caller should have used [`send_on_stream`]); [`io::ErrorKind::BrokenPipe`]
 /// when the connection or datagram support is gone.
 pub fn send_datagram(conn: &Connection, frame: &[u8]) -> io::Result<()> {
-    conn.send_datagram(bytes::Bytes::copy_from_slice(frame))
-        .map_err(|e| match e {
-            quinn::SendDatagramError::TooLarge => io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "datagram frame of {} bytes exceeds the datagram size",
-                    frame.len()
-                ),
-            ),
-            quinn::SendDatagramError::ConnectionLost(_)
-            | quinn::SendDatagramError::UnsupportedByPeer
-            | quinn::SendDatagramError::Disabled => {
-                io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
-            }
-        })
+    send_datagram_owned(conn, bytes::Bytes::copy_from_slice(frame))
+}
+
+/// [`send_datagram`] for a frame the caller already owns (no copy).
+fn send_datagram_owned(conn: &Connection, frame: bytes::Bytes) -> io::Result<()> {
+    let len = frame.len();
+    conn.send_datagram(frame).map_err(|e| match e {
+        quinn::SendDatagramError::TooLarge => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("datagram frame of {len} bytes exceeds the datagram size"),
+        ),
+        quinn::SendDatagramError::ConnectionLost(_)
+        | quinn::SendDatagramError::UnsupportedByPeer
+        | quinn::SendDatagramError::Disabled => {
+            io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
+        }
+    })
 }
 
 /// Write one already-encoded frame to a fresh reliable, ordered stream and
@@ -211,16 +215,16 @@ pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Message>, io::
             space_protocol::CodecError::Oversized { declared }.to_string(),
         ));
     }
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + declared);
-    frame.extend_from_slice(&header);
-    // Read the payload in chunks so a huge-but-legal frame does not need one
-    // giant contiguous read.
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut remaining = declared;
-    while remaining > 0 {
-        let want = remaining.min(buf.len());
+    // The payload is read straight into the frame buffer, which is exactly as
+    // large as the (already bounded) declared length. An earlier revision read
+    // through a 64 KiB scratch buffer that was allocated and zeroed for every
+    // frame, however small, and then copied out of.
+    let mut frame = vec![0u8; FRAME_HEADER_LEN + declared];
+    frame[..FRAME_HEADER_LEN].copy_from_slice(&header);
+    let mut filled = FRAME_HEADER_LEN;
+    while filled < frame.len() {
         let n = stream
-            .read(&mut buf[..want])
+            .read(&mut frame[filled..])
             .await
             .map_err(|e| io::Error::other(e.to_string()))?
             .unwrap_or(0);
@@ -230,8 +234,7 @@ pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Message>, io::
                 space_protocol::CodecError::Truncated.to_string(),
             ));
         }
-        frame.extend_from_slice(&buf[..n]);
-        remaining -= n;
+        filled += n;
     }
     space_protocol::decode_frame(&frame)
         .map(Some)

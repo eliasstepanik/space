@@ -163,11 +163,17 @@ impl EpochParticipant {
     }
 }
 
-/// Build the map that activates at commit: `current` with every change appended
+/// Build the map that activates at commit: `current` with every change applied
 /// and the epoch bumped to `epoch`.
 ///
-/// A change `(node, new_owner)` is appended as a region owned by `new_owner`.
-/// Its endpoint is copied from an existing region already owned by `new_owner`
+/// A change `(node, new_owner)` for a node the map does not name yet (a split
+/// carving a child) is appended as a region owned by `new_owner`. A change for a
+/// node the map **already** names (a merge handing a child back to its parent's
+/// owner, a rebalance) *replaces* that region's owner: appending a second
+/// region at the same node would leave the old owner in charge, because
+/// [`ShardMap::lookup`] keeps the first of two regions of equal depth.
+///
+/// The endpoint is copied from an existing region already owned by `new_owner`
 /// (the common case for a rebalance or merge); when the owner is new to the map
 /// the endpoint is the un-dialable [`ShardRegion::UNRESOLVED_ENDPOINT`] sentinel
 /// (never a parent's address, which would misroute peer traffic to the wrong
@@ -181,6 +187,9 @@ fn apply_changes(current: &ShardMap, epoch: u64, changes: &[EpochChange]) -> Sha
             .iter()
             .find(|r| r.shard == *new_owner)
             .map_or(ShardRegion::UNRESOLVED_ENDPOINT, |r| r.endpoint);
+        // One region per node. A node the map already names changes hands in
+        // place (and any duplicate a malformed map carried goes with it).
+        regions.retain(|r| r.node != *node);
         regions.push(ShardRegion::new(*node, *new_owner, endpoint));
     }
     ShardMap::new(epoch, regions)
@@ -365,6 +374,49 @@ mod tests {
             .find(|r| r.node == child)
             .expect("present");
         assert_eq!(region.endpoint, addr(7_002));
+    }
+
+    /// A merge hands a child node back to its parent's owner: the change names a
+    /// node the map already has, and the owner must actually change.
+    ///
+    /// Mutation this catches: appending the change as a second region at the
+    /// same node — `lookup` keeps the first of two regions of equal depth, so
+    /// the departed shard would still own the node.
+    #[test]
+    fn a_change_for_a_node_the_map_already_names_replaces_its_owner() {
+        let mut ep = EpochParticipant::new();
+        let current = map_with_two();
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let child = space_world::octree::children(root).unwrap()[0];
+        assert_eq!(
+            current.lookup(&child.center()),
+            Some(ShardId::new(2)),
+            "precondition: shard 2 owns the child"
+        );
+        ep.handle_prepare(
+            &prepare(2, vec![(child, ShardId::new(1))]),
+            1,
+            ShardId::new(1),
+        )
+        .expect("acked");
+        let new_map = ep
+            .handle_commit(&EpochCommit { epoch: 2 }, &current)
+            .expect("commit installs");
+        assert_eq!(
+            new_map.lookup(&child.center()),
+            Some(ShardId::new(1)),
+            "the child's new owner must win the lookup"
+        );
+        let regions: Vec<&ShardRegion> =
+            new_map.regions.iter().filter(|r| r.node == child).collect();
+        assert_eq!(regions.len(), 1, "one region per node");
+        assert_eq!(regions[0].shard, ShardId::new(1));
+        assert_eq!(
+            regions[0].endpoint,
+            addr(7_001),
+            "with the endpoint its new owner is already known by"
+        );
+        assert_eq!(new_map.regions.len(), 2, "nothing was appended");
     }
 
     #[test]
