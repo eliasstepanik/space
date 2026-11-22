@@ -6,6 +6,13 @@ rust-version.workspace = true
 publish = false
 description = "Native client: winit window + space-render, offline demo of the deterministic galaxy"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-client"
+path = "src/main.rs"
+
 [dependencies]
 space-render = { workspace = true }
 space-world = { workspace = true }
