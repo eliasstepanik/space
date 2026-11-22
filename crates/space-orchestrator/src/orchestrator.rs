@@ -385,11 +385,28 @@ impl<L: Launcher> Orchestrator<L> {
                 inbound = server.next_inbound() => {
                     match inbound {
                         Some(Inbound::Hello { hello, reply }) => {
-                            if let Ok(welcome) = self.handle_shard_hello(&hello) {
-                                server.register(welcome.shard, reply.clone()).await;
-                                let _ = reply
-                                    .send(Message::ShardWelcome(welcome))
-                                    .await;
+                            match self.handle_shard_hello(&hello) {
+                                Ok(welcome) => {
+                                    server.register(welcome.shard, reply.clone()).await;
+                                    let _ = reply
+                                        .send(Message::ShardWelcome(welcome))
+                                        .await;
+                                }
+                                Err(reason) => {
+                                    // Say why, on the hello connection, with the
+                                    // existing `Reject` message (no protocol
+                                    // change): the shard fails fast with the
+                                    // reason instead of timing out.
+                                    eprintln!(
+                                        "space-orchestrator: rejected hello from {}: {reason}",
+                                        hello.endpoint
+                                    );
+                                    let _ = reply
+                                        .send(Message::Reject(space_protocol::Reject {
+                                            reason: space_protocol::RejectReason::Other(reason),
+                                        }))
+                                        .await;
+                                }
                             }
                         }
                         Some(Inbound::Report(report)) => self.handle_load_report(&report),
