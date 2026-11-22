@@ -3,7 +3,7 @@
 //! This closes Phase-2 MAJOR 3: production shard ids stop coming from
 //! `main.rs --shard` argv and start coming from a counter the orchestrator owns
 //! and persists. The counter itself is [`space_server::alloc::ShardIdAllocator`]
-//! — monotonic, no `free`, panics at the id-space limit (plan F2) — and this
+//! — monotonic, no `free`, returns an error at the id-space limit (plan F2) — and this
 //! module composes it with durability:
 //!
 //! * **persist before hand-out**, never hand-out before persist. A crash between
