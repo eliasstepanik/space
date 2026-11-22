@@ -365,4 +365,155 @@ mod tests {
         drop(ws);
         wait_for(|| client.viewer_count() == 0).await;
     }
+
+    /// Poll `cond` every 25 ms for up to `secs` seconds; true if it held.
+    async fn wait_up_to(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cond()
+    }
+
+    /// Finding B: a viewer that never reads must be dropped after the write
+    /// timeout, freeing its slot so it cannot be used to exhaust `MAX_VIEWERS`.
+    #[tokio::test]
+    async fn stalled_viewer_is_dropped_after_write_timeout() {
+        let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        // Connects, completes the handshake, then never reads a byte.
+        let _stalled = connect(addr).await;
+        wait_for(|| client.viewer_count() == 1).await;
+
+        // Frames far larger than the socket buffers, so the send really blocks.
+        let big = vec![0u8; 16 * 1024 * 1024];
+        let start = tokio::time::Instant::now();
+        let mut freed = false;
+        while start.elapsed() < VIEWER_WRITE_TIMEOUT + Duration::from_secs(10) {
+            client.push_jpeg(big.clone(), 0);
+            if wait_up_to(0, || client.viewer_count() == 0).await {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(freed, "stalled viewer still holds its slot");
+
+        // The slot is reusable: a fresh viewer connects and receives a frame.
+        let mut ws = connect(addr).await;
+        let seq = client.push_jpeg(vec![7], 0);
+        let msg = next_binary(&mut ws).await;
+        let (header, jpeg) = decode_frame(&msg).unwrap();
+        assert_eq!((header.seq >= seq, jpeg), (true, &[7u8][..]));
+    }
+
+    /// Finding A(a): the viewer cap is enforced; the extra connection is refused
+    /// and a slot freed later can be taken again.
+    #[tokio::test]
+    async fn max_viewers_is_enforced() {
+        let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let mut viewers = Vec::new();
+        for _ in 0..MAX_VIEWERS {
+            viewers.push(connect(addr).await);
+        }
+        wait_for(|| client.viewer_count() == MAX_VIEWERS).await;
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let extra = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp),
+        )
+        .await
+        .expect("the refused peer was left hanging");
+        assert!(extra.is_err(), "viewer MAX_VIEWERS+1 was accepted");
+        assert_eq!(client.viewer_count(), MAX_VIEWERS);
+
+        drop(viewers.pop());
+        wait_for(|| client.viewer_count() == MAX_VIEWERS - 1).await;
+        let _again = connect(addr).await;
+        wait_for(|| client.viewer_count() == MAX_VIEWERS).await;
+    }
+
+    /// Finding A(b): input over the size cap is rejected (never delivered) and
+    /// the server keeps serving. A message past the websocket limit drops only
+    /// that connection.
+    #[tokio::test]
+    async fn oversized_input_is_rejected_and_server_keeps_serving() {
+        let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let mut ws = connect(addr).await;
+
+        // A well-formed key event padded just past the cap: rejected, counted.
+        let mut padded = ViewerInput::Key {
+            key: Key::Forward,
+            down: true,
+        }
+        .encode();
+        padded.resize(MAX_INPUT_MESSAGE_LEN + 1, 0);
+        ws.send(Message::Binary(padded.into())).await.unwrap();
+        wait_for(|| client.rejected_input() == 1).await;
+        assert!(client.poll_input().is_empty(), "oversized input delivered");
+
+        // The same connection still works.
+        let ok = ViewerInput::View {
+            yaw: 1.0,
+            pitch: 0.0,
+        };
+        ws.send(Message::Binary(ok.encode().into())).await.unwrap();
+        let mut got = Vec::new();
+        wait_for(|| {
+            got.extend(client.poll_input());
+            !got.is_empty()
+        })
+        .await;
+        assert_eq!(got, [ok]);
+
+        // Far past the cap: the connection is cut, nothing is delivered.
+        let _ = ws
+            .send(Message::Binary(vec![2u8; MAX_INPUT_MESSAGE_LEN * 64].into()))
+            .await;
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "connection survived a huge input message");
+        assert!(client.poll_input().is_empty());
+        wait_for(|| client.viewer_count() == 0).await;
+
+        // And the server still serves new viewers.
+        let mut ws2 = connect(addr).await;
+        client.push_jpeg(vec![9], 0);
+        let msg = next_binary(&mut ws2).await;
+        assert_eq!(decode_frame(&msg).unwrap().1, &[9u8][..]);
+    }
+
+    /// Finding A(c): a peer that never completes the WebSocket handshake is
+    /// dropped within `HANDSHAKE_TIMEOUT` (plus slack).
+    #[tokio::test]
+    async fn handshake_timeout_drops_silent_peer() {
+        let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+        let _silent = TcpStream::connect(server.local_addr()).await.unwrap();
+        wait_for(|| client.viewer_count() == 1).await;
+        let start = tokio::time::Instant::now();
+        let slack = Duration::from_secs(3);
+        let dropped = wait_up_to((HANDSHAKE_TIMEOUT + slack).as_secs(), || {
+            client.viewer_count() == 0
+        })
+        .await;
+        assert!(dropped, "silent peer still holds a slot");
+        assert!(
+            start.elapsed() >= HANDSHAKE_TIMEOUT / 2,
+            "dropped suspiciously early: {:?}",
+            start.elapsed()
+        );
+    }
 }
