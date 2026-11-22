@@ -713,6 +713,7 @@ fn build_uniforms(
     let view_proj = scene.view_proj();
     let inv_view_proj = scene.inv_view_proj().unwrap_or(view_proj);
     let tan_half_fov = (cam.fov_y * 0.5).tan();
+    let features = options.preset.features();
 
     let mut forward = params::ForwardParams {
         camera: params::Camera {
