@@ -150,8 +150,9 @@ impl Swapchain {
                 }
                 bgra
             })
-            .ok_or_else(|| RenderError::new("surface offers no usable format"))?
-            .format;
+            .ok_or_else(|| RenderError::new("surface offers no usable format"))?;
+        // Use the colour space the chosen surface format was reported with.
+        let (format, color_space) = (format.format, format.color_space);
         // `current_extent` is authoritative unless it is the (MAX, MAX) sentinel;
         // otherwise clamp the request into the supported range (never below 1x1,
         // and tolerate a driver reporting max < min).
