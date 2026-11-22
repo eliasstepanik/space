@@ -408,6 +408,10 @@ mod tests {
         let f = initial_input(Mode::Galaxy).forward();
         assert!(f[0].abs() < 1e-6 && (f[2] - 1.0).abs() < 1e-6, "{f:?}");
         assert_eq!(initial_input(Mode::Demo), InputState::default());
+        let cam = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), 32, 32).camera;
+        assert!(cam.forward[2] > 0.99, "{:?}", cam.forward);
+        let base = crate::galaxy_camera(32, 32);
+        assert_eq!(base.forward, [0.0, 0.0, 1.0]);
     }
 
     /// Renders the galaxy through the stream's default camera and asserts lit
