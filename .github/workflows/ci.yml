@@ -3,7 +3,7 @@ name: CI
 # Where the jobs run:
 #   * Linux jobs (lint, linux, wasm, docker) run BARE on SELF-HOSTED runners
 #     labelled `space-ci` (Linux, x64, dind over TCP) on the maintainer's
-#     `proxy` host. They install Rust via rustup (no job `container:`), because
+#     `proxy` host. They install Rust via rustup (no job containers), because
 #     the runner's docker-in-docker sidecar cannot mount the runner's tool dirs
 #     into job containers (actions/checkout fails with a missing /__e/node24).
 #     The docker job uses the runner's docker/buildx directly.
