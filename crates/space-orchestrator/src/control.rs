@@ -46,6 +46,9 @@ pub struct ControlPlane {
     pub autoscaler: Autoscaler,
     /// The shared peer secret handed to every shard on welcome.
     pub peer_token: String,
+    /// The root owner the orchestrator reserved at startup that no live shard
+    /// has claimed yet. The first root (or region-less) hello adopts it.
+    unclaimed_root_owner: Option<ShardId>,
 }
 
 impl ControlPlane {
