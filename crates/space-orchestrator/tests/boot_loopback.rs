@@ -74,7 +74,10 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
         ShardId::new(1),
         "the first shard adopts the reserved root owner"
     );
-    assert_ne!(shard.endpoint, control_addr, "a shard is not the control port");
+    assert_ne!(
+        shard.endpoint, control_addr,
+        "a shard is not the control port"
+    );
 
     // --- a real client over QUIC.
     let endpoint = space_net::client_endpoint().expect("client endpoint");
