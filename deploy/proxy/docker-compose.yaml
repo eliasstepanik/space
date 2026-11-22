@@ -83,8 +83,12 @@ services:
     networks:
       space:
         ipv4_address: 172.29.0.12
+<<<<<<< HEAD
     # Client needs a ray-tracing-capable GPU (VK_KHR_acceleration_structure); not auto-restarted so it doesn't churn sessions on hosts without one.
     restart: "no"
+=======
+    restart: unless-stopped
+>>>>>>> refs/remotes/origin/main
 
 networks:
   space:
