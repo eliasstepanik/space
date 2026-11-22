@@ -30,6 +30,7 @@
 //! production code.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use space_orchestrator::config::OrchestratorConfig;
@@ -190,6 +191,12 @@ struct Cluster {
     /// Beats run so far. Every member is ticked exactly once per beat, so this is
     /// also the simulation tick every member is at.
     beats: u64,
+    /// `EpochPrepare`s delivered since the last beat began. Each one makes its
+    /// member queue an ack that leaves on the *next* beat's flush.
+    prepares_sent: AtomicUsize,
+    /// Acks this beat's flush is expected to forward (the prepares outstanding
+    /// when the beat began); `drain_acks` waits wall-clock time only for these.
+    acks_expected: usize,
 }
 
 impl Cluster {
@@ -205,6 +212,8 @@ impl Cluster {
             ack_tx,
             clients: Vec::new(),
             beats: 0,
+            prepares_sent: AtomicUsize::new(0),
+            acks_expected: 0,
         }
     }
 
@@ -318,6 +327,7 @@ impl Cluster {
     /// beat is the one `Orchestrator::run` runs, minus the wall-clock interval.
     async fn beat(&mut self) {
         self.beats += 1;
+        self.acks_expected = self.prepares_sent.swap(0, Ordering::SeqCst);
         for m in &self.members {
             m.shard.lock().await.tick();
             m.net.flush(&m.shard).await;
@@ -370,6 +380,9 @@ impl Cluster {
             | Message::EpochAbort(_)
             | Message::DirectoryReply(_) => {
                 if let Some(m) = self.members.iter().find(|m| m.id == to) {
+                    if matches!(message, Message::EpochPrepare(_)) {
+                        self.prepares_sent.fetch_add(1, Ordering::SeqCst);
+                    }
                     m.shard.lock().await.orchestrator_message(message);
                 }
             }
@@ -383,19 +396,33 @@ impl Cluster {
     /// forwarded by a task, so they are not synchronously available the instant
     /// the beat ends. Wait on the channel with a bounded wall-clock timeout
     /// (not a fixed number of scheduler yields, which a CPU-saturated host can
-    /// exhaust before the forwarding task runs): keep handling acks until none
-    /// arrives within the window or the channel closes.
+    /// exhaust before the forwarding task runs), but only while acks are
+    /// actually owed: a beat with no prepare in flight costs nothing.
     async fn drain_acks(&mut self) {
         const ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-        loop {
+        while self.acks_expected > 0 {
             let next = {
                 let mut rx = self.ack_rx.lock().await;
                 tokio::time::timeout(ACK_WAIT, rx.recv()).await
             };
             match next {
-                Ok(Some(Message::EpochAck(ack))) => self.orch.handle_epoch_ack_message(&ack),
+                Ok(Some(Message::EpochAck(ack))) => {
+                    self.acks_expected -= 1;
+                    self.orch.handle_epoch_ack_message(&ack);
+                }
                 Ok(Some(_)) => continue,
+                // Timed out (a rejected prepare sends no ack) or channel closed.
                 Ok(None) | Err(_) => break,
+            }
+        }
+        self.acks_expected = 0;
+        // Sweep anything else already queued, without waiting.
+        loop {
+            let next = self.ack_rx.lock().await.try_recv();
+            match next {
+                Ok(Message::EpochAck(ack)) => self.orch.handle_epoch_ack_message(&ack),
+                Ok(_) => continue,
+                Err(_) => break,
             }
         }
     }
