@@ -13,7 +13,7 @@
 //! ```text
 //! loop { select! {
 //!     report = load_reports()      => orch.handle_load_report(report),
-//!     ack    = control.acks()      => orch.handle_epoch_ack(shard),
+//!     ack    = control.acks()      => orch.handle_epoch_ack(shard, epoch),
 //!     hello  = control.hellos()    => orch.handle_shard_hello(hello),
 //!     _      = clock.tick()        => { orch.tick(); drain outbox; launcher.poll(); }
 //! }}
