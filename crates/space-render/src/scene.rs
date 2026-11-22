@@ -309,7 +309,7 @@ impl Scene {
                 ],
                 roughness: 0.6,
                 shape,
-                _pad0: 0.0,
+                transmission: 0.0,
                 _pad1: 0.0,
             });
             meshes.push(match shape {

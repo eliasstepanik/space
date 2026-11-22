@@ -231,7 +231,7 @@ fn gi_scene(width: u32, height: u32) -> Scene {
                 emissive: [0.0, 0.0, 0.0, 1.0],
                 roughness: 0.9,
                 shape: space_render::SHAPE_BOX,
-                _pad0: 0.0,
+                transmission: 0.0,
                 _pad1: 0.0,
             },
             // Emitter: well behind the camera and large enough to fill the
@@ -243,7 +243,7 @@ fn gi_scene(width: u32, height: u32) -> Scene {
                 emissive: [10.0, 10.0, 10.0, 1.0],
                 roughness: 0.5,
                 shape: space_render::SHAPE_SPHERE,
-                _pad0: 0.0,
+                transmission: 0.0,
                 _pad1: 0.0,
             },
         ],
@@ -496,7 +496,7 @@ fn brdf_analytic_light_lights_the_sphere() {
             emissive: [0.0, 0.0, 0.0, 1.0],
             roughness: 0.3,
             shape: space_render::SHAPE_SPHERE,
-            _pad0: 0.0,
+            transmission: 0.0,
             _pad1: 0.0,
         }],
     )
@@ -568,7 +568,7 @@ fn fog_scene(distance: f32, radius: f32) -> Scene {
             emissive: [4.0, 4.0, 4.0, 1.0],
             roughness: 0.5,
             shape: space_render::SHAPE_SPHERE,
-            _pad0: 0.0,
+            transmission: 0.0,
             _pad1: 0.0,
         }],
     )

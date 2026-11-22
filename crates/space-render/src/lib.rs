@@ -122,7 +122,7 @@ pub fn demo_scene(width: u32, height: u32) -> Scene {
             emissive: [4.0, 4.0, 4.0, 1.0],
             roughness: 0.5,
             shape: crate::scene::SHAPE_SPHERE,
-            _pad0: 0.0,
+            transmission: 0.0,
             _pad1: 0.0,
         }],
     )

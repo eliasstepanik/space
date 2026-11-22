@@ -7,12 +7,12 @@
 //!
 //! ## Feature matrix
 //!
-//! | preset | fog | fog density (1/m) |
-//! |--------|-----|-------------------|
-//! | High   | on  | 2.0e-3            |
-//! | Medium | on  | 1.0e-3            |
-//! | Low    | off | —                 |
-//! | Ci     | off | —                 |
+//! | preset | fog | fog density (1/m) | SSR | SSR steps | SSR max roughness | refraction |
+//! |--------|-----|-------------------|-----|-----------|-------------------|------------|
+//! | High   | on  | 2.0e-3            | on  | 32        | 0.5               | on         |
+//! | Medium | on  | 1.0e-3            | on  | 16        | 0.3               | on         |
+//! | Low    | off | —                 | off | —         | —                 | off        |
+//! | Ci     | off | —                 | off | —         | —                 | off        |
 //!
 //! `Ci` is the deterministic, cheapest tier: every optional feature is off so
 //! golden-pixel tests are independent of feature work. `Low` also has all
@@ -20,7 +20,17 @@
 //! camera and applies to shaded surfaces (after lighting, before tone map);
 //! the empty background is not fogged.
 //!
-//! ## Adding a feature (Phase 5b: SSR, refraction)
+//! SSR (screen-space reflections) and refraction are done by the `post.wgsl`
+//! compute pass, which runs between the forward pass(es) and the tone map and
+//! is **not dispatched at all** unless `FEATURE_SSR` or `FEATURE_REFRACT` is
+//! set. Because it runs after the forward pass, fog is already part of the
+//! scene colour it reflects/refracts, so fog stays applied to the composited
+//! result. Refraction additionally splits transmissive instances
+//! (`GpuInstance::transmission > 0`) into a second "glass" draw (only when
+//! `FEATURE_REFRACT` is set; otherwise they render as ordinary opaque
+//! surfaces) so the post pass can see the opaque scene *behind* the glass.
+//!
+//! ## Adding a feature
 //!
 //! 1. add a `bool` (and any level) to [`RenderFeatures`] and set it in each
 //!    arm of [`QualityPreset::features`];
@@ -33,6 +43,17 @@ use std::str::FromStr;
 
 /// Bit in `ForwardParams::features`: distance fog enabled.
 pub const FEATURE_FOG: u32 = 1 << 0;
+
+/// Bit in `ForwardParams::features` / `PostParams::features`: screen-space
+/// reflections (post pass).
+pub const FEATURE_SSR: u32 = 1 << 1;
+
+/// Bit in `ForwardParams::features` / `PostParams::features`: refraction
+/// through transmissive instances (glass draw + post pass).
+pub const FEATURE_REFRACT: u32 = 1 << 2;
+
+/// Mask of the features that need the post pass.
+pub const POST_FEATURES: u32 = FEATURE_SSR | FEATURE_REFRACT;
 
 /// Linear-light fog colour (pre tone map) used when fog is enabled.
 pub const FOG_COLOR: [f32; 3] = [0.35, 0.45, 0.60];
@@ -59,14 +80,26 @@ impl QualityPreset {
             Self::High => RenderFeatures {
                 fog: true,
                 fog_density: 2.0e-3,
+                ssr: true,
+                ssr_steps: 32,
+                ssr_max_roughness: 0.5,
+                refraction: true,
             },
             Self::Medium => RenderFeatures {
                 fog: true,
                 fog_density: 1.0e-3,
+                ssr: true,
+                ssr_steps: 16,
+                ssr_max_roughness: 0.3,
+                refraction: true,
             },
             Self::Low | Self::Ci => RenderFeatures {
                 fog: false,
                 fog_density: 0.0,
+                ssr: false,
+                ssr_steps: 0,
+                ssr_max_roughness: 0.0,
+                refraction: false,
             },
         }
     }
@@ -127,17 +160,37 @@ pub struct RenderFeatures {
     /// Fog density in 1/metre (`f = 1 - exp(-(d * density)^2)`); ignored when
     /// `fog` is off.
     pub fog_density: f32,
+    /// Screen-space reflections for smooth metals (post pass).
+    pub ssr: bool,
+    /// Ray-march steps per SSR ray; ignored when `ssr` is off.
+    pub ssr_steps: u32,
+    /// Largest roughness that still gets SSR; ignored when `ssr` is off.
+    pub ssr_max_roughness: f32,
+    /// Refraction through transmissive instances (glass draw + post pass).
+    pub refraction: bool,
 }
 
 impl RenderFeatures {
     /// The `ForwardParams::features` bitmask.
     #[must_use]
     pub const fn flags(self) -> u32 {
+        let mut f = 0;
         if self.fog {
-            FEATURE_FOG
-        } else {
-            0
+            f |= FEATURE_FOG;
         }
+        if self.ssr {
+            f |= FEATURE_SSR;
+        }
+        if self.refraction {
+            f |= FEATURE_REFRACT;
+        }
+        f
+    }
+
+    /// True when the post pass must be dispatched.
+    #[must_use]
+    pub const fn needs_post(self) -> bool {
+        self.flags() & POST_FEATURES != 0
     }
 }
 
@@ -174,8 +227,29 @@ mod tests {
         );
         assert_eq!(QualityPreset::Ci.features().flags(), 0);
         assert_eq!(QualityPreset::Low.features().flags(), 0);
-        assert_eq!(QualityPreset::High.features().flags(), FEATURE_FOG);
+        assert_eq!(
+            QualityPreset::High.features().flags(),
+            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT
+        );
+        assert_eq!(
+            QualityPreset::Medium.features().flags(),
+            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT
+        );
         // Presets with fog off must not leak a density to the shader.
         assert_eq!(QualityPreset::Ci.features().fog_density, 0.0);
+
+        // SSR / refraction: High and Medium on, Low and Ci off.
+        let (high, medium) = (QualityPreset::High.features(), QualityPreset::Medium.features());
+        assert!(high.ssr && high.refraction && high.needs_post());
+        assert!(medium.ssr && medium.refraction && medium.needs_post());
+        assert_eq!((high.ssr_steps, medium.ssr_steps), (32, 16));
+        assert_eq!(high.ssr_max_roughness, 0.5);
+        assert_eq!(medium.ssr_max_roughness, 0.3);
+        for p in [QualityPreset::Low, QualityPreset::Ci] {
+            let f = p.features();
+            assert!(!f.ssr && !f.refraction && !f.needs_post(), "{p}");
+            assert_eq!((f.ssr_steps, f.ssr_max_roughness), (0, 0.0), "{p}");
+            assert_eq!(f.flags() & POST_FEATURES, 0, "{p}");
+        }
     }
 }
