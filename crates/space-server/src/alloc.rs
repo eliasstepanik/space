@@ -69,17 +69,17 @@ impl ShardIdAllocator {
         let mut current = self.next.load(Ordering::SeqCst);
         loop {
             // Exhausted: past u32::MAX, or on it (that is `ShardId::NONE`).
-            match u32::try_from(current) {
-                Ok(v) if v != u32::MAX => {}
+            let id = match u32::try_from(current) {
+                Ok(v) if v != u32::MAX => v,
                 _ => return Err(IdSpaceExhausted { next: current }),
-            }
+            };
             match self.next.compare_exchange(
                 current,
                 current + 1,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Ok(ShardId::new(u32::try_from(current).unwrap_or(u32::MAX - 1))),
+                Ok(_) => return Ok(ShardId::new(id)),
                 Err(actual) => current = actual,
             }
         }
