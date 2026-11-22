@@ -381,17 +381,15 @@ mod tests {
 
     #[test]
     fn the_reserved_none_id_is_never_handed_out() {
-        // The inner allocator panics at the id-space limit rather than wrapping
-        // onto ShardId::NONE (u32::MAX); the wrapper must not change that.
+        // The inner allocator errors at the id-space limit rather than wrapping
+        // onto ShardId::NONE (u32::MAX); the wrapper must not change that, and
+        // must not persist anything for the failed allocation.
         let mut alloc = PersistentShardIdAllocator::with_sink(
             u64::from(u32::MAX - 1),
             Box::new(MemoryCounterSink::default()),
         );
-        assert_eq!(alloc.allocate(), ShardId::new(u32::MAX - 1));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alloc.allocate()));
-        assert!(
-            result.is_err(),
-            "allocating past u32::MAX must fail loudly, not wrap"
-        );
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(u32::MAX - 1)));
+        assert!(alloc.allocate().is_err(), "must fail, not wrap or panic");
+        assert_eq!(alloc.peek(), u64::from(u32::MAX));
     }
 }
