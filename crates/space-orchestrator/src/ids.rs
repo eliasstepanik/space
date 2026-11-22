@@ -227,17 +227,17 @@ impl PersistentShardIdAllocator {
     /// counter, the new value is persisted **before** returning (same rule as
     /// [`allocate`](Self::allocate)).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when persistence fails, like [`allocate`](Self::allocate).
-    pub fn reserve(&mut self, id: ShardId) {
+    /// The sink's error when persisting the bumped counter fails, so the caller
+    /// can refuse to proceed rather than silently lose the reservation.
+    pub fn reserve(&mut self, id: ShardId) -> io::Result<()> {
         let before = self.inner.peek();
         self.inner.reserve(id);
         if self.inner.peek() != before {
-            self.sink.persist(self.inner.peek()).expect(
-                "reserve: persisting the counter failed; refusing to proceed with an unpersisted id",
-            );
+            self.sink.persist(self.inner.peek())?;
         }
+        Ok(())
     }
 }
 
