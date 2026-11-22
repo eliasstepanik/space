@@ -203,16 +203,13 @@ mod tests {
             let task = {
                 let guard = launcher.running.lock().await;
                 let running = guard.get(&id).expect("registered");
-                if abort_tick {
-                    running.tick.abort();
+                let task = if abort_tick {
+                    &running.tick
                 } else {
-                    running.serve.abort();
-                }
-                if abort_tick {
-                    running.tick.abort_handle()
-                } else {
-                    running.serve.abort_handle()
-                }
+                    &running.serve
+                };
+                task.abort();
+                task.abort_handle()
             };
             // Wait for the abort to land, then poll: bounded, no fixed sleep.
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
