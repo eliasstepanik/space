@@ -537,6 +537,42 @@ mod tests {
     }
 
     #[test]
+    fn a_shard_claiming_the_next_to_issue_id_does_not_cause_a_collision() {
+        // Counter at 100; the root is staged for owner 100 (the id the
+        // orchestrator is about to hand out elsewhere).
+        let config = OrchestratorConfig::default();
+        let root = config.root_node();
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(root, ShardId::new(100), addr(7_001))],
+        );
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        let mut plane = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+
+        let claim = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(100),
+            endpoint: addr(9_000),
+            region: None,
+        };
+        let welcome = plane.handle_shard_hello(&claim).expect("claim confirmed");
+        assert_eq!(welcome.shard, ShardId::new(100));
+
+        // A later anonymous hello (for a free child node) must not get 100.
+        let child = space_world::octree::children(root).expect("root splits")[0];
+        let anon = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::NONE,
+            endpoint: addr(9_001),
+            region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+        };
+        let second = plane.handle_shard_hello(&anon).expect("allocation");
+        assert_eq!(second.shard, ShardId::new(101), "100 was already taken");
+        assert_ne!(second.shard, welcome.shard, "no id is handed out twice");
+    }
+
+    #[test]
     fn a_hello_naming_another_cluster_is_refused() {
         let mut plane = plane();
         let hello = ShardHello {
