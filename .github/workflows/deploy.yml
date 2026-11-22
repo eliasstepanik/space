@@ -29,7 +29,8 @@ permissions:
 jobs:
   redeploy:
     name: Redeploy on proxy
-    runs-on: ubuntu-latest
+    # Self-hosted space-ci runner (proxy host); it only needs ssh to reach the host.
+    runs-on: [self-hosted, linux, x64, space-ci]
     steps:
       - name: Check secrets are configured
         env:
