@@ -747,7 +747,10 @@ fn mirror_scene(roughness: f32) -> Scene {
     };
     Scene::from_instances(
         post_camera(),
-        vec![floor, emissive_sphere([0.0, -0.4, -6.0], 0.5, [6.0, 0.0, 0.0])],
+        vec![
+            floor,
+            emissive_sphere([0.0, -0.4, -6.0], 0.5, [6.0, 0.0, 0.0]),
+        ],
     )
 }
 

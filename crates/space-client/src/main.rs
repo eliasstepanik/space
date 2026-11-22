@@ -108,7 +108,8 @@ fn print_usage() {
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
         \x20 --size WxH frame size in pixels (default 640x480)\n\
         \x20 --out FILE write the frame to FILE (PPM); default demo.ppm / galaxy.ppm\n\
-        \x20 --quality P quality preset: high (default), medium, low or ci (fog etc.)\n\
+        \x20 --quality P quality preset: high (default), medium, low or ci\n\
+        \x20              (fog, screen-space reflections, refraction)\n\
         \n\
         With neither --demo nor --galaxy a winit window is opened."
     );
@@ -150,8 +151,11 @@ fn write_ppm(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> st
     std::fs::write(path, out)
 }
 
-/// The CI-cheap, deterministic render options used by the offline demo; the
-/// preset selects the optional render features (fog, ...).
+/// The CI-cheap, deterministic render options used by both the offline demo and
+/// the windowed/swapchain path (`App` renders with these through
+/// `render_frame_gpu`, so the same preset gates the same features, including the
+/// SSR/refraction post pass, before `Swapchain::present` copies the tone-mapped
+/// image); the preset selects the optional render features.
 fn demo_options(preset: QualityPreset) -> RenderOptions {
     RenderOptions {
         gi_enabled: false,
@@ -393,6 +397,33 @@ mod tests {
             .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
             .count();
         assert!(lit > 0, "the demo scene rendered nothing");
+    }
+
+    /// The windowed path renders through `render_frame_gpu` with the same
+    /// options as the offline demo: every preset (including the SSR/refraction
+    /// presets) must render cleanly through it and carry the preset into the
+    /// frame, with zero validation messages.
+    #[test]
+    fn every_preset_renders_through_the_swapchain_frame_path() {
+        let Ok(ctx) = RenderContext::new(&ContextOptions::default()) else {
+            eprintln!("SKIP: no Vulkan device");
+            return;
+        };
+        let size = 64;
+        let scene = demo_scene(size, size);
+        for preset in QualityPreset::ALL {
+            let options = demo_options(preset);
+            assert_eq!(options.preset, preset);
+            let (out, frame) = ctx
+                .render_frame_gpu(&scene, size, size, &options)
+                .expect("frame render");
+            drop(frame);
+            assert_eq!(out.validation_messages, 0, "{preset}");
+            assert!(
+                out.pixels.chunks_exact(4).any(|px| px[0] > 8),
+                "{preset}: nothing rendered"
+            );
+        }
     }
 
     /// The galaxy scene builds through the LOD selector and stays within the

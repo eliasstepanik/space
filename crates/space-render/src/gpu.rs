@@ -795,7 +795,7 @@ const REFRACT_ETA: f32 = 1.0 / 1.5;
 
 /// Metres the refracted ray travels behind a transmissive surface before the
 /// post pass looks the scene up (the screen-space "thickness" of the glass).
-const REFRACT_DISTANCE_M: f32 = 1.0;
+const REFRACT_DISTANCE_M: f32 = 2.0;
 
 /// The [`params::PostParams`] for the SSR / refraction post pass: the same
 /// camera matrices as the forward pass, so the pass reconstructs positions and

@@ -1875,22 +1875,22 @@ impl FrameGpu {
                 );
             }
             initial_barriers.extend([
-                    vk::ImageMemoryBarrier::default()
-                        .image(self.out.handle)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .subresource_range(color_range()),
-                    // The GI dummy (bound when GI is off) is sampled by the
-                    // forward pass; it never sees another layout transition.
-                    vk::ImageMemoryBarrier::default()
-                        .image(self.dummy_tex.0.handle)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .subresource_range(color_range()),
+                vk::ImageMemoryBarrier::default()
+                    .image(self.out.handle)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .subresource_range(color_range()),
+                // The GI dummy (bound when GI is off) is sampled by the
+                // forward pass; it never sees another layout transition.
+                vk::ImageMemoryBarrier::default()
+                    .image(self.dummy_tex.0.handle)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(color_range()),
             ]);
             device.cmd_pipeline_barrier(
                 self.cmd_frame,

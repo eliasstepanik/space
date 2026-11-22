@@ -239,7 +239,10 @@ mod tests {
         assert_eq!(QualityPreset::Ci.features().fog_density, 0.0);
 
         // SSR / refraction: High and Medium on, Low and Ci off.
-        let (high, medium) = (QualityPreset::High.features(), QualityPreset::Medium.features());
+        let (high, medium) = (
+            QualityPreset::High.features(),
+            QualityPreset::Medium.features(),
+        );
         assert!(high.ssr && high.refraction && high.needs_post());
         assert!(medium.ssr && medium.refraction && medium.needs_post());
         assert_eq!((high.ssr_steps, medium.ssr_steps), (32, 16));
