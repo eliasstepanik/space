@@ -799,15 +799,17 @@ fn ssr_reflects_a_bright_object_where_mirror_geometry_predicts() {
         );
         // Floor pixels away from the mirror image stay as without SSR.
         for (x, y) in [(10, 110), (118, 110), (30, 100), (64, 120)] {
-            assert_eq!(
-                pixel(out, x, y),
-                pixel(&ci, x, y),
-                "{name}: floor pixel ({x},{y}) must not change"
+            // (+-2: the High/Medium presets also enable distance fog.)
+            let (a, b) = (pixel(out, x, y), pixel(&ci, x, y));
+            assert!(
+                (0..3).all(|c| a[c].abs_diff(b[c]) <= 2),
+                "{name}: floor pixel ({x},{y}) must not change: {a:?} vs {b:?}"
             );
         }
     }
     // The direct (non-reflective) sphere pixels are untouched by SSR.
-    assert_eq!(pixel(&high, 64, 71), pixel(&ci, 64, 71));
+    let (a, b) = (pixel(&high, 64, 71), pixel(&ci, 64, 71));
+    assert!((0..3).all(|c| a[c].abs_diff(b[c]) <= 2), "{a:?} vs {b:?}");
 
     // Roughness gate: 0.4 is within High's limit (0.5) but not Medium's (0.3).
     let rough = mirror_scene(0.4);
@@ -824,12 +826,12 @@ fn ssr_reflects_a_bright_object_where_mirror_geometry_predicts() {
 }
 
 /// A transmissive ball lens (radius 2, centre (0, 0, -4)) in front of a green
-/// marker sphere (radius 0.6, centre (1.0, 0, -9)) that sits entirely behind it
+/// marker sphere (radius 0.6, centre (1.6, 0, -9)) that sits entirely behind it
 /// on screen. Without refraction the lens is an opaque black ball that hides the
 /// marker; with refraction the marker shows through, displaced from where it
 /// appears with no lens at all.
 fn refraction_scene(with_glass: bool) -> Scene {
-    let mut instances = vec![emissive_sphere([1.0, 0.0, -9.0], 0.6, [0.0, 6.0, 0.0])];
+    let mut instances = vec![emissive_sphere([1.6, 0.0, -9.0], 0.6, [0.0, 6.0, 0.0])];
     if with_glass {
         instances.push(GpuInstance {
             center: [0.0, 0.0, -4.0, 2.0],
