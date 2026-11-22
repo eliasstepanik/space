@@ -2,6 +2,13 @@
 // level) with a metallic-roughness BRDF (Cook-Torrance GGX + Smith visibility),
 // analytic point lights, 1-bounce probe GI as indirect diffuse, HDR output.
 // Depth test is provided by the render pass depth attachment.
+//
+// Outputs (opaque pass, `fs_main`): location 0 = HDR colour (alpha 1),
+// location 1 = material channel `rg8unorm` (r = metallic, g = roughness) read
+// by `post.wgsl`. With FEATURE_REFRACT, transmissive instances (transmission
+// > 0) are skipped here and drawn by the glass pass (`vs_glass`/`fs_glass`)
+// into a separate attachment (rgb = lit colour, a = transmission), so the
+// opaque scene behind the glass survives in the HDR target for refraction.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -34,6 +41,7 @@ struct Params {
 }
 
 const FEATURE_FOG: u32 = 1u;
+const FEATURE_REFRACT: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
@@ -47,6 +55,12 @@ struct VsOut {
     @location(2) albedo: vec3<f32>,
     @location(3) material: vec2<f32>, // x = metallic, y = roughness
     @location(4) emissive: vec3<f32>,
+    @location(5) @interpolate(flat) transmission: f32,
+}
+
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    @location(1) material: vec2<f32>, // r = metallic, g = roughness
 }
 
 // Unit icosphere: 12 vertices, 20 triangles (60 indices). Positions are
@@ -104,10 +118,25 @@ fn box_normal(index: u32) -> vec3<f32> {
     return n[(index / 6u) % 6u];
 }
 
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+// `glass_pass` selects which instances this draw keeps: the opaque pass drops
+// transmissive instances when refraction is on, the glass pass keeps only
+// those. A dropped instance collapses to one point (zero-area triangles
+// rasterise nothing).
+fn vertex_body(vi: u32, ii: u32, glass_pass: bool) -> VsOut {
     var out: VsOut;
     let inst = instances[ii];
+    let glass = inst.transmission > 0.0;
+    let refract_on = (params.features & FEATURE_REFRACT) != 0u;
+    if (glass_pass && !glass) || (!glass_pass && glass && refract_on) {
+        out.world = vec3(0.0);
+        out.normal = vec3(0.0, 0.0, 1.0);
+        out.albedo = vec3(0.0);
+        out.material = vec2(0.0);
+        out.emissive = vec3(0.0);
+        out.transmission = 0.0;
+        out.pos = vec4(0.0, 0.0, 0.0, 1.0);
+        return out;
+    }
     var local: vec3<f32>;
     var normal: vec3<f32>;
     if inst.shape == 0u {
@@ -124,8 +153,19 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     out.albedo = inst.albedo.rgb;
     out.material = vec2(inst.albedo.w, inst.roughness);
     out.emissive = inst.emissive.rgb;
+    out.transmission = clamp(inst.transmission, 0.0, 1.0);
     out.pos = params.camera.view_proj * vec4(world, 1.0);
     return out;
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    return vertex_body(vi, ii, false);
+}
+
+@vertex
+fn vs_glass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    return vertex_body(vi, ii, true);
 }
 
 const PI: f32 = 3.14159265359;
@@ -196,8 +236,8 @@ fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+// Lit (and fogged) colour of one surface point.
+fn shade(in: VsOut) -> vec3<f32> {
     let n = normalize(in.normal);
     let v = normalize(params.camera.position.xyz - in.world);
     let metallic = in.material.x;
@@ -220,5 +260,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let f = 1.0 - exp(-d * d);
         color = mix(color, params.fog.rgb, f);
     }
-    return vec4(max(color, vec3(0.0)), 1.0);
+    return max(color, vec3(0.0));
+}
+
+@fragment
+fn fs_main(in: VsOut) -> FsOut {
+    var out: FsOut;
+    out.color = vec4(shade(in), 1.0);
+    out.material = vec2(in.material.x, clamp(in.material.y, 0.05, 1.0));
+    return out;
+}
+
+@fragment
+fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4(shade(in), in.transmission);
 }

@@ -11,7 +11,7 @@ struct Instance {
     emissive: vec4<f32>, // rgb radiance, a = GI ray contribution weight
     roughness: f32,
     shape: u32,          // 0 = sphere, 1 = box
-    _pad0: f32,
+    transmission: f32,   // 0 = opaque, > 0 = transmissive (glass) when refraction is on
     _pad1: f32,
 }
 
