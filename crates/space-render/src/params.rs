@@ -215,6 +215,8 @@ mod tests {
             gi_spacing => FORWARDPARAMS_GI_SPACING,
             gi_grid_size_x => FORWARDPARAMS_GI_GRID_SIZE_X,
             gi_grid_size_y => FORWARDPARAMS_GI_GRID_SIZE_Y,
+            fog => FORWARDPARAMS_FOG,
+            features => FORWARDPARAMS_FEATURES,
         } size = FORWARDPARAMS_SIZE);
         assert_layout!(Camera {
             view_proj => CAMERA_VIEW_PROJ,
