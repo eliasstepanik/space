@@ -197,7 +197,11 @@ impl ControlPlane {
 
     /// The owner of `node` when `hello` is that owner restarting: a `NONE`
     /// hello advertising the very endpoint the owner already holds.
-    fn incumbent_for_restart(&self, hello: &ShardHello, node: NodeRef) -> Option<ShardId> {
+    fn incumbent_for_restart(
+        &self,
+        hello: &ShardHello,
+        node: space_world::NodeRef,
+    ) -> Option<ShardId> {
         if hello.shard != ShardId::NONE {
             return None;
         }
