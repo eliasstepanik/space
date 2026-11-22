@@ -28,9 +28,10 @@ use space_protocol::{
 };
 use space_world::WorldPos;
 
-/// Loopback address both endpoints use.
+/// Loopback address both endpoints use. IPv4 on purpose: quinn binds IPv6
+/// sockets dual-stack, which Windows rejects with WSAEINVAL (10022).
 fn addr() -> SocketAddr {
-    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
 /// A shard map with one region covering the whole world (depth 0), owned by
