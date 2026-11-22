@@ -24,11 +24,10 @@ jobs:
   lint:
     name: Workflow YAML
     runs-on: [self-hosted, linux, x64, space-ci]
-    container: python:3.12-slim
     steps:
       - uses: actions/checkout@v4
       - name: Install PyYAML
-        run: python3 -m pip install pyyaml
+        run: python3 -m pip install --user pyyaml || pip3 install --user pyyaml || (apt-get update && apt-get install -y python3-yaml)
       - name: Parse .github/workflows and deploy YAML
         run: python3 .github/scripts/check_yaml.py
 
