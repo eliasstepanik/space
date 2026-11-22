@@ -1,9 +1,17 @@
-# Space cluster: one orchestrator + two shards on a user-defined bridge network.
+# Space cluster: one orchestrator + ONE shard on a user-defined bridge network.
 #
 #   docker compose -f deploy/docker-compose.yaml up --build
 #
 # NOT EXECUTED: the authoring sandbox has no Docker daemon, so this file is
 # correct by inspection only (docs/plan-phase3.md P3.0 is the real verification).
+#
+# The cluster starts with ONE shard. The orchestrator pre-allocates the root
+# region's owner and the first region-less hello (shard-a, no --shard, no region
+# claim) adopts it. A second region-less shard would ask for the same root, which
+# is already owned, and be rejected (and, restarting forever, never join). More
+# shards join only after a split assigns them a region (the orchestrator spawns
+# the child itself), or by starting a shard with an explicit --shard / --claim-region
+# naming a free region.
 #
 # Addressing: `--orchestrator`, `--control-addr` and `--advertise` are parsed as
 # socket ADDRESSES, not resolved as host names, so every container gets a fixed
@@ -11,15 +19,16 @@
 #
 #   orchestrator  172.31.0.10:7900   binds 0.0.0.0:7900, shards dial 172.31.0.10:7900
 #   shard-a       172.31.0.11:7870   binds 0.0.0.0:7870, advertises 172.31.0.11:7870
-#   shard-b       172.31.0.12:7870   binds 0.0.0.0:7870, advertises 172.31.0.12:7870
 #
 # Shards advertise their in-network address (peers dial each other over the
-# bridge). Clients on the host use the published UDP ports 7871/7872; a shard that
+# bridge). Clients on the host use the published UDP port 7871; a shard that
 # must hand out a host-reachable address to clients would advertise the host
 # address instead (the plan's two-address case, R12, is not implemented here).
 #
-# Both shards register with ShardHello and are placed by the orchestrator. The
-# orchestrator runs `--launcher local`: `--launcher docker` is deferred.
+# The shard registers with ShardHello and is placed by the orchestrator. If it
+# restarts it re-advertises the same address, which the orchestrator recognises
+# as the same shard and answers with the same id. The orchestrator runs
+# `--launcher local`: `--launcher docker` is deferred.
 
 x-cluster: &cluster
   SPACE_CLUSTER: space-local
