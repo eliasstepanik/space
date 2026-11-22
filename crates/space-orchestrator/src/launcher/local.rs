@@ -187,6 +187,48 @@ mod tests {
         assert_eq!(launcher.poll(ShardId::new(2)).await.unwrap(), Poll::Dead);
     }
 
+    /// The liveness branch: a shard still *registered* whose tick loop has died
+    /// (a panic, or an abort that did not go through `kill`) is reported dead.
+    /// The entry stays in the map, so this is not the "unknown shard" path.
+    ///
+    /// Mutation this catches: dropping the `is_finished` checks in `poll`.
+    #[tokio::test]
+    async fn poll_reports_dead_when_a_registered_shards_tick_loop_stops() {
+        for abort_tick in [true, false] {
+            let launcher = LocalLauncher::new();
+            let id = ShardId::new(if abort_tick { 30 } else { 31 });
+            launcher.spawn(spec(id.0)).await.expect("spawn");
+            assert_eq!(launcher.poll(id).await.unwrap(), Poll::Alive);
+
+            let task = {
+                let guard = launcher.running.lock().await;
+                let running = guard.get(&id).expect("registered");
+                let task = if abort_tick {
+                    &running.tick
+                } else {
+                    &running.serve
+                };
+                task.abort();
+                task.abort_handle()
+            };
+            // Wait for the abort to land, then poll: bounded, no fixed sleep.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the aborted task finishes");
+
+            assert_eq!(launcher.poll(id).await.unwrap(), Poll::Dead);
+            assert!(
+                launcher.running.lock().await.contains_key(&id),
+                "still registered: the liveness branch fired, not the unknown-shard one"
+            );
+            launcher.kill(id).await.expect("kill");
+        }
+    }
+
     #[tokio::test]
     async fn poll_on_an_unknown_shard_is_dead() {
         let launcher = LocalLauncher::new();

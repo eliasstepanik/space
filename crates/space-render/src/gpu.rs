@@ -15,6 +15,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use crate::alloc::SharedAllocator;
 use crate::params;
+use crate::quality::{self, QualityPreset};
 use crate::scene::Scene;
 
 /// Validation layer name (NUL-terminated for the Vulkan API).
@@ -108,6 +109,11 @@ pub struct RenderOptions {
     /// Run the ray-query probe GI pass and feed it into the forward pass.
     pub gi_enabled: bool,
     pub quality: Quality,
+    /// Quality tier driving the optional render features (fog, ...); see
+    /// [`crate::quality`]. `RenderOptions::default()` uses
+    /// [`QualityPreset::Ci`] (all optional features off) so headless/golden
+    /// callers stay deterministic; the client opts in to its own preset.
+    pub preset: QualityPreset,
     pub exposure: f32,
     /// MUTATION SWITCH: skip the forward draw entirely (the render pass is
     /// still begun and ended, so only the draw is removed). Any pixel test
@@ -132,6 +138,7 @@ impl Default for RenderOptions {
         Self {
             gi_enabled: true,
             quality: Quality::DEFAULT,
+            preset: QualityPreset::Ci,
             exposure: 1.0,
             mutate_skip_forward_draw: false,
             mutate_skip_gi_dispatch: false,
@@ -606,6 +613,10 @@ impl RenderContext {
             frame.gi_params.write(params::as_bytes(&gi))?;
         }
         frame.tone_params.write(params::as_bytes(&tone_params))?;
+        if let Some(post) = &frame.post {
+            let post_params = build_post_params(&forward_params, width, height, &options);
+            post.params.write(params::as_bytes(&post_params))?;
+        }
         if options.ray_probe {
             let rq = rq_uniforms(scene, width, height);
             frame.rq_params.write(params::as_bytes(&rq))?;
@@ -708,6 +719,7 @@ fn build_uniforms(
     let view_proj = scene.view_proj();
     let inv_view_proj = scene.inv_view_proj().unwrap_or(view_proj);
     let tan_half_fov = (cam.fov_y * 0.5).tan();
+    let features = options.preset.features();
 
     let mut forward = params::ForwardParams {
         camera: params::Camera {
@@ -730,6 +742,14 @@ fn build_uniforms(
         gi_grid_size_x: options.quality.grid,
         gi_grid_size_y: options.quality.grid,
         _pad1: 0.0,
+        fog: [
+            quality::FOG_COLOR[0],
+            quality::FOG_COLOR[1],
+            quality::FOG_COLOR[2],
+            features.fog_density,
+        ],
+        features: features.flags(),
+        _pad2: [0; 3],
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {
         // World-space light -> camera-relative f32 offset.
@@ -768,6 +788,35 @@ fn build_uniforms(
         _pad1: [0.0; 2],
     };
     (forward, gi, tone)
+}
+
+/// Index-of-refraction ratio for light entering glass from air (1 / 1.5).
+const REFRACT_ETA: f32 = 1.0 / 1.5;
+
+/// Metres the refracted ray travels behind a transmissive surface before the
+/// post pass looks the scene up (the screen-space "thickness" of the glass).
+const REFRACT_DISTANCE_M: f32 = 2.0;
+
+/// The [`params::PostParams`] for the SSR / refraction post pass: the same
+/// camera matrices as the forward pass, so the pass reconstructs positions and
+/// projects rays in exactly the forward pass's depth/projection convention.
+fn build_post_params(
+    forward: &params::ForwardParams,
+    width: u32,
+    height: u32,
+    options: &RenderOptions,
+) -> params::PostParams {
+    let features = options.preset.features();
+    params::PostParams {
+        camera: forward.camera,
+        features: features.flags(),
+        ssr_steps: features.ssr_steps,
+        image_size: [width, height],
+        ssr_max_roughness: features.ssr_max_roughness,
+        refract_distance: REFRACT_DISTANCE_M,
+        refract_eta: REFRACT_ETA,
+        _pad: 0.0,
+    }
 }
 
 /// The [`params::RqParams`] for a raw ray-query probe frame: a bright magenta

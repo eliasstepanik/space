@@ -329,10 +329,10 @@ impl ShardNet {
         for out in outbox {
             match out.dest {
                 Destination::Shard(shard_id) => {
-                    // An endpoint registered by hand wins; otherwise the peer is
-                    // dialled at the address the shard's own map names for it, so
-                    // a shard that appears through an epoch change is reachable
-                    // without any extra wiring.
+                    // The peer is dialled at the address the shard's own map
+                    // names for it, so a shard that appears or migrates through
+                    // an epoch change is reachable without any extra wiring; an
+                    // endpoint registered by hand is only the fallback.
                     let from_map = shard.lock().await.peer_endpoint(shard_id);
                     self.send_to_peer(local, shard_id, from_map, out.message)
                         .await;
@@ -364,8 +364,11 @@ impl ShardNet {
         from_map: Option<SocketAddr>,
         message: Message,
     ) {
+        // The shard map is current; a hand-registered endpoint is only a fallback
+        // for a peer the map does not (yet) name, so it can never shadow a
+        // migrated shard's new address.
         let registered = self.shard_endpoints.lock().await.get(&shard_id).copied();
-        let Some(addr) = registered.or(from_map) else {
+        let Some(addr) = from_map.or(registered) else {
             self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
             eprintln!("space-server: no endpoint known for peer shard {shard_id}; message dropped");
             return;
@@ -621,5 +624,40 @@ mod tests {
             let hello = peer_hello(ShardId::new(id));
             assert_eq!(peer_shard_id(&hello.player_token), Some(ShardId::new(id)));
         }
+    }
+
+    fn probe() -> Message {
+        Message::Reject(Reject {
+            reason: space_protocol::RejectReason::Draining,
+        })
+    }
+
+    /// A hand-registered endpoint must not shadow the map's current address: the
+    /// sender `send_to_peer` selects is dialled at the map-pushed endpoint.
+    ///
+    /// Mutation this catches: `registered.or(from_map)` in `send_to_peer`.
+    #[tokio::test]
+    async fn a_map_pushed_endpoint_supersedes_a_hand_registered_one() {
+        let net = ShardNet::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let peer = ShardId::new(5);
+        let stale = SocketAddr::from(([127, 0, 0, 1], 9_001));
+        let fresh = SocketAddr::from(([127, 0, 0, 1], 9_002));
+        net.set_shard_endpoint(peer, stale).await;
+
+        // No map entry yet: the registered endpoint is the fallback.
+        net.send_to_peer(ShardId::new(1), peer, None, probe()).await;
+        assert_eq!(
+            net.peers.lock().await.get(&peer).map(|s| s.addr),
+            Some(stale)
+        );
+
+        // The map now names a new address: sends must target it.
+        net.send_to_peer(ShardId::new(1), peer, Some(fresh), probe())
+            .await;
+        assert_eq!(
+            net.peers.lock().await.get(&peer).map(|s| s.addr),
+            Some(fresh)
+        );
+        net.close();
     }
 }
