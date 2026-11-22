@@ -128,7 +128,7 @@ fn parse_args() -> Config {
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
-               [--quality high|medium|low|ci]\n\
+               [--quality high|medium|low|ci] [--stream ADDR [--frames N]]\n\
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\

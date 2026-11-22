@@ -76,7 +76,9 @@ impl InputState {
 
     /// Advance the camera by `dt` seconds at `speed` metres/second.
     pub fn step(&mut self, dt: f32, speed: f64) {
-        let axis = |pos: Key, neg: Key| f64::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)));
+        let axis = |pos: Key, neg: Key| {
+            f64::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)))
+        };
         let (fwd, right, up) = (
             axis(Key::Forward, Key::Back),
             axis(Key::Right, Key::Left),
@@ -141,7 +143,11 @@ pub fn stream_loop(
         flags |= FLAG_DOWNSCALED;
     }
     // Scale movement with the scene: the galaxy spans ~1e5 m, the demo ~6 m.
-    let speed = if config.mode == Mode::Galaxy { 5.0e3 } else { 3.0 };
+    let speed = if config.mode == Mode::Galaxy {
+        5.0e3
+    } else {
+        3.0
+    };
     let options = demo_options(config.quality);
     let mut input = InputState::default();
     let mut last = Instant::now();
@@ -199,8 +205,8 @@ pub fn run_stream(config: &Config, addr: &str) -> Result<(), RenderError> {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use space_stream::protocol::decode_frame;
     use space_stream::jpeg_dimensions;
+    use space_stream::protocol::decode_frame;
     use std::sync::Arc;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -217,7 +223,10 @@ mod tests {
         assert!((s.offset[2] + 2.0).abs() < 1e-9 && s.offset[0].abs() < 1e-9);
         s.apply(key(Key::Forward, false));
         s.step(1.0, 2.0);
-        assert!((s.offset[2] + 2.0).abs() < 1e-9, "released key stops motion");
+        assert!(
+            (s.offset[2] + 2.0).abs() < 1e-9,
+            "released key stops motion"
+        );
 
         s.apply(ViewerInput::View {
             yaw: std::f32::consts::FRAC_PI_2,
@@ -306,7 +315,9 @@ mod tests {
                 yaw: 0.5,
                 pitch: 0.0,
             };
-            ws.send(Message::Binary(view.encode().into())).await.unwrap();
+            ws.send(Message::Binary(view.encode().into()))
+                .await
+                .unwrap();
             let mut frames = Vec::new();
             while frames.len() < 3 {
                 let msg = tokio::time::timeout(Duration::from_secs(60), ws.next())
@@ -327,7 +338,10 @@ mod tests {
             assert_eq!(header.flags, FLAG_KEYFRAME | FLAG_DOWNSCALED);
             assert_eq!(jpeg_dimensions(jpeg), Some((32, 24)), "half of 64x48");
         }
-        assert!((input.yaw - 0.5).abs() < 1e-6, "viewer input reached the proxy");
+        assert!(
+            (input.yaw - 0.5).abs() < 1e-6,
+            "viewer input reached the proxy"
+        );
         drop(server);
     }
 }
