@@ -189,10 +189,15 @@ fn space_orchestrator_root_depth() -> u8 {
 }
 
 impl Options {
-    /// The address to put in `ShardHello`: `--advertise` if given, else the
-    /// address the socket actually bound.
-    fn advertised(&self, bound: SocketAddr) -> SocketAddr {
-        self.advertise.unwrap_or(bound)
+    /// The orchestrated-boot options this command line describes.
+    fn orchestrated(&self) -> space_server::orchestrated::OrchestratedOptions {
+        space_server::orchestrated::OrchestratedOptions {
+            shard: self.shard,
+            bind: self.bind,
+            advertise: self.advertise,
+            claim_region: self.claim_region,
+            cluster: self.cluster.clone(),
+        }
     }
 }
 
