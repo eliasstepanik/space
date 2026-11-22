@@ -88,7 +88,7 @@ pub mod web {
         ImageBitmap, KeyboardEvent, MessageEvent, MouseEvent, WebSocket,
     };
 
-    use super::{key_message, pointer_message, ViewAngles};
+    use super::{key_message, pointer_message, release_messages, ViewAngles};
 
     fn send(ws: &WebSocket, msg: &[u8]) {
         if ws.ready_state() == WebSocket::OPEN {
