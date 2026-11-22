@@ -6,7 +6,7 @@ auto-redeployed by Watchtower.
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped`; orchestrator state in `./state` |
+| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped` (except `client`: `restart: "no"`, see Client configuration); orchestrator state in `./state` |
 | `.env.example` | copy to `.env`: cluster name, host ports, image tag |
 | `redeploy.sh` | manual path only (used by `.github/workflows/deploy.yml`): `compose pull`, `up -d`, image prune |
 
@@ -49,6 +49,12 @@ The client image's ENTRYPOINT is a shell wrapper that runs
 so the compose file sets those env vars (`STREAM_BIND=0.0.0.0:8099`,
 `SPACE_SERVER=172.29.0.11:7870`, `CLIENT_ARGS=--galaxy`) instead of a
 `command:` (which the wrapper would ignore).
+
+Note: the `client` service requires a GPU with `VK_KHR_acceleration_structure`
+(ray tracing). On hosts without one (e.g. software Vulkan such as lavapipe) it
+exits, and it is set to `restart: "no"` so it is not restarted (a crash loop
+would churn a new backend session each time). `orchestrator` and `shard-a` stay
+at `restart: unless-stopped`.
 
 ## Network subnet
 
