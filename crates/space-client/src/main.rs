@@ -138,8 +138,12 @@ fn parse_args() -> Config {
             }
         }
     }
-    if config.server.is_some() && config.stream.is_none() {
-        eprintln!("space-client: --server is only supported together with --stream");
+    // `--server` joins a shard from the stream path or from the windowed path;
+    // the headless one-frame modes (`--demo` / `--galaxy`) never connect.
+    if config.server.is_some() && config.stream.is_none() && config.mode != Mode::Window {
+        eprintln!(
+            "space-client: --server needs --stream or the windowed client (not --demo/--galaxy)"
+        );
         std::process::exit(2);
     }
     config
