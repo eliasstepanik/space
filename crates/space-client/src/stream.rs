@@ -738,6 +738,19 @@ mod tests {
     /// sits still and is re-based onto the camera once the server moves it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windowed_join_builds_its_scene_from_live_replica_state() {
+        /// What the windowed client (`window.rs`) does each frame online: the
+        /// camera offset comes from the replicated ship, then the shared
+        /// scene building.
+        fn live_scene(
+            replica: &space_client::link::Replica,
+            input: &InputState,
+            width: u32,
+            height: u32,
+        ) -> Scene {
+            let mut input = input.clone();
+            input.offset = replica.offset();
+            scene_for_input(Mode::Window, &input, width, height)
+        }
         use space_protocol::ShardId;
         use space_server::net::ShardNet;
         use space_server::{Shard, ShardConfig};
