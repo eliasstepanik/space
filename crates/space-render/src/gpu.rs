@@ -440,6 +440,24 @@ impl RenderContext {
         if ray_query_support.complete() {
             required.push(vk::KHR_RAY_QUERY_NAME.as_ref());
         }
+        if window_surface {
+            // Without VK_KHR_swapchain enabled on the *device*, the swapchain entry
+            // points are not valid for it and `vkCreateSwapchainKHR` fails with
+            // VK_ERROR_INITIALIZATION_FAILED (seen on NVIDIA/Windows).
+            let available =
+                unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                    .map_err(|e| {
+                        RenderError::new(format!("enumerate_device_extension_properties: {e}"))
+                    })?;
+            if !available.iter().any(|p| {
+                carray_to_string(&p.extension_name) == vk::KHR_SWAPCHAIN_NAME.to_string_lossy()
+            }) {
+                return Err(RenderError::new(format!(
+                    "{device_name} lacks VK_KHR_swapchain, which the windowed path requires"
+                )));
+            }
+            required.push(vk::KHR_SWAPCHAIN_NAME);
+        }
         let ext_names: Vec<*const c_char> = required.iter().map(|c| c.as_ptr()).collect();
 
         let mut rq_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
