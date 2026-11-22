@@ -234,7 +234,7 @@ impl Swapchain {
                         .surface(surface)
                         .min_image_count(image_count)
                         .image_format(format)
-                        .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                        .image_color_space(color_space)
                         .image_extent(extent)
                         .image_array_layers(1)
                         .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
