@@ -59,6 +59,12 @@ impl InputState {
         }
     }
 
+    /// Release every held movement key (a viewer that vanished can never send
+    /// its key-ups, so its keys would otherwise stay held forever).
+    pub fn release_keys(&mut self) {
+        self.held = [false; 6];
+    }
+
     fn is_held(&self, key: Key) -> bool {
         self.held[key as usize - 1]
     }
