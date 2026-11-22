@@ -330,6 +330,19 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_tmp_file_is_resumed_from_not_reset_to_first() {
+        let path = temp_path("tmponly");
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&tmp, b"57\n").unwrap();
+        let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("open");
+        assert_eq!(alloc.allocate(), ShardId::new(57));
+        assert_eq!(alloc.allocate(), ShardId::new(58));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
     fn a_corrupt_counter_file_is_an_error_not_a_silent_reset() {
         let path = temp_path("corrupt");
         std::fs::write(&path, b"not-a-number").unwrap();
