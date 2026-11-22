@@ -6,7 +6,7 @@ auto-redeployed by Watchtower.
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped`; orchestrator state in `./state` |
+| `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped` (except `client`: `restart: "no"`, see Client configuration); orchestrator state in `./state` |
 | `.env.example` | copy to `.env`: cluster name, host ports, image tag |
 | `redeploy.sh` | manual path only (used by `.github/workflows/deploy.yml`): `compose pull`, `up -d`, image prune |
 
