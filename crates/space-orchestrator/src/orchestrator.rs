@@ -338,10 +338,36 @@ impl<L: Launcher> Orchestrator<L> {
     ///
     /// [`std::io::Error`] if the control endpoint cannot be bound.
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
-        use crate::control::{ControlServer, Inbound};
+        let server = self.bind()?;
+        self.run_with(server).await
+    }
+
+    /// Bind the control endpoint on the configured address. Split from
+    /// [`Self::run_with`] so a caller (a test binding port 0) can read the real
+    /// address from [`crate::control::ControlServer::local_addr`] before the loop
+    /// starts.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] if the control endpoint cannot be bound.
+    pub fn bind(&self) -> Result<Arc<crate::control::ControlServer>, std::io::Error> {
+        Ok(Arc::new(crate::control::ControlServer::bind(
+            self.control.config.bind,
+        )?))
+    }
+
+    /// Run the event loop over an already-bound `server` until it closes.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` keeps [`Self::run`]'s signature.
+    pub async fn run_with(
+        &mut self,
+        server: Arc<crate::control::ControlServer>,
+    ) -> Result<(), std::io::Error> {
+        use crate::control::Inbound;
         use std::time::Duration;
 
-        let server = Arc::new(ControlServer::bind(self.control.config.bind)?);
         let accept = Arc::clone(&server).spawn_accept();
         let mut clock = tokio::time::interval(Duration::from_secs_f64(
             1.0 / f64::from(crate::config::TICK_HZ as u32),
