@@ -455,6 +455,25 @@ mod tests {
             lit * 100 > (w * h) as usize * 2,
             "too few lit pixels ({lit}) for a frame-filling galaxy"
         );
+        // The spawn cube: a solid magenta block (red and blue high, green low)
+        // that no star tint produces, centred in the frame.
+        let magenta: Vec<usize> = out
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p[0] > 120 && p[2] > 90 && u16::from(p[1]) * 5 < u16::from(p[0]) * 3)
+            .map(|(i, _)| i)
+            .collect();
+        eprintln!("spawn cube: {} magenta pixels", magenta.len());
+        assert!(
+            magenta.len() * 100 > (w * h) as usize * 3,
+            "the spawn cube is not visible ({} magenta pixels)",
+            magenta.len()
+        );
+        let cx = magenta.iter().map(|i| *i as u32 % w).sum::<u32>() / magenta.len() as u32;
+        assert!(cx.abs_diff(w / 2) < w / 8, "spawn cube is not ahead of the player (x={cx})");
     }
 
     #[test]
