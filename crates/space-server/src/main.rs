@@ -433,7 +433,7 @@ mod tests {
     fn the_advertised_address_defaults_to_the_bound_address() {
         let options = parse(&["--orchestrator", "127.0.0.1:7900"]).expect("parses");
         let bound: SocketAddr = "127.0.0.1:41234".parse().unwrap();
-        assert_eq!(options.advertised(bound), bound);
+        assert_eq!(options.orchestrated().advertised(bound), bound);
     }
 
     #[test]
