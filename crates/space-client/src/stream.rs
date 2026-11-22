@@ -1,0 +1,333 @@
+//! `--stream ADDR`: render headlessly, JPEG-encode each frame and broadcast it to
+//! browser viewers over `ws://` (see the `space-stream` crate).
+//!
+//! # Multiplayer seam
+//!
+//! A browser viewer is not a peer of the authoritative server. This process is
+//! the *proxy client*: it is the player the server knows (connecting through the
+//! ordinary `space-net` client path, like a windowed client), and the viewer is
+//! only its remote screen and controller. Viewer input arrives through
+//! [`StreamClient::poll_input`] and is applied to the proxy's own [`InputState`]
+//! by [`InputState::apply`] — the one place client input is handled — so from
+//! there it follows the same route to the server as local input would. No new
+//! server protocol is involved. (This binary does not yet open that `space-net`
+//! connection itself: today the offline demo/galaxy scene is rendered, driven by
+//! the same input state.)
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use space_render::{CameraPose, ContextOptions, RenderContext, RenderError, Scene};
+use space_stream::protocol::{FLAG_DOWNSCALED, FLAG_KEYFRAME};
+use space_stream::{JpegEncoder, Key, StreamClient, StreamServer, ViewerInput};
+use space_world::WorldPos;
+
+use crate::{demo_options, Config, Mode};
+
+/// Target stream frame rate.
+const FRAME_BUDGET: Duration = Duration::from_millis(33);
+/// Poll interval while no viewer is connected (nothing is rendered).
+const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// The proxy client's input state: where the (viewer-driven) camera is and
+/// which way it looks. Local and viewer input both end up here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputState {
+    /// Camera offset from the scene's base camera, metres.
+    pub offset: [f64; 3],
+    /// Yaw about +Y in radians (0 looks down -Z, positive turns left).
+    pub yaw: f32,
+    /// Pitch in radians (positive looks up).
+    pub pitch: f32,
+    /// Held movement keys, indexed by `Key as usize - 1`.
+    held: [bool; 6],
+    /// Last pointer position (normalised) and button mask, if any.
+    pub pointer: Option<(f32, f32, u8)>,
+}
+
+impl InputState {
+    /// Apply one input event.
+    pub fn apply(&mut self, input: ViewerInput) {
+        match input {
+            ViewerInput::Key { key, down } => self.held[key as usize - 1] = down,
+            ViewerInput::View { yaw, pitch } => {
+                self.yaw = yaw;
+                self.pitch = pitch.clamp(-1.553_343, 1.553_343);
+            }
+            ViewerInput::Pointer { x, y, buttons } => self.pointer = Some((x, y, buttons)),
+        }
+    }
+
+    fn is_held(&self, key: Key) -> bool {
+        self.held[key as usize - 1]
+    }
+
+    /// Unit view direction.
+    pub fn forward(&self) -> [f32; 3] {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        [-sy * cp, sp, -cy * cp]
+    }
+
+    fn right(&self) -> [f32; 3] {
+        let (sy, cy) = self.yaw.sin_cos();
+        [cy, 0.0, -sy]
+    }
+
+    /// Advance the camera by `dt` seconds at `speed` metres/second.
+    pub fn step(&mut self, dt: f32, speed: f64) {
+        let axis = |pos: Key, neg: Key| f64::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)));
+        let (fwd, right, up) = (
+            axis(Key::Forward, Key::Back),
+            axis(Key::Right, Key::Left),
+            axis(Key::Up, Key::Down),
+        );
+        let (f, r) = (self.forward(), self.right());
+        let step = f64::from(dt) * speed;
+        for i in 0..3 {
+            self.offset[i] += step * (fwd * f64::from(f[i]) + right * f64::from(r[i]));
+        }
+        self.offset[1] += step * up;
+    }
+
+    /// The camera for this input, relative to the scene's `base` camera.
+    pub fn camera(&self, base: &CameraPose) -> CameraPose {
+        CameraPose {
+            position: WorldPos::from_f64_metres_around(base.position, self.offset),
+            forward: self.forward(),
+            up: [0.0, 1.0, 0.0],
+            ..*base
+        }
+    }
+}
+
+/// Build the scene as seen by `input`.
+fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> Scene {
+    if mode == Mode::Galaxy {
+        let camera = input.camera(&crate::galaxy_camera(width, height));
+        return crate::galaxy_scene_at(&camera);
+    }
+    // The demo scene is camera-relative around the origin: re-base it onto the
+    // moved camera by shifting every instance and mesh by -offset.
+    let mut scene = space_render::demo_scene(width, height);
+    scene.camera = input.camera(&scene.camera);
+    let off = input.offset.map(|v| v as f32);
+    for inst in &mut scene.instances {
+        for (c, o) in inst.center.iter_mut().zip(off) {
+            *c -= o;
+        }
+    }
+    for v in scene.meshes.iter_mut().flatten() {
+        for (c, o) in v.iter_mut().zip(off) {
+            *c -= o;
+        }
+    }
+    scene
+}
+
+/// Render → JPEG → push, applying viewer input, until `stop` is set or
+/// `max_frames` frames were streamed. While no viewer is connected nothing is
+/// rendered. Returns the final input state.
+pub fn stream_loop(
+    ctx: &RenderContext,
+    config: &Config,
+    client: &StreamClient,
+    stop: &AtomicBool,
+    max_frames: Option<u64>,
+) -> Result<InputState, RenderError> {
+    let encoder = JpegEncoder::default();
+    let mut flags = FLAG_KEYFRAME;
+    if encoder.downscale() > 1 {
+        flags |= FLAG_DOWNSCALED;
+    }
+    // Scale movement with the scene: the galaxy spans ~1e5 m, the demo ~6 m.
+    let speed = if config.mode == Mode::Galaxy { 5.0e3 } else { 3.0 };
+    let options = demo_options(config.quality);
+    let mut input = InputState::default();
+    let mut last = Instant::now();
+    let mut streamed = 0u64;
+    while !stop.load(Ordering::Relaxed) && max_frames.is_none_or(|m| streamed < m) {
+        let start = Instant::now();
+        for event in client.poll_input() {
+            input.apply(event);
+        }
+        input.step(start.duration_since(last).as_secs_f32().min(0.25), speed);
+        last = start;
+        if client.viewer_count() == 0 {
+            std::thread::sleep(IDLE_POLL);
+            continue;
+        }
+        let scene = scene_for_input(config.mode, &input, config.width, config.height);
+        let out = ctx.render_offscreen(&scene, config.width, config.height, &options)?;
+        let jpeg = encoder
+            .encode(&out.pixels, out.width, out.height)
+            .map_err(|e| RenderError::new(format!("stream: {e}")))?;
+        client.push_jpeg(jpeg.bytes, flags);
+        streamed += 1;
+        if let Some(rest) = FRAME_BUDGET.checked_sub(start.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    Ok(input)
+}
+
+/// Run the streaming client until killed: bind `ws://addr`, stream frames.
+pub fn run_stream(config: &Config, addr: &str) -> Result<(), RenderError> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| RenderError::new(format!("tokio runtime: {e}")))?;
+    let (server, client) = rt
+        .block_on(StreamServer::bind(addr))
+        .map_err(|e| RenderError::new(format!("stream bind {addr}: {e}")))?;
+    let ctx = RenderContext::new(&ContextOptions::default())?;
+    eprintln!(
+        "space-client: device {:?}; streaming {}x{} on ws://{} (plain ws://, no TLS)",
+        ctx.device_name(),
+        config.width,
+        config.height,
+        server.local_addr()
+    );
+    let stop = AtomicBool::new(false);
+    stream_loop(&ctx, config, &client, &stop, config.frames)?;
+    drop(server);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use space_stream::protocol::decode_frame;
+    use space_stream::jpeg_dimensions;
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn key(key: Key, down: bool) -> ViewerInput {
+        ViewerInput::Key { key, down }
+    }
+
+    #[test]
+    fn viewer_input_moves_and_turns_the_camera() {
+        let mut s = InputState::default();
+        s.apply(key(Key::Forward, true));
+        s.step(1.0, 2.0);
+        // Yaw 0 looks down -Z.
+        assert!((s.offset[2] + 2.0).abs() < 1e-9 && s.offset[0].abs() < 1e-9);
+        s.apply(key(Key::Forward, false));
+        s.step(1.0, 2.0);
+        assert!((s.offset[2] + 2.0).abs() < 1e-9, "released key stops motion");
+
+        s.apply(ViewerInput::View {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+        });
+        let f = s.forward();
+        assert!((f[0] + 1.0).abs() < 1e-6 && f[2].abs() < 1e-6, "{f:?}");
+        s.apply(key(Key::Right, true));
+        s.step(1.0, 1.0);
+        // Turned left 90 degrees, so "right" is now -Z.
+        assert!((s.offset[2] + 3.0).abs() < 1e-6, "{:?}", s.offset);
+
+        s.apply(key(Key::Up, true));
+        s.step(1.0, 1.0);
+        assert!((s.offset[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn view_pitch_is_clamped_and_pointer_recorded() {
+        let mut s = InputState::default();
+        s.apply(ViewerInput::View {
+            yaw: 0.0,
+            pitch: 9.0,
+        });
+        assert!(s.pitch < std::f32::consts::FRAC_PI_2);
+        s.apply(ViewerInput::Pointer {
+            x: 0.5,
+            y: 0.25,
+            buttons: 1,
+        });
+        assert_eq!(s.pointer, Some((0.5, 0.25, 1)));
+    }
+
+    #[test]
+    fn demo_scene_is_rebased_onto_the_moved_camera() {
+        let base = scene_for_input(Mode::Demo, &InputState::default(), 32, 32);
+        let mut s = InputState::default();
+        s.offset = [0.0, 0.0, -1.0];
+        let moved = scene_for_input(Mode::Demo, &s, 32, 32);
+        // Camera moved 1 m toward the sphere, so it is 1 m closer.
+        assert!((moved.instances[0].center[2] - (base.instances[0].center[2] + 1.0)).abs() < 1e-6);
+        assert_eq!(moved.meshes.len(), base.meshes.len());
+    }
+
+    /// End to end with a real render: the stream loop renders the demo scene,
+    /// streams it to a WebSocket viewer, and applies that viewer's input. Skips
+    /// loudly when no Vulkan device is available.
+    #[test]
+    fn stream_loop_delivers_frames_and_applies_viewer_input() {
+        if RenderContext::new(&ContextOptions::default()).is_err() {
+            eprintln!("SKIP: no Vulkan device");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client) = rt.block_on(StreamServer::bind("127.0.0.1:0")).unwrap();
+        let client = Arc::new(client);
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = Config {
+            mode: Mode::Demo,
+            width: 64,
+            height: 48,
+            out: None,
+            quality: space_render::QualityPreset::Ci,
+            stream: None,
+            frames: None,
+        };
+        let worker = {
+            let (client, stop) = (Arc::clone(&client), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let ctx = RenderContext::new(&ContextOptions::default()).unwrap();
+                stream_loop(&ctx, &config, &client, &stop, None)
+            })
+        };
+
+        let addr = server.local_addr();
+        let frames = rt.block_on(async {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp)
+                .await
+                .unwrap();
+            let view = ViewerInput::View {
+                yaw: 0.5,
+                pitch: 0.0,
+            };
+            ws.send(Message::Binary(view.encode().into())).await.unwrap();
+            let mut frames = Vec::new();
+            while frames.len() < 3 {
+                let msg = tokio::time::timeout(Duration::from_secs(60), ws.next())
+                    .await
+                    .expect("timed out waiting for a frame")
+                    .unwrap()
+                    .unwrap();
+                if let Message::Binary(b) = msg {
+                    frames.push(b.to_vec());
+                }
+            }
+            frames
+        });
+        stop.store(true, Ordering::Relaxed);
+        let input = worker.join().unwrap().unwrap();
+        for f in &frames {
+            let (header, jpeg) = decode_frame(f).unwrap();
+            assert_eq!(header.flags, FLAG_KEYFRAME | FLAG_DOWNSCALED);
+            assert_eq!(jpeg_dimensions(jpeg), Some((32, 24)), "half of 64x48");
+        }
+        assert!((input.yaw - 0.5).abs() < 1e-6, "viewer input reached the proxy");
+        drop(server);
+    }
+}
