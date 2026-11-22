@@ -161,6 +161,17 @@ pub fn pump_input(
     events.len()
 }
 
+/// The input a stream starts with. The galaxy's base camera sits at -Z looking
+/// at the origin (+Z), but yaw 0 looks down -Z, so a galaxy stream starts turned
+/// half a revolution to face its centre; a viewer's `View` event overrides it.
+fn initial_input(mode: Mode) -> InputState {
+    let mut input = InputState::default();
+    if mode == Mode::Galaxy {
+        input.yaw = std::f32::consts::PI;
+    }
+    input
+}
+
 /// Build the scene as seen by `input`.
 fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> Scene {
     if mode == Mode::Galaxy {
