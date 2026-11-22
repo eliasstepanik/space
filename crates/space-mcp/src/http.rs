@@ -949,12 +949,12 @@ mod tests {
         let mut put = post("", &[]);
         put.head.method = "PUT".into();
         assert_eq!(t.handle(put).await.status, 405);
-        assert_eq!(
-            t.handle(post(INIT, &[("content-type", "text/plain")]))
-                .await
-                .status,
-            415
-        );
+        let mut text = post(INIT, &[]);
+        text.head.headers.retain(|(n, _)| n != "content-type");
+        text.head
+            .headers
+            .push(("content-type".into(), "text/plain".into()));
+        assert_eq!(t.handle(text).await.status, 415);
         let mut html = post(INIT, &[]);
         html.head.headers.retain(|(n, _)| n != "accept");
         html.head
