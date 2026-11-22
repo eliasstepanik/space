@@ -193,18 +193,22 @@ fn galaxy_camera(width: u32, height: u32) -> CameraPose {
 fn galaxy_scene_at(camera: &CameraPose) -> Scene {
     let galaxy = Galaxy::new(0x5eed);
     let lod = LodSelector::new(30, 63, 8.0);
-    // Traverse from the octree root, not `Scene::build`'s depth-30 node around the
-    // camera: the camera sits exactly on the x=0/y=0 cell boundary, so that node
-    // covers only one octant and the galaxy would fill a single frame quadrant.
-    let candidates = lod.candidates_from(
-        NodeRef::ROOT,
-        camera.position,
-        camera.forward,
-        camera.fov_y,
-    );
-    let mut selected = lod.select(&candidates, camera.position, camera.fov_y);
+    // `Scene::build` traverses only the one depth-30 node containing the camera.
+    // The galaxy is centred on the cell origin and the camera sits on its x=0/y=0
+    // boundary, so that node covers a single octant and the galaxy would fill one
+    // frame quadrant. Traverse the 8 nodes of that depth meeting at the origin.
+    let mut selected = Vec::new();
+    for octant in 0..8i64 {
+        let index = [-(octant & 1), -((octant >> 1) & 1), -((octant >> 2) & 1)];
+        let root = NodeRef::new(lod.min_depth, index);
+        let candidates = lod.candidates_from(root, camera.position, camera.forward, camera.fov_y);
+        selected.extend(lod.select(&candidates, camera.position, camera.fov_y));
+    }
+    selected.sort_unstable_by_key(|n| (n.depth, n.index));
     selected.truncate(MAX_SELECTED);
-    Scene::from_selection(&galaxy, camera, &selected)
+    let sc = Scene::from_selection(&galaxy, camera, &selected);
+    eprintln!("DBG selected {} inst {}", selected.len(), sc.instances.len());
+    sc
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
