@@ -5,15 +5,18 @@
 //!
 //! * [`local::LocalLauncher`] — a real in-process [`space_server::shard::Shard`]
 //!   with a [`space_server::net::ShardNet`] per shard, in the caller's tokio
-//!   runtime. The sandbox-testable impl: no Docker daemon is required, and it
-//!   is what makes the split/merge loop verifiable end to end.
+//!   runtime, registered with the orchestrator at [`SpawnSpec::control_addr`]
+//!   like any orchestrated shard. The sandbox-testable impl: no Docker daemon
+//!   is required, and it is what makes the split/merge loop verifiable end to
+//!   end.
 //! * [`docker::DockerLauncher`] — **deferred stub.** The real `bollard`-backed
 //!   impl needs `bollard` and the hyper stack, which are not in the offline cargo
 //!   cache; every call returns [`LaunchError::Unavailable`] (see `docker.rs`).
 //!
-//! The trait is deliberately small and *asynchronous*: `spawn` must not return
-//! until the shard is reachable, because the orchestrator's next step is to
-//! open a control connection to it.
+//! The trait is deliberately small and *asynchronous*: `spawn` does not return
+//! until the shard is reachable and has registered. The orchestrator's loop
+//! therefore runs each `spawn` in a task of its own — the registration is a
+//! `ShardHello` that only that loop can answer.
 
 use space_protocol::shard::{ShardId, ShardRegion};
 use std::net::SocketAddr;

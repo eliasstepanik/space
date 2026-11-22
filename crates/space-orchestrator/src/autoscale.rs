@@ -50,7 +50,10 @@ pub enum ScaleAction {
     Split {
         /// The hot shard.
         shard: ShardId,
-        /// Which child octant to carve.
+        /// A placeholder (always 0): the autoscaler sees load, not positions, so
+        /// it cannot know which octant holds the players. The orchestrator picks
+        /// the octant when it plans the split
+        /// ([`crate::topology::pick_split_octant`]).
         octant: usize,
     },
     /// Merge `shard`'s region back into its parent's owner.
@@ -202,6 +205,25 @@ impl Autoscaler {
     fn commit(&mut self, tick: u64) {
         self.busy_until = tick + SPLIT_DWELL_TICKS;
     }
+
+    /// Drop everything remembered about `shard`: its dwell timers and its
+    /// cooldown.
+    ///
+    /// Called when a shard leaves the cluster (it was merged away or killed) or
+    /// goes silent (its reports stopped). Without this its last dwell timer kept
+    /// counting on a report nobody was sending any more, and the autoscaler went
+    /// on proposing splits and merges for a shard that was no longer there —
+    /// each one a refused plan that made the whole cluster "busy" for a dwell.
+    /// A shard that comes back starts from a clean state: a full, fresh dwell.
+    pub fn forget(&mut self, shard: ShardId) {
+        self.states.remove(&shard);
+    }
+
+    /// Whether the autoscaler holds any state for `shard`.
+    #[must_use]
+    pub fn tracks(&self, shard: ShardId) -> bool {
+        self.states.contains_key(&shard)
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +356,42 @@ mod tests {
             "dwell reset by note_action"
         );
         assert!(matches!(action, ScaleAction::Split { .. }));
+    }
+
+    /// Mutation this catches: `forget` not clearing the dwell timer. A shard
+    /// that left with a completed dwell would be picked the moment any other
+    /// report is fed, although nobody reports for it any more.
+    #[test]
+    fn a_forgotten_shard_is_never_chosen_on_its_old_dwell() {
+        let mut a = Autoscaler::new();
+        let (gone, alive) = (report(1, 90, 1.0), report(2, 50, 1.0));
+        // Shard 1 is hot for all but the last tick of the dwell...
+        for t in 0..SPLIT_DWELL_TICKS {
+            assert_eq!(a.on_reports(&[gone, alive], t), None, "early at {t}");
+        }
+        assert!(a.tracks(ShardId::new(1)));
+        // ...then it leaves the cluster. Only shard 2 (mid-band) still reports.
+        a.forget(ShardId::new(1));
+        assert!(!a.tracks(ShardId::new(1)));
+        for t in SPLIT_DWELL_TICKS..(3 * SPLIT_DWELL_TICKS) {
+            assert_eq!(
+                a.on_reports(&[alive], t),
+                None,
+                "a departed shard must not be split at {t}"
+            );
+        }
+        // If it comes back it needs a fresh, full dwell.
+        let back = 3 * SPLIT_DWELL_TICKS;
+        for t in back..(back + SPLIT_DWELL_TICKS) {
+            assert_eq!(a.on_reports(&[gone, alive], t), None, "fresh dwell at {t}");
+        }
+        assert_eq!(
+            a.on_reports(&[gone, alive], back + SPLIT_DWELL_TICKS),
+            Some(ScaleAction::Split {
+                shard: ShardId::new(1),
+                octant: 0
+            })
+        );
     }
 
     #[test]

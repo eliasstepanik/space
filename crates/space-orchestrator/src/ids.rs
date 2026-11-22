@@ -9,13 +9,18 @@
 //! * **persist before hand-out**, never hand-out before persist. A crash between
 //!   "allocated" and "persisted" is the one window in which an id could be
 //!   reused; writing first closes it.
-//! * **atomic write**: write a sibling `.tmp` file, then `rename` it directly
-//!   over the counter file. Rename replaces the destination atomically on
-//!   POSIX, so a crash at any point leaves the old file, the new file, or (only
-//!   before the first rename ever completes) the `.tmp` file holding the last
-//!   written value — never *no* counter. The old file is never deleted first.
-//!   The reader falls back to the `.tmp` file when the main file is missing, and
-//!   to `first` only when neither exists (a genuinely fresh state dir).
+//! * **atomic, durable write**: write a sibling `.tmp` file, `fsync` it, then
+//!   `rename` it directly over the counter file (and sync the directory where
+//!   the platform allows it). Rename replaces the destination atomically, so a
+//!   crash at any point leaves the old file, the new file, or (only before the
+//!   first rename ever completes) the `.tmp` file holding the last written
+//!   value — never *no* counter, and never a renamed-but-empty one. The old
+//!   file is never deleted first. The reader falls back to the `.tmp` file when
+//!   the main file is missing, and to `first` only when neither exists (a
+//!   genuinely fresh state dir).
+//! * **a failed write is an error, not a panic**: [`PersistentShardIdAllocator::allocate`]
+//!   withholds the id and returns [`AllocError::Persist`], so the caller (boot,
+//!   a `ShardHello`, a split) reports it instead of taking the process down.
 //! * **resume on restart**: `open` reads the file if present, so the first id
 //!   after a restart is strictly greater than the last one before it.
 //!
@@ -70,6 +75,41 @@ impl std::error::Error for InitError {}
 impl From<io::Error> for InitError {
     fn from(err: io::Error) -> Self {
         Self::Io(err)
+    }
+}
+
+/// Why an id could not be allocated.
+///
+/// Either way **no id was handed out**. A failed persist leaves the in-memory
+/// counter one ahead of the file, so the id that could not be persisted is
+/// skipped by the next successful allocation — never reused (H9 asks for
+/// "never reused", not "contiguous").
+#[derive(Debug)]
+pub enum AllocError {
+    /// The id space is used up (ids are never reused).
+    Exhausted(IdSpaceExhausted),
+    /// The bumped counter could not be persisted, so the id was withheld.
+    Persist(io::Error),
+}
+
+impl core::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AllocError::Exhausted(err) => write!(f, "{err}"),
+            AllocError::Persist(err) => write!(
+                f,
+                "the shard-id counter could not be persisted ({err}); \
+                 refusing to hand out an unpersisted id"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AllocError {}
+
+impl From<IdSpaceExhausted> for AllocError {
+    fn from(err: IdSpaceExhausted) -> Self {
+        Self::Exhausted(err)
     }
 }
 
@@ -138,18 +178,73 @@ impl FileCounterSink {
     }
 }
 
+impl FileCounterSink {
+    /// The directory that holds `path`, for the post-rename directory sync.
+    ///
+    /// [`Path::parent`] of a bare file name (`space-orchestrator.id`, the
+    /// default) is `Some("")`, not `None` — and `""` cannot be opened, so the
+    /// sync used to be skipped silently for exactly the default configuration.
+    /// An empty parent means "the current directory".
+    fn dir_of(path: &Path) -> &Path {
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
+    }
+
+    /// Rename `tmp` over `target`, retrying a sharing violation briefly.
+    ///
+    /// On Windows a rename fails with `PermissionDenied` while another process
+    /// (a virus scanner, an indexer, a file-sync client) has either file open
+    /// without share-delete — typically for a few milliseconds right after the
+    /// file was written. A short, bounded retry rides that out; anything that
+    /// lasts longer is reported to the caller, which refuses the allocation.
+    fn rename_over(tmp: &Path, target: &Path) -> io::Result<()> {
+        const ATTEMPTS: u32 = 5;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+        let mut attempt = 1;
+        loop {
+            match std::fs::rename(tmp, target) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if cfg!(windows)
+                        && err.kind() == io::ErrorKind::PermissionDenied
+                        && attempt < ATTEMPTS =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(PAUSE);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
 impl CounterSink for FileCounterSink {
     fn persist(&mut self, next: u64) -> io::Result<()> {
+        use std::io::Write as _;
+
         // Write to a sibling temp file, then rename it directly over the
         // target. The rename is atomic and replaces the destination, so a crash
         // leaves either the old or the new counter file present, never neither.
         // The target is deliberately not removed first.
+        //
+        // The temp file is synced **before** the rename: without that, a power
+        // loss shortly after can leave the renamed file empty (the rename was
+        // journalled, the data was not), and an empty counter refuses the next
+        // boot — or, worse, the old contents come back and an id is reused.
         let tmp = Self::tmp_path(&self.path);
-        std::fs::write(&tmp, format!("{next}\n"))?;
-        std::fs::rename(&tmp, &self.path)?;
-        if let Ok(dir) = std::fs::File::open(self.path.parent().unwrap_or(Path::new("."))) {
-            // Best-effort durability; a failure here is not worth failing the
-            // allocation over, since the rename already committed the value.
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(format!("{next}\n").as_bytes())?;
+            file.sync_all()?;
+        }
+        Self::rename_over(&tmp, &self.path)?;
+        if let Ok(dir) = std::fs::File::open(Self::dir_of(&self.path)) {
+            // Best-effort durability of the rename itself; a failure here is
+            // not worth failing the allocation over, since the rename already
+            // committed the value. (A directory cannot be opened this way on
+            // Windows, where the rename is durable through the journal.)
             let _ = dir.sync_all();
         }
         Ok(())
@@ -217,20 +312,22 @@ impl PersistentShardIdAllocator {
     ///
     /// # Errors
     ///
-    /// [`IdSpaceExhausted`] when the id space is used up (ids are never reused);
-    /// nothing is persisted or handed out then.
+    /// [`AllocError::Exhausted`] when the id space is used up (ids are never
+    /// reused); nothing is persisted or handed out then.
     ///
-    /// # Panics
-    ///
-    /// Panics when persistence fails (an un-persisted id is the one way an id
-    /// could be reused after a crash).
-    pub fn allocate(&mut self) -> Result<ShardId, IdSpaceExhausted> {
+    /// [`AllocError::Persist`] when the bumped counter could not be written. The
+    /// id is **not** returned: an un-persisted id is the one way an id could be
+    /// reused after a crash, so the caller gets an error to report instead (this
+    /// used to be a panic, which let a full disk, a missing state directory or a
+    /// momentary sharing violation take the whole orchestrator down — including
+    /// from a `ShardHello` arriving over the network). The in-memory counter
+    /// stays bumped, so the withheld id is skipped, not handed out later.
+    pub fn allocate(&mut self) -> Result<ShardId, AllocError> {
         let id = self.inner.allocate()?;
-        // Persist-then-return: if this fails the process must not hand the id
-        // to a launcher, so a failed write is a panic, not a swallowed error.
-        self.sink.persist(self.inner.peek()).expect(
-            "allocate: persisting the counter failed; refusing to hand out an unpersisted id",
-        );
+        // Persist-then-return: if this fails the id must not reach a launcher.
+        self.sink
+            .persist(self.inner.peek())
+            .map_err(AllocError::Persist)?;
         Ok(id)
     }
 
@@ -300,8 +397,8 @@ mod tests {
         // the returned id.
         let sink = Box::<MemoryCounterSink>::default();
         let mut alloc = PersistentShardIdAllocator::with_sink(7, sink);
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(7)));
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(8)));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(7));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(8));
         // Rebuild the sink view through peek: after two allocations the counter
         // sits at 9 and both persists wrote 8 then 9.
         assert_eq!(alloc.peek(), 9);
@@ -313,13 +410,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("open");
-            assert_eq!(alloc.allocate(), Ok(ShardId::new(1)));
-            assert_eq!(alloc.allocate(), Ok(ShardId::new(2)));
+            assert_eq!(alloc.allocate().unwrap(), ShardId::new(1));
+            assert_eq!(alloc.allocate().unwrap(), ShardId::new(2));
         }
         // Fresh process, same file: the first id is strictly greater than the
         // last one before the restart.
         let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("reopen");
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(3)));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(3));
         std::fs::remove_file(&path).ok();
     }
 
@@ -328,7 +425,7 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         let mut alloc = PersistentShardIdAllocator::open(&path, 42).expect("open");
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(42)));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(42));
         std::fs::remove_file(&path).ok();
     }
 
@@ -340,8 +437,8 @@ mod tests {
         // The file stores the *next* id: 57 was the last one handed out.
         std::fs::write(&tmp, b"58\n").unwrap();
         let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("open");
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(58)));
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(59)));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(58));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(59));
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&tmp).ok();
     }
@@ -379,6 +476,98 @@ mod tests {
         assert!(failing.reserve(ShardId::new(100)).is_err());
     }
 
+    /// A sink that fails while `broken` is set and records what it persisted.
+    #[derive(Debug, Default)]
+    struct FlakySink {
+        broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl CounterSink for FlakySink {
+        fn persist(&mut self, next: u64) -> io::Result<()> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::Error::other("disk full"));
+            }
+            self.written.lock().unwrap().push(next);
+            Ok(())
+        }
+    }
+
+    /// Mutation this catches: panicking on a failed persist (the old `expect`),
+    /// and handing the withheld id out on the next call (a reuse after a crash).
+    #[test]
+    fn a_failed_persist_withholds_the_id_and_it_is_never_handed_out_later() {
+        let sink = FlakySink::default();
+        let (broken, written) = (
+            std::sync::Arc::clone(&sink.broken),
+            std::sync::Arc::clone(&sink.written),
+        );
+        let mut alloc = PersistentShardIdAllocator::with_sink(10, Box::new(sink));
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(10));
+
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = alloc
+            .allocate()
+            .expect_err("an unpersisted id is not handed out");
+        assert!(matches!(err, AllocError::Persist(_)), "{err:?}");
+        assert!(err.to_string().contains("could not be persisted"), "{err}");
+
+        // The disk comes back: id 11 was withheld, so it is skipped for good.
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(12));
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![11, 13],
+            "every id handed out was persisted first, and the counter only moved up"
+        );
+    }
+
+    /// The file-backed path of the same rule: a state path in a directory that
+    /// does not exist is an error from `allocate`, not a panic.
+    #[test]
+    fn a_counter_in_a_missing_directory_is_an_error_not_a_panic() {
+        let dir = temp_path("no-such-dir");
+        let path = dir.join("orchestrator.id");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("nothing to read yet");
+        let err = alloc.allocate().expect_err("the counter cannot be written");
+        assert!(matches!(err, AllocError::Persist(_)), "{err:?}");
+        assert!(!path.exists(), "nothing was created");
+    }
+
+    /// A bare file name (the default `space-orchestrator.id`) lives in the
+    /// current directory; `Path::parent` says `""` for it, which cannot be
+    /// opened, so the directory sync was silently skipped.
+    #[test]
+    fn the_directory_of_a_bare_file_name_is_the_current_directory() {
+        assert_eq!(
+            FileCounterSink::dir_of(Path::new("space-orchestrator.id")),
+            Path::new(".")
+        );
+        assert_eq!(
+            FileCounterSink::dir_of(Path::new("state/orchestrator.id")),
+            Path::new("state")
+        );
+    }
+
+    /// Every persist replaces the counter file in place, leaves no temp file
+    /// behind, and the value on disk is the one a restart resumes from.
+    #[test]
+    fn persist_replaces_the_counter_file_and_leaves_no_temp_file() {
+        let path = temp_path("replace");
+        let _ = std::fs::remove_file(&path);
+        let mut sink = FileCounterSink::new(&path);
+        for next in [2u64, 3, 40] {
+            sink.persist(next).expect("persist");
+            assert_eq!(FileCounterSink::read_one(&path).unwrap(), Some(next));
+            assert!(
+                !FileCounterSink::tmp_path(&path).exists(),
+                "the temp file was renamed away"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn the_reserved_none_id_is_never_handed_out() {
         // The inner allocator errors at the id-space limit rather than wrapping
@@ -388,8 +577,11 @@ mod tests {
             u64::from(u32::MAX - 1),
             Box::new(MemoryCounterSink::default()),
         );
-        assert_eq!(alloc.allocate(), Ok(ShardId::new(u32::MAX - 1)));
-        assert!(alloc.allocate().is_err(), "must fail, not wrap or panic");
+        assert_eq!(alloc.allocate().unwrap(), ShardId::new(u32::MAX - 1));
+        assert!(
+            matches!(alloc.allocate(), Err(AllocError::Exhausted(_))),
+            "must fail, not wrap or panic"
+        );
         assert_eq!(alloc.peek(), u64::from(u32::MAX));
     }
 }

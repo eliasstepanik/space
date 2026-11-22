@@ -6,9 +6,10 @@
 //! a socket.
 //!
 //! The handlers implemented in this slice:
-//! * [`ControlPlane::handle_shard_hello`] — allocate-or-confirm the id, place
-//!   the region, return a [`ShardWelcome`] carrying the current map and an
-//!   issued `peer_token`. Only the protocol version and the cluster name are
+//! * [`ControlPlane::handle_shard_hello`] — confirm the id (the reserved root
+//!   owner, a restarting owner, or the id a split allocated for its child; a
+//!   hello never allocates one), return a [`ShardWelcome`] carrying the current
+//!   map and an issued `peer_token`. Only the protocol version and the cluster name are
 //!   checked on the way in, and the `peer_token` is **not enforced** by anyone
 //!   today (shards never present it; `Shard::peer_message` checks map membership
 //!   only). The control port binds to loopback by default, which is the only
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use space_protocol::control::{AdminCommand, AdminReply, LoadReport};
 use space_protocol::shard::{EpochAck, ShardId, ShardMap, ShardRegion};
@@ -95,10 +97,13 @@ impl ControlPlane {
     /// A hello naming a different cluster is refused (the caller drops the
     /// connection); a hello claiming a region already owned by another shard is
     /// refused (the first claim wins) — that includes a region-less hello, which
-    /// means "the root"; a hello with `ShardId::NONE` gets a fresh allocation for
-    /// a free node. The one exception is the pre-allocated root owner
-    /// ([`Self::set_unclaimed_root_owner`]): the first anonymous (or by-id) hello
-    /// for the root adopts that id, since no shard was ever launched for it.
+    /// means "the root"; a hello with `ShardId::NONE` for a node the published
+    /// map does not name is refused too (a region is created by a split, whose
+    /// child arrives with the id allocated for it — an anonymous claim would
+    /// get an id and a region no map ever carried). The one exception is the
+    /// pre-allocated root owner ([`Self::set_unclaimed_root_owner`]): the first
+    /// anonymous (or by-id) hello for the root adopts that id, since no shard
+    /// was ever launched for it. No hello allocates an id.
     ///
     /// A `NONE` hello for an owned node is idempotent when it advertises the
     /// owner's own endpoint (the same process restarting): it gets the same id
@@ -164,35 +169,47 @@ impl ControlPlane {
                 return Err(format!("region at depth {} is already owned", node.depth));
             }
             if hello.shard == ShardId::NONE {
-                self.ids.allocate().map_err(|e| e.to_string())?
-            } else {
-                // A relaunch (or an orchestrated child booting with the id the
-                // orchestrator allocated for it): confirm the id and make sure
-                // the allocator never hands it out again. The endpoint may
-                // legitimately differ from a placeholder the split staged, so
-                // the known-id path always confirms and lets the region
-                // endpoint be refreshed below.
-                //
-                // Only a *plausible* id may move the persistent counter: one
-                // that already owns a region, or one the allocator has already
-                // issued. Anything higher would let a single packet poison the
-                // counter (e.g. claiming u32::MAX - 1 exhausts the id space).
-                let known = self.map().regions.iter().any(|r| r.shard == hello.shard)
-                    || u64::from(hello.shard.0) < self.ids.peek();
-                if !known {
-                    return Err(format!(
-                        "shard id {} was never issued by this orchestrator",
-                        hello.shard.0
-                    ));
-                }
-                self.ids.reserve(hello.shard).map_err(|e| {
-                    format!(
-                        "could not persist the reservation of {}: {e}",
-                        hello.shard.0
-                    )
-                })?;
-                hello.shard
+                // An anonymous hello that reached this point names a node the
+                // published map does not contain (the root-adoption, restart
+                // and already-owned cases are all handled above). Welcoming it
+                // used to allocate an id and hand back a region that was never
+                // published: the shard's own map (the welcome's) did not name
+                // it, so it handed every ship it was given straight back to the
+                // map's real owner, two shards could "own" the same node, and
+                // every restart burned another id. A region comes into being
+                // through a split (whose child says hello with the id the
+                // orchestrator allocated for it), never through a claim.
+                return Err(format!(
+                    "the node at depth {} index {:?} is not in the published map; \
+                     a new region is created by a split, not by claiming it",
+                    node.depth, node.index
+                ));
             }
+            // A relaunch (or an orchestrated child booting with the id the
+            // orchestrator allocated for it): confirm the id and make sure the
+            // allocator never hands it out again. The endpoint may legitimately
+            // differ from a placeholder the split staged, so the known-id path
+            // always confirms and lets the region endpoint be refreshed below.
+            //
+            // Only a *plausible* id may move the persistent counter: one that
+            // already owns a region, or one the allocator has already issued.
+            // Anything higher would let a single packet poison the counter
+            // (e.g. claiming u32::MAX - 1 exhausts the id space).
+            let known = self.map().regions.iter().any(|r| r.shard == hello.shard)
+                || u64::from(hello.shard.0) < self.ids.peek();
+            if !known {
+                return Err(format!(
+                    "shard id {} was never issued by this orchestrator",
+                    hello.shard.0
+                ));
+            }
+            self.ids.reserve(hello.shard).map_err(|e| {
+                format!(
+                    "could not persist the reservation of {}: {e}",
+                    hello.shard.0
+                )
+            })?;
+            hello.shard
         };
         let region = ShardRegion::new(node, shard, hello.endpoint);
         Ok(ShardWelcome {
@@ -286,6 +303,18 @@ pub const SERVER_NAME: &str = "space.local";
 /// against a shard that has stopped reading.
 const OUT_QUEUE: usize = 256;
 
+/// How long a freshly accepted control connection has to send its
+/// [`ShardHello`] before it is closed.
+///
+/// The transport keeps a quiet connection alive, so without a bound a peer that
+/// completes the transport handshake and then never says who it is (a game
+/// client pointed at the control port, a stuck shard) would hold a task and a
+/// connection for as long as it liked.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Application close code for a control connection that never sent its hello.
+const NO_HELLO_CLOSE_CODE: u32 = 0x21;
+
 /// An event the front end hands to the run loop.
 #[derive(Debug)]
 pub enum Inbound {
@@ -323,6 +352,8 @@ pub struct ControlServer {
     inbound: Arc<Mutex<mpsc::Receiver<Inbound>>>,
     /// A clone of the inbound sender, handed to each connection task.
     tx: mpsc::Sender<Inbound>,
+    /// How long a connection may take to send its `ShardHello`.
+    hello_timeout: Duration,
 }
 
 impl ControlServer {
@@ -340,7 +371,16 @@ impl ControlServer {
             registry: Arc::new(Mutex::new(HashMap::new())),
             inbound: Arc::new(Mutex::new(rx)),
             tx,
+            hello_timeout: HELLO_TIMEOUT,
         })
+    }
+
+    /// Use `limit` instead of [`HELLO_TIMEOUT`] as the bound on a connection's
+    /// `ShardHello` (a test that wants the bound to run out quickly).
+    #[must_use]
+    pub fn with_hello_timeout(mut self, limit: Duration) -> Self {
+        self.hello_timeout = limit;
+        self
     }
 
     /// The bound address (the `:0` case resolves to a real port).
@@ -378,12 +418,36 @@ impl ControlServer {
         self.registry.lock().await.insert(shard, sender);
     }
 
-    /// Send `message` to `shard`, if it is registered. A shard that is not (or no
-    /// longer) connected drops the message — the epoch protocol tolerates a lost
-    /// push (a shard learns the new epoch from the next `Redirect`/`StaleEpoch`).
-    pub async fn send_to(&self, shard: ShardId, message: Message) {
-        if let Some(tx) = self.registry.lock().await.get(&shard).cloned() {
-            let _ = tx.send(message).await;
+    /// Offer `message` to `shard`'s FIFO sender, if it is registered. Returns
+    /// whether the message was queued.
+    ///
+    /// A shard that is not (or no longer) connected drops the message — the
+    /// epoch protocol tolerates a lost push (a prepare that is never acked
+    /// aborts at its deadline; a shard learns a missed commit from the next map
+    /// push or `Redirect`/`StaleEpoch`).
+    ///
+    /// **This never waits.** It is called from the run loop, so the sender is
+    /// cloned out of the registry (the lock is released before anything else
+    /// happens) and the message is *offered* with `try_send`: a shard whose
+    /// queue is full — it stopped reading — loses the message, logged, instead
+    /// of stopping the orchestrator's clock and every other shard's epoch
+    /// traffic behind it.
+    pub async fn send_to(&self, shard: ShardId, message: Message) -> bool {
+        let sender = self.registry.lock().await.get(&shard).cloned();
+        let Some(tx) = sender else {
+            return false;
+        };
+        match tx.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                eprintln!(
+                    "space-orchestrator: the queue for {shard} is full (has it stopped reading?); \
+                     message dropped"
+                );
+                false
+            }
+            // The connection is gone; its writer went with it.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -414,10 +478,15 @@ impl ControlServer {
         if conn.send_control(&placeholder).await.is_err() {
             return;
         }
-        // The first real message must be a ShardHello.
-        let hello = match conn.recv_control().await {
-            Ok(Some(Message::ShardHello(h))) => h,
-            _ => return,
+        // The first real message must be a ShardHello, and it must arrive
+        // promptly (see [`HELLO_TIMEOUT`]).
+        let hello = match tokio::time::timeout(self.hello_timeout, conn.recv_control()).await {
+            Ok(Ok(Some(Message::ShardHello(h)))) => h,
+            Ok(_) => return,
+            Err(_) => {
+                conn.close(NO_HELLO_CLOSE_CODE, "no ShardHello");
+                return;
+            }
         };
         // This shard's outbound channel: the run loop registers it and writes
         // the welcome + every epoch message through it, in order.
@@ -610,17 +679,70 @@ mod tests {
         let welcome = plane.handle_shard_hello(&claim).expect("claim confirmed");
         assert_eq!(welcome.shard, ShardId::new(100));
 
-        // A later anonymous hello (for a free child node) must not get 100.
-        let child = space_world::octree::children(root).expect("root splits")[0];
-        let anon = ShardHello {
+        // The next allocation (a split's child) must not get 100.
+        let next = plane.ids.allocate().expect("allocation");
+        assert_eq!(next, ShardId::new(101), "100 was already taken");
+        assert_ne!(next, welcome.shard, "no id is handed out twice");
+    }
+
+    /// An anonymous hello for a node the published map does not name is refused
+    /// and burns no id: a region is created by a split, not by claiming it.
+    ///
+    /// Mutation this catches: allocating an id for such a claim again — the
+    /// shard would be welcomed onto a region no map carries (its own map
+    /// included), and every restart of it would burn another id.
+    #[test]
+    fn an_anonymous_claim_for_a_node_outside_the_published_map_is_refused() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        plane
+            .handle_shard_hello(&ShardHello {
+                cluster: plane.config.cluster.clone(),
+                shard: ShardId::NONE,
+                endpoint: addr(9_000),
+                region: None,
+            })
+            .expect("adopts the root");
+        let (counter, map) = (plane.ids.peek(), plane.map().clone());
+        let child = space_world::octree::children(plane.config.root_node()).expect("splits")[0];
+        let claim = ShardHello {
             cluster: plane.config.cluster.clone(),
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
         };
-        let second = plane.handle_shard_hello(&anon).expect("allocation");
-        assert_eq!(second.shard, ShardId::new(101), "100 was already taken");
-        assert_ne!(second.shard, welcome.shard, "no id is handed out twice");
+        let err = plane
+            .handle_shard_hello(&claim)
+            .expect_err("no region is created by claiming it");
+        assert!(err.contains("not in the published map"), "{err}");
+        assert_eq!(plane.ids.peek(), counter, "the refusal burned no id");
+        assert_eq!(plane.map(), &map, "and the published map is untouched");
+        // Asking again changes nothing (it used to allocate a fresh id each time).
+        assert!(plane.handle_shard_hello(&claim).is_err());
+        assert_eq!(plane.ids.peek(), counter);
+    }
+
+    /// The split's child is not anonymous: it arrives with the id the
+    /// orchestrator allocated for it, for a node the map does not name yet, and
+    /// is welcomed.
+    #[test]
+    fn a_split_child_claiming_its_allocated_id_on_a_new_node_is_welcomed() {
+        let mut plane = plane();
+        let child_id = plane
+            .ids
+            .allocate()
+            .expect("the split allocates the child's id");
+        let child = space_world::octree::children(plane.config.root_node()).expect("splits")[0];
+        let welcome = plane
+            .handle_shard_hello(&ShardHello {
+                cluster: plane.config.cluster.clone(),
+                shard: child_id,
+                endpoint: addr(9_001),
+                region: Some(ShardRegion::new(child, child_id, addr(9_001))),
+            })
+            .expect("the child registers");
+        assert_eq!(welcome.shard, child_id);
+        assert_eq!(welcome.region.node, child);
     }
 
     #[test]
@@ -684,13 +806,9 @@ mod tests {
         };
         assert!(plane.handle_shard_hello(&poison).is_err(), "never issued");
         assert_eq!(plane.ids.peek(), counter, "the counter did not move");
-        // A legitimate anonymous hello still allocates normally.
-        let ok = ShardHello {
-            shard: ShardId::NONE,
-            ..poison
-        };
-        let welcome = plane.handle_shard_hello(&ok).expect("allocates");
-        assert_eq!(u64::from(welcome.shard.0), counter);
+        // The next real allocation (a split's child) is exactly the next id.
+        let next = plane.ids.allocate().expect("allocates");
+        assert_eq!(u64::from(next.0), counter);
     }
 
     #[test]
@@ -723,27 +841,52 @@ mod tests {
         );
     }
 
+    /// A sink that cannot write: every persist fails.
+    #[derive(Debug)]
+    struct BrokenSink;
+
+    impl crate::ids::CounterSink for BrokenSink {
+        fn persist(&mut self, _next: u64) -> io::Result<()> {
+            Err(io::Error::other("disk full"))
+        }
+    }
+
+    /// The hello path with a counter that cannot be persisted: a hello that
+    /// would have to move the counter is refused with the reason, never a panic,
+    /// and one that moves nothing still works.
     #[test]
-    fn a_hello_is_refused_not_panicked_when_the_id_space_is_exhausted() {
+    fn a_hello_is_refused_not_panicked_when_the_counter_cannot_be_persisted() {
         let config = OrchestratorConfig::default();
         let root = config.root_node();
+        // The root is staged for id 100, which the counter has not passed yet,
+        // so confirming it has to persist 101.
         let map = ShardMap::new(
             1,
-            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            vec![ShardRegion::new(root, ShardId::new(100), addr(7_001))],
         );
-        let ids = PersistentShardIdAllocator::with_sink(
-            u64::from(u32::MAX),
-            Box::new(MemoryCounterSink::default()),
-        );
+        let ids = PersistentShardIdAllocator::with_sink(100, Box::new(BrokenSink));
         let mut plane = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+        let claim = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(100),
+            endpoint: addr(9_000),
+            region: None,
+        };
+        let err = plane
+            .handle_shard_hello(&claim)
+            .expect_err("the reservation cannot be persisted");
+        assert!(err.contains("could not persist"), "{err}");
+        // And an anonymous claim allocates nothing, so it cannot even reach the
+        // sink: it is refused for its own reason.
         let child = space_world::octree::children(root).expect("splits")[0];
-        let hello = ShardHello {
+        let anonymous = ShardHello {
             cluster: plane.config.cluster.clone(),
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
         };
-        assert!(plane.handle_shard_hello(&hello).is_err());
+        let err = plane.handle_shard_hello(&anonymous).expect_err("refused");
+        assert!(err.contains("not in the published map"), "{err}");
     }
 
     #[test]
@@ -796,6 +939,81 @@ mod tests {
             AdminReply::Refused { reason, .. } => assert!(reason.contains("Phase-7")),
             other => panic!("expected Refused, got {other:?}"),
         }
+    }
+
+    fn probe() -> Message {
+        Message::EpochCommit(space_protocol::EpochCommit { epoch: 2 })
+    }
+
+    /// The run loop calls `send_to`; a shard that stopped reading must cost that
+    /// shard its message, never the loop its clock.
+    ///
+    /// Mutation this catches: `tx.send(message).await` on the bounded per-shard
+    /// queue (it waits for room that never comes), and holding the registry lock
+    /// while doing so (nothing else could register or unregister meanwhile).
+    #[tokio::test]
+    async fn send_to_never_waits_on_a_full_queue_or_holds_the_registry() {
+        let server = ControlServer::bind(addr(0)).expect("bind control");
+        // A registered shard whose queue holds one message and is never read.
+        let (stuck_tx, _stuck_rx) = mpsc::channel::<Message>(1);
+        server.register(ShardId::new(1), stuck_tx).await;
+        assert!(
+            server.send_to(ShardId::new(1), probe()).await,
+            "there was room for the first message"
+        );
+
+        let bounded = Duration::from_secs(2);
+        let queued = tokio::time::timeout(bounded, server.send_to(ShardId::new(1), probe()))
+            .await
+            .expect("a full queue must not be waited on");
+        assert!(!queued, "the message for the stuck shard is dropped");
+
+        // The registry is free, and other shards are unaffected.
+        let (tx, mut rx) = mpsc::channel::<Message>(4);
+        tokio::time::timeout(bounded, server.register(ShardId::new(2), tx))
+            .await
+            .expect("the registry lock is not held across a send");
+        assert!(server.send_to(ShardId::new(2), probe()).await);
+        assert_eq!(rx.recv().await, Some(probe()));
+
+        // An unknown or departed shard is a quiet `false`.
+        assert!(!server.send_to(ShardId::new(9), probe()).await);
+        drop(rx);
+        assert!(!server.send_to(ShardId::new(2), probe()).await);
+        server.close();
+    }
+
+    /// A peer that completes the transport handshake and then never says who it
+    /// is must not hold a connection and a task open.
+    ///
+    /// Mutation this catches: reading the `ShardHello` with no bound — the
+    /// transport's keep-alive keeps such a connection up indefinitely.
+    #[tokio::test]
+    async fn a_connection_that_never_sends_its_hello_is_closed() {
+        let server = Arc::new(
+            ControlServer::bind(addr(0))
+                .expect("bind control")
+                .with_hello_timeout(Duration::from_millis(200)),
+        );
+        let bound = server.local_addr().expect("bound");
+        let accept = Arc::clone(&server).spawn_accept();
+
+        let endpoint = space_net::client_endpoint().expect("client endpoint");
+        let (conn, _placeholder) =
+            space_net::connect(&endpoint, bound, SERVER_NAME, &space_net::hello("shard:1"))
+                .await
+                .expect("the transport handshake completes");
+        // Say nothing. The orchestrator gives up on its own.
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.connection().closed())
+            .await
+            .expect("the orchestrator must close a connection that never says hello");
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "closed by the orchestrator, not timed out: {closed:?}"
+        );
+        assert!(conn.is_closed());
+        accept.abort();
+        server.close();
     }
 
     #[test]

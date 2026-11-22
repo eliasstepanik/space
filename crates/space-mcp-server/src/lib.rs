@@ -353,7 +353,19 @@ fn advance_ticks(h: Arc<ShardHarness>, args: Value) -> BoxFuture<Result<String, 
         if !(1..=MAX_ADVANCE_TICKS).contains(&ticks) {
             return Err(format!("`ticks` must be in 1..={MAX_ADVANCE_TICKS}"));
         }
-        let tick = h.shard.lock().await.tick_n(ticks);
+        // One tick, then deliver what it queued — exactly what the 30 Hz loop
+        // does. Stepping all the ticks under one lock and never flushing (as
+        // this used to) meant that with `--no-tick`, where no loop flushes
+        // either, a connected client never received a single frame: it never
+        // learnt which ship was its own, so it never sent input, and every tick
+        // stepped here piled one more undelivered frame per client into the
+        // shard's outbox. The lock is released between ticks, so status tools
+        // and joining clients are not held up for the whole run.
+        let mut tick = h.shard.lock().await.stats().tick;
+        for _ in 0..ticks {
+            tick = h.shard.lock().await.tick();
+            h.net.flush(&h.shard).await;
+        }
         pretty(&json!({"tick": tick}))
     })
 }

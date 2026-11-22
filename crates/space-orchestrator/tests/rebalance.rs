@@ -519,10 +519,21 @@ impl Cluster {
     }
 
     /// Stage a merge of `child` back into its parent's owner and commit it.
+    ///
+    /// The orchestrator only merges a shard whose own load report says it has
+    /// no players, so the child reports first — its real client count, exactly
+    /// what a shard's `LoadReport` carries.
     async fn merge(&mut self, child: ShardId) {
         let before = self.epoch();
-        self.orch
+        let players = self.member(child).shard.lock().await.stats().clients;
+        self.report_load(child, u32::try_from(players).expect("a small client count"));
+        let reply = self
+            .orch
             .handle_admin(&space_protocol::AdminCommand::ForceMerge(child));
+        assert!(
+            matches!(reply, space_protocol::AdminReply::Accepted { .. }),
+            "the merge of an empty child is accepted: {reply:?}"
+        );
         for (to, message) in self.orch.drain_outbox() {
             self.deliver(to, message).await;
         }

@@ -138,11 +138,12 @@ async fn mcp_over_streamable_http_drives_a_real_shard() {
     .await;
     assert_eq!((note.status, note.body.as_str()), (202, ""));
 
-    // session enforcement: missing and unknown ids are 400 with a JSON-RPC error
+    // session enforcement: a missing id is 400, an unknown one 404 (the status
+    // that tells a client to re-initialise), both with a JSON-RPC error
     let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-    for bad in [None, Some("not-a-session")] {
+    for (bad, status) in [(None, 400), (Some("not-a-session"), 404)] {
         let r = post(addr, BOTH, bad, list).await;
-        assert_eq!(r.status, 400, "{bad:?}");
+        assert_eq!(r.status, status, "{bad:?}");
         assert_eq!(r.rpc()["error"]["code"], -32600);
     }
 
@@ -333,5 +334,51 @@ async fn the_stdio_shim_round_trips_newline_json_rpc() {
         tool_json(&lines[3])["tick"],
         5,
         "stdio shares the shard with the tools"
+    );
+}
+
+/// `--no-tick`: nothing but `advance_ticks` moves the shard, so `advance_ticks`
+/// is also the only thing that can deliver what a tick queued.
+///
+/// Mutation this catches: stepping with `tick_n` and never flushing. Every tick
+/// then left its frames for the joined player in the shard's outbox — the
+/// client never saw one (so it never learnt its ship and never sent input), and
+/// the outbox grew by a frame per client per tick for as long as the server ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_ticks_delivers_each_tick_instead_of_hoarding_frames() {
+    let harness = Arc::new(
+        ShardHarness::boot(([127, 0, 0, 1], 0).into(), false)
+            .await
+            .expect("boot shard"),
+    );
+    let server = mcp_server(&harness);
+    // A player joins: the call the QUIC front end makes for a connecting client.
+    let welcome = harness
+        .shard
+        .lock()
+        .await
+        .join(&space_protocol::Hello {
+            protocol: space_protocol::PROTOCOL_VERSION,
+            player_token: "player".into(),
+        })
+        .expect("the shard has room");
+
+    let reply = server
+        .handle_bytes(call(1, "advance_ticks", &json!({"ticks": 20})).as_bytes())
+        .await
+        .expect("a reply")
+        .to_value();
+    assert_eq!(tool_json(&reply)["tick"], 20);
+
+    let mut shard = harness.shard.lock().await;
+    assert!(
+        shard.ship_of(welcome.session).is_some(),
+        "the player has a ship, so every tick built a frame for it"
+    );
+    let undelivered = shard.take_outbox();
+    assert!(
+        undelivered.is_empty(),
+        "{} message(s) were left in the outbox: advance_ticks must flush after every tick",
+        undelivered.len()
     );
 }

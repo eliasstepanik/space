@@ -36,6 +36,16 @@ pub const MIN_EPOCH_INTERVAL_TICKS: u64 = 90;
 /// A shard that misses these beats is declared dead (H15).
 pub const LOAD_REPORT_INTERVAL_TICKS: u64 = 30;
 
+/// How long a shard's last load report is believed, in ticks (3 s: three missed
+/// beats).
+///
+/// The autoscaler is fed the latest report per shard on every tick. Without an
+/// expiry a shard that died or was removed kept "reporting" its last load for
+/// ever, and was split or merged on it again and again. Three intervals of
+/// silence is long enough to ride out a late report and short enough that a
+/// stale one never completes a dwell on its own.
+pub const REPORT_EXPIRY_TICKS: u64 = 3 * LOAD_REPORT_INTERVAL_TICKS;
+
 /// Which launcher the binary uses.
 ///
 /// `Local` runs shards in-process / as subprocesses (sandbox-testable);
