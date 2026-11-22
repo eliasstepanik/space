@@ -646,12 +646,18 @@ mod tests {
 
         // No map entry yet: the registered endpoint is the fallback.
         net.send_to_peer(ShardId::new(1), peer, None, probe()).await;
-        assert_eq!(net.peers.lock().await.get(&peer).map(|s| s.addr), Some(stale));
+        assert_eq!(
+            net.peers.lock().await.get(&peer).map(|s| s.addr),
+            Some(stale)
+        );
 
         // The map now names a new address: sends must target it.
         net.send_to_peer(ShardId::new(1), peer, Some(fresh), probe())
             .await;
-        assert_eq!(net.peers.lock().await.get(&peer).map(|s| s.addr), Some(fresh));
+        assert_eq!(
+            net.peers.lock().await.get(&peer).map(|s| s.addr),
+            Some(fresh)
+        );
         net.close();
     }
 }
