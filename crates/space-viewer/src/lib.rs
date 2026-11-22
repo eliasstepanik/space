@@ -160,20 +160,41 @@ pub mod web {
             on_message.forget();
         }
 
-        // Keyboard: forward mapped keys, ignoring auto-repeat.
+        // Keyboard: forward mapped keys, ignoring auto-repeat. The set of keys
+        // currently held is tracked so a window blur can release them (the
+        // browser delivers no keyup once focus is lost).
+        let held: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
         for (event, down) in [("keydown", true), ("keyup", false)] {
-            let ws = ws.clone();
+            let (ws, held) = (ws.clone(), Rc::clone(&held));
             let on_key = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
                 if ev.repeat() {
                     return;
                 }
-                if let Some(msg) = key_message(&ev.code(), down) {
+                let code = ev.code();
+                if let Some(msg) = key_message(&code, down) {
                     ev.prevent_default();
+                    if down {
+                        held.borrow_mut().insert(code);
+                    } else {
+                        held.borrow_mut().remove(&code);
+                    }
                     send(&ws, &msg);
                 }
             });
             window.add_event_listener_with_callback(event, on_key.as_ref().unchecked_ref())?;
             on_key.forget();
+        }
+        // Best effort: on blur, send key-up for every key still held.
+        {
+            let (ws, held) = (ws.clone(), Rc::clone(&held));
+            let on_blur = Closure::<dyn FnMut()>::new(move || {
+                for msg in release_messages(&held.borrow()) {
+                    send(&ws, &msg);
+                }
+                held.borrow_mut().clear();
+            });
+            window.add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref())?;
+            on_blur.forget();
         }
 
         // Mouse: pointer position always; dragging with the left button also
