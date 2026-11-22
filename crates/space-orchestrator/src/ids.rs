@@ -26,7 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use space_protocol::ShardId;
-use space_server::alloc::ShardIdAllocator;
+use space_server::alloc::{IdSpaceExhausted, ShardIdAllocator};
 
 /// Why the allocator could not be initialised.
 #[derive(Debug)]
