@@ -44,4 +44,3 @@
   - wasm thin viewer for QA (QA).
 - Phase 7 — MCP
 - Phase 8 — packaging + skill
-
