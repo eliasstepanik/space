@@ -518,6 +518,7 @@ impl RenderContext {
             device_name,
             ray_query: ray_query_support,
             validation_active: with_debug_utils,
+            window_surface,
         })
     }
 
