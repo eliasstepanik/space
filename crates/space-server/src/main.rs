@@ -321,73 +321,20 @@ async fn run(options: Options) -> Result<(), String> {
 }
 
 /// Serve as an orchestrated shard: register with the orchestrator, adopt the id,
-/// region and map it hands back, and follow every epoch it publishes.
+/// region and map it hands back, and follow every epoch it publishes. The boot
+/// itself lives in [`space_server::orchestrated`] so tests can run it in-process.
 async fn run_orchestrated(options: Options, orch_addr: SocketAddr) -> Result<(), String> {
-    use space_protocol::{ShardHello, ShardRegion};
-    use space_server::net::OrchestratorLink;
-
-    // Bind first (default `127.0.0.1:0`): without `--advertise` the endpoint we
-    // report is the one we listen on. With it, we report that address instead,
-    // so a peer or client on another host/container can dial us.
-    let net = Arc::new(ShardNet::bind(options.bind).map_err(|e| format!("bind: {e}"))?);
-    let listening = net.local_addr().map_err(|e| e.to_string())?;
-    let advertised = options.advertised(listening);
-
-    // Ask the orchestrator for an id + region + map. `ShardId::NONE` requests a
-    // fresh allocation; `--claim-region` names a node, else the orchestrator
-    // places us at its root.
-    let claim = options
-        .claim_region
-        .map(|node| ShardRegion::new(node, ShardId::NONE, advertised));
-    let hello = ShardHello {
-        cluster: options.cluster.clone(),
-        shard: options.shard,
-        endpoint: advertised,
-        region: claim,
-    };
-    let (welcome, conn) = OrchestratorLink::handshake(orch_addr, hello)
-        .await
-        .map_err(|e| format!("orchestrator handshake: {e}"))?;
-
-    let config = ShardConfig::new(welcome.shard, advertised, welcome.region.node);
-    let mut shard = Shard::new(config);
-    shard.set_shard_map(welcome.shard_map.clone());
-    shard.set_endpoint(advertised);
-    let shard = Arc::new(tokio::sync::Mutex::new(shard));
-
-    // Register the map's peer endpoints and route orchestrator traffic through
-    // the link's FIFO sender (epoch acks + load reports go out in order).
-    for region in &welcome.shard_map.regions {
-        if region.shard != welcome.shard {
-            net.set_shard_endpoint(region.shard, region.endpoint).await;
-        }
-    }
-    let link = OrchestratorLink::attach(conn, Arc::clone(&shard));
-    net.set_orchestrator_sender(link.tx.clone()).await;
-
-    println!(
-        "shard {} on {listening} (advertised {advertised}, orchestrated by {orch_addr}), region depth {}",
-        welcome.shard.0, welcome.region.node.depth
-    );
-
-    let serve = {
-        let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
-        tokio::spawn(async move { net.serve(shard).await })
-    };
-    let ticking = tokio::spawn(async move {
-        let mut clock = tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            clock.tick().await;
-            shard.lock().await.tick();
-            net.flush(&shard).await;
-        }
-    });
-
-    serve.await.map_err(|e| e.to_string())?;
-    ticking.abort();
-    link.close();
-    Ok(())
+    space_server::orchestrated::run_orchestrated(
+        space_server::orchestrated::OrchestratedOptions {
+            shard: options.shard,
+            bind: options.bind,
+            advertise: options.advertise,
+            claim_region: options.claim_region,
+            cluster: options.cluster,
+        },
+        orch_addr,
+    )
+    .await
 }
 
 #[cfg(test)]
