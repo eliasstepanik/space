@@ -122,6 +122,21 @@ struct SsrResult {
     confidence: f32, // 0 = miss
 }
 
+// Clip-space point of the ray segment `a -> b` at screen-space fraction `s`
+// (the screen position is linear in `s`; the clip parameter is not, so the
+// depth stays perspective-correct): u = s * wa / (wb - s * (wb - wa)).
+fn ray_point(a: vec4<f32>, b: vec4<f32>, s: f32) -> vec4<f32> {
+    let u = s * a.w / (b.w - s * (b.w - a.w));
+    return mix(a, b, u);
+}
+
+// Signed depth of the ray point behind the stored surface at its pixel
+// (> 0: the ray is behind the surface).
+fn ray_diff(h: vec4<f32>) -> f32 {
+    let ndc = h.xy / h.w;
+    return h.w - view_depth(ndc, load_depth(pixel_of_uv(ndc * 0.5 + vec2(0.5))));
+}
+
 fn trace_ssr(pos: vec3<f32>, normal: vec3<f32>, dir: vec3<f32>, roughness: f32) -> SsrResult {
     var res: SsrResult;
     res.color = vec3(0.0);
@@ -136,45 +151,43 @@ fn trace_ssr(pos: vec3<f32>, normal: vec3<f32>, dir: vec3<f32>, roughness: f32) 
     if t_end <= 0.0 {
         return res;
     }
+    // The segment from the origin to where the ray leaves the screen.
+    let a = h0;
+    let b = mix(h0, h1, t_end);
     // Depth tolerance grows with roughness (blurrier lobes accept more slack)
     // and with distance (depth precision).
     let thickness = (0.1 + 2.0 * roughness) * max(1.0, 0.02 * w0);
     let steps = max(post.ssr_steps, 1u);
 
-    var t_prev = 0.0;
+    var s_prev = 0.0;
     var prev_diff = -1.0;
     for (var i = 1u; i <= steps; i = i + 1u) {
-        let t = t_end * f32(i) / f32(steps);
-        let h = mix(h0, h1, t);
-        let ndc = h.xy / h.w;
-        let diff = h.w - view_depth(ndc, load_depth(pixel_of_uv(ndc * 0.5 + vec2(0.5))));
+        let s = f32(i) / f32(steps);
+        let diff = ray_diff(ray_point(a, b, s));
         if diff > 0.0 && prev_diff <= 0.0 {
-            // The ray went behind a surface between t_prev and t: bisect.
-            var lo = t_prev;
-            var hi = t;
+            // The ray went behind a surface between s_prev and s: bisect.
+            var lo = s_prev;
+            var hi = s;
             for (var k = 0u; k < REFINE_STEPS; k = k + 1u) {
                 let mid = 0.5 * (lo + hi);
-                let hm = mix(h0, h1, mid);
-                let nm = hm.xy / hm.w;
-                let dm = hm.w - view_depth(nm, load_depth(pixel_of_uv(nm * 0.5 + vec2(0.5))));
-                if dm > 0.0 { hi = mid; } else { lo = mid; }
+                if ray_diff(ray_point(a, b, mid)) > 0.0 { hi = mid; } else { lo = mid; }
             }
-            let hh = mix(h0, h1, hi);
-            let nh = hh.xy / hh.w;
-            let uv = nh * 0.5 + vec2(0.5);
+            let hh = ray_point(a, b, hi);
+            let uv = (hh.xy / hh.w) * 0.5 + vec2(0.5);
             let px = pixel_of_uv(uv);
-            let dh = hh.w - view_depth(nh, load_depth(px));
-            if dh < thickness {
+            // Accept only a hit that is close to the surface; a ray that slips
+            // behind a silhouette to far geometry converges on a big gap.
+            if ray_diff(hh) < thickness {
                 let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
                 let edge_fade = clamp(edge / 0.1, 0.0, 1.0);
-                let step_fade = 1.0 - smoothstep(0.75, 1.0, f32(i) / f32(steps));
+                let step_fade = 1.0 - smoothstep(0.75, 1.0, s);
                 res.color = min(textureLoad(scene_tex, px, 0).rgb, vec3(64.0));
                 res.confidence = edge_fade * step_fade;
                 return res;
             }
         }
         prev_diff = diff;
-        t_prev = t;
+        s_prev = s;
     }
     return res;
 }
