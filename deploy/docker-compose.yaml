@@ -19,6 +19,8 @@
 #
 #   orchestrator  172.31.0.10:7900   binds 0.0.0.0:7900, shards dial 172.31.0.10:7900
 #   shard-a       172.31.0.11:7870   binds 0.0.0.0:7870, advertises 172.31.0.11:7870
+#   client        172.31.0.12:8099   (profile "stream" only) ws:// pixel stream,
+#                                    plays on shard-a at 172.31.0.11:7870
 #
 # Shards advertise their in-network address (peers dial each other over the
 # bridge). Clients on the host use the published UDP port 7871; a shard that
@@ -75,6 +77,27 @@ services:
     networks:
       space:
         ipv4_address: 172.31.0.11
+
+  client:
+    profiles: ["stream"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: space/client:dev
+    container_name: space-client
+    depends_on:
+      - shard-a
+    environment:
+      STREAM_BIND: 0.0.0.0:8099
+      # The shard's in-network address (an `ip:port`, like the other fixed IPs).
+      SPACE_SERVER: 172.31.0.11:7870
+      CLIENT_ARGS: "--galaxy"
+    ports:
+      - "8099:8099/tcp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.12
+    restart: unless-stopped
 
 volumes:
   orchestrator-state:

@@ -10,7 +10,7 @@ FROM rust:1-slim-bookworm
 WORKDIR /src
 # rust-toolchain.toml pins the toolchain (1.100.0 + rustfmt, clippy, wasm32 target);
 # `rustup toolchain install` with no argument installs exactly that. build-essential
-# is for `ring` (the one sanctioned C/asm dependency); cmake-free otherwise.
+# (a C compiler/linker) is for `ring`, the one sanctioned C/asm dependency.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates \
  && rm -rf /var/lib/apt/lists/*
