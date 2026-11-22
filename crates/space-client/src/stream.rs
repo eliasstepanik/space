@@ -196,6 +196,20 @@ fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> S
     scene
 }
 
+/// The scene for the windowed client joined to a server: the same scene
+/// building as the stream path ([`scene_for_input`]), with the camera offset
+/// taken from the live replicated ship state instead of a local integration.
+pub fn live_scene(
+    replica: &space_client::link::Replica,
+    input: &InputState,
+    width: u32,
+    height: u32,
+) -> Scene {
+    let mut input = input.clone();
+    input.offset = replica.offset();
+    scene_for_input(Mode::Window, &input, width, height)
+}
+
 /// Render → JPEG → push, applying viewer input, until `stop` is set or
 /// `max_frames` frames were streamed. While no viewer is connected nothing is
 /// rendered. Returns the final input state.
