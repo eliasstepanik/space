@@ -21,6 +21,27 @@ Fixed IPs on the `172.31.0.0/24` bridge (addresses are parsed as socket
 addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
 `.12:8099`.
 
+## Publishing pipeline
+
+- **Images**: every push to `main` touching `crates/**`, `deploy/**`,
+  `Dockerfile` or `Cargo.*` runs `.github/workflows/release-images.yml`, which
+  builds and pushes `ghcr.io/eliasstepanik/space-shard`, `space-orchestrator`
+  and `space-client` as `:latest` and `:sha-<shortsha>` (the `space/*:dev` names
+  above are local compose builds only). The repo owner must make the packages
+  public after the first push. `ci.yml`'s `docker` job still only builds.
+- **Release**: pushing a `v*` tag runs `.github/workflows/release.yml`: builds
+  `space-client` (`--release --locked`) on Linux and Windows plus the wasm viewer,
+  and attaches `space-client`, `space-client.exe` and `space-viewer.zip`
+  (`index.html` + `pkg/`) to a GitHub Release with generated notes.
+- **Proxy**: `deploy/proxy/` is the production bundle (compose pulling the ghcr
+  images, `.env.example`, `redeploy.sh`). A poll-based systemd timer on the host
+  runs `redeploy.sh` every 5 minutes; `.github/workflows/deploy.yml` is the manual
+  SSH path (secrets `DEPLOY_SSH_HOST/USER/KEY`, not yet created). See
+  `deploy/proxy/README.md`.
+- **Workflow lint**: `ci.yml`'s `lint` job parses every workflow and deploy YAML
+  (`.github/scripts/check_yaml.py`), because GitHub silently drops a workflow
+  with invalid YAML.
+
 ## Streaming client and the wasm viewer
 
 `Dockerfile.client` starts `space-client --stream $STREAM_BIND [--server
