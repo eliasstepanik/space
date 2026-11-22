@@ -78,7 +78,16 @@ impl Response {
     /// The wire form as one compact line (no embedded newline).
     #[must_use]
     pub fn to_json(&self) -> String {
-        self.to_value().to_string()
+        // Hand-assembled so `jsonrpc` comes first and the bytes are stable.
+        let id = &self.id;
+        match &self.outcome {
+            Ok(result) => format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
+            Err(e) => format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":{},"message":{}}}}}"#,
+                e.code,
+                Value::String(e.message.clone())
+            ),
+        }
     }
 }
 

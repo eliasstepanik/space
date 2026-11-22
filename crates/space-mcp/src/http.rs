@@ -753,7 +753,7 @@ mod tests {
     fn json_responses_carry_content_length() {
         let r = Response::ok(json!(1), json!({}));
         let bytes = String::from_utf8(HttpResponse::json(200, &r).to_bytes()).unwrap();
-        let body = r#"{"id":1,"jsonrpc":"2.0","result":{}}"#;
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         assert!(bytes.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"));
         assert!(bytes.contains(&format!("Content-Length: {}\r\n", body.len())), "{bytes}");
         assert!(bytes.ends_with(&format!("\r\n\r\n{body}")), "{bytes}");
