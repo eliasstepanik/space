@@ -205,8 +205,20 @@ async fn serve_viewer(
                     FrameHeader { seq: frame.seq, flags: frame.flags },
                     &frame.jpeg,
                 );
-                if write.send(Message::Binary(wire.into())).await.is_err() {
-                    break;
+                let sent = tokio::time::timeout(
+                    VIEWER_WRITE_TIMEOUT,
+                    write.send(Message::Binary(wire.into())),
+                )
+                .await;
+                match sent {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        // The viewer is not reading: drop it so it cannot hold
+                        // a slot forever (the caller closes the connection).
+                        log::debug!("space-stream: viewer write timed out, dropping it");
+                        break;
+                    }
                 }
             }
             msg = read.next() => match msg {
