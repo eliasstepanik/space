@@ -213,5 +213,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let gi = probe_radiance(in.world, n);
         color = color + gi * in.albedo * (1.0 - metallic) / PI;
     }
+    if (params.features & FEATURE_FOG) != 0u {
+        // Exponential-squared fog on camera distance, after lighting and
+        // before the tone map: f = 1 - exp(-(d * density)^2).
+        let d = length(in.world - params.camera.position.xyz) * params.fog.w;
+        let f = 1.0 - exp(-d * d);
+        color = mix(color, params.fog.rgb, f);
+    }
     return vec4(max(color, vec3(0.0)), 1.0);
 }
