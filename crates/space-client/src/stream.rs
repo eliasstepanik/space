@@ -401,6 +401,44 @@ mod tests {
         });
     }
 
+    /// Regression: the default galaxy stream camera must face the galaxy (+Z
+    /// from the base position at -Z), not away from it (which rendered black).
+    #[test]
+    fn default_galaxy_stream_camera_faces_the_galaxy() {
+        let f = initial_input(Mode::Galaxy).forward();
+        assert!(f[0].abs() < 1e-6 && (f[2] - 1.0).abs() < 1e-6, "{f:?}");
+        assert_eq!(initial_input(Mode::Demo), InputState::default());
+    }
+
+    /// Renders the galaxy through the stream's default camera and asserts lit
+    /// pixels. Skips loudly when no Vulkan device is available.
+    #[test]
+    fn default_galaxy_stream_view_renders_lit_pixels() {
+        let ctx = match RenderContext::new(&ContextOptions::default()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!(
+                    "SKIP: no usable Vulkan device ({e}); needs VK_KHR_acceleration_structure"
+                );
+                return;
+            }
+        };
+        let size = 64;
+        let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), size, size);
+        let out = ctx
+            .render_offscreen(&scene, size, size, &demo_options(QualityPreset::Ci))
+            .expect("galaxy render");
+        let lit = out
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
+            .count();
+        eprintln!("galaxy stream view: {lit} lit pixels of {}", size * size);
+        assert!(lit > 0, "the default galaxy stream view is black");
+    }
+
     #[test]
     fn view_pitch_is_clamped_and_pointer_recorded() {
         let mut s = InputState::default();
