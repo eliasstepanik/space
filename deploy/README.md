@@ -35,8 +35,8 @@ addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
   and attaches `space-client`, `space-client.exe` and `space-viewer.zip`
   (`index.html` + `pkg/`) to a GitHub Release with generated notes.
 - **Proxy**: `deploy/proxy/` is the production bundle (compose pulling the ghcr
-  images, `.env.example`, `redeploy.sh`). A poll-based systemd timer on the host
-  runs `redeploy.sh` every 5 minutes; `.github/workflows/deploy.yml` is the manual
+  images, `.env.example`, `redeploy.sh`). Watchtower on the host (label opt-in,
+  60s poll) redeploys on new images; `.github/workflows/deploy.yml` is the manual
   SSH path (secrets `DEPLOY_SSH_HOST/USER/KEY`, not yet created). See
   `deploy/proxy/README.md`.
 - **Workflow lint**: `ci.yml`'s `lint` job parses every workflow and deploy YAML
