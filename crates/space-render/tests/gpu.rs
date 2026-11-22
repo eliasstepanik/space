@@ -29,6 +29,7 @@ fn context() -> Option<RenderContext> {
     let options = ContextOptions {
         validation: Some(requested),
         prefer_ray_query: true,
+        window_display: None,
     };
     match RenderContext::new(&options) {
         Ok(ctx) => {
