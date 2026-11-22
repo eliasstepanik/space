@@ -328,7 +328,7 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         let mut alloc = PersistentShardIdAllocator::open(&path, 42).expect("open");
-        assert_eq!(alloc.allocate(), ShardId::new(42));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(42)));
         std::fs::remove_file(&path).ok();
     }
 
