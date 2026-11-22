@@ -16,14 +16,8 @@
 //! * **multiplayer streaming** (`--stream ADDR --server ADDR`): the same, but the
 //!   process is also a normal `space-net` player on the authoritative shard;
 //!   viewer input becomes the player's input and the replicated state drives the
-<<<<<<< HEAD
 //!   camera (see [`space_client::link`] and [`stream`]).
 
-=======
-//!   camera (see [`link`] and [`stream`]).
-
-mod link;
->>>>>>> refs/remotes/origin/main
 mod stream;
 
 use std::net::{SocketAddr, ToSocketAddrs};

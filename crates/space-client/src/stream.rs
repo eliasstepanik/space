@@ -5,11 +5,7 @@
 //!
 //! A browser viewer is not a peer of the authoritative server. This process is
 //! the *proxy client*: with `--server ADDR` it connects to the shard as an
-<<<<<<< HEAD
 //! ordinary player through the `space-net` client path ([`space_client::link`]), and
-=======
-//! ordinary player through the `space-net` client path ([`crate::link`]), and
->>>>>>> refs/remotes/origin/main
 //! the viewer is only its remote screen and controller. Viewer input arrives
 //! through [`StreamClient::poll_input`], is applied to the proxy's
 //! [`InputState`] by [`InputState::apply`] and, by [`pump_input`], turned into
@@ -26,13 +22,8 @@ use space_stream::protocol::{FLAG_DOWNSCALED, FLAG_KEYFRAME};
 use space_stream::{JpegEncoder, Key, StreamClient, StreamServer, ViewerInput};
 use space_world::WorldPos;
 
-<<<<<<< HEAD
 use crate::{demo_options, Config, Mode};
 use space_client::link::ServerLink;
-=======
-use crate::link::ServerLink;
-use crate::{demo_options, Config, Mode};
->>>>>>> refs/remotes/origin/main
 
 /// Target stream frame rate.
 const FRAME_BUDGET: Duration = Duration::from_millis(33);
@@ -502,7 +493,6 @@ mod tests {
         );
         drop(server);
     }
-<<<<<<< HEAD
 
     /// Loopback, no GPU: a real in-process shard (same boot wiring as
     /// `space-server`'s acceptance harness), the stream proxy's `ServerLink`
@@ -604,6 +594,4 @@ mod tests {
         net.close();
         drop(stream_server);
     }
-=======
->>>>>>> refs/remotes/origin/main
 }
