@@ -50,6 +50,9 @@ pub struct RunningShard {
     pub region: NodeRef,
     /// The address clients and peers dial (what the hello advertised).
     pub endpoint: SocketAddr,
+    /// The shard's live state (tests read it; the serve and tick tasks own the
+    /// write side).
+    pub state: Arc<Mutex<Shard>>,
     serve: JoinHandle<()>,
     ticking: JoinHandle<()>,
     link: OrchestratorLink,
