@@ -26,7 +26,14 @@ struct Params {
     gi_grid_size_x: u32,
     gi_grid_size_y: u32,
     _pad1: f32,
+    fog: vec4<f32>, // rgb linear fog colour, w = exp-squared density (1/m)
+    features: u32,  // FEATURE_* bitmask (mirrors src/quality.rs)
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 }
+
+const FEATURE_FOG: u32 = 1u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
