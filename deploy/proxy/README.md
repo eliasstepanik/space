@@ -49,7 +49,6 @@ The client image's ENTRYPOINT is a shell wrapper that runs
 so the compose file sets those env vars (`STREAM_BIND=0.0.0.0:8099`,
 `SPACE_SERVER=172.29.0.11:7870`, `CLIENT_ARGS=--galaxy`) instead of a
 `command:` (which the wrapper would ignore).
-<<<<<<< HEAD
 
 Note: the `client` service requires a GPU with `VK_KHR_acceleration_structure`
 (ray tracing). On hosts without one (e.g. software Vulkan such as lavapipe) it
