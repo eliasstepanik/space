@@ -78,7 +78,7 @@ jobs:
           wasm-bindgen --target web --out-dir space-viewer/pkg \
             target/wasm32-unknown-unknown/release/space_viewer.wasm
           cp crates/space-viewer/index.html space-viewer/index.html
-      # The rust image does not ship zip.
+      # The bare runner does not ship zip.
       - name: Install zip
         run: apt-get update && apt-get install -y --no-install-recommends zip
       - name: Zip bundle
