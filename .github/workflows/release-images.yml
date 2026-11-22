@@ -27,7 +27,9 @@ concurrency:
 jobs:
   push:
     name: Push ${{ matrix.image }}
-    runs-on: ubuntu-latest
+    # Self-hosted space-ci runner on the proxy host, directly (no container):
+    # it needs the host's docker/buildx.
+    runs-on: [self-hosted, linux, x64, space-ci]
     permissions:
       contents: read
       packages: write
