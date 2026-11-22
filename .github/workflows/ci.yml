@@ -1,5 +1,14 @@
 name: CI
 
+# Where the jobs run:
+#   * Linux jobs (lint, linux, wasm, docker) run on SELF-HOSTED runners labelled
+#     `space-ci` (Linux, x64, docker socket) on the maintainer's `proxy` host.
+#     The runner is a bare container with docker + basic tools, so toolchains
+#     come from job containers (rust:1.100-bookworm, python:3.12-slim); the
+#     docker job runs directly on the runner and uses its docker/buildx.
+#   * The Windows job stays on GitHub-hosted `windows-latest`: it cannot run on
+#     the Linux self-hosted runner (assumption: no Windows self-hosted runner).
+
 on:
   push:
     branches: [main]
