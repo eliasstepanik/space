@@ -135,6 +135,30 @@ impl ControlPlane {
             self.publisher.set_endpoints(&endpoints);
             owner
         } else {
+            // The same process re-saying hello (it crashed and restarted with
+            // no id): a NONE hello whose endpoint is the one the node's owner
+            // already holds *is* that owner. Same id back, no allocation, no
+            // reservation; the endpoint is refreshed (a no-op by construction,
+            // but it keeps the published map the single source of truth).
+            let incumbent = self
+                .map()
+                .regions
+                .iter()
+                .find(|r| r.node == node)
+                .filter(|r| hello.shard == ShardId::NONE && r.endpoint == hello.endpoint)
+                .map(|r| r.shard);
+            if let Some(owner) = incumbent {
+                let mut endpoints = std::collections::BTreeMap::new();
+                endpoints.insert(owner, hello.endpoint);
+                self.publisher.set_endpoints(&endpoints);
+                let region = ShardRegion::new(node, owner, hello.endpoint);
+                return Ok(ShardWelcome {
+                    shard: owner,
+                    region,
+                    shard_map: self.map().clone(),
+                    peer_token: self.peer_token.clone(),
+                });
+            }
             // The first claim on a node wins; a conflicting claim (including a
             // second region-less hello for the root) is refused, and refused
             // before any id is allocated or reserved.
@@ -147,7 +171,7 @@ impl ControlPlane {
                 return Err(format!("region at depth {} is already owned", node.depth));
             }
             if hello.shard == ShardId::NONE {
-                self.ids.allocate()
+                self.ids.allocate().map_err(|e| e.to_string())?
             } else {
                 // A relaunch (or an orchestrated child booting with the id the
                 // orchestrator allocated for it): confirm the id and make sure
@@ -155,6 +179,19 @@ impl ControlPlane {
                 // legitimately differ from a placeholder the split staged, so
                 // the known-id path always confirms and lets the region
                 // endpoint be refreshed below.
+                //
+                // Only a *plausible* id may move the persistent counter: one
+                // that already owns a region, or one the allocator has already
+                // issued. Anything higher would let a single packet poison the
+                // counter (e.g. claiming u32::MAX - 1 exhausts the id space).
+                let known = self.map().regions.iter().any(|r| r.shard == hello.shard)
+                    || u64::from(hello.shard.0) < self.ids.peek();
+                if !known {
+                    return Err(format!(
+                        "shard id {} was never issued by this orchestrator",
+                        hello.shard.0
+                    ));
+                }
                 self.ids.reserve(hello.shard).map_err(|e| {
                     format!(
                         "could not persist the reservation of {}: {e}",
