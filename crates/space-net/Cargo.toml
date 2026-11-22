@@ -1,0 +1,23 @@
+[package]
+name = "space-net"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+description = "QUIC transport for space: space-protocol framing, hello handshake, datagram + stream message classes"
+
+[dependencies]
+space-protocol = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+space-world = { workspace = true }
+space-ecs = { workspace = true }
+space-sim = { workspace = true }
+
+[lints]
+workspace = true

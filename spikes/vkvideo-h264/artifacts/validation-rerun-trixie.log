@@ -1,0 +1,13 @@
+ERROR:            /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by /workspace/.local/vvl14/usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so)
+[dev] using AMD Radeon Graphics (RADV GFX1151) (queue family 3)
+[enc] picture format G8_B8R8_2PLANE_420_UNORM (candidates: G8_B8R8_2PLANE_420_UNORM)
+[enc] session memory: 1 bind(s), sizes [131072]
+[main] caps: minCodedExtent=Extent2D { width: 16, height: 16 } maxCodedExtent=Extent2D { width: 4096, height: 4096 } granularity=Extent2D { width: 16, height: 16 } maxDpbSlots=16 maxActiveRefs=16 bitstreamAlign(size=16 offset=16) rateControlModes=DISABLED | CBR | VBR feedback=BITSTREAM_BUFFER_OFFSET | BITSTREAM_BYTES_WRITTEN | h264: maxLevelIdc=0 minQp=0 maxQp=51 maxL0Refs(P)=1 maxTemporalLayers=4 stdSyntaxFlags=WEIGHTED_BIPRED_IDC_EXPLICIT | ENTROPY_CODING_MODE_FLAG_UNSET | ENTROPY_CODING_MODE_FLAG_SET | CONSTRAINED_INTRA_PRED_FLAG_SET
+[enc] driver SPS 28 B (nalType 0), PPS 8 B (nalType 0)
+[main] frame 0: submission completed in 10674.37 ms
+Error: read feedback frame 0
+
+Caused by:
+    0: get_query_pool_results(frame 0)
+    1: A fence or query has not yet completed
+EXIT=1

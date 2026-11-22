@@ -1,0 +1,94 @@
+# Space cluster: one orchestrator + two shards on a user-defined bridge network.
+#
+#   docker compose -f deploy/docker-compose.yaml up --build
+#
+# NOT EXECUTED: the authoring sandbox has no Docker daemon, so this file is
+# correct by inspection only (docs/plan-phase3.md P3.0 is the real verification).
+#
+# Addressing: `--orchestrator`, `--control-addr` and `--advertise` are parsed as
+# socket ADDRESSES, not resolved as host names, so every container gets a fixed
+# IPv4 on the bridge subnet below.
+#
+#   orchestrator  172.31.0.10:7900   binds 0.0.0.0:7900, shards dial 172.31.0.10:7900
+#   shard-a       172.31.0.11:7870   binds 0.0.0.0:7870, advertises 172.31.0.11:7870
+#   shard-b       172.31.0.12:7870   binds 0.0.0.0:7870, advertises 172.31.0.12:7870
+#
+# Shards advertise their in-network address (peers dial each other over the
+# bridge). Clients on the host use the published UDP ports 7871/7872; a shard that
+# must hand out a host-reachable address to clients would advertise the host
+# address instead (the plan's two-address case, R12, is not implemented here).
+#
+# Both shards register with ShardHello and are placed by the orchestrator. The
+# orchestrator runs `--launcher local`: `--launcher docker` is deferred.
+
+x-cluster: &cluster
+  SPACE_CLUSTER: space-local
+
+x-shard: &shard
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.shard
+  image: space/shard:dev
+  depends_on:
+    - orchestrator
+  restart: unless-stopped
+
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.orchestrator
+    image: space/orchestrator:dev
+    environment:
+      <<: *cluster
+      ORCHESTRATOR_BIND: 0.0.0.0:7900
+      # What shards dial; distinct from the wildcard bind above.
+      ORCHESTRATOR_CONTROL_ADDR: 172.31.0.10:7900
+    volumes:
+      - orchestrator-state:/var/lib/space
+    ports:
+      - "7900:7900/udp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.10
+    restart: unless-stopped
+
+  shard-a:
+    <<: *shard
+    container_name: space-shard-a
+    environment:
+      <<: *cluster
+      ORCHESTRATOR_ADDR: 172.31.0.10:7900
+      SHARD_BIND: 0.0.0.0:7870
+      SHARD_ADVERTISE: 172.31.0.11:7870
+    ports:
+      - "7871:7870/udp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.11
+
+  shard-b:
+    <<: *shard
+    container_name: space-shard-b
+    environment:
+      <<: *cluster
+      ORCHESTRATOR_ADDR: 172.31.0.10:7900
+      SHARD_BIND: 0.0.0.0:7870
+      SHARD_ADVERTISE: 172.31.0.12:7870
+    ports:
+      - "7872:7870/udp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.12
+
+volumes:
+  orchestrator-state:
+
+networks:
+  space:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1

@@ -1,0 +1,9 @@
+[dev] using AMD Radeon Graphics (RADV GFX1151) (queue family 3)
+[enc] picture format G8_B8R8_2PLANE_420_UNORM (candidates: G8_B8R8_2PLANE_420_UNORM)
+Validation Error: [ VUID-VkVideoSessionCreateInfoKHR-pStdHeaderVersion-parameter ] | MessageID = 0xcf94a003
+vkCreateVideoSessionKHR(): pCreateInfo->pStdHeaderVersion is NULL.
+The Vulkan spec states: pStdHeaderVersion must be a valid pointer to a valid VkExtensionProperties structure (https://docs.vulkan.org/spec/latest/chapters/videocoding.html#VUID-VkVideoSessionCreateInfoKHR-pStdHeaderVersion-parameter)
+
+timeout: the monitored command dumped core
+Segmentation fault
+EXIT=139

@@ -1,0 +1,56 @@
+# Phase-0 spike 0.6: orchestrator <-> sibling shard containers.
+#
+# This compose file is the TEMPLATE Phase 8 will refine. It proves that a
+# container can act as an orchestrator: it mounts the host Docker socket so the
+# `orchestrator` service can create / health-check / remove sibling "shard"
+# containers via the Docker Engine API (bollard).
+#
+# Usage (on a host WITH a Docker daemon):
+#
+#   # The orchestrator runs as non-root (uid 10001). It must be in the group
+#   # that owns /var/run/docker.sock. Pass the host's docker group id:
+#   DOCKER_GID=$(getent group docker | cut -d: -f3) docker compose up --build
+#
+#   # Or, if your socket is owned by root:root (mode 666), DOCKER_GID can be 0.
+#
+# The orchestrator creates shard containers on the host's default bridge (they
+# are siblings of the orchestrator, NOT children on this custom network), so
+# the published host ports come from HOST_PORT_RANGE on the host.
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: space/orch-docker:spike-0.6
+    container_name: space-orchestrator-spike
+    # Reach the host Docker daemon through the mounted socket.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Add the (non-root, uid 10001) orchestrator user to the docker group so it
+    # may open the socket. Set DOCKER_GID to the host's docker gid, e.g.
+    #   DOCKER_GID=$(getent group docker | cut -d: -f3)
+    group_add:
+      - "${DOCKER_GID:-999}"
+    environment:
+      # Configurable published-port range for shard UDP ports.
+      HOST_PORT_RANGE: "46001-46064"
+      SPACE_CLUSTER_ID: "spike-0.6"
+      # bollard's connect_with_defaults() defaults to this socket path.
+      DOCKER_HOST: "unix:///var/run/docker.sock"
+    # Explicit subnet to avoid Docker's default address-pool exhaustion when
+    # many shard networks are created. Phase 8 will parameterise this.
+    networks:
+      orch_net:
+        ipv4_address: 172.31.99.10
+    # The spike is a one-shot: it runs the full cycle and exits 0.
+    restart: "no"
+
+networks:
+  orch_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.99.0/24
+          gateway: 172.31.99.1

@@ -1,0 +1,16 @@
+[package]
+name = "space-protocol"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Wire protocol: versioned handshake, input/snapshot/delta messages, epoch-versioned shard map, handoff and orchestrator control messages, frame codec"
+
+[dependencies]
+space-world = { workspace = true }
+space-ecs = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[lints]
+workspace = true

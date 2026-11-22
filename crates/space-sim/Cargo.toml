@@ -1,0 +1,16 @@
+[package]
+name = "space-sim"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Shared deterministic ship-flight simulation: fixed-step semi-implicit Euler physics, ticked simulation world with a canonical state hash, on-rail orbits and client-side prediction with reconciliation"
+
+[dependencies]
+space-world = { workspace = true }
+space-ecs = { workspace = true }
+space-protocol = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

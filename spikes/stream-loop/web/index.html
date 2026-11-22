@@ -1,0 +1,85 @@
+<!doctype html>
+<!--
+  Phase-0 spike 0.4 viewer: proves the transport loop only.
+  NOTE: the final product will use a Rust->wasm viewer (decision QA); this spike
+  uses plain HTML/JS to prove the WebSocket + JPEG + canvas + input path.
+-->
+<meta charset="utf-8">
+<title>stream-loop viewer</title>
+<style>body{margin:0;background:#111;color:#eee;font:14px monospace}canvas{display:block}#s{padding:6px}</style>
+<canvas id="c" width="640" height="480"></canvas>
+<div id="s">connecting…</div>
+<script>
+const WS_URL = "ws://127.0.0.1:8099";
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("s");
+
+// State read back by the smoke test via CDP (Runtime.evaluate).
+window.__stream = {
+  connected: false,
+  frameId: 0,        // last presented frame id
+  presented: 0,      // total frames presented
+  fps: 0,            // measured over a 1s window
+  lastHostT: 0,      // host wall-clock ms of the last presented frame
+  latencyMs: 0,      // browser arrival - host produce time
+  seq: 0,            // last input seq we sent
+};
+
+let pendingMeta = {};
+let frameCount = 0;
+let lastFpsT = performance.now();
+let ws = null;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { window.__stream.connected = true; };
+  ws.onclose = () => { window.__stream.connected = false; setTimeout(connect, 500); };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      const m = JSON.parse(ev.data);
+      if (m.type === "meta") pendingMeta[m.id] = m.t;
+      return;
+    }
+    const buf = new Uint8Array(ev.data);
+    const view = new DataView(buf.buffer);
+    const frameId = Number(view.getBigUint64(0, false)); // u64 big-endian
+    const jpeg = buf.subarray(8);
+    const arrival = Date.now();
+    const hostT = pendingMeta[frameId];
+    delete pendingMeta[frameId];
+    const blob = new Blob([jpeg], { type: "image/jpeg" });
+    createImageBitmap(blob).then((bmp) => {
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      const st = window.__stream;
+      st.frameId = frameId;
+      st.presented += 1;
+      frameCount += 1;
+      if (hostT !== undefined) {
+        st.lastHostT = hostT;
+        st.latencyMs = arrival - hostT;
+      }
+      const now = performance.now();
+      if (now - lastFpsT >= 1000) {
+        st.fps = Math.round((frameCount * 1000) / (now - lastFpsT));
+        frameCount = 0;
+        lastFpsT = now;
+      }
+      statusEl.textContent =
+        `frame=${st.frameId} fps=${st.fps} latency=${st.latencyMs.toFixed(1)}ms hostT=${st.lastHostT}`;
+    });
+  };
+}
+connect();
+
+// Input: forward physical key events with a monotonic sequence number.
+function sendKey(down, e) {
+  if (!ws || ws.readyState !== 1) return;
+  window.__stream.seq += 1;
+  ws.send(JSON.stringify({ type: "key", code: e.code, down, seq: window.__stream.seq }));
+}
+window.addEventListener("keydown", (e) => { if (!e.repeat) sendKey(true, e); });
+window.addEventListener("keyup", (e) => sendKey(false, e));
+</script>

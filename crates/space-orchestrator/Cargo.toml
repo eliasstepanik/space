@@ -1,0 +1,23 @@
+[package]
+name = "space-orchestrator"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Cluster orchestrator: shard-id allocation, split/merge topology, epoch publication, autoscaler, shard launcher"
+
+[dependencies]
+space-world = { workspace = true }
+space-protocol = { workspace = true }
+space-sim = { workspace = true }
+space-net = { path = "../space-net" }
+# `ids` composes `space_server::alloc::ShardIdAllocator` with persistence
+# (plan §1.2: the allocator type stays in space-server; the counter moves here).
+# `launcher::local` runs a real in-process shard (Shard + ShardNet) so the
+# split/merge loop is verifiable in-sandbox (plan §3.4).
+space-server = { path = "../space-server" }
+quinn = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

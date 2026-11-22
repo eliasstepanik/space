@@ -1,0 +1,12 @@
+[package]
+name = "space-ecs"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Custom archetype ECS: generational entities, SoA archetype columns, typed queries with change ticks, command buffer and staged scheduler"
+
+[lints]
+workspace = true
+
+[dev-dependencies]

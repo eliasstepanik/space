@@ -1,0 +1,43 @@
+# Space shard image: builds `space-server` (release) and runs it as an
+# orchestrated shard.
+#
+# Build from the REPOSITORY ROOT (the workspace is the build context):
+#   docker build -f deploy/Dockerfile.shard -t space/shard .
+#
+# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
+# inspection only; the first real build is the Docker-equipped-runner entry
+# criterion (docs/plan-phase3.md P3.0).
+
+# ---- build stage ----------------------------------------------------------
+FROM rust:1.100-bookworm AS build
+WORKDIR /src
+# `rust-toolchain.toml` pins 1.100.0 *and* the wasm32 target; the image already
+# has 1.100, so select it explicitly rather than have rustup fetch a target
+# the server does not need.
+ENV RUSTUP_TOOLCHAIN=1.100.0
+COPY . .
+RUN cargo build --release --locked -p space-server --bin space-server
+
+# ---- runtime stage --------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN useradd --create-home --uid 10001 shard
+COPY --from=build /src/target/release/space-server /usr/local/bin/space-server
+USER shard
+
+# QUIC is UDP. Bind the wildcard so the container's published port is reachable;
+# the address peers/clients should DIAL is passed as SHARD_ADVERTISE.
+ENV SHARD_BIND=0.0.0.0:7870 \
+    SPACE_CLUSTER=space-local
+EXPOSE 7870/udp
+
+# The orchestrator's control address (ORCHESTRATOR_ADDR) and the advertised
+# address (SHARD_ADVERTISE) are required, as `ip:port` (they are parsed as socket
+# addresses, not resolved as host names). An optional SHARD_CLAIM_REGION
+# (`depth:x:y:z`) is added by the shell below when set. The id and region come
+# from the orchestrator's welcome: no `--shard` here (H9).
+ENTRYPOINT ["/bin/sh", "-c", "exec space-server \
+  --orchestrator \"${ORCHESTRATOR_ADDR:?set ORCHESTRATOR_ADDR=ip:port}\" \
+  --cluster \"$SPACE_CLUSTER\" \
+  --bind \"$SHARD_BIND\" \
+  --advertise \"${SHARD_ADVERTISE:?set SHARD_ADVERTISE=ip:port}\" \
+  ${SHARD_CLAIM_REGION:+--claim-region \"$SHARD_CLAIM_REGION\"}", "space-shard"]
