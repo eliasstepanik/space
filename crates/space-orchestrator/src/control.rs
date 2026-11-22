@@ -150,7 +150,9 @@ impl ControlPlane {
                 // legitimately differ from a placeholder the split staged, so
                 // the known-id path always confirms and lets the region
                 // endpoint be refreshed below.
-                self.ids.reserve(hello.shard);
+                self.ids
+                    .reserve(hello.shard)
+                    .map_err(|e| format!("could not persist the reservation of {}: {e}", hello.shard.0))?;
                 hello.shard
             }
         };
