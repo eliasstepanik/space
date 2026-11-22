@@ -284,6 +284,9 @@ pub struct RenderContext {
     /// instance (requested *and* installed). Lets a test tell "validated and
     /// clean" apart from "no layer, so nothing to report".
     validation_active: bool,
+    /// True when the instance was created with the window-surface extensions
+    /// (`ContextOptions::window_display`); `Swapchain::new` refuses otherwise.
+    pub(crate) window_surface: bool,
 }
 
 impl RenderContext {
