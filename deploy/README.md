@@ -58,7 +58,9 @@ wasm viewer is served separately: build it (`crates/space-viewer/README.md`:
 --out-dir crates/space-viewer/pkg`) and serve `crates/space-viewer/` with any
 static server, e.g. `python3 -m http.server 8000`. Open
 `http://127.0.0.1:8000/index.html?ws=ws://127.0.0.1:8099`; the `ws` query
-parameter is the viewer's only configuration (default `ws://127.0.0.1:8099`).
+parameter is the viewer's only configuration (default: port 8099 on the host
+that served the page, `ws://<page hostname>:8099`). The viewer shows a status
+line and reconnects on its own when the stream goes away.
 `ws://` only, no TLS; put a TLS-terminating proxy in front for `wss://`.
 
 ## What is and is not verified

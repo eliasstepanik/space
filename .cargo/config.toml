@@ -1,0 +1,14 @@
+# Link the MSVC C runtime statically on Windows.
+#
+# By default a `*-pc-windows-msvc` binary imports `VCRUNTIME140.dll`, which is
+# not part of Windows: it only exists where a Visual C++ redistributable was
+# installed. The release workflow attaches a bare `space-client.exe`, so on a
+# clean machine it would fail to start with "VCRUNTIME140.dll was not found".
+# With `+crt-static` the C runtime (vcruntime and the universal CRT) is linked
+# into the executable instead, which then imports only DLLs that are part of
+# Windows itself (kernel32, ntdll, ...).
+#
+# Scoped to the MSVC target only: Linux and the wasm32 viewer are unaffected.
+# Note that a `RUSTFLAGS` environment variable replaces this list entirely.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

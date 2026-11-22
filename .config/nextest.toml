@@ -1,0 +1,20 @@
+# cargo-nextest configuration (`cargo run -p xtask -- ci` runs nextest when it
+# is installed).
+#
+# nextest runs every test in its own process, as many at once as there are CPUs.
+# The tests of the packages below create a Vulkan device when one is available,
+# and GPU tests must not run in parallel (skills/space-dev/SKILL.md). On CI they
+# skip (no usable device), but on a developer machine with a real GPU a plain
+# nextest run would start many devices at once. This group runs them one at a
+# time; every other test stays parallel.
+#
+# Keep the package list in sync with `GPU_PACKAGES` in xtask/src/main.rs (its
+# `cargo test` fallback passes `--test-threads=1` for the same packages; a unit
+# test there checks the two lists agree).
+
+[test-groups]
+gpu = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(space-render) | package(space-client) | package(space-mcp-client)'
+test-group = 'gpu'
