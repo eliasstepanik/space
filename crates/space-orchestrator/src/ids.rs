@@ -127,13 +127,12 @@ impl FileCounterSink {
 
 impl CounterSink for FileCounterSink {
     fn persist(&mut self, next: u64) -> io::Result<()> {
-        // Write to a sibling temp file, then rename over the target. Delete
-        // first: on Windows a plain rename over an existing file fails, and the
-        // delete-then-rename window is the "skipped id" case the module docs
-        // already allow.
-        let tmp = self.path.with_extension("tmp");
+        // Write to a sibling temp file, then rename it directly over the
+        // target. The rename is atomic and replaces the destination, so a crash
+        // leaves either the old or the new counter file present, never neither.
+        // The target is deliberately not removed first.
+        let tmp = Self::tmp_path(&self.path);
         std::fs::write(&tmp, format!("{next}\n"))?;
-        let _ = std::fs::remove_file(&self.path);
         std::fs::rename(&tmp, &self.path)?;
         if let Ok(dir) = std::fs::File::open(self.path.parent().unwrap_or(Path::new("."))) {
             // Best-effort durability; a failure here is not worth failing the
