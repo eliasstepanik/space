@@ -111,7 +111,8 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
         .ship_of(welcome.session)
         .expect("a join spawns a ship");
 
-    // Watch for ~1.5 s (45 ticks): frames must keep arriving, no Redirect.
+    // Watch for ~1.5 s (45 ticks): the first frame carries the ship, and no
+    // Redirect may ever follow (an idle ship is not re-sent in deltas).
     let deadline = Instant::now() + Duration::from_millis(1_500);
     let mut own_frames = 0u32;
     let mut redirects = Vec::new();
@@ -149,8 +150,8 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
             .collect::<Vec<_>>()
     );
     assert!(
-        own_frames >= 2,
-        "the client must keep receiving frames for its own ship, got {own_frames}"
+        own_frames >= 1,
+        "the client must receive a frame carrying its own ship, got {own_frames}"
     );
 
     shard.abort();
