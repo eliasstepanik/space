@@ -13,6 +13,11 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use crate::gpu::{RenderContext, RenderError};
 use crate::passes::FrameGpu;
 
+/// Upper bound for every blocking Vulkan wait in `present` (acquire, fences),
+/// in nanoseconds. Finite so a stuck GPU/compositor surfaces as an error
+/// instead of freezing the window's event loop.
+const PRESENT_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// A window a swapchain can be created for.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowHandles {
