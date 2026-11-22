@@ -43,24 +43,8 @@ jobs:
           echo "::endgroup::"
           vulkaninfo --json > vulkaninfo.json || true
           if [ -s vulkaninfo.json ]; then
-            python3 - <<'PY' || echo "ray_query: could not be determined from vulkaninfo.json"
-import json
-with open("vulkaninfo.json") as f:
-    info = json.load(f)
-groups = info.get("device_group", [])
-found = False
-for g in groups:
-    for dev in g.get("devices", []):
-        name = dev.get("deviceName", "<unknown>")
-        feats = dev.get("VkPhysicalDeviceFeatures2", {}).get("features", {})
-        rq = feats.get("VkPhysicalDeviceRayQueryFeaturesKHR", {}).get("rayQuery")
-        print(f"device: {name} (apiVersion={dev.get('apiVersion')}) ray_query={rq}")
-        if "llvmpipe" in name.lower() or "lavapipe" in name.lower():
-            found = True
-            print(f"lavapipe ray_query: {rq}")
-if not found:
-    print("lavapipe: no llvmpipe/lavapipe device reported by vulkaninfo")
-PY
+            python3 .github/scripts/ray_query_report.py \
+              || echo "ray_query: could not be determined from vulkaninfo.json"
           else
             echo "vulkaninfo produced no JSON; no Vulkan device on this runner"
           fi
