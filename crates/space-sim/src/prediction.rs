@@ -43,6 +43,20 @@ use crate::physics::step_ship;
 use crate::tick::SimTick;
 use crate::ShipState;
 
+/// How far past the last authoritative tick [`PredictedShip::predict`] will
+/// replay, in ticks — and how many unacknowledged inputs
+/// [`PredictedShip::apply_input`] keeps.
+///
+/// Both numbers come off the network: the tick to predict to is a snapshot's
+/// tick (or a clock derived from one), and the queue grows by one per tick for
+/// as long as the server acknowledges nothing. Unbounded, a corrupt or hostile
+/// `new_tick` (say `u64::MAX`) would make [`PredictedShip::reconcile`] replay
+/// forever, and an outage would grow the queue without limit. 300 ticks is 10 s
+/// at [`crate::tick::TICK_HZ`] — an order of magnitude more than a healthy
+/// prediction window (latency plus the snapshot interval, a handful of ticks),
+/// so the bound never changes a prediction that means anything.
+pub const MAX_PREDICT_TICKS: SimTick = 300;
+
 /// A predicted ship: the last authoritative state plus the inputs on their way
 /// to the server.
 ///
@@ -50,6 +64,17 @@ use crate::ShipState;
 /// [`ShipParams`] the integrator needs — prediction must integrate with exactly
 /// the parameters the server used, so they live next to the state rather than
 /// being threaded through every call.
+///
+/// # Invariant
+///
+/// [`pending`](Self::pending) is sorted by tick, holds at most one input per
+/// tick, at most [`MAX_PREDICT_TICKS`] inputs, and — after every
+/// [`apply_input`](Self::apply_input) and [`reconcile`](Self::reconcile) — no
+/// input at or before [`last_tick`](Self::last_tick). The last part matters: the
+/// server applies an input tagged `T` only in the step that *produces* tick `T`
+/// and drops it once that tick has passed, so an input the authority has
+/// already moved past is dead, and leaving it in the queue would let
+/// [`predict`](Self::predict) "hold" a stick the server never saw.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PredictedShip {
     /// The newest state the server has confirmed.
@@ -91,13 +116,21 @@ impl PredictedShip {
     /// Inputs are kept in tick order. An input that repeats a tick already
     /// pending *replaces* it — that is a client correcting itself before the
     /// server saw it, and keeping both would double-step the ship.
+    ///
+    /// An input for a tick the authority already covers (`tick <= last_tick`) is
+    /// **ignored**: the server can no longer apply it (see the
+    /// [invariant](Self#invariant)), so it must not enter the replay queue. That
+    /// is ordinary network timing — a snapshot overtook the input — not a logic
+    /// error, so it is not a panic in any build.
+    ///
+    /// The queue is bounded at [`MAX_PREDICT_TICKS`] inputs; past that the
+    /// oldest is dropped (after ten seconds without an acknowledgement the
+    /// server has certainly dropped it too, and the newest inputs are the ones
+    /// a late snapshot will still be waiting for).
     pub fn apply_input(&mut self, input: PlayerInput) {
-        debug_assert!(
-            input.tick > self.last_tick,
-            "apply_input: tick {} is already covered by authority {}",
-            input.tick,
-            self.last_tick
-        );
+        if input.tick <= self.last_tick {
+            return;
+        }
         if let Some(slot) = self.pending.iter_mut().find(|p| p.tick == input.tick) {
             *slot = input;
             return;
@@ -108,6 +141,10 @@ impl PredictedShip {
         match self.pending.iter().rposition(|p| p.tick < input.tick) {
             Some(i) => self.pending.insert(i + 1, input),
             None => self.pending.push_front(input),
+        }
+        let cap = usize::try_from(MAX_PREDICT_TICKS).unwrap_or(usize::MAX);
+        while self.pending.len() > cap {
+            self.pending.pop_front();
         }
     }
 
@@ -131,17 +168,19 @@ impl PredictedShip {
     /// the ship coasts. `tick <= last_tick` returns the authoritative state
     /// unchanged.
     ///
+    /// The replay is **bounded**: at most [`MAX_PREDICT_TICKS`] steps are taken,
+    /// so `predict(tick)` for a `tick` further ahead than that returns the state
+    /// at `last_tick + MAX_PREDICT_TICKS`. `tick` ultimately comes off the
+    /// network; without the bound a single absurd value is an endless loop.
+    ///
     /// [`SimWorld::step`]: crate::SimWorld::step
     #[must_use]
     pub fn predict(&self, tick: SimTick) -> ShipState {
-        let steps = tick.saturating_sub(self.last_tick);
+        let steps = tick.saturating_sub(self.last_tick).min(MAX_PREDICT_TICKS);
         let mut state = self.authoritative;
         if steps == 0 {
             return state;
         }
-        // A prediction window longer than `usize` cannot be replayed on this
-        // platform; clamping is deterministic and only happens for absurd ticks.
-        let steps = usize::try_from(steps).unwrap_or(usize::MAX);
         let coast = Self::coast(tick);
         let last_pending = self.pending.back().unwrap_or(&coast);
         // Index the pending inputs by tick so a gap coasts instead of shifting the
@@ -149,11 +188,9 @@ impl PredictedShip {
         for step in 0..steps {
             // The step producing tick `t` consumes the input tagged `t` (the
             // server drains `input_buf[tick + 1]`), so the first step after
-            // `last_tick` uses the input tagged `last_tick + 1`.
-            let step_tick = self
-                .last_tick
-                .wrapping_add(1)
-                .wrapping_add(u64::try_from(step).unwrap_or(u64::MAX));
+            // `last_tick` uses the input tagged `last_tick + 1`. This cannot
+            // overflow: `last_tick + steps <= tick`.
+            let step_tick = self.last_tick.wrapping_add(1).wrapping_add(step);
             // The first `pending.len()` ticks replay the pending inputs *by tick*;
             // a tick with no pending input coasts (a lost/never-sent input). Past
             // the last pending tick the client holds its last input (or coasts).
@@ -185,15 +222,44 @@ impl PredictedShip {
     /// corrected or never-sent tick) cannot shift the drop window onto the wrong
     /// inputs. The rest survive and are replayed on top of the new authority by
     /// the next [`predict`](Self::predict).
+    ///
+    /// Inputs with `tick <= new_tick` are dropped as well, acknowledged or not.
+    /// The server applies an input tagged `T` only in the step that produces
+    /// tick `T`; an authority at `new_tick` therefore already contains every
+    /// input up to `new_tick` that will *ever* be applied, and one the server
+    /// missed is gone for good. Such an input could never be replayed (the
+    /// replay starts at `new_tick + 1`), but left in the queue it could be the
+    /// *newest* entry — and [`predict`](Self::predict) holds the newest entry
+    /// past the end of the queue, so the client would keep predicting thrust
+    /// the server never applied, snapshot after snapshot.
+    ///
+    /// # Stale snapshots
+    ///
+    /// A snapshot **older than the current authority** (`new_tick < last_tick`)
+    /// is ignored and reports a correction of `0.0`: deltas travel as datagrams
+    /// and can be reordered, and adopting an older state would rewind the ship
+    /// after the inputs between the two ticks have already been dropped — the
+    /// replay would coast through ticks the server actually drove. A snapshot
+    /// for the *same* tick is adopted as before (it is idempotent).
+    ///
+    /// "Older" is a statement about **one** tick clock. A ship that is handed to
+    /// a shard whose tick counter differs must be given a fresh `PredictedShip`
+    /// seeded from that shard's first snapshot: its pending inputs are tagged in
+    /// the old clock, and this guard would otherwise sit out every snapshot of a
+    /// shard whose clock is behind.
     pub fn reconcile(
         &mut self,
         new_authority: ShipState,
         new_tick: SimTick,
         input_ack: SimTick,
     ) -> f32 {
+        if new_tick < self.last_tick {
+            return 0.0;
+        }
         let predicted = self.predict(new_tick);
         let correction = WorldPos::distance(predicted.pos, new_authority.pos) as f32;
-        self.pending.retain(|i| i.tick > input_ack);
+        let covered = input_ack.max(new_tick);
+        self.pending.retain(|i| i.tick > covered);
         self.authoritative = new_authority;
         self.last_tick = new_tick;
         correction
@@ -467,6 +533,151 @@ mod tests {
             one_step.ship_state(guid()).unwrap(),
             "predict(1) must equal the server after one driven step"
         );
+    }
+
+    /// A snapshot older than the current authority (a reordered datagram) must
+    /// not rewind the ship: the inputs between the two ticks were already
+    /// dropped by the newer acknowledgement, so adopting it would replay those
+    /// ticks as a coast.
+    #[test]
+    fn reconcile_ignores_a_snapshot_older_than_the_authority() {
+        let script = driven(8, [1.0, 0.0, 0.0]);
+        let mut p = predicted();
+        for slot in &script {
+            p.apply_input(slot.unwrap());
+        }
+        let at_3 = server_truth(ShipState::IDENTITY, &script[..3]);
+        let at_5 = server_truth(ShipState::IDENTITY, &script[..5]);
+        assert_eq!(p.reconcile(at_5, 5, 5), 0.0);
+        let before = p.clone();
+
+        // The tick-3 snapshot arrives late.
+        let correction = p.reconcile(at_3, 3, 3);
+        assert_eq!(correction, 0.0, "a stale snapshot applies no correction");
+        assert_eq!(p, before, "a stale snapshot must change nothing");
+        // The prediction is still the server's future, not a rewound one.
+        assert_eq!(p.predict(8), server_truth(ShipState::IDENTITY, &script));
+
+        // A repeat of the *current* tick is still adopted (idempotent).
+        assert_eq!(p.reconcile(at_5, 5, 5), 0.0);
+        assert_eq!(p, before);
+    }
+
+    /// The replay window is bounded: a tick absurdly far ahead (it comes off
+    /// the network) must not loop forever, in `predict` or in `reconcile`.
+    #[test]
+    fn predict_is_bounded_for_an_absurd_tick() {
+        use super::MAX_PREDICT_TICKS;
+
+        let mut p = predicted();
+        p.apply_input(input(1, [1.0, 0.0, 0.0]));
+        // Held thrust: the ship is still accelerating at the bound, so every
+        // further step would change the state.
+        let at_bound = p.predict(MAX_PREDICT_TICKS);
+        assert_ne!(at_bound, p.predict(MAX_PREDICT_TICKS - 1));
+        // Past the bound nothing more is replayed. (Unbounded, the next line is
+        // 2^64 integrator steps.)
+        assert_eq!(p.predict(MAX_PREDICT_TICKS + 1), at_bound);
+        assert_eq!(p.predict(u64::MAX), at_bound);
+
+        // `reconcile` predicts to the snapshot's tick: it must return too.
+        let mut q = p.clone();
+        let correction = q.reconcile(ShipState::IDENTITY, u64::MAX, 0);
+        assert!(correction.is_finite());
+        assert_eq!(q.last_tick, u64::MAX);
+        assert_eq!(q.pending_ticks(), 0);
+        // Nothing lies beyond the last tick, so nothing more is predicted or
+        // queued — and nothing overflows.
+        assert_eq!(q.predict(u64::MAX), ShipState::IDENTITY);
+        q.apply_input(input(7, [1.0, 0.0, 0.0]));
+        assert_eq!(q.pending_ticks(), 0);
+    }
+
+    /// With the server silent, the pending queue stops growing at
+    /// `MAX_PREDICT_TICKS` and keeps the newest inputs.
+    #[test]
+    fn pending_queue_is_bounded() {
+        use super::MAX_PREDICT_TICKS;
+
+        let mut p = predicted();
+        let total = MAX_PREDICT_TICKS * 3 + 17;
+        for tick in 1..=total {
+            p.apply_input(input(tick, [0.5, 0.0, 0.0]));
+        }
+        assert_eq!(p.pending_ticks() as u64, MAX_PREDICT_TICKS);
+        assert_eq!(p.pending.back().map(|i| i.tick), Some(total));
+        assert_eq!(
+            p.pending.front().map(|i| i.tick),
+            Some(total - MAX_PREDICT_TICKS + 1)
+        );
+        let ticks: Vec<u64> = p.pending.iter().map(|i| i.tick).collect();
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]), "still sorted");
+    }
+
+    /// An input the authority has already moved past is dead even when the
+    /// server never acknowledged it — the server drops an input once its tick
+    /// has been simulated — so `reconcile` must drop it too. Left in the queue
+    /// it becomes the "last pending input" and `predict` holds it forever: the
+    /// client predicts thrust the server never applied.
+    #[test]
+    fn reconcile_drops_inputs_the_authority_has_passed() {
+        let thrust = [1.0, 0.0, 0.0];
+        let mut p = predicted();
+        // The client sent ticks 1..=4, then released the stick and sent nothing.
+        for tick in 1..=4 {
+            p.apply_input(input(tick, thrust));
+        }
+        // The server got 1 and 2 only; 3 and 4 were lost. Its tick-6 state:
+        let mut seen: Vec<Option<PlayerInput>> =
+            vec![Some(input(1, thrust)), Some(input(2, thrust))];
+        seen.resize(6, None);
+        let at_6 = server_truth(ShipState::IDENTITY, &seen);
+        // ...arrives with input_ack = 2 (the highest input tick it applied).
+        let correction = p.reconcile(at_6, 6, 2);
+        assert!(correction > 0.0, "the client had predicted the lost thrust");
+        assert_eq!(
+            p.pending_ticks(),
+            0,
+            "inputs 3 and 4 are behind the authority and can never be applied"
+        );
+
+        // From here the server coasts, and so must the prediction. (Holding
+        // the stale tick-4 input instead would keep thrusting.)
+        seen.resize(9, None);
+        assert_eq!(p.predict(9), server_truth(ShipState::IDENTITY, &seen));
+
+        // An acknowledgement *ahead* of the snapshot tick still wins: inputs up
+        // to it are dropped even though their ticks are in the future.
+        let mut p = predicted();
+        for tick in 1..=8 {
+            p.apply_input(input(tick, thrust));
+        }
+        p.reconcile(ShipState::IDENTITY, 2, 5);
+        let ticks: Vec<u64> = p.pending.iter().map(|i| i.tick).collect();
+        assert_eq!(ticks, [6, 7, 8]);
+    }
+
+    /// An input for a tick the authority already covers is ignored (in every
+    /// build — a snapshot overtaking an input is ordinary timing, not a bug).
+    #[test]
+    fn apply_input_ignores_a_tick_the_authority_already_covers() {
+        let script = driven(8, [1.0, 0.0, 0.0]);
+        let mut p = predicted();
+        for slot in &script {
+            p.apply_input(slot.unwrap());
+        }
+        let at_5 = server_truth(ShipState::IDENTITY, &script[..5]);
+        p.reconcile(at_5, 5, 5);
+        let before = p.clone();
+
+        p.apply_input(input(5, [0.0, 1.0, 0.0])); // the authority's own tick
+        p.apply_input(input(2, [0.0, 0.0, 1.0])); // long gone
+        assert_eq!(p, before, "a dead input must not enter the queue");
+        assert_eq!(p.predict(8), server_truth(ShipState::IDENTITY, &script));
+
+        // The next tick is live.
+        p.apply_input(input(6, [0.0, 1.0, 0.0]));
+        assert_eq!(p.pending[0].thrust, [0.0, 1.0, 0.0]);
     }
 
     /// A tiny integer-only PRNG so the test's input script is deterministic.

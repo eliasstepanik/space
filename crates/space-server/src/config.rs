@@ -37,6 +37,30 @@ pub const REDIRECT_TIMEOUT_TICKS: SimTick = 4 * space_sim::TICK_HZ as SimTick;
 /// transfer) we fall back to the ordinary join behaviour.
 pub const ADOPT_TIMEOUT_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 
+/// Ticks a shard waits before offering an entity to the **same** peer again
+/// after that peer refused it.
+///
+/// A refusal is the peer's [`HandoffAbort`](space_protocol::HandoffAbort)
+/// (`TargetFull`, "entity is not available here", …) or its
+/// [`StaleEpoch`](space_protocol::StaleEpoch). The ship is still across the
+/// boundary on the next tick, so without a pause the shard re-offered at once —
+/// about fifteen offer/refusal round trips a second, each with a `Redirect`
+/// (carrying the whole shard map) to every client watching the ship — for as
+/// long as the peer kept refusing. Two seconds matches the handoff timeout: it
+/// is the rate a peer that does not answer at all is retried at. A shard-map
+/// change clears the pause, because the refusal was about the old map.
+pub const REOFFER_BACKOFF_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
+
+/// How many inputs one client may have waiting between two ticks.
+///
+/// Every input is rewritten to the session's one ship and the simulation keeps
+/// at most one input per ship per tick for the next
+/// [`MAX_INPUT_LEAD`](space_sim::sim_world::MAX_INPUT_LEAD) ticks, so a client
+/// has no use for more than a few redundant windows of that size. Without a cap
+/// a single 1 MiB frame put ~23 000 inputs through the simulation's buffer under
+/// the shard lock.
+pub const MAX_PENDING_INPUTS: usize = 4 * (space_sim::sim_world::MAX_INPUT_LEAD as usize + 1);
+
 /// The settings of one shard.
 #[derive(Debug, Clone)]
 pub struct ShardConfig {

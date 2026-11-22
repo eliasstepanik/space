@@ -90,10 +90,12 @@ fn hot_report(s: ShardId) -> LoadReport {
     }
 }
 
+/// A cold **and empty** shard: only a shard with no players is merged away (a
+/// merge removes the shard, and nothing hands its players to anyone).
 fn cold_report(s: ShardId) -> LoadReport {
     LoadReport {
         shard: s,
-        players: 5,
+        players: 0,
         tick_p95_ms: 1.0,
         load: 0.0,
     }
@@ -225,26 +227,31 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
     for _ in 0..(space_orchestrator::autoscale::MERGE_DWELL_TICKS + 5) {
         orch.handle_load_report(&cold_report(shard(2)));
         orch.tick();
-        let kills = orch.take_pending_kill();
-        if !kills.is_empty() {
-            staged_kill = true;
-            assert!(
-                kills.contains(&shard(2)),
-                "the cold child is staged for kill"
-            );
-            let recipients: Vec<(ShardId, u64)> = orch
-                .drain_outbox()
-                .into_iter()
-                .filter_map(|(to, m)| match m {
-                    Message::EpochPrepare(p) => Some((to, p.epoch)),
-                    _ => None,
-                })
-                .collect();
-            for (r, epoch) in recipients {
-                orch.handle_epoch_ack(r, epoch);
-            }
-            break;
+        assert!(
+            orch.take_pending_kill().is_empty(),
+            "nothing is killed before the merge has committed"
+        );
+        let recipients: Vec<(ShardId, u64)> = orch
+            .drain_outbox()
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                Message::EpochPrepare(p) => Some((to, p.epoch)),
+                _ => None,
+            })
+            .collect();
+        if recipients.is_empty() {
+            continue;
         }
+        // The merge was proposed: the child is still running (it has to ack).
+        assert_eq!(orch.pending_merge(), Some(shard(2)));
+        for (r, epoch) in recipients {
+            orch.handle_epoch_ack(r, epoch);
+        }
+        // Committed: only now is the cold child staged for kill.
+        let kills = orch.take_pending_kill();
+        assert_eq!(kills, vec![shard(2)], "the cold child is staged for kill");
+        staged_kill = true;
+        break;
     }
     assert!(staged_kill, "a merge staged a kill");
     assert_eq!(orch.map().epoch, 2, "the merge bumped the epoch");
@@ -359,7 +366,9 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
 #[tokio::test]
 async fn the_local_launcher_spawns_a_reachable_child_over_loopback() {
     // The launcher half of a split: a spawned shard answers a real client.
-    let launcher = LocalLauncher::new();
+    // Detached — there is no orchestrator here for it to register with; the
+    // registering launch is proven end to end in `boot_loopback.rs`.
+    let launcher = LocalLauncher::detached();
     let spec = SpawnSpec {
         shard: shard(2),
         region: ShardRegion::new(NodeRef::new(40, [0, 0, 0]), shard(2), addr(0)),

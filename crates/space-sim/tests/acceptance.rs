@@ -1160,11 +1160,175 @@ fn ship_state_codec_rejects_non_finite_dynamics() {
         }
     }
 
-    // A finite value in those fields is still accepted (sanity: the check is
-    // finiteness, not a range).
+    // A finite, plausible value in those fields is still accepted.
     let mut ok = encode_ship_state(&base);
-    ok[36..40].copy_from_slice(&1e30f32.to_bits().to_be_bytes());
+    ok[36..40].copy_from_slice(&2.5e4f32.to_bits().to_be_bytes());
     assert!(decode_ship_state(&ok).is_ok(), "a finite vel is accepted");
+}
+
+/// Finite is not enough: `decode_ship_state` also rejects a state the integrator
+/// could not have produced and could be driven to `inf`/NaN by — a quaternion
+/// far from unit, an absurd linear or angular velocity — while every state the
+/// simulation *does* produce still round-trips bit for bit.
+///
+/// The first block shows the poisoning the check exists to stop: the forged
+/// state is entirely finite, and one tick of thrust later the ship is not.
+#[test]
+fn ship_state_codec_rejects_states_that_would_poison_the_integrator() {
+    use space_sim::wire::{
+        decode_ship_state, encode_ship_state, MAX_SPEED, MAX_SPIN, QUAT_NORM2_MAX, QUAT_NORM2_MIN,
+    };
+
+    let base = ShipState::at_rest(WorldPos::from_metres([5_000, -7_000, 9_000]));
+    let params = ShipParams::PLACEHOLDER;
+    let thrust = PlayerInput {
+        entity: guid(1),
+        thrust: [0.0, 0.0, 1.0],
+        torque: [0.0; 3],
+        tick: 1,
+    };
+    let coast = PlayerInput {
+        thrust: [0.0; 3],
+        ..thrust
+    };
+    let is_finite = |s: &ShipState| {
+        s.pos.local.iter().all(|v| v.is_finite())
+            && s.vel.iter().all(|v| v.is_finite())
+            && s.quat.iter().all(|v| v.is_finite())
+            && s.ang_vel.iter().all(|v| v.is_finite())
+    };
+
+    // --- why: a finite but huge quaternion poisons the state in one tick -----
+    let mut huge_quat = base;
+    huge_quat.quat = [0.0, 2.0e19, 0.0, 0.0];
+    assert!(is_finite(&huge_quat), "the forged state itself is finite");
+    let mut poisoned = huge_quat;
+    step_ship(&mut poisoned, &thrust, &params);
+    assert!(
+        !is_finite(&poisoned),
+        "one tick of thrust must overflow: {poisoned:?}"
+    );
+    assert!(
+        decode_ship_state(&encode_ship_state(&huge_quat)).is_err(),
+        "a quaternion of norm 2e19 must be rejected"
+    );
+
+    // --- and a finite but absurd spin does it with no input at all ------------
+    // The angular damping term overflows: -inf after one tick, NaN after two.
+    let mut huge_spin = base;
+    huge_spin.ang_vel = [3.0e38, 0.0, 0.0];
+    let mut poisoned = huge_spin;
+    step_ship(&mut poisoned, &coast, &params);
+    step_ship(&mut poisoned, &coast, &params);
+    assert!(
+        poisoned.ang_vel[0].is_nan(),
+        "two coasting ticks must turn the spin into NaN: {poisoned:?}"
+    );
+    assert!(decode_ship_state(&encode_ship_state(&huge_spin)).is_err());
+
+    // --- the quaternion bound: |q|² within QUAT_NORM2_MIN..=QUAT_NORM2_MAX ----
+    let with_quat = |quat: [f32; 4]| {
+        let mut s = base;
+        s.quat = quat;
+        decode_ship_state(&encode_ship_state(&s))
+    };
+    for bad in [
+        [0.0; 4],                // degenerate
+        [0.5, 0.0, 0.0, 0.0],    // |q|² = 0.25
+        [0.0, 0.0, 1.5, 0.0],    // |q|² = 2.25
+        [1.0, 1.0, 1.0, 1.0],    // |q|² = 4
+        [3.0e38, 0.0, 0.0, 0.0], // |q|² overflows to inf
+        [0.0, 0.0, 0.0, -1.0e30],
+    ] {
+        assert!(with_quat(bad).is_err(), "quat {bad:?} must be rejected");
+    }
+    for good in [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, -1.0],
+        [0.923_879_5, 0.0, 0.382_683_4, -0.0],
+        [0.5, 0.5, 0.5, 0.5],
+        // Hand-written and not quite unit: accepted, the integrator normalises.
+        [0.7, 0.7, 0.0, 0.0],
+        [1.1, 0.0, 0.0, 0.0],
+    ] {
+        let back = with_quat(good).unwrap_or_else(|e| panic!("quat {good:?}: {e}"));
+        for axis in 0..4 {
+            assert_eq!(back.quat[axis].to_bits(), good[axis].to_bits());
+        }
+    }
+    // Just inside and just outside each end of the accepted |q|² range.
+    for (norm2, accepted) in [
+        (QUAT_NORM2_MIN * 0.99, false),
+        (QUAT_NORM2_MIN * 1.01, true),
+        (QUAT_NORM2_MAX * 0.99, true),
+        (QUAT_NORM2_MAX * 1.01, false),
+    ] {
+        let w = norm2.sqrt();
+        assert_eq!(
+            with_quat([w, 0.0, 0.0, 0.0]).is_ok(),
+            accepted,
+            "|q|² = {norm2}"
+        );
+    }
+
+    // --- the velocity bounds, on every axis, both signs -----------------------
+    for axis in 0..3 {
+        for sign in [1.0f32, -1.0] {
+            let mut s = base;
+            s.vel[axis] = sign * MAX_SPEED;
+            assert!(
+                decode_ship_state(&encode_ship_state(&s)).is_ok(),
+                "vel[{axis}] at the limit is accepted"
+            );
+            s.vel[axis] = sign * MAX_SPEED * 1.001;
+            assert!(
+                decode_ship_state(&encode_ship_state(&s)).is_err(),
+                "vel[{axis}] beyond the limit is rejected"
+            );
+            s.vel[axis] = sign * 1.0e30;
+            assert!(decode_ship_state(&encode_ship_state(&s)).is_err());
+
+            let mut s = base;
+            s.ang_vel[axis] = sign * MAX_SPIN;
+            assert!(
+                decode_ship_state(&encode_ship_state(&s)).is_ok(),
+                "ang_vel[{axis}] at the limit is accepted"
+            );
+            s.ang_vel[axis] = sign * MAX_SPIN * 1.001;
+            assert!(
+                decode_ship_state(&encode_ship_state(&s)).is_err(),
+                "ang_vel[{axis}] beyond the limit is rejected"
+            );
+        }
+    }
+
+    // --- no state the simulation produces is ever rejected --------------------
+    // A hard-driven ship for 2 000 ticks, then a long coast down to rest: every
+    // state on the way must decode to exactly itself, so a valid state is the
+    // same bits on both sides of the wire.
+    let mut rng = Rng::new(SEED ^ 0x5AFE);
+    let mut state = base;
+    for tick in 1..=4_000u64 {
+        let input = if tick <= 2_000 {
+            PlayerInput {
+                entity: guid(1),
+                thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
+                torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
+                tick,
+            }
+        } else {
+            coast
+        };
+        step_ship(&mut state, &input, &params);
+        let bytes = encode_ship_state(&state);
+        let back = decode_ship_state(&bytes)
+            .unwrap_or_else(|e| panic!("tick {tick}: a simulated state was rejected: {e}"));
+        assert_eq!(
+            encode_ship_state(&back),
+            bytes,
+            "tick {tick}: a valid state must round-trip bit for bit"
+        );
+    }
 }
 
 /// The largest `f32` strictly below `x` (toward negative infinity).

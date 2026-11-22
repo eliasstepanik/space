@@ -61,6 +61,12 @@ const SHADERS: &[(&str, &str, naga::ShaderStage, &str)] = &[
         naga::ShaderStage::Fragment,
         "fs_glass",
     ),
+    (
+        "forward.wgsl",
+        "forward_mesh_vs",
+        naga::ShaderStage::Vertex,
+        "vs_mesh",
+    ),
     ("post.wgsl", "post", naga::ShaderStage::Compute, "main"),
 ];
 
@@ -78,6 +84,7 @@ const LAYOUT_MAP: &[(&str, &str, &str)] = &[
     ("forward_fs", "Camera", "Camera"),
     ("forward_fs", "Light", "Light"),
     ("forward_fs", "Instance", "GpuInstance"),
+    ("forward_mesh_vs", "MeshInstance", "MeshInstanceGpu"),
 ];
 
 /// The `naga` version this build actually resolved, read from `Cargo.lock`.

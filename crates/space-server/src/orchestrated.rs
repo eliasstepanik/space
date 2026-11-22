@@ -59,11 +59,13 @@ pub struct RunningShard {
 }
 
 impl RunningShard {
-    /// Wait until the shard's endpoint closes.
+    /// Wait until the shard's endpoint closes — or its tick loop dies.
     ///
     /// # Errors
     ///
-    /// The serve task panicked or was cancelled.
+    /// The serve task panicked or was cancelled, or the tick loop ended (see
+    /// [`crate::net::supervise`]: a shard that cannot tick must not keep
+    /// serving).
     pub async fn wait(self) -> Result<(), String> {
         let Self {
             serve,
@@ -71,8 +73,7 @@ impl RunningShard {
             link,
             ..
         } = self;
-        let result = serve.await.map_err(|e| e.to_string());
-        ticking.abort();
+        let result = crate::net::supervise(serve, ticking).await;
         link.close();
         result
     }
@@ -96,7 +97,8 @@ pub async fn start_orchestrated(
     options: OrchestratedOptions,
     orch_addr: SocketAddr,
 ) -> Result<RunningShard, String> {
-    // Bind first (default `127.0.0.1:0`): without `advertise` the endpoint we
+    // Bind first (whatever `options.bind` says; the binary defaults it to the
+    // fixed `127.0.0.1:7777`): without `advertise` the endpoint we
     // report is the one we listen on. With it, we report that address instead,
     // so a peer or client on another host/container can dial us.
     let net = Arc::new(ShardNet::bind(options.bind).map_err(|e| format!("bind: {e}"))?);

@@ -10,7 +10,9 @@
 //! * server → viewer: one binary WebSocket message per frame,
 //!   `[seq: u64 BE][flags: u8][JPEG bytes…]`.
 //! * viewer → server: one small binary message per input event
-//!   ([`protocol::ViewerInput`]).
+//!   ([`protocol::ViewerInput`]): pointer position, key transitions and
+//!   *relative* view rotation (`Turn`). The proxy owns the absolute view
+//!   direction; a viewer never sends one.
 //!
 //! # Multiplayer seam
 //!
@@ -44,7 +46,7 @@ pub mod jpeg;
 pub mod server;
 
 #[cfg(feature = "net")]
-pub use jpeg::{jpeg_dimensions, EncodedJpeg, JpegEncoder, JpegError};
+pub use jpeg::{jpeg_dimensions, EncodeScratch, EncodedJpeg, JpegEncoder, JpegError};
 pub use protocol::{FrameHeader, Key, ProtocolError, ViewerInput};
 #[cfg(feature = "net")]
 pub use server::{StreamClient, StreamServer, MAX_VIEWERS};

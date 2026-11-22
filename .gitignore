@@ -13,3 +13,8 @@ artifacts/*.png
 
 # Local GPU/Vulkan userspace prefix (never commit; ~64 MB of .debs extracted)
 /.local/
+
+# Local run artefacts: offline client renders and the orchestrator state file
+/*.ppm
+/*.glb
+/space-orchestrator.id*

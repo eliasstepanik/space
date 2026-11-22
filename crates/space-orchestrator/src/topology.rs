@@ -73,6 +73,9 @@ pub enum TopologyError {
     TooSmallToSplit(NodeRef),
     /// The shard's region has no parent in the map to merge into.
     NoMergeTarget(NodeRef),
+    /// Every octant of the shard's region is already carved out for another
+    /// shard: there is nothing left of it to split off.
+    NoFreeOctant(NodeRef),
     /// A produced map violated an invariant (never expected; a bug guard).
     Invalid(String),
 }
@@ -90,6 +93,11 @@ impl core::fmt::Display for TopologyError {
             TopologyError::NoMergeTarget(n) => {
                 write!(f, "region at depth {} has no parent to merge into", n.depth)
             }
+            TopologyError::NoFreeOctant(n) => write!(
+                f,
+                "every octant of the region at depth {} is already carved out",
+                n.depth
+            ),
             TopologyError::Invalid(reason) => write!(f, "produced map is invalid: {reason}"),
         }
     }
@@ -121,12 +129,63 @@ pub fn region_of(map: &ShardMap, shard: ShardId) -> Option<&ShardRegion> {
         .max_by_key(|r| r.node.depth)
 }
 
+/// The octant of `node` whose child contains the node's centre.
+///
+/// The centre is where a shard spawns a joining ship, so in a region nobody has
+/// flown far in, this is the octant that holds the players. `0` for a node with
+/// no children (it cannot be split anyway).
+#[must_use]
+pub fn centre_octant(node: NodeRef) -> usize {
+    let centre = node.center();
+    octree::children(node)
+        .and_then(|children| {
+            children
+                .iter()
+                .position(|child| octree::contains(*child, centre))
+        })
+        .unwrap_or(0)
+}
+
+/// Which octant of `shard`'s region to carve: the first one, starting at
+/// `first` and going round (`first`, `first + 1`, … modulo 8), whose
+/// [`split_plan`] validates.
+///
+/// A [`LoadReport`](space_protocol::control::LoadReport) carries a player count,
+/// not positions, so the octant holding the most players is not knowable here.
+/// What *is* knowable is which octants are still free: an octant already carved
+/// out for another shard can never be carved again, and always proposing the
+/// same one made every split after a region's first fail validation. Callers
+/// start at [`centre_octant`] (where ships spawn) so the first split of a fresh
+/// region actually moves someone. The choice is a pure function of the map, so
+/// the same history yields the same splits (H14).
+///
+/// # Errors
+///
+/// [`TopologyError::UnknownShard`], [`TopologyError::TooSmallToSplit`], or
+/// [`TopologyError::NoFreeOctant`] when all eight are taken.
+pub fn pick_split_octant(
+    map: &ShardMap,
+    shard: ShardId,
+    first: usize,
+) -> Result<usize, TopologyError> {
+    let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
+    if !can_split(region.node) {
+        return Err(TopologyError::TooSmallToSplit(region.node));
+    }
+    // The owner is irrelevant to whether a plan validates, so a placeholder
+    // stands in for the id that is only allocated once a plan is known to work.
+    (0..8)
+        .map(|step| (first + step) % 8)
+        .find(|octant| split_plan(map, shard, *octant, ShardId::NONE).is_ok())
+        .ok_or(TopologyError::NoFreeOctant(region.node))
+}
+
 /// Plan a one-octant split of `shard`'s region.
 ///
 /// `octant` selects which of the eight children to carve (bit 0 = +x, bit 1 = +y,
-/// bit 2 = +z, matching `octree::children` order); the caller — the autoscaler
-/// using the last `LoadReport`s — picks the octant holding the most players,
-/// falling back to 0. `new_shard` is the id the caller allocated for the child.
+/// bit 2 = +z, matching `octree::children` order); the caller picks it with
+/// [`pick_split_octant`]. `new_shard` is the id the caller allocated for the
+/// child.
 ///
 /// The child's endpoint is the un-dialable [`ShardRegion::UNRESOLVED_ENDPOINT`]
 /// sentinel (never the parent's address): the orchestrator patches in the real
@@ -378,6 +437,57 @@ mod tests {
             split_plan(&root_map(), shard(99), 0, shard(2)).unwrap_err(),
             TopologyError::UnknownShard(shard(99))
         );
+    }
+
+    #[test]
+    fn the_centre_of_a_region_lies_in_its_last_octant() {
+        // A node spans [lower, lower + size) per axis and its centre is the
+        // lower corner of the +x+y+z child, so that child (octant 7) is the one
+        // a ship spawned at the centre is in.
+        let root = NodeRef::new(40, [0, 0, 0]);
+        assert_eq!(centre_octant(root), 7);
+        let kids = octree::children(root).unwrap();
+        assert!(octree::contains(kids[7], root.center()));
+        assert_eq!(root_map().lookup(&root.center()), Some(shard(1)));
+        // A single cell has no children; the answer is the harmless 0.
+        assert_eq!(centre_octant(NodeRef::new(64, [0, 0, 0])), 0);
+    }
+
+    /// Mutation this catches: always proposing the same octant. The second split
+    /// of a region then names a node the map already has and fails validation —
+    /// for ever, so a hot shard could be relieved exactly once.
+    #[test]
+    fn the_picked_octant_skips_the_ones_already_carved_and_starts_where_told() {
+        let mut map = root_map();
+        // Fresh region: the octant asked for first is the one picked.
+        assert_eq!(pick_split_octant(&map, shard(1), 7), Ok(7));
+        assert_eq!(pick_split_octant(&map, shard(1), 0), Ok(0));
+        // Carve all eight, one at a time, always asking for 7 first: every pick
+        // is a new octant, in the documented order 7, 0, 1, … 6.
+        let mut picked = Vec::new();
+        for round in 0..8u32 {
+            let octant = pick_split_octant(&map, shard(1), 7).expect("a free octant");
+            picked.push(octant);
+            map = split_plan(&map, shard(1), octant, shard(round + 2))
+                .expect("the picked octant's plan validates")
+                .map;
+        }
+        assert_eq!(picked, vec![7, 0, 1, 2, 3, 4, 5, 6]);
+        // Nothing is left of the root to split off.
+        assert_eq!(
+            pick_split_octant(&map, shard(1), 7),
+            Err(TopologyError::NoFreeOctant(NodeRef::new(40, [0, 0, 0])))
+        );
+        // The other refusals are reported as themselves.
+        assert_eq!(
+            pick_split_octant(&map, shard(99), 0),
+            Err(TopologyError::UnknownShard(shard(99)))
+        );
+        let small = ShardMap::new(1, vec![region(55, [0, 0, 0], 1)]);
+        assert!(matches!(
+            pick_split_octant(&small, shard(1), 0),
+            Err(TopologyError::TooSmallToSplit(_))
+        ));
     }
 
     #[test]

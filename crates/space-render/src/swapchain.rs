@@ -1,22 +1,24 @@
-//! Swapchain path: present a rendered frame into a portable window.
+//! Swapchain path: present rendered frames into a portable window.
 //!
 //! The window itself is owned by the caller (`space-client` uses winit, which
 //! is pure Rust); this module only needs the `raw-window-handle` raw handles,
 //! so `space-render` never depends on a windowing library.
 //!
-//! The frame is rendered offscreen exactly as in the headless path (so the
-//! pixels are identical) and then copied into the acquired swapchain image.
+//! A frame is rendered exactly as in the headless path (so the pixels are
+//! identical) and, instead of being read back, blitted into the acquired
+//! swapchain image at the end of the same command buffer — see
+//! [`RenderContext::render_to_swapchain`].
 
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crate::gpu::{RenderContext, RenderError};
-use crate::passes::FrameGpu;
 
-/// Upper bound for every blocking Vulkan wait in `present` (acquire, fences),
-/// in nanoseconds. Finite so a stuck GPU/compositor surfaces as an error
-/// instead of freezing the window's event loop.
-const PRESENT_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Upper bound for every blocking Vulkan wait on the present path (image
+/// acquisition, the previous frame's fence), in nanoseconds. Finite so a stuck
+/// GPU/compositor surfaces as an error instead of freezing the window's event
+/// loop.
+pub(crate) const PRESENT_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// A window a swapchain can be created for.
 #[derive(Clone, Copy, Debug)]
@@ -27,10 +29,6 @@ pub struct WindowHandles {
 
 impl WindowHandles {
     /// The instance extensions a surface on `display` requires.
-    ///
-    /// # Safety
-    /// `display` must be a live display handle for the process (the same
-    /// requirement `ash_window::create_surface` has).
     pub fn required_instance_extensions(
         display: RawDisplayHandle,
     ) -> Result<&'static [*const std::ffi::c_char], RenderError> {
@@ -39,41 +37,101 @@ impl WindowHandles {
     }
 }
 
-/// A swapchain plus the objects needed to blit a rendered frame into it.
+/// How a swapchain paces presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapchainConfig {
+    /// `true` (the default): wait for the display's vertical blank (`FIFO`) —
+    /// no tearing, and the GPU idles between refreshes. `false`: present as
+    /// fast as frames are produced (`MAILBOX`, else `IMMEDIATE`, else `FIFO`),
+    /// for benchmarking.
+    pub vsync: bool,
+}
+
+impl Default for SwapchainConfig {
+    fn default() -> Self {
+        Self { vsync: true }
+    }
+}
+
+/// What became of a frame handed to [`RenderContext::render_to_swapchain`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentOutcome {
+    /// The frame is on its way to the screen.
+    Presented,
+    /// The frame was presented, but the swapchain no longer matches the
+    /// surface exactly: call [`Swapchain::recreate`] before the next frame.
+    Suboptimal,
+    /// Nothing was presented: the swapchain no longer matches the surface
+    /// (the window was resized). Call [`Swapchain::recreate`], then render
+    /// again.
+    OutOfDate,
+}
+
+/// The surface-dependent half of a [`Swapchain`], replaced on every recreate.
+struct Chain {
+    handle: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    present_mode: vk::PresentModeKHR,
+}
+
+/// A window surface, its swapchain and the semaphores that order image
+/// acquisition, the frame's blit and the present.
 pub struct Swapchain {
-    pub(crate) surface: vk::SurfaceKHR,
+    surface: vk::SurfaceKHR,
     surface_ext: ash::khr::surface::Instance,
     swapchain_ext: ash::khr::swapchain::Device,
-    pub(crate) handle: vk::SwapchainKHR,
-    pub(crate) images: Vec<vk::Image>,
-    pub(crate) views: Vec<vk::ImageView>,
-    // Recorded for diagnostics. The format *does* matter on the present path:
-    // the blit only preserves texel values between format-compatible formats, so
-    // the selection below deliberately prefers `R8G8B8A8_UNORM` (matching the
-    // offscreen target) over the usual `B8G8R8A8_UNORM` first choice — do not
-    // "simplify" it back to BGRA, that swaps red and blue. See the comment at the
-    // format selection in [`Swapchain::new`].
-    #[allow(dead_code)]
-    pub(crate) format: vk::Format,
-    pub(crate) extent: vk::Extent2D,
-    cmd_pool: vk::CommandPool,
-    /// The one blit command buffer, allocated with the swapchain and reset on
-    /// every `present` (allocating per frame leaked a command buffer per frame).
-    present_cmd: vk::CommandBuffer,
-    present_ready: vk::Fence,
+    physical_device: vk::PhysicalDevice,
+    config: SwapchainConfig,
+    chain: Chain,
+    /// Signalled when the acquired image may be written. One is enough: a
+    /// frame is only acquired after the previous frame's submission, which
+    /// waited on it, has completed.
     image_ready: vk::Semaphore,
-    present_done: vk::Semaphore,
+    /// One per swapchain image, signalled when the blit into that image is
+    /// done and waited on by its present. Per image because a present may
+    /// still hold its semaphore when the *next* image is being rendered.
+    present_done: Vec<vk::Semaphore>,
     device: ash::Device,
 }
 
+/// `count` fresh binary semaphores; on failure none are left behind.
+fn semaphores(device: &ash::Device, count: usize) -> Result<Vec<vk::Semaphore>, RenderError> {
+    let mut made = Vec::with_capacity(count);
+    for _ in 0..count {
+        match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+            Ok(s) => made.push(s),
+            Err(e) => {
+                for s in made {
+                    unsafe { device.destroy_semaphore(s, None) };
+                }
+                return Err(RenderError::new(format!("create_semaphore: {e}")));
+            }
+        }
+    }
+    Ok(made)
+}
+
 impl Swapchain {
-    /// Create a surface for `handles` and a swapchain sized to `width` x
-    /// `height` (clamped to the surface's supported extent).
+    /// Create a surface for `handles` and a vsynced swapchain sized to
+    /// `width` x `height` (clamped to the surface's supported extent).
     pub fn new(
         ctx: &RenderContext,
         handles: WindowHandles,
         width: u32,
         height: u32,
+    ) -> Result<Self, RenderError> {
+        Self::with_config(ctx, handles, width, height, SwapchainConfig::default())
+    }
+
+    /// [`Swapchain::new`] with explicit pacing.
+    pub fn with_config(
+        ctx: &RenderContext,
+        handles: WindowHandles,
+        width: u32,
+        height: u32,
+        config: SwapchainConfig,
     ) -> Result<Self, RenderError> {
         // `ash_window::create_surface` panics (and, in a non-unwinding fn,
         // aborts) when the platform surface extension was not enabled on the
@@ -85,6 +143,7 @@ impl Swapchain {
             ));
         }
         let surface_ext = ash::khr::surface::Instance::new(&ctx.entry, &ctx.instance);
+        let swapchain_ext = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
         let surface = unsafe {
             ash_window::create_surface(
                 &ctx.entry,
@@ -95,250 +154,72 @@ impl Swapchain {
             )
             .map_err(|e| RenderError::new(format!("create_surface: {e}")))?
         };
-        let capabilities = unsafe {
-            surface_ext
-                .get_physical_device_surface_capabilities(ctx.physical_device, surface)
-                .map_err(|e| RenderError::new(format!("surface capabilities: {e}")))?
-        };
-        let formats = unsafe {
-            surface_ext
-                .get_physical_device_surface_formats(ctx.physical_device, surface)
-                .map_err(|e| RenderError::new(format!("surface formats: {e}")))?
-        };
-        let present_modes = unsafe {
-            surface_ext
-                .get_physical_device_surface_present_modes(ctx.physical_device, surface)
-                .map_err(|e| RenderError::new(format!("surface present modes: {e}")))?
-        };
-        // Prefer a mailbox (no tearing, no artificial cap); fall back to FIFO.
-        let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
-            vk::PresentModeKHR::MAILBOX
-        } else {
-            vk::PresentModeKHR::FIFO
-        };
-        // The blit below copies the offscreen `out` image into the swapchain
-        // image. `cmd_blit_image` only preserves texel values exactly between
-        // *format-compatible* formats (same component count, order and size).
-        // The offscreen target is `R8G8B8A8_UNORM` (see `passes::create_frame`),
-        // so the swapchain must pick the same format: `B8G8R8A8_UNORM` — the
-        // usual first choice — is **not** format-compatible with it (red and
-        // blue are swapped), so a blit into it would swap the red and blue
-        // channels of every pixel. Prefer the exact match, then any
-        // `R8G8B8A8_UNORM` colour space, and only then fall back to a
-        // `B8G8R8A8_UNORM` surface format.
-        let format = formats
-            .iter()
-            .find(|f| {
-                f.format == vk::Format::R8G8B8A8_UNORM
-                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            })
-            .or_else(|| {
-                formats
-                    .iter()
-                    .find(|f| f.format == vk::Format::R8G8B8A8_UNORM)
-            })
-            .or_else(|| {
-                let bgra = formats
-                    .iter()
-                    .find(|f| f.format == vk::Format::B8G8R8A8_UNORM);
-                if bgra.is_some() {
-                    // Last resort: the offscreen target is `R8G8B8A8_UNORM`, so
-                    // blitting into a BGRA swapchain is *not* format-compatible
-                    // and the presentation engine will show red and blue swapped
-                    // on every pixel. Every real ICD offers RGBA, so reaching
-                    // this branch means the surface is unusual — make it loud
-                    // rather than silently mis-tinted.
-                    log::warn!(
-                        "surface offers no R8G8B8A8_UNORM format; falling back to B8G8R8A8_UNORM, \
-                         which the RGBA blit will channel-swap (red/blue swapped on screen)"
-                    );
+        // From here on the surface (and later the chain) must not leak on an
+        // error path.
+        let created = (|| {
+            // The queue must be able to present to this surface.
+            let can_present = unsafe {
+                surface_ext
+                    .get_physical_device_surface_support(
+                        ctx.physical_device,
+                        ctx.queue_family(),
+                        surface,
+                    )
+                    .unwrap_or(false)
+            };
+            if !can_present {
+                return Err(RenderError::new(
+                    "create_swapchain: the render queue family cannot present to this surface",
+                ));
+            }
+            let chain = create_chain(
+                &surface_ext,
+                &swapchain_ext,
+                ctx.physical_device,
+                surface,
+                config,
+                (width, height),
+                vk::SwapchainKHR::null(),
+            )?
+            .ok_or_else(|| {
+                // A minimised window reports a 0x0 extent; a swapchain cannot
+                // be created for it.
+                RenderError::new(
+                    "create_swapchain: surface extent is 0x0 (window minimised or not yet laid out)",
+                )
+            })?;
+            // One per image for the presents, plus the acquire semaphore.
+            match semaphores(&ctx.device, chain.images.len() + 1) {
+                Ok(made) => Ok((chain, made)),
+                Err(e) => {
+                    unsafe { swapchain_ext.destroy_swapchain(chain.handle, None) };
+                    Err(e)
                 }
-                bgra
-            })
-            .ok_or_else(|| RenderError::new("surface offers no usable format"))?;
-        // Use the colour space the chosen surface format was reported with.
-        let (format, color_space) = (format.format, format.color_space);
-        // `current_extent` is authoritative unless it is the (MAX, MAX) sentinel;
-        // otherwise clamp the request into the supported range (never below 1x1,
-        // and tolerate a driver reporting max < min).
-        let extent = if capabilities.current_extent.width != u32::MAX
-            && capabilities.current_extent.height != u32::MAX
-        {
-            capabilities.current_extent
-        } else {
-            vk::Extent2D {
-                width: width.max(1).clamp(
-                    capabilities.min_image_extent.width.max(1),
-                    capabilities
-                        .max_image_extent
-                        .width
-                        .max(capabilities.min_image_extent.width.max(1)),
-                ),
-                height: height.max(1).clamp(
-                    capabilities.min_image_extent.height.max(1),
-                    capabilities
-                        .max_image_extent
-                        .height
-                        .max(capabilities.min_image_extent.height.max(1)),
-                ),
+            }
+        })();
+        let (chain, mut present_done) = match created {
+            Ok(parts) => parts,
+            Err(e) => {
+                unsafe { surface_ext.destroy_surface(surface, None) };
+                return Err(e);
             }
         };
-        if extent.width == 0 || extent.height == 0 {
-            // A minimised window reports a 0x0 current extent; a swapchain cannot
-            // be created for it.
-            unsafe { surface_ext.destroy_surface(surface, None) };
-            return Err(RenderError::new(
-                "create_swapchain: surface extent is 0x0 (window minimised or not yet laid out)",
-            ));
-        }
-        // max_image_count == 0 means "no limit".
-        let mut image_count = capabilities.min_image_count.max(2);
-        if capabilities.max_image_count != 0 {
-            image_count = image_count.min(capabilities.max_image_count);
-        }
-        // The blit needs TRANSFER_DST on the swapchain images.
-        if !capabilities
-            .supported_usage_flags
-            .contains(vk::ImageUsageFlags::TRANSFER_DST)
-        {
-            unsafe { surface_ext.destroy_surface(surface, None) };
-            return Err(RenderError::new(
-                "create_swapchain: surface does not support TRANSFER_DST image usage",
-            ));
-        }
-        // composite_alpha must be one of the supported bits.
-        let composite_alpha = [
-            vk::CompositeAlphaFlagsKHR::OPAQUE,
-            vk::CompositeAlphaFlagsKHR::INHERIT,
-            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-        ]
-        .into_iter()
-        .find(|c| capabilities.supported_composite_alpha.contains(*c))
-        .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
-        // The queue must be able to present to this surface.
-        let can_present = unsafe {
-            surface_ext
-                .get_physical_device_surface_support(
-                    ctx.physical_device,
-                    ctx.queue_family(),
-                    surface,
-                )
-                .unwrap_or(false)
-        };
-        if !can_present {
-            unsafe { surface_ext.destroy_surface(surface, None) };
-            return Err(RenderError::new(
-                "create_swapchain: the render queue family cannot present to this surface",
-            ));
-        }
-        let swapchain_ext = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
-        let handle = unsafe {
-            swapchain_ext
-                .create_swapchain(
-                    &vk::SwapchainCreateInfoKHR::default()
-                        .surface(surface)
-                        .min_image_count(image_count)
-                        .image_format(format)
-                        .image_color_space(color_space)
-                        .image_extent(extent)
-                        .image_array_layers(1)
-                        .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
-                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .pre_transform(capabilities.current_transform)
-                        .composite_alpha(composite_alpha)
-                        .present_mode(present_mode)
-                        .clipped(true),
-                    None,
-                )
-                .map_err(|e| RenderError::new(format!("create_swapchain: {e}")))?
-        };
-        let images = unsafe {
-            swapchain_ext
-                .get_swapchain_images(handle)
-                .map_err(|e| RenderError::new(format!("get_swapchain_images: {e}")))?
-        };
-        let views: Vec<vk::ImageView> = unsafe {
-            let mut v = Vec::with_capacity(images.len());
-            for image in &images {
-                v.push(
-                    ctx.device
-                        .create_image_view(
-                            &vk::ImageViewCreateInfo::default()
-                                .image(*image)
-                                .view_type(vk::ImageViewType::TYPE_2D)
-                                .format(format)
-                                .subresource_range(vk::ImageSubresourceRange {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    base_mip_level: 0,
-                                    level_count: 1,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                }),
-                            None,
-                        )
-                        .map_err(|e| RenderError::new(format!("swapchain image view: {e}")))?,
-                );
-            }
-            v
-        };
-        let cmd_pool = unsafe {
-            ctx.device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(ctx.queue_family())
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .map_err(|e| RenderError::new(format!("swapchain command pool: {e}")))?
-        };
-        let present_ready = unsafe {
-            ctx.device
-                // Created SIGNALED: the first `present` waits on this fence before
-                // anything has been submitted, so an unsignaled fence would block
-                // the main thread forever (the "not responding" freeze).
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .map_err(|e| RenderError::new(format!("create_fence: {e}")))?
-        };
-        // One primary command buffer for the whole lifetime of the swapchain:
-        // `present` resets it before recording, and the `present_ready` fence
-        // wait at the top of `present` guarantees the previous submit (and so
-        // this buffer) has finished before it is reused.
-        let present_cmd = unsafe {
-            ctx.device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .map_err(|e| RenderError::new(format!("allocate cmd buffer: {e}")))?[0]
-        };
-        let image_ready = unsafe {
-            ctx.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(|e| RenderError::new(format!("create_semaphore: {e}")))?
-        };
-        let present_done = unsafe {
-            ctx.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(|e| RenderError::new(format!("create_semaphore: {e}")))?
-        };
+        let image_ready = present_done.pop().unwrap_or_default();
+        log::info!(
+            "swapchain: {}x{} {:?} {:?}, {} images",
+            chain.extent.width,
+            chain.extent.height,
+            chain.format,
+            chain.present_mode,
+            chain.images.len()
+        );
         Ok(Self {
             surface,
             surface_ext,
             swapchain_ext,
-            handle,
-            images,
-            views,
-            format,
-            extent,
-            cmd_pool,
-            present_cmd,
-            present_ready,
+            physical_device: ctx.physical_device,
+            config,
+            chain,
             image_ready,
             present_done,
             device: ctx.device.clone(),
@@ -348,161 +229,294 @@ impl Swapchain {
     /// The swapchain's size in pixels.
     #[must_use]
     pub fn extent(&self) -> (u32, u32) {
-        (self.extent.width, self.extent.height)
+        (self.chain.extent.width, self.chain.extent.height)
     }
 
-    /// Acquire an image, blit `frame`'s `out` image into it and present.
+    /// Whether presentation waits for the vertical blank (`FIFO`). False when
+    /// vsync was turned off *and* the surface offers an unthrottled mode.
+    #[must_use]
+    pub fn is_vsynced(&self) -> bool {
+        matches!(
+            self.chain.present_mode,
+            vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        )
+    }
+
+    /// Rebuild the swapchain for the surface's current size (after a resize,
+    /// or when a frame came back [`PresentOutcome::OutOfDate`] /
+    /// [`PresentOutcome::Suboptimal`]). `width` x `height` is only used when
+    /// the surface does not dictate its own extent.
     ///
-    /// `frame` must have been produced by
-    /// [`RenderContext::render_frame_gpu`] at the same extent.
-    pub fn present(&self, ctx: &RenderContext, frame: &FrameGpu) -> Result<(), RenderError> {
-        let (index, suboptimal) = unsafe {
-            self.swapchain_ext
-                .acquire_next_image2(
-                    &vk::AcquireNextImageInfoKHR::default()
-                        .swapchain(self.handle)
-                        .timeout(PRESENT_TIMEOUT_NS)
-                        .semaphore(self.image_ready)
-                        .fence(vk::Fence::null()),
-                )
-                .map_err(|e| RenderError::new(format!("acquire_next_image: {e}")))?
+    /// Returns `Ok(false)` — and keeps the old swapchain — while the surface
+    /// is 0x0 (minimised window): there is nothing to render to until it has
+    /// a size again.
+    pub fn recreate(&mut self, width: u32, height: u32) -> Result<bool, RenderError> {
+        // Nothing may still be rendering into or presenting the old images.
+        unsafe {
+            self.device
+                .device_wait_idle()
+                .map_err(|e| RenderError::new(format!("device_wait_idle: {e}")))?;
+        }
+        let Some(chain) = create_chain(
+            &self.surface_ext,
+            &self.swapchain_ext,
+            self.physical_device,
+            self.surface,
+            self.config,
+            (width, height),
+            self.chain.handle,
+        )?
+        else {
+            return Ok(false);
         };
-        if suboptimal {
-            return Err(RenderError::new("swapchain suboptimal: recreate it"));
-        }
+        let retired = std::mem::replace(&mut self.chain, chain);
+        unsafe { self.swapchain_ext.destroy_swapchain(retired.handle, None) };
+        // Fresh semaphores: an acquire that was never followed by a present
+        // (an error mid-frame) would otherwise leave one signalled, and the
+        // image count may have changed.
+        let mut fresh = semaphores(&self.device, self.chain.images.len() + 1)?;
         unsafe {
-            ctx.device
-                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
-                .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
-            ctx.device
-                .reset_fences(&[self.present_ready])
-                .map_err(|e| RenderError::new(format!("reset present fence: {e}")))?;
-        }
-        let cmd = self.present_cmd;
-        unsafe {
-            // Safe to reset: the `present_ready` wait above proves the previous
-            // submit that recorded this buffer has completed.
-            ctx.device
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| RenderError::new(format!("reset cmd buffer: {e}")))?;
-        }
-        let region = vk::ImageBlit {
-            src_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            src_offsets: [
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: self.extent.width as i32,
-                    y: self.extent.height as i32,
-                    z: 1,
-                },
-            ],
-            dst_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            dst_offsets: [
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: self.extent.width as i32,
-                    y: self.extent.height as i32,
-                    z: 1,
-                },
-            ],
-        };
-        unsafe {
-            ctx.device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .map_err(|e| RenderError::new(format!("begin: {e}")))?;
-            // The offscreen `out` image is in TRANSFER_SRC_OPTIMAL after the
-            // readback copy; the swapchain image is UNDEFINED until we blit.
-            ctx.device.cmd_blit_image(
-                cmd,
-                frame.out.handle,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.images[index as usize],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-                vk::Filter::NEAREST,
-            );
-            // A swapchain image may only be presented from PRESENT_SRC_KHR, so
-            // transition it out of TRANSFER_DST_OPTIMAL (where the blit left it)
-            // before `queue_present` waits on `present_done`. Presenting from
-            // any other layout is undefined behaviour and validation-error
-            // territory; the barrier makes the blit's TRANSFER_WRITE visible to
-            // the presentation engine.
-            ctx.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::empty())
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                    .image(self.images[index as usize])
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })],
-            );
-            ctx.device
-                .end_command_buffer(cmd)
-                .map_err(|e| RenderError::new(format!("end: {e}")))?;
-            let wait = [self.image_ready];
-            let signal = [self.present_done];
-            let blit = vk::SubmitInfo::default()
-                .wait_semaphores(&wait)
-                .wait_dst_stage_mask(&[vk::PipelineStageFlags::TRANSFER])
-                .command_buffers(std::slice::from_ref(&cmd))
-                .signal_semaphores(&signal);
-            ctx.device
-                .queue_submit(ctx.queue, std::slice::from_ref(&blit), self.present_ready)
-                .map_err(|e| RenderError::new(format!("blit submit: {e}")))?;
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&self.present_done))
-                .swapchains(std::slice::from_ref(&self.handle))
-                .image_indices(std::slice::from_ref(&index));
-            let result = self.swapchain_ext.queue_present(ctx.queue, &present);
-            ctx.device
-                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
-                .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
-            match result {
-                Ok(false) | Ok(true) => Ok(()),
-                Err(e) => Err(RenderError::new(format!("queue_present: {e}"))),
+            self.device.destroy_semaphore(self.image_ready, None);
+            for s in self.present_done.drain(..) {
+                self.device.destroy_semaphore(s, None);
             }
+        }
+        self.image_ready = fresh.pop().unwrap_or_default();
+        self.present_done = fresh;
+        Ok(true)
+    }
+
+    /// Acquire the next image. `Ok(None)` when the swapchain is out of date
+    /// (nothing was acquired); otherwise the image index and whether the
+    /// swapchain is merely suboptimal (the image *was* acquired and must be
+    /// presented).
+    pub(crate) fn acquire(&self) -> Result<Option<(u32, bool)>, RenderError> {
+        let acquired = unsafe {
+            self.swapchain_ext.acquire_next_image(
+                self.chain.handle,
+                PRESENT_TIMEOUT_NS,
+                self.image_ready,
+                vk::Fence::null(),
+            )
+        };
+        match acquired {
+            Ok((index, suboptimal)) if (index as usize) < self.chain.images.len() => {
+                Ok(Some((index, suboptimal)))
+            }
+            Ok((index, _)) => Err(RenderError::new(format!(
+                "acquire_next_image returned image {index} of {}",
+                self.chain.images.len()
+            ))),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(None),
+            Err(e) => Err(RenderError::new(format!("acquire_next_image: {e}"))),
+        }
+    }
+
+    /// The swapchain image at `index` (as returned by [`Swapchain::acquire`]).
+    pub(crate) fn image(&self, index: u32) -> vk::Image {
+        self.chain.images[index as usize]
+    }
+
+    /// The semaphore the acquisition signals: the frame's submission waits on it.
+    pub(crate) fn image_ready(&self) -> vk::Semaphore {
+        self.image_ready
+    }
+
+    /// The semaphore the frame's submission signals for image `index`.
+    pub(crate) fn present_done(&self, index: u32) -> vk::Semaphore {
+        self.present_done[index as usize]
+    }
+
+    /// Queue image `index` for presentation once its `present_done` semaphore
+    /// is signalled.
+    pub(crate) fn present(
+        &self,
+        queue: vk::Queue,
+        index: u32,
+    ) -> Result<PresentOutcome, RenderError> {
+        let wait = [self.present_done(index)];
+        let swapchains = [self.chain.handle];
+        let indices = [index];
+        let info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&wait)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        match unsafe { self.swapchain_ext.queue_present(queue, &info) } {
+            Ok(false) => Ok(PresentOutcome::Presented),
+            Ok(true) => Ok(PresentOutcome::Suboptimal),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(PresentOutcome::OutOfDate),
+            Err(e) => Err(RenderError::new(format!("queue_present: {e}"))),
         }
     }
 }
 
+/// Create a swapchain for `surface` as it is right now, retiring `old`.
+/// `Ok(None)` when the surface is currently 0x0.
+fn create_chain(
+    surface_ext: &ash::khr::surface::Instance,
+    swapchain_ext: &ash::khr::swapchain::Device,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    config: SwapchainConfig,
+    (width, height): (u32, u32),
+    old: vk::SwapchainKHR,
+) -> Result<Option<Chain>, RenderError> {
+    let capabilities = unsafe {
+        surface_ext
+            .get_physical_device_surface_capabilities(physical_device, surface)
+            .map_err(|e| RenderError::new(format!("surface capabilities: {e}")))?
+    };
+    let formats = unsafe {
+        surface_ext
+            .get_physical_device_surface_formats(physical_device, surface)
+            .map_err(|e| RenderError::new(format!("surface formats: {e}")))?
+    };
+    let present_modes = unsafe {
+        surface_ext
+            .get_physical_device_surface_present_modes(physical_device, surface)
+            .map_err(|e| RenderError::new(format!("surface present modes: {e}")))?
+    };
+
+    // FIFO is the one mode every surface must offer.
+    let present_mode = if config.vsync {
+        vk::PresentModeKHR::FIFO
+    } else {
+        [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE]
+            .into_iter()
+            .find(|mode| present_modes.contains(mode))
+            .unwrap_or(vk::PresentModeKHR::FIFO)
+    };
+
+    // The frame is tone-mapped and gamma-encoded into an `rgba8unorm` image
+    // and *blitted* into the swapchain image. A blit converts between formats
+    // channel by channel, so both RGBA and BGRA orders show the right colours;
+    // what matters is that the surface format is UNORM (an `_SRGB` format would
+    // gamma-encode the already-encoded values a second time). Prefer the
+    // 8-bit formats in the standard sRGB colour space, then any colour space,
+    // then the 10-bit UNORM formats.
+    let unorm = [
+        vk::Format::R8G8B8A8_UNORM,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::Format::A2B10G10R10_UNORM_PACK32,
+        vk::Format::A2R10G10B10_UNORM_PACK32,
+    ];
+    let pick = |srgb_only: bool| {
+        unorm.iter().find_map(|wanted| {
+            formats.iter().find(|f| {
+                f.format == *wanted
+                    && (!srgb_only || f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            })
+        })
+    };
+    let surface_format = pick(true)
+        .or_else(|| pick(false))
+        .ok_or_else(|| RenderError::new("surface offers no 8- or 10-bit UNORM format"))?;
+
+    // `current_extent` is authoritative unless it is the (MAX, MAX) sentinel;
+    // otherwise clamp the request into the supported range (tolerating a
+    // driver reporting max < min).
+    let extent = if capabilities.current_extent.width != u32::MAX
+        && capabilities.current_extent.height != u32::MAX
+    {
+        capabilities.current_extent
+    } else {
+        let clamp = |value: u32, min: u32, max: u32| value.clamp(min, max.max(min));
+        vk::Extent2D {
+            width: clamp(
+                width,
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: clamp(
+                height,
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    };
+    if extent.width == 0 || extent.height == 0 {
+        return Ok(None);
+    }
+
+    // One more than the minimum, so acquiring never has to wait for the
+    // presentation engine to release its last image. max_image_count == 0
+    // means "no limit".
+    let mut image_count = capabilities.min_image_count.saturating_add(1).max(2);
+    if capabilities.max_image_count != 0 {
+        image_count = image_count.min(capabilities.max_image_count);
+    }
+    // The blit needs TRANSFER_DST on the swapchain images.
+    if !capabilities
+        .supported_usage_flags
+        .contains(vk::ImageUsageFlags::TRANSFER_DST)
+    {
+        return Err(RenderError::new(
+            "create_swapchain: surface does not support TRANSFER_DST image usage",
+        ));
+    }
+    // composite_alpha must be one of the supported bits.
+    let composite_alpha = [
+        vk::CompositeAlphaFlagsKHR::OPAQUE,
+        vk::CompositeAlphaFlagsKHR::INHERIT,
+        vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+        vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+    ]
+    .into_iter()
+    .find(|c| capabilities.supported_composite_alpha.contains(*c))
+    .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
+
+    let handle = unsafe {
+        swapchain_ext
+            .create_swapchain(
+                &vk::SwapchainCreateInfoKHR::default()
+                    .surface(surface)
+                    .min_image_count(image_count)
+                    .image_format(surface_format.format)
+                    .image_color_space(surface_format.color_space)
+                    .image_extent(extent)
+                    .image_array_layers(1)
+                    .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+                    .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .pre_transform(capabilities.current_transform)
+                    .composite_alpha(composite_alpha)
+                    .present_mode(present_mode)
+                    .clipped(true)
+                    .old_swapchain(old),
+                None,
+            )
+            .map_err(|e| RenderError::new(format!("create_swapchain: {e}")))?
+    };
+    let images = match unsafe { swapchain_ext.get_swapchain_images(handle) } {
+        Ok(images) if !images.is_empty() => images,
+        other => {
+            unsafe { swapchain_ext.destroy_swapchain(handle, None) };
+            return Err(RenderError::new(match other {
+                Err(e) => format!("get_swapchain_images: {e}"),
+                Ok(_) => "get_swapchain_images: the swapchain has no images".to_owned(),
+            }));
+        }
+    };
+    Ok(Some(Chain {
+        handle,
+        images,
+        format: surface_format.format,
+        extent,
+        present_mode,
+    }))
+}
+
 impl Drop for Swapchain {
     fn drop(&mut self) {
+        // The device and instance must still be alive: drop the swapchain
+        // before the `RenderContext` it was created from.
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_semaphore(self.present_done, None);
-            self.device.destroy_semaphore(self.image_ready, None);
-            self.device.destroy_fence(self.present_ready, None);
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            for view in &self.views {
-                self.device.destroy_image_view(*view, None);
+            for s in &self.present_done {
+                self.device.destroy_semaphore(*s, None);
             }
-            self.swapchain_ext.destroy_swapchain(self.handle, None);
+            self.device.destroy_semaphore(self.image_ready, None);
+            self.swapchain_ext
+                .destroy_swapchain(self.chain.handle, None);
             self.surface_ext.destroy_surface(self.surface, None);
         }
     }

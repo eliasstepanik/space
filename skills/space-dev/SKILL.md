@@ -20,8 +20,8 @@ Rust workspace, toolchain pinned in `rust-toolchain.toml` (1.100.0 + rustfmt, cl
 | `space-net` | quinn QUIC transport (self-signed rustls, `ring`), hello/handshake |
 | `space-server` | authoritative shard (`space-server` bin), `handoff.rs` seamless handoff |
 | `space-orchestrator` | epoch-versioned shard map, autoscaler, ShardId counter, `--launcher local` |
-| `space-render` | ash/Vulkan renderer, naga WGSL->SPIR-V in `build.rs`, ray-query GI, presets |
-| `space-client` | native client: offline `--demo/--galaxy`, window, `--stream ADDR [--server ADDR]`, `link.rs` |
+| `space-render` | ash/Vulkan renderer, naga WGSL->SPIR-V in `build.rs`, ray-query GI, presets, reversed-Z, `mesh.rs` (GLB models), `swapchain.rs` |
+| `space-client` | native client: window (`window.rs`, input, `--server`), offline scene renders, `--stream`; scenes `--demo/--galaxy/--materials/--solar` (`scenes.rs`), `--glb`; `link.rs` (player link, shard transitions) |
 | `space-stream` | JPEG frame + input wire format; feature `net` = ws:// server (tokio-tungstenite, no TLS) |
 | `space-viewer` | wasm cdylib browser viewer (canvas + WebSocket), `index.html?ws=ws://host:8099` |
 | `space-mcp` | hand-rolled JSON-RPC MCP core: `--stdio` or `--http addr` (HTTP/1.1 + SSE on tokio) |
@@ -36,7 +36,9 @@ TMPDIR=/workspace/.warren/tmp RUSTUP_HOME=/workspace/.warren/rustup RUSTUP_TOOLC
 ```
 = `cargo fmt --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`;
 `cargo nextest run --workspace --locked` (falls back to `cargo test` without nextest;
-test target dir `target/xtask-test`). Baseline at Phase 8: 394 passed, 0 failed.
+test target dir `<target dir>/xtask-test`, honouring `CARGO_TARGET_DIR`). GPU-using packages run
+one test at a time: `.config/nextest.toml` group `gpu`, `--test-threads=1` in the fallback. Baseline at Phase 8: 394 passed, 0 failed;
+after the audit (renderer rewrite, client window, GLB, shard transitions, fixes): 557 passed, 0 failed.
 Wasm build (also a CI job):
 `cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer`.
 Lockfile edits need a non-`--locked` cargo command first (e.g. `cargo metadata`).
@@ -58,6 +60,25 @@ VK_DRIVER_FILES=$P/share/vulkan/icd.d/radeon_icd.json cargo test -p space-render
 requires the Khronos validation layer and asserts zero validation messages (a missing
 layer is then a hard failure; the CI GPU step is `continue-on-error: true` as it is unproven on hosted runners).
 Do not run GPU tests in parallel (`--test-threads=1`).
+`SPACE_REQUIRE_GPU=1` turns the skip into a failure (`space_render::skip_or_require_gpu`): set it on any
+machine that is supposed to have a device, otherwise "nothing rendered" is a green run.
+On Windows with a ray-tracing GPU and the Vulkan SDK the same tests run natively:
+`$env:SPACE_REQUIRE_GPU='1'; $env:SPACE_RENDER_VALIDATION='1'; cargo test -p space-render -p space-client -- --test-threads=1`.
+
+## Renderer notes
+- One frame = one command buffer, one submission. `RenderContext` keeps the frame's GPU resources
+  (`passes::FrameGpu`, instance buffers, BLAS/TLAS, uploaded meshes) and reuses them while the size/feature
+  set is unchanged; `render_offscreen` reads pixels back, `render_to_swapchain` blits into the swapchain
+  image and presents (no readback, no wait). Drop a `Swapchain` before its `RenderContext`.
+- Depth is **reversed with an infinite far plane** (`scene::mat4_perspective_reversed`: depth = near/distance,
+  compare `GREATER`, clear 0). That is what makes solar-system distances work; do not "fix" it back.
+- Spheres are tessellated per instance from projected size (`scene::sphere_level_for`, levels 0..3 =
+  1/4/16/64 segments per icosahedron edge; the draw's first vertex carries the level). The vertex shader's
+  tables and `scene::sphere_mesh` must stay identical - tests compare them, and the rasterised vs
+  ray-traced outline.
+- The material buffer (rgba16f) carries metallic, roughness and the octahedral shading normal; the post
+  pass (SSR/refraction) reads normals from it, not from depth.
+- Golden `GALAXY_BRIGHTNESS` in `tests/gpu.rs` pins LOD selection + star geometry; its comment has the history.
 
 ## Invariants - do not break
 - **Wire gate**: `PROTOCOL_VERSION` (`space-protocol/src/codec.rs`, now 3) is checked in every hello
@@ -102,6 +123,10 @@ Typical loop: start server, `shard_status` -> addr; client `connect`; `send_inpu
 `ship_state` vs `client_status` to check replication; `capture_frame` to inspect pixels.
 
 ## Run the stack by hand
-`cargo run -p space-client -- --stream 127.0.0.1:8099 --galaxy` (add `--server HOST:PORT` to play on a shard,
-`--frames N` to stop); serve `crates/space-viewer` statically and open `index.html?ws=ws://127.0.0.1:8099`
-(build steps: `crates/space-viewer/README.md`). Containers: `deploy/README.md`.
+Windows: `.\scripts\dev.ps1 [-Topology single|two-shards|orchestrated|offline] [-Scene demo|galaxy|materials|solar]`
+builds, starts the servers in the background (logs `target\dev\`) and runs the window client; see `README.md`.
+`two-shards` is the manual seamless-handoff setup (shard 1 owns `64:0:0:0`, shard 2 `64:1:0:0`, `--peer` each
+other); the automated version is `crates/space-client/tests/handoff.rs`.
+Pixel stream: `cargo run -p space-client -- --stream 127.0.0.1:8099 --galaxy` (add `--server HOST:PORT` to play
+on a shard, `--frames N` to stop); serve `crates/space-viewer` statically and open
+`index.html?ws=ws://127.0.0.1:8099` (build steps: `crates/space-viewer/README.md`). Containers: `deploy/README.md`.

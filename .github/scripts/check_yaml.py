@@ -10,6 +10,19 @@ import sys
 
 import yaml
 
+WORKFLOWS = ".github/workflows/"
+
+
+def is_workflow(path):
+    """True for a file under .github/workflows/, whatever separator glob used.
+
+    On Windows glob returns `.github/workflows\\ci.yml`, so a plain
+    `startswith(".github/workflows/")` never matched there and the `jobs`
+    check below was silently skipped.
+    """
+    return path.replace("\\", "/").startswith(WORKFLOWS)
+
+
 paths = sorted(
     glob.glob(".github/workflows/*.yml")
     + glob.glob(".github/workflows/*.yaml")
@@ -18,15 +31,18 @@ paths = sorted(
 )
 if not paths:
     sys.exit("no YAML files found; run from the repository root")
+if not any(is_workflow(p) for p in paths):
+    sys.exit("no workflow recognised under .github/workflows; the `jobs` check would not run")
 
 failed = False
 for p in paths:
     try:
-        with open(p) as f:
+        # The files are UTF-8; do not depend on the platform's default encoding.
+        with open(p, encoding="utf-8") as f:
             doc = yaml.safe_load(f)
         if doc is None:
             raise ValueError("empty document")
-        if p.startswith(".github/workflows/") and "jobs" not in doc:
+        if is_workflow(p) and "jobs" not in doc:
             raise ValueError("workflow has no `jobs` key")
         print(f"ok   {p}")
     except Exception as e:  # noqa: BLE001

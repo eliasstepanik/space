@@ -101,18 +101,20 @@ jobs:
       # `validation_messages == 0`, so a layout or barrier regression fails here
       # rather than shipping. The exact-pixel tests must pass on lavapipe.
       #
-      # `continue-on-error: true` on purpose: this has never been run on the
-      # self-hosted runner (no GPU) (the authoring sandbox is not one), and both the
-      # lavapipe ICD file name below and the layer path depend on the runner's
-      # Mesa packaging. With SPACE_RENDER_VALIDATION=1 a missing layer is a hard
-      # failure, so until a green run on a hosted runner proves the environment,
-      # this step reports but does not gate. Flip it to false once it has.
+      # `continue-on-error: true` on purpose: the runner's Mesa (jammy, 23.x)
+      # ships a lavapipe without VK_KHR_acceleration_structure, which the
+      # renderer needs, so no context can be created there. SPACE_REQUIRE_GPU=1
+      # makes that a *failed* step instead of thirteen "passed" tests that
+      # rendered nothing (which is what this step used to report): the job stays
+      # green, but the step is red until the runner has Mesa >= 24.1 or a real
+      # GPU. Once it has, drop `continue-on-error` so the GPU tests gate.
       - name: GPU tests (lavapipe + validation layer)
         continue-on-error: true
         env:
           VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
           VK_LAYER_PATH: /usr/share/vulkan/explicit_layer.d
           SPACE_RENDER_VALIDATION: "1"
+          SPACE_REQUIRE_GPU: "1"
         run: cargo test -p space-render -p space-client -- --test-threads=1
       # The `naga < 30` guard lives in `crates/space-render/build.rs`
       # (`assert_naga_at_least_30`), which runs on every build of the renderer

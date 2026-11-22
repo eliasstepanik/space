@@ -49,8 +49,8 @@ pub enum Phase {
         deadline: u64,
         /// Acks still missing.
         awaiting: BTreeSet<ShardId>,
-        /// Everyone the prepare was sent to (the abort goes to those who acked,
-        /// i.e. `recipients - awaiting`).
+        /// Everyone the prepare was sent to. An abort goes to **all** of them:
+        /// a shard whose ack is merely late has staged the change too.
         recipients: BTreeSet<ShardId>,
     },
     /// A commit landed; the published map is the new one.
@@ -73,6 +73,10 @@ pub struct EpochPublisher {
     phase: Phase,
     /// The prepare currently staged (kept so a commit can swap it in).
     staged: Option<ShardMap>,
+    /// The `EpochPrepare` currently outstanding, kept so it can be sent again
+    /// to a recipient that only registers after it was first published (a
+    /// split's child, which does not exist yet when its parent is told).
+    outstanding: Option<Message>,
     /// The last tick a commit landed at (enforces `MIN_EPOCH_INTERVAL_TICKS`).
     last_commit_tick: Option<u64>,
 }
@@ -85,6 +89,7 @@ impl EpochPublisher {
             published: map,
             phase: Phase::Idle,
             staged: None,
+            outstanding: None,
             last_commit_tick: None,
         }
     }
@@ -208,6 +213,7 @@ impl EpochPublisher {
             }),
         };
         self.staged = Some(new_map);
+        self.outstanding = Some(outbound.message.clone());
         self.phase = Phase::Preparing {
             epoch,
             activation_tick,
@@ -246,6 +252,7 @@ impl EpochPublisher {
             return None;
         }
         let new_map = self.staged.take().expect("a prepare stages a map");
+        self.outstanding = None;
         self.published = new_map;
         self.phase = Phase::Committed { epoch };
         self.last_commit_tick = Some(tick);
@@ -267,14 +274,23 @@ impl EpochPublisher {
 
     /// The deadline check: at `tick >= deadline` an un-acked prepare aborts.
     ///
-    /// Returns the `EpochAbort` to send to everyone who *did* ack. The published
-    /// map is byte-identical to what it was before the propose.
+    /// Returns the `EpochAbort` to send to **every recipient of the prepare**,
+    /// acked or not. The published map is byte-identical to what it was before
+    /// the propose.
+    ///
+    /// The abort used to go only to the shards that had acked, on the theory
+    /// that a straggler "never staged the change". But a shard stages the change
+    /// the moment the prepare *arrives*; its ack can simply be late (it was
+    /// paused, its link hiccupped) or lost. Such a shard was never told to roll
+    /// back, kept the prepare staged for ever, and — a shard holds one staged
+    /// prepare at a time — refused every later prepare, so no epoch that needed
+    /// its ack could commit again. A shard that really staged nothing ignores an
+    /// abort for an epoch it does not know.
     #[must_use]
     pub fn timeout(&mut self, tick: u64) -> Option<Outbound> {
         let Phase::Preparing {
             epoch,
             deadline,
-            awaiting,
             recipients,
             ..
         } = &self.phase
@@ -285,13 +301,13 @@ impl EpochPublisher {
             return None;
         }
         let epoch = *epoch;
-        // The abort goes to everyone who acked: recipients minus the stragglers
-        // (the straggler never staged the change, so it has nothing to roll back).
-        let acked: Vec<ShardId> = recipients.difference(awaiting).copied().collect();
+        // Everyone the prepare went to, stragglers included (see above).
+        let to: Vec<ShardId> = recipients.iter().copied().collect();
         self.staged = None;
+        self.outstanding = None;
         self.phase = Phase::Aborted { epoch };
         Some(Outbound {
-            to: acked,
+            to,
             message: Message::EpochAbort(space_protocol::EpochAbort {
                 epoch,
                 reason: AbortReason::Timeout,
@@ -303,6 +319,24 @@ impl EpochPublisher {
     /// change can be proposed.
     pub fn reset(&mut self) {
         self.phase = Phase::Idle;
+    }
+
+    /// The outstanding `EpochPrepare`, if `shard` is a recipient whose ack is
+    /// still missing.
+    ///
+    /// A split names its child as a recipient before the child exists: the
+    /// prepare is published, the child is launched, and only then does it
+    /// register. Whoever registers it asks here whether there is a prepare it
+    /// still owes an ack for, and sends it — without this the child could never
+    /// ack and no split could ever commit.
+    #[must_use]
+    pub fn outstanding_prepare_for(&self, shard: ShardId) -> Option<Message> {
+        match &self.phase {
+            Phase::Preparing { awaiting, .. } if awaiting.contains(&shard) => {
+                self.outstanding.clone()
+            }
+            _ => None,
+        }
     }
 }
 
@@ -405,14 +439,50 @@ mod tests {
             .timeout(500 + EPOCH_ACK_TIMEOUT_TICKS)
             .expect("deadline aborts");
         assert!(matches!(abort.message, Message::EpochAbort(_)));
+        // Mutation this catches: aborting only the shards that acked. The
+        // straggler has the prepare staged too (its ack is merely missing), and
+        // a shard that is never told to roll back refuses every later prepare.
+        let mut told = abort.to.clone();
+        told.sort_unstable();
+        let mut everyone = prepare.to.clone();
+        everyone.sort_unstable();
         assert_eq!(
-            abort.to,
-            vec![acker],
-            "the abort goes to the shard that acked"
+            told, everyone,
+            "the abort goes to every recipient of the prepare"
         );
+        assert!(abort.to.contains(&acker) && abort.to.contains(&straggler));
         assert_eq!(pub_.published(), &before, "byte-identical after an abort");
         pub_.reset();
         assert!(pub_.can_propose(10_000, 0), "idle again after the abort");
+    }
+
+    #[test]
+    fn the_outstanding_prepare_is_available_to_a_recipient_that_has_not_acked() {
+        let mut pub_ = EpochPublisher::new(map_with_two());
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let child = space_world::octree::children(root).unwrap()[6];
+        assert!(pub_.outstanding_prepare_for(shard(3)).is_none(), "idle");
+        let mut next = pub_.published().clone();
+        next.epoch = 2;
+        next.regions.push(region(41, child.index, 3));
+        let prepare = pub_
+            .propose(next, vec![(child, shard(3))], &[(shard(1), 10)], 10)
+            .expect("propose");
+        // The child (3) has not acked: it can be handed the same prepare again.
+        assert_eq!(
+            pub_.outstanding_prepare_for(shard(3)),
+            Some(prepare.message.clone())
+        );
+        // A shard that is not a recipient gets nothing.
+        assert!(pub_.outstanding_prepare_for(shard(99)).is_none());
+        // Once it has acked there is nothing left to send it.
+        let _ = pub_.ack(shard(3), 2, 11);
+        assert!(pub_.outstanding_prepare_for(shard(3)).is_none());
+        // And after the abort nothing is outstanding for anyone.
+        let _ = pub_.timeout(10 + EPOCH_ACK_TIMEOUT_TICKS).expect("abort");
+        for s in prepare.to {
+            assert!(pub_.outstanding_prepare_for(s).is_none());
+        }
     }
 
     #[test]

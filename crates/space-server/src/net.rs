@@ -48,18 +48,41 @@
 //! persistent and never closed right after a send, there is no drain-before-close
 //! race (a `CONNECTION_CLOSE` beating its stream data — the race
 //! [`space_net::accept_incoming`]'s reject path deliberately avoids).
+//!
+//! # The tick loop never waits on the network
+//!
+//! [`ShardNet::flush`] runs inside the tick loop, so it only ever *offers* a
+//! message to a queue (`try_send`): a client's, a peer's, the orchestrator's. A
+//! queue that is full loses the message — counted and logged for a peer — and
+//! the tick goes on. The one thing a dead neighbour must never be able to do is
+//! stop this shard's simulation; the handoff protocol already treats a message
+//! that does not arrive as a transfer that did not happen (its timeouts), so
+//! dropping is the correct degradation.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use space_net::{accept_incoming, client_endpoint, connect, hello, server_endpoint, Conn};
-use space_protocol::{Message, Reject, ShardHello, ShardId, ShardWelcome};
+use space_net::{
+    accept_incoming, client_endpoint_for, connect, connect_within, hello, server_endpoint, Conn,
+};
+use space_protocol::{Message, ShardHello, ShardId, ShardWelcome};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::shard::{Destination, Shard};
+
+/// How long a peer sender waits for one dial (QUIC/TLS plus the hello exchange)
+/// to a neighbour shard before it gives up on that attempt.
+///
+/// A neighbour on the same cluster answers in milliseconds, so this only ever
+/// runs out for a peer that is down — and while a dial is pending nothing queued
+/// for that peer moves, so the bound is what keeps a dead neighbour's queue from
+/// backing up for the transport's full ten seconds per attempt.
+pub const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many frames may sit unsent on one connection before the reader notices.
 ///
@@ -200,14 +223,32 @@ impl ShardNet {
         hello: space_protocol::Hello,
         shard: Arc<Mutex<Shard>>,
     ) {
-        let welcome = {
+        let (tx, mut rx) = mpsc::channel::<Message>(WRITE_QUEUE);
+        let joined = {
             let mut s = shard.lock().await;
-            match s.join(&hello) {
-                Ok(w) => w,
-                Err(reason) => {
-                    let _ = conn.send_control(&Message::Reject(Reject { reason })).await;
-                    return;
-                }
+            let joined = s.join(&hello);
+            if let Ok(welcome) = &joined {
+                // Registered **before the shard lock is released**. The session
+                // exists from the moment `join` returns, so the very next tick
+                // builds its first frame — the snapshot that tells the client
+                // which ship is its own. `flush` drops a frame for a session it
+                // has no queue for, and that snapshot is never sent twice: when
+                // the queue was only registered after the welcome had been
+                // written, a tick landing in between left the client connected,
+                // shipless and silent for good. Holding the shard lock across
+                // this insert is safe: nothing waits for the shard while holding
+                // `writers`.
+                self.writers.lock().await.insert(welcome.session, tx);
+            }
+            joined
+        };
+        let welcome = match joined {
+            Ok(welcome) => welcome,
+            Err(reason) => {
+                // The refusal has to *arrive*: writing it and returning would
+                // drop the connection and the close would beat the reason there.
+                conn.reject(reason).await;
+                return;
             }
         };
         if conn
@@ -215,14 +256,10 @@ impl ShardNet {
             .await
             .is_err()
         {
+            self.writers.lock().await.remove(&welcome.session);
             shard.lock().await.leave(welcome.session);
             return;
         }
-        let (tx, mut rx) = mpsc::channel::<Message>(WRITE_QUEUE);
-        self.writers
-            .lock()
-            .await
-            .insert(welcome.session, tx.clone());
         let dead = Arc::new(AtomicBool::new(false));
 
         let writer = {
@@ -299,7 +336,14 @@ impl ShardNet {
             };
             match next {
                 Ok(Some(message)) => shard.lock().await.peer_message(peer, message),
-                _ => break,
+                Ok(None) => {
+                    eprintln!("space-server: the connection from peer shard {peer} closed");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("space-server: the connection from peer shard {peer} failed: {e}");
+                    break;
+                }
             }
         }
     }
@@ -307,26 +351,45 @@ impl ShardNet {
     /// Deliver everything the shard queued.
     ///
     /// Client frames go into that client's write queue (dropped if it is full: a
-    /// client that cannot keep up loses frames, and the next delta or snapshot
-    /// resynchronises it). Shard-to-shard frames go into that peer's FIFO sender,
-    /// which preserves order on one persistent connection (see the module docs).
+    /// client that cannot keep up loses frames; what a lost frame carried is
+    /// sent again once the client's acknowledgements show it never arrived — see
+    /// [`crate::replicate`]). Shard-to-shard frames go into that peer's FIFO
+    /// sender, which preserves order on one persistent connection (see the
+    /// module docs).
+    ///
+    /// **Nothing in here waits on a queue.** This runs inside the tick loop, so
+    /// a full queue — a client that stopped reading, a neighbour that is down,
+    /// an orchestrator that is not answering — costs that destination its
+    /// message, never the shard its tick.
     pub async fn flush(&self, shard: &Arc<Mutex<Shard>>) {
-        let outbox = shard.lock().await.take_outbox();
-        let local = shard.lock().await.shard();
+        let (outbox, local) = {
+            let mut s = shard.lock().await;
+            (s.take_outbox(), s.shard())
+        };
+        if outbox.is_empty() {
+            return;
+        }
+        // Client frames are moved into their queues (not cloned: a frame is a
+        // few allocations per entity), in outbox order; everything else is kept
+        // back, still in outbox order, for the peer senders.
+        let mut elsewhere = Vec::new();
         {
             let writers = self.writers.lock().await;
-            for out in &outbox {
-                if let Destination::Client(session) = out.dest {
-                    if let Some(tx) = writers.get(&session) {
-                        // `try_send` rather than `send`: never let one slow client
-                        // hold the tick loop.
-                        let _ = tx.try_send(out.message.clone());
+            for out in outbox {
+                match out.dest {
+                    Destination::Client(session) => {
+                        if let Some(tx) = writers.get(&session) {
+                            // `try_send` rather than `send`: never let one slow
+                            // client hold the tick loop.
+                            let _ = tx.try_send(out.message);
+                        }
                     }
+                    Destination::Shard(_) | Destination::Orchestrator => elsewhere.push(out),
                 }
             }
         }
         // Peer messages go out in outbox order through each peer's FIFO sender.
-        for out in outbox {
+        for out in elsewhere {
             match out.dest {
                 Destination::Shard(shard_id) => {
                     // The peer is dialled at the address the shard's own map
@@ -339,7 +402,13 @@ impl ShardNet {
                 }
                 Destination::Orchestrator => {
                     if let Some(tx) = self.orchestrator.lock().await.as_ref() {
-                        let _ = tx.send(out.message).await;
+                        if tx.try_send(out.message).is_err() {
+                            self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
+                            eprintln!(
+                                "space-server: the orchestrator link is closed or backed up; \
+                                 message dropped"
+                            );
+                        }
                     }
                 }
                 Destination::Client(_) => {}
@@ -355,8 +424,13 @@ impl ShardNet {
     /// Queue `message` for `shard_id`'s FIFO sender, starting one if needed.
     ///
     /// Ordering is preserved because every message for a peer goes through the
-    /// same channel and the same sender task. An unknown endpoint, or a sender
-    /// that has gone away, is logged and counted — never silently dropped.
+    /// same channel and the same sender task. An unknown endpoint, a sender that
+    /// has gone away, or a queue that is full (the peer is down and its sender is
+    /// still dialling) is logged and counted — never silently dropped, and never
+    /// waited for: this is called from the tick loop, and a neighbour that is
+    /// down must not be able to stop this shard's simulation. Every handoff
+    /// message is covered by a timeout on the side that is waiting for it, so a
+    /// dropped one degrades to "the transfer did not happen".
     async fn send_to_peer(
         &self,
         local: ShardId,
@@ -374,9 +448,19 @@ impl ShardNet {
             return;
         };
         let sender = self.peer_sender(local, shard_id, addr).await;
-        if sender.tx.send(message).await.is_err() {
-            self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
-            eprintln!("space-server: peer sender for shard {shard_id} gone; message dropped");
+        match sender.tx.try_send(message) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
+                eprintln!(
+                    "space-server: the queue for peer shard {shard_id} is full (is it down?); \
+                     message dropped"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
+                eprintln!("space-server: peer sender for shard {shard_id} gone; message dropped");
+            }
         }
     }
 
@@ -417,6 +501,41 @@ impl ShardNet {
     }
 }
 
+/// Wait for a shard's two long-running tasks and say why the shard stopped.
+///
+/// * `serve` ending is the ordinary shutdown — the endpoint was closed. The tick
+///   loop is stopped and the result is `Ok`.
+/// * `ticking` ending is **never** ordinary: the loop has no exit, so it means
+///   the task panicked (or was cancelled from outside). The accept loop is
+///   stopped and the result is an error.
+///
+/// The second case is the reason this exists. A caller that only waits on
+/// `serve` does not notice the tick loop dying: the endpoint keeps accepting,
+/// every newcomer is welcomed, and the world they joined never advances again.
+/// A shard that cannot tick must stop, loudly.
+///
+/// # Errors
+///
+/// The tick loop ended, or the accept loop panicked.
+pub async fn supervise(
+    mut serve: JoinHandle<()>,
+    mut ticking: JoinHandle<()>,
+) -> Result<(), String> {
+    tokio::select! {
+        served = &mut serve => {
+            ticking.abort();
+            served.map_err(|e| format!("the accept loop failed: {e}"))
+        }
+        ticked = &mut ticking => {
+            serve.abort();
+            Err(match ticked {
+                Ok(()) => "the tick loop ended".to_owned(),
+                Err(e) => format!("the tick loop died ({e}); the shard cannot simulate any more"),
+            })
+        }
+    }
+}
+
 /// Drain `rx` and write each message to `addr` on one persistent connection.
 ///
 /// The connection is opened on the first message and reused; if it closes, the
@@ -426,6 +545,13 @@ impl ShardNet {
 /// failure bumps `failures` and logs, and the loop keeps trying on the next
 /// message rather than tearing the sender down (a transient failure must not
 /// permanently stall the transfer).
+///
+/// A dial is bounded by [`PEER_DIAL_TIMEOUT`], and a dial that fails takes
+/// **everything queued behind it** with it, each counted as a failure. Those
+/// messages belong to handoffs that have been waiting for the length of the
+/// dial already; delivering them one failed dial apart (which is what "try again
+/// on the next message" amounted to while a peer was down) only kept the queue
+/// full, and a full queue used to stall the tick loop.
 async fn run_peer_sender(
     mut rx: mpsc::Receiver<Message>,
     addr: SocketAddr,
@@ -435,8 +561,9 @@ async fn run_peer_sender(
     failures: Arc<AtomicU64>,
 ) {
     // One client endpoint for the life of the sender: a quinn `Endpoint` drives
-    // its connections, so it must outlive them.
-    let endpoint = match client_endpoint() {
+    // its connections, so it must outlive them. It is bound in the address
+    // family of the peer it dials.
+    let endpoint = match client_endpoint_for(addr) {
         Ok(endpoint) => endpoint,
         Err(e) => {
             failures.fetch_add(1, Ordering::SeqCst);
@@ -448,11 +575,22 @@ async fn run_peer_sender(
     let mut conn: Option<Conn> = None;
     while let Some(message) = rx.recv().await {
         if conn.as_ref().is_none_or(|c| c.is_closed()) {
-            conn = match connect(&endpoint, addr, SERVER_NAME, &peer_hello(local)).await {
+            let hello = peer_hello(local);
+            let dial = connect_within(&endpoint, addr, SERVER_NAME, &hello, PEER_DIAL_TIMEOUT);
+            conn = match dial.await {
                 Ok((conn, _welcome)) => Some(conn),
                 Err(e) => {
-                    failures.fetch_add(1, Ordering::SeqCst);
-                    eprintln!("space-server: connect to peer shard {peer} at {addr} failed: {e}");
+                    // This message is lost, and so is everything that queued up
+                    // behind it while the dial was pending (see the docs above).
+                    let mut dropped = 1u64;
+                    while rx.try_recv().is_ok() {
+                        dropped += 1;
+                    }
+                    failures.fetch_add(dropped, Ordering::SeqCst);
+                    eprintln!(
+                        "space-server: connect to peer shard {peer} at {addr} failed: {e}; \
+                         {dropped} queued message(s) dropped"
+                    );
                     continue; // try again on the next message
                 }
             };
@@ -492,9 +630,9 @@ pub struct OrchestratorLink {
     /// The shard's outbound sender: queue a message to send to the orchestrator.
     pub tx: mpsc::Sender<Message>,
     /// The reader task handle (kept so a caller can abort it on shutdown).
-    reader: tokio::task::JoinHandle<()>,
+    reader: JoinHandle<()>,
     /// The sender task handle.
-    sender: tokio::task::JoinHandle<()>,
+    sender: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for OrchestratorLink {
@@ -518,7 +656,7 @@ impl OrchestratorLink {
         hello: ShardHello,
     ) -> Result<(ShardWelcome, Conn), space_net::NetError> {
         let endpoint =
-            client_endpoint().map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
+            client_endpoint_for(addr).map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
         let (conn, _welcome) =
             connect(&endpoint, addr, SERVER_NAME, &peer_hello(hello.shard)).await?;
         // The orchestrator answered the transport handshake with a placeholder;
@@ -528,11 +666,23 @@ impl OrchestratorLink {
             .map_err(|e| space_net::NetError::Io(e.to_string()))?;
         // The welcome comes back on the reliable stream (the orchestrator's
         // per-shard FIFO sender writes every message, welcome included, with
-        // `send_reliable`), so read whichever path delivers it.
-        let next = tokio::select! {
-            m = conn.recv_control() => m,
-            m = conn.recv_stream() => m,
+        // `send_reliable`), so read whichever path delivers it. Bounded like the
+        // transport handshake: the connection is kept alive by pings, so an
+        // orchestrator that never answers would otherwise be waited on forever.
+        let answer = async {
+            tokio::select! {
+                m = conn.recv_control() => m,
+                m = conn.recv_stream() => m,
+            }
         };
+        let next = tokio::time::timeout(space_net::HANDSHAKE_TIMEOUT, answer)
+            .await
+            .map_err(|_| {
+                space_net::NetError::Handshake(format!(
+                    "no ShardWelcome from the orchestrator at {addr} within {:?}",
+                    space_net::HANDSHAKE_TIMEOUT
+                ))
+            })?;
         let welcome = match next.map_err(|e| space_net::NetError::Io(e.to_string()))? {
             Some(Message::ShardWelcome(w)) => w,
             Some(Message::Reject(reject)) => {
@@ -568,18 +718,27 @@ impl OrchestratorLink {
         let sender_conn = conn.clone();
         let sender = tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                if sender_conn.send_reliable(&message).await.is_err() {
+                if let Err(e) = sender_conn.send_reliable(&message).await {
+                    eprintln!(
+                        "space-server: the orchestrator link stopped sending ({e}); epoch acks \
+                         from this shard no longer reach the orchestrator"
+                    );
                     return;
                 }
             }
         });
         // Inbound: epoch prepare/commit/abort, fed to the shard.
+        //
+        // The reader ending is the end of this shard's membership of the
+        // cluster: no further epoch or map push will reach it, and nothing
+        // re-dials. That must not happen silently, so whatever ends the loop is
+        // logged.
         let reader = {
             let conn = conn.clone();
             tokio::spawn(async move {
-                loop {
-                    if conn.is_closed() {
-                        break;
+                let why = loop {
+                    if let Some(reason) = conn.close_reason() {
+                        break reason.to_string();
                     }
                     let next = tokio::select! {
                         m = conn.recv_control() => m,
@@ -596,9 +755,18 @@ impl OrchestratorLink {
                             }
                             _ => {}
                         },
-                        _ => break,
+                        Ok(None) => {
+                            break conn
+                                .close_reason()
+                                .map_or_else(|| "the stream ended".to_owned(), |r| r.to_string());
+                        }
+                        Err(e) => break e.to_string(),
                     }
-                }
+                };
+                eprintln!(
+                    "space-server: the orchestrator link closed ({why}); this shard no longer \
+                     receives epoch changes or map pushes"
+                );
             })
         };
         Self { tx, reader, sender }
@@ -627,9 +795,230 @@ mod tests {
     }
 
     fn probe() -> Message {
-        Message::Reject(Reject {
+        Message::Reject(space_protocol::Reject {
             reason: space_protocol::RejectReason::Draining,
         })
+    }
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    /// A served shard on loopback with **no** tick loop: the tests below decide
+    /// exactly when a tick and a flush happen.
+    async fn served_shard() -> (Arc<ShardNet>, Arc<Mutex<Shard>>, JoinHandle<()>) {
+        let net = Arc::new(ShardNet::bind(loopback()).expect("bind"));
+        let shard = Arc::new(Mutex::new(Shard::new(crate::ShardConfig::new(
+            ShardId::new(1),
+            net.local_addr().expect("addr"),
+            space_world::NodeRef::new(64, [0, 0, 0]),
+        ))));
+        let serve = tokio::spawn({
+            let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
+            async move { net.serve(shard).await }
+        });
+        (net, shard, serve)
+    }
+
+    /// A session is never visible to the tick loop without its write queue.
+    ///
+    /// The test holds the `writers` lock, so a serving task that joins the shard
+    /// has to stop wherever it registers its queue. The old order was "join,
+    /// release the shard, send the welcome, *then* register": the join was
+    /// visible (one client, shard lock free) while the queue was still missing,
+    /// and a tick + flush in that window built the client's first snapshot and
+    /// threw it away — for good, since a ship at rest is never sent twice. The
+    /// fixed order registers under the shard lock, so while registration is
+    /// blocked the shard lock is held and no tick can observe the session at all.
+    ///
+    /// Mutation this catches: moving `writers.insert` back after the shard lock
+    /// is released — `try_lock` then succeeds with one client and no queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_is_never_visible_without_its_write_queue() {
+        let (net, shard, serve) = served_shard().await;
+        let bound = net.local_addr().expect("addr");
+
+        let writers = net.writers.lock().await; // block registration
+        let client = tokio::spawn(async move {
+            let endpoint = client_endpoint_for(bound).expect("client endpoint");
+            connect(&endpoint, bound, SERVER_NAME, &hello("player")).await
+        });
+
+        // Wait until the serving task is parked on `writers` with the shard lock
+        // held: the shard stays locked across many consecutive looks. A join that
+        // merely passes through the lock releases it within microseconds, so it
+        // can never produce a run this long — and then the session shows.
+        let mut held_for = 0;
+        for _ in 0..2_000 {
+            match shard.try_lock() {
+                Ok(s) => {
+                    held_for = 0;
+                    assert_eq!(
+                        s.stats().clients,
+                        0,
+                        "the session is visible to a tick, but it has no write queue \
+                         (registered: {}): its first snapshot would be dropped",
+                        writers.len()
+                    );
+                }
+                Err(_) => held_for += 1,
+            }
+            if held_for >= 40 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            held_for >= 40,
+            "the serving task never reached registration under the shard lock"
+        );
+        drop(writers);
+
+        // From here on it is an ordinary join: one tick, one flush, and the
+        // first snapshot — the frame that names the client's own ship — arrives.
+        let (conn, welcome) = client.await.expect("client task").expect("connect");
+        assert!(net.writers.lock().await.contains_key(&welcome.session));
+        shard.lock().await.tick();
+        net.flush(&shard).await;
+        let frame = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
+            .await
+            .expect("the first snapshot must arrive")
+            .expect("recv")
+            .expect("a frame");
+        let Message::Snapshot(snapshot) = frame else {
+            panic!("the first frame for a new client is a snapshot, got {frame:?}");
+        };
+        let ship = shard
+            .lock()
+            .await
+            .ship_of(welcome.session)
+            .expect("a ship was spawned");
+        assert!(
+            snapshot.entities.iter().any(|e| e.guid == ship),
+            "the snapshot must carry the client's own ship"
+        );
+        serve.abort();
+        net.close();
+    }
+
+    /// A shard at the player cap tells the client so.
+    ///
+    /// Mutation this catches: answering a refused `join` with
+    /// `send_control(Reject)` and returning — the connection is dropped, its
+    /// close overtakes the reject, and the client sees a transport error.
+    #[tokio::test]
+    async fn a_full_shard_tells_the_client_it_is_full() {
+        let (net, shard, serve) = served_shard().await;
+        {
+            let mut s = shard.lock().await;
+            for i in 0..crate::shard::MAX_PLAYERS_PER_SHARD {
+                s.join(&hello(format!("filler-{i}"))).expect("filler joins");
+            }
+        }
+        let bound = net.local_addr().expect("addr");
+        let endpoint = client_endpoint_for(bound).expect("client endpoint");
+        let err = connect(&endpoint, bound, SERVER_NAME, &hello("one-too-many"))
+            .await
+            .expect_err("a full shard refuses");
+        assert_eq!(
+            err,
+            space_net::NetError::Rejected(space_protocol::RejectReason::Full),
+            "the client must learn that the shard is full"
+        );
+        serve.abort();
+        net.close();
+    }
+
+    /// A neighbour that is down cannot stop this shard's tick loop.
+    ///
+    /// More messages than a peer queue holds are queued for a peer whose port
+    /// nothing listens on, and `flush` — the call the tick loop makes — must
+    /// still return at once, with the overflow counted. When the dial has timed
+    /// out, everything that was queued behind it is counted as dropped too.
+    ///
+    /// Mutation this catches: `sender.tx.send(message).await` in `send_to_peer`
+    /// — the flush then waits for a slot the dialling sender does not free, and
+    /// the first assertion times out.
+    #[tokio::test]
+    async fn a_dead_neighbour_cannot_stall_the_tick_loop() {
+        let net = Arc::new(ShardNet::bind(loopback()).expect("bind"));
+        // A port that was just free: bind one, note it, let it go.
+        let dead = {
+            let probe = std::net::UdpSocket::bind(loopback()).expect("probe socket");
+            probe.local_addr().expect("probe addr")
+        };
+        let peer = ShardId::new(2);
+        let mut shard = Shard::new(crate::ShardConfig::new(
+            ShardId::new(1),
+            net.local_addr().expect("addr"),
+            space_world::NodeRef::new(64, [0, 0, 0]),
+        ));
+        shard.set_shard_map(space_protocol::ShardMap::new(
+            1,
+            vec![
+                space_protocol::ShardRegion::new(
+                    space_world::NodeRef::new(64, [0, 0, 0]),
+                    ShardId::new(1),
+                    net.local_addr().expect("addr"),
+                ),
+                space_protocol::ShardRegion::new(
+                    space_world::NodeRef::new(64, [1, 0, 0]),
+                    peer,
+                    dead,
+                ),
+            ],
+        ));
+        let queued = PEER_QUEUE as u64 + 50;
+        for _ in 0..queued {
+            shard.send_to(Destination::Shard(peer), probe());
+        }
+        let shard = Arc::new(Mutex::new(shard));
+
+        tokio::time::timeout(Duration::from_secs(1), net.flush(&shard))
+            .await
+            .expect("flush must never wait on a peer queue");
+        assert!(
+            net.peer_send_failures() >= 49,
+            "the messages that did not fit must be counted, got {}",
+            net.peer_send_failures()
+        );
+
+        // The dial gives up after `PEER_DIAL_TIMEOUT`; the whole backlog goes
+        // with it rather than being delivered one failed dial apart.
+        let deadline = tokio::time::Instant::now() + PEER_DIAL_TIMEOUT + Duration::from_secs(5);
+        while net.peer_send_failures() < queued && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            net.peer_send_failures(),
+            queued,
+            "every message for the dead peer must end up counted as dropped"
+        );
+        net.close();
+    }
+
+    /// The tick loop dying is an error, not something to serve through.
+    ///
+    /// Mutation this catches: `supervise` (or its callers) waiting on `serve`
+    /// only — the first case below then never returns.
+    #[tokio::test]
+    async fn a_dead_tick_loop_stops_the_shard_with_an_error() {
+        // The tick loop panics while the accept loop is still running.
+        let serve = tokio::spawn(std::future::pending::<()>());
+        let ticking = tokio::spawn(async { panic!("tick loop bug") });
+        let stopped = tokio::time::timeout(Duration::from_secs(5), supervise(serve, ticking))
+            .await
+            .expect("a dead tick loop must end the wait");
+        let why = stopped.expect_err("a dead tick loop is an error");
+        assert!(
+            why.contains("tick loop"),
+            "the error names the cause: {why}"
+        );
+
+        // The ordinary shutdown: the endpoint closed, so the accept loop ended.
+        let serve = tokio::spawn(async {});
+        let ticking = tokio::spawn(std::future::pending::<()>());
+        assert_eq!(supervise(serve, ticking).await, Ok(()));
     }
 
     /// A hand-registered endpoint must not shadow the map's current address: the

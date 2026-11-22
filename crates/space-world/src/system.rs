@@ -172,11 +172,59 @@ impl StarSystem {
         let r = self.belt_axis * (0.9 + hash_unit(h) * 0.2);
         let phase = hash_unit(h2) * std::f64::consts::TAU;
         let period = 2.0 * std::f64::consts::PI * (r * r * r / SYSTEM_MU).sqrt();
-        let z = (hash_unit(h2 ^ 0x9) - 0.5) * 1.0e6;
+        // A *re-mixed* draw. `hash_unit(h2 ^ 0x9)` would be the phase draw
+        // again: xor-ing two low bits moves `h2` by at most 9, so
+        // `hash_unit` (a remainder) moves by at most 9e-6 and every body's
+        // height would be a function of its starting angle — a one-turn helix
+        // instead of a scattered belt.
+        let z = (hash_unit(splitmix64(h2 ^ 0x9)) - 0.5) * 1.0e6;
         // Reduce `t` modulo the period first so the trigonometric argument
         // stays small and platform-stable for large `t`.
         let tt = t % period;
         let ang = phase + (std::f64::consts::TAU * tt) / period;
         WorldPos::from_f64_metres_around(self.star, [r * ang.cos(), r * ang.sin(), z])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StarSystem;
+    use crate::pos::WorldPos;
+
+    /// A belt body's height above the orbital plane must be independent of
+    /// where on the ring it starts.
+    ///
+    /// Both are drawn from the same hash; the height used to be drawn from that
+    /// hash with two low bits flipped, which moves a `hash_unit` draw by at most
+    /// 9e-6 — so `height = phase ± 9e-6` for *every* body and the belt was a
+    /// one-turn helix. With independent draws, a body lands within 1e-3 of that
+    /// line by chance about twice in a thousand.
+    #[test]
+    fn belt_height_is_independent_of_orbital_phase() {
+        const BODIES: u32 = 1000;
+        for seed in [0x5EED_u64, 7, 0xDEAD_BEEF] {
+            let star = WorldPos::ZERO;
+            let sys = StarSystem::new(seed, star);
+            assert!(sys.belt_body_count() >= BODIES);
+            let mut on_the_helix = 0u32;
+            for i in 0..BODIES {
+                let d = WorldPos::delta(star, sys.belt_body_pos(i, 0.0));
+                // The starting angle as a fraction of a turn and the height as
+                // a fraction of the belt's 1000 km thickness: both in [0, 1].
+                let phase =
+                    d[1].atan2(d[0]).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+                let height = d[2] / 1.0e6 + 0.5;
+                assert!((0.0..=1.0).contains(&height), "body {i}: height {height}");
+                // Distance on the unit circle, so 0.999 and 0.001 are close.
+                let gap = (phase - height).abs();
+                if gap.min(1.0 - gap) < 1e-3 {
+                    on_the_helix += 1;
+                }
+            }
+            assert!(
+                on_the_helix < BODIES / 20,
+                "seed {seed:#x}: {on_the_helix}/{BODIES} belt bodies have height == phase"
+            );
+        }
     }
 }

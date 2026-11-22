@@ -8,7 +8,7 @@
 //! lets the acceptance tests run two shards inside one process and hand their
 //! outboxes to each other.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use space_protocol::{
     EntityGuid, HandoffReason, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
@@ -17,13 +17,31 @@ use space_protocol::{
 use space_sim::{ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
 
-use crate::config::{ShardConfig, ADOPT_TIMEOUT_TICKS, REDIRECT_TIMEOUT_TICKS};
+use crate::config::{
+    ShardConfig, ADOPT_TIMEOUT_TICKS, MAX_PENDING_INPUTS, REDIRECT_TIMEOUT_TICKS,
+    REOFFER_BACKOFF_TICKS,
+};
 use crate::epoch::EpochParticipant;
 use crate::handoff::{Ledger, HANDOFF_TIMEOUT_TICKS};
-use crate::replicate::{self, ClientReplica, Frame, GuidIndex, Interest};
+use crate::replicate::{self, ClientReplica, Frame, GuidIndex, Interest, PassCache, Visible};
 
 /// Hard cap on concurrent client sessions per shard (docs/plan.md U9).
 pub const MAX_PLAYERS_PER_SHARD: usize = 100;
+
+/// Most undelivered messages the outbox holds before old client deltas are
+/// discarded.
+///
+/// The front end drains the outbox after every tick, so a running shard never
+/// holds more than one tick's worth (at most one frame per client plus a few
+/// handoff messages). The bound is for a caller that steps the shard *without*
+/// draining it — [`Shard::tick_n`] from a tool or a test. Every client is sent a
+/// frame every tick, so an undrained outbox would otherwise grow by one message
+/// per client per tick for as long as nobody collects it. Only [`Message::Delta`]
+/// frames for clients are discarded, oldest first: a newer delta supersedes an
+/// older one, and what a discarded one carried is re-sent once the client's
+/// acknowledgements show it never arrived (see [`crate::replicate`]). Snapshots,
+/// redirects and everything addressed to a shard or the orchestrator are kept.
+pub const MAX_OUTBOX: usize = 4096;
 
 /// One message routed to a peer: a client session or another shard.
 #[derive(Debug, Clone)]
@@ -130,6 +148,10 @@ pub struct Shard {
     ledger: Ledger,
     /// Commits waiting for their activation tick (see [`PendingCommit`]).
     pending_commits: Vec<PendingCommit>,
+    /// Entities a peer refused, with the peer and the tick before which they are
+    /// not offered to it again (see
+    /// [`REOFFER_BACKOFF_TICKS`](crate::config::REOFFER_BACKOFF_TICKS)).
+    refused: HashMap<EntityGuid, (ShardId, SimTick)>,
     outbox: Vec<OutMessage>,
     /// Ships whose commit went out this tick; despawned once the tick's frames
     /// are built (see [`Shard::tick`] step 7).
@@ -161,6 +183,7 @@ impl Shard {
             next_serial: 1,
             ledger: Ledger::new(),
             pending_commits: Vec::new(),
+            refused: HashMap::new(),
             outbox: Vec::new(),
             departing: Vec::new(),
             shard_map: map,
@@ -231,8 +254,12 @@ impl Shard {
     }
 
     /// Replace the shard map (an orchestrator, or a test wiring two shards).
+    ///
+    /// A new map also ends every re-offer pause: a refusal was a statement about
+    /// the map it was made under.
     pub fn set_shard_map(&mut self, map: ShardMap) {
         self.shard_map = map;
+        self.refused.clear();
     }
 
     /// The current epoch.
@@ -262,6 +289,8 @@ impl Shard {
         // (the participant allows one outstanding prepare at a time).
         let _ = self.epoch_participant.discard_through(map.epoch);
         self.shard_map = map;
+        // A refusal under the old map says nothing about the new one.
+        self.refused.clear();
         // Abort every in-flight outgoing transfer that is now stale, so the guid
         // is released immediately (guarantee 8) rather than after the next tick.
         let stale: Vec<EntityGuid> = self
@@ -439,6 +468,15 @@ impl Shard {
     /// ship was in goes with it — the player is gone, so the handoff is off, and
     /// telling the peer so is what stops it waiting for a commit that can never
     /// come (guarantee 3's gate is a *connected* client).
+    ///
+    /// The same holds on the **accepting** side. A client that adopted a staged
+    /// entity and then left has a ship that is not in the world yet: it is
+    /// either still staged (the commit has not arrived) or committed and waiting
+    /// for its install tick. Neither is touched by `despawn_ship`, so both are
+    /// dropped here — the staged one with an abort to the offering shard, which
+    /// then simply keeps the ship. Left alone, the commit would later install a
+    /// ship owned by a session that no longer exists, and nothing would ever
+    /// despawn it.
     pub fn leave(&mut self, session: u64) {
         let Some(client) = self.clients.remove(&session) else {
             return;
@@ -449,6 +487,16 @@ impl Shard {
         if self.ledger.activation_of(ship).is_some() {
             self.abort_outgoing(ship, HandoffReason::ClientNotConnected);
         }
+        if self
+            .ledger
+            .incoming()
+            .get(&ship)
+            .is_some_and(|staged| staged.session == Some(session))
+        {
+            self.abort_incoming(ship, HandoffReason::ClientNotConnected);
+        }
+        self.pending_commits
+            .retain(|pending| !(pending.guid == ship && pending.session == session));
         self.despawn_ship(ship);
     }
 
@@ -480,11 +528,11 @@ impl Shard {
 
     /// Despawn `guid` and drop it from every local index.
     pub fn despawn_ship(&mut self, guid: EntityGuid) {
-        if let Some(entity) = self.guids.entity_of(guid) {
+        if self.guids.entity_of(guid).is_some() {
             self.guids.remove(guid);
             self.interest.remove(guid);
             self.sim.despawn_ship(guid);
-            let _ = entity;
+            self.refused.remove(&guid);
         }
     }
 
@@ -501,16 +549,15 @@ impl Shard {
         let Some(client) = self.clients.get_mut(&session) else {
             return;
         };
-        // The client's view of what it has applied: never let the replica fall
-        // behind it, or a delta would be built against a tick the client has
-        // already moved past. **Clamped to our own tick**: a client claiming a
-        // far-future ack would otherwise push `ack_tick` past every future change
-        // tick and silently stop its own replication (nothing is ever
-        // "changed since" a tick that has not happened).
+        // The client's view of what it has applied settles the frames we are
+        // still holding for it: the acknowledged one arrived, an older one that
+        // was never acknowledged is presumed lost and owed again (see
+        // [`ClientReplica::acknowledge`]). **Clamped to our own tick**: a client
+        // cannot have applied a frame that has not been built, and an
+        // acknowledgement from the future would write off every frame still in
+        // flight.
         let ack = batch.ack_tick.min(self.sim.tick());
-        if client.replica.ack_tick < ack {
-            client.replica.ack_tick = ack;
-        }
+        client.replica.acknowledge(ack);
         // Rewrite every input to this session's ship. This is the `entity_of`
         // trust boundary: the guid that reaches the simulation is ours, whatever
         // the client sent. An awaiting-adopt client has no ship yet, so its
@@ -518,7 +565,11 @@ impl Shard {
         let Some(ship) = client.ship else {
             return;
         };
-        for input in &batch.inputs {
+        // Bounded: only one input per tick can ever be applied to the one ship
+        // this session drives, so anything past a few windows is noise (see
+        // [`MAX_PENDING_INPUTS`]).
+        let room = MAX_PENDING_INPUTS.saturating_sub(client.pending_inputs.len());
+        for input in batch.inputs.iter().take(room) {
             let mut input = *input;
             input.entity = ship;
             client.pending_inputs.push(input);
@@ -530,23 +581,25 @@ impl Shard {
         // The client telling us it reached the accepting shard is the gate for the
         // commit (guarantee 3). We mirror it to the offering shard, per
         // `NeighbourStatus`'s contract.
+        //
+        // Either way the status is a claim about a staged entity, and a claim is
+        // only honoured from the player that entity belongs to — **the client
+        // whose hello token is the token the offer carried the owner under**. A
+        // guid is `(shard, serial)` with serials starting at 1, so it is trivially
+        // guessable; the token is what makes the claim non-forgeable. Without the
+        // match, a second client could name somebody else's staged ship and be
+        // handed its `Owner` stamp and its inputs (`connected = true`), or cancel
+        // somebody else's handoff (`connected = false`).
+        let claim_is_authorized =
+            self.ledger
+                .incoming()
+                .get(&status.entity)
+                .is_some_and(|staged| {
+                    self.clients
+                        .get(&session)
+                        .is_some_and(|client| client.player_token == staged.owner_token)
+                });
         if status.connected {
-            // Adopt: the client reporting that it reached us *for this entity* is
-            // the player that entity belongs to — **but only if its hello token is
-            // the token the offer carried the owner under**. A guid is
-            // `(shard, serial)` with serials starting at 1, so it is trivially
-            // guessable; the token is what makes the claim non-forgeable. Without
-            // the match, a second client could name somebody else's staged ship
-            // and be handed its `Owner` stamp and its inputs.
-            let claim_is_authorized =
-                self.ledger
-                    .incoming()
-                    .get(&status.entity)
-                    .is_some_and(|staged| {
-                        self.clients
-                            .get(&session)
-                            .is_some_and(|client| client.player_token == staged.owner_token)
-                    });
             if claim_is_authorized {
                 let placeholder = self
                     .clients
@@ -581,13 +634,11 @@ impl Shard {
                     client.redirect_deadline = None;
                 }
             }
-        } else if let Some(abort) = self.ledger.abort_incoming(
-            status.entity,
-            status.shard,
-            HandoffReason::ClientNotConnected,
-        ) {
-            self.stats.aborted += 1;
-            self.send_to(Destination::Shard(abort.from), Message::HandoffAbort(abort));
+        } else if claim_is_authorized {
+            // The owner could not reach us: give the staged entity back. The
+            // abort names *this* shard as the one that would have taken it — not
+            // whatever shard id the client put in its status.
+            self.abort_incoming(status.entity, HandoffReason::ClientNotConnected);
         }
     }
 
@@ -631,15 +682,19 @@ impl Shard {
             Message::NeighbourStatus(status) => self.on_neighbour_status(from, status),
             Message::StaleEpoch(stale) => {
                 // Our map is behind: any transfer we have in flight is invalid.
-                let entities: Vec<EntityGuid> = self
+                let stale_transfers: Vec<(EntityGuid, ShardId)> = self
                     .ledger
                     .outgoing()
-                    .keys()
-                    .copied()
+                    .iter()
                     .filter(|_| stale.current > self.epoch())
+                    .map(|(guid, entry)| (*guid, entry.to))
                     .collect();
-                for entity in entities {
+                for (entity, to) in stale_transfers {
                     self.abort_outgoing(entity, HandoffReason::EpochChanged);
+                    // The peer will keep refusing until our map catches up, and
+                    // a new map clears this pause: there is nothing to gain from
+                    // offering again before then.
+                    self.pause_reoffer(entity, to);
                 }
             }
             other => {
@@ -696,15 +751,38 @@ impl Shard {
             self.send_to(Destination::Shard(offer.from), Message::HandoffAbort(abort));
             return;
         }
-        // Two guarantee-6 failures: we cannot take an entity we are ourselves
-        // moving, and we cannot take one we already hold (a duplicate offer after
-        // a lost accept).
-        if self.ledger.is_busy(offer.entity) || self.sim.entity_of(offer.entity).is_some() {
+        // Three guarantee-6 failures: we cannot take an entity we are ourselves
+        // moving, we cannot take one we already hold (a duplicate offer after a
+        // lost accept), and we cannot take one whose commit has already arrived
+        // and is waiting for its install tick — it is in neither the ledger nor
+        // the world for those few ticks, and staging it a second time would end
+        // in two installs of one guid.
+        if self.ledger.is_busy(offer.entity)
+            || self.sim.entity_of(offer.entity).is_some()
+            || self
+                .pending_commits
+                .iter()
+                .any(|pending| pending.guid == offer.entity)
+        {
             let abort = space_protocol::HandoffAbort {
                 entity: offer.entity,
                 from: self.config.shard,
                 to: offer.to,
                 reason: HandoffReason::Other("entity is not available here".into()),
+            };
+            self.send_to(Destination::Shard(offer.from), Message::HandoffAbort(abort));
+            return;
+        }
+        // The state must be one we can install. Refusing here, while the offering
+        // shard still simulates the entity, is the only point at which an
+        // undecodable state costs nothing: once the commit is out the sender has
+        // let go, and there is no good answer left.
+        if decode_ship_state(&offer.state).is_none() {
+            let abort = space_protocol::HandoffAbort {
+                entity: offer.entity,
+                from: self.config.shard,
+                to: offer.to,
+                reason: HandoffReason::Other("the offered state is not a decodable ship".into()),
             };
             self.send_to(Destination::Shard(offer.from), Message::HandoffAbort(abort));
             return;
@@ -745,10 +823,48 @@ impl Shard {
         let Some(staged) = self.ledger.take_incoming_from(commit.entity, commit.from) else {
             return; // aborted, never staged, or staged by a different shard
         };
-        // The commit's final state replaces the staged one (guarantee 4).
-        let state = decode_ship_state(&commit.state)
-            .or_else(|| decode_ship_state(&staged.state))
-            .unwrap_or(ShipState::IDENTITY);
+        // The commit's final state replaces the staged one (guarantee 4). A
+        // commit whose state does not decode falls back to the state the offer
+        // staged — a few ticks old, but the entity's own — and says so. It is
+        // never replaced by a default: a ship silently re-created at
+        // `ShipState::IDENTITY` is a ship teleported to the world origin. The
+        // staged state was checked when the offer was accepted, so the refusal
+        // below is unreachable through `on_offer`; it is here so that no path can
+        // install a state nobody sent.
+        let state = match decode_ship_state(&commit.state) {
+            Some(state) => state,
+            None => match decode_ship_state(&staged.state) {
+                Some(state) => {
+                    eprintln!(
+                        "space-server: the commit for {} from {} carried an undecodable \
+                         state; installing the state its offer staged",
+                        commit.entity, staged.from
+                    );
+                    state
+                }
+                None => {
+                    eprintln!(
+                        "space-server: neither the commit nor the offer for {} from {} \
+                         carried a decodable state; the transfer is refused",
+                        commit.entity, staged.from
+                    );
+                    self.stats.aborted += 1;
+                    let abort = space_protocol::HandoffAbort {
+                        entity: commit.entity,
+                        from: staged.from,
+                        to: self.config.shard,
+                        reason: HandoffReason::Other(
+                            "the committed state is not a decodable ship".into(),
+                        ),
+                    };
+                    self.send_to(
+                        Destination::Shard(staged.from),
+                        Message::HandoffAbort(abort),
+                    );
+                    return;
+                }
+            },
+        };
         let session = staged.session.unwrap_or(0);
         // The entity is **not** spawned here. The commit's state is the state as
         // of the offering shard's `activation_tick`, and a commit can be delivered
@@ -776,11 +892,22 @@ impl Shard {
     fn on_abort(&mut self, abort: space_protocol::HandoffAbort) {
         // Either way an abort means "nothing happened": drop our half and keep
         // simulating whatever we have (guarantee 6).
-        if self.ledger.take_outgoing(abort.entity).is_some()
-            || self.ledger.take_incoming(abort.entity).is_some()
-        {
+        if let Some(outgoing) = self.ledger.take_outgoing(abort.entity) {
+            self.stats.aborted += 1;
+            // The peer turned our offer down. The ship is still on its side of
+            // the boundary, so the handoff pass would offer it again on the very
+            // next tick, be refused again, and so on at tick rate.
+            self.pause_reoffer(abort.entity, outgoing.to);
+        } else if self.ledger.take_incoming(abort.entity).is_some() {
             self.stats.aborted += 1;
         }
+    }
+
+    /// Do not offer `entity` to `to` again for
+    /// [`REOFFER_BACKOFF_TICKS`](crate::config::REOFFER_BACKOFF_TICKS).
+    fn pause_reoffer(&mut self, entity: EntityGuid, to: ShardId) {
+        let until = self.sim.tick().saturating_add(REOFFER_BACKOFF_TICKS);
+        self.refused.insert(entity, (to, until));
     }
 
     fn abort_outgoing(&mut self, entity: EntityGuid, reason: HandoffReason) {
@@ -895,6 +1022,25 @@ impl Shard {
             .extract_if(.., |p| p.install_at <= tick)
             .collect();
         for pending in due {
+            // Never spawn a guid that is already alive here. `on_offer` refuses
+            // an entity whose commit is pending, so two installs of one guid
+            // should not be reachable — but `SimWorld::spawn_ship` *panics* on a
+            // duplicate, a panic here kills the tick loop, and a shard whose tick
+            // loop is dead keeps accepting players into a frozen world. A guard
+            // is cheaper than that failure.
+            if self.sim.entity_of(pending.guid).is_some() {
+                eprintln!(
+                    "space-server: dropped a second install of {}: it is already alive here",
+                    pending.guid
+                );
+                continue;
+            }
+            // The player this ship was committed for has left in the meantime
+            // (see [`Shard::leave`]): installing it would leave a ship nobody
+            // owns and nothing ever despawns.
+            if pending.session != 0 && !self.clients.contains_key(&pending.session) {
+                continue;
+            }
             let entity = self
                 .sim
                 .spawn_ship(pending.guid, pending.session, pending.state);
@@ -957,8 +1103,11 @@ impl Shard {
 
     /// The handoff pass: boundary crossings, commits, timeouts.
     fn handoff_pass(&mut self, tick: SimTick) {
+        // A re-offer pause that has run out is forgotten.
+        self.refused.retain(|_, (_, until)| tick < *until);
+
         // --- start a transfer for every client ship that left our region.
-        let mut to_offer: Vec<(EntityGuid, ShardId)> = Vec::new();
+        let mut to_offer: Vec<(EntityGuid, ShardId, WorldPos)> = Vec::new();
         for client in self.clients.values() {
             let Some(guid) = client.ship else {
                 continue; // awaiting adopt: no ship of ours to offer
@@ -972,11 +1121,20 @@ impl Shard {
             let owner = self.shard_map.lookup(&state.pos);
             if let Some(owner) = owner {
                 if owner != self.config.shard && owner != ShardId::NONE {
-                    to_offer.push((guid, owner));
+                    // The peer refused this ship a moment ago: wait before asking
+                    // it again (a different peer is a different question).
+                    if self
+                        .refused
+                        .get(&guid)
+                        .is_some_and(|(refused_by, _)| *refused_by == owner)
+                    {
+                        continue;
+                    }
+                    to_offer.push((guid, owner, state.pos));
                 }
             }
         }
-        for (guid, to) in to_offer {
+        for (guid, to, ship_pos) in to_offer {
             let Some(entity) = self.sim.entity_of(guid) else {
                 continue;
             };
@@ -1003,19 +1161,22 @@ impl Shard {
             // the player driving it: `Redirect::entity` is "the entity the client
             // is now interested in", so an observer that has been watching the ship
             // must be told to follow it to `to` rather than simply lose it.
+            //
+            // "Holds the entity" is a distance test against the one ship being
+            // offered — the same `distance² <= radius²` rule the interest grid
+            // applies — not a full sphere query per client, which walked ~9 000
+            // grid cells for every client for every offer.
+            let radius_sq =
+                f64::from(self.config.interest_radius) * f64::from(self.config.interest_radius);
             let watchers: Vec<u64> = self
                 .clients
                 .values()
                 .filter(|client| {
-                    self.interest
-                        .visible(
-                            client
-                                .ship
-                                .and_then(|g| self.sim.ship_state(g))
-                                .map_or(WorldPos::ZERO, |s| s.pos),
-                            self.config.interest_radius,
-                        )
-                        .contains(&guid)
+                    let anchor = client
+                        .ship
+                        .and_then(|g| self.sim.ship_state(g))
+                        .map_or(WorldPos::ZERO, |s| s.pos);
+                    WorldPos::distance_squared(anchor, ship_pos) <= radius_sq
                 })
                 .map(|client| client.session)
                 .collect();
@@ -1131,16 +1292,45 @@ impl Shard {
         }
     }
 
+    /// Keep an outbox nobody is draining from growing without bound (see
+    /// [`MAX_OUTBOX`]): once it is over the limit, the oldest client deltas are
+    /// discarded until it is half full again. A no-op in a running shard.
+    fn trim_outbox(&mut self) {
+        if self.outbox.len() <= MAX_OUTBOX {
+            return;
+        }
+        let mut to_drop = self.outbox.len() - MAX_OUTBOX / 2;
+        self.outbox.retain(|out| {
+            let stale = to_drop > 0
+                && matches!(out.dest, Destination::Client(_))
+                && matches!(out.message, Message::Delta(_));
+            if stale {
+                to_drop -= 1;
+            }
+            !stale
+        });
+    }
+
     /// Build and queue one frame per client.
+    ///
+    /// Every client that has a ship in this world gets a frame every tick (see
+    /// [`crate::replicate`], "A frame every tick"). The interest sphere is
+    /// queried once per client, and whatever is the same for every client this
+    /// tick — the encoded entities, the changed set — is computed once in a
+    /// [`PassCache`].
     fn replicate_pass(&mut self) {
+        self.trim_outbox();
         let radius = self.config.interest_radius;
-        let budget = self.config.frame_budget;
-        let shard = self.config.shard;
-        let epoch = self.epoch();
-        let mut frames: Vec<(u64, Frame)> = Vec::with_capacity(self.clients.len());
-        let sessions: Vec<u64> = self.clients.keys().copied().collect();
-        for session in sessions {
-            let Some(ship) = self.clients.get(&session).and_then(|c| c.ship) else {
+        let cx = replicate::FrameContext {
+            shard: self.config.shard,
+            epoch: self.shard_map.epoch,
+            budget: self.config.frame_budget,
+            guids: &self.guids,
+        };
+        let mut cache = PassCache::new();
+        let mut visible_set: HashSet<EntityGuid> = HashSet::new();
+        for client in self.clients.values_mut() {
+            let Some(ship) = client.ship else {
                 continue; // awaiting adopt: nothing to anchor a view on yet
             };
             // The anchor is the client's own ship; if it is gone (handed off and
@@ -1150,43 +1340,26 @@ impl Shard {
                 continue;
             };
             let visible = self.interest.visible(anchor, radius);
-            let ack = self.clients.get(&session).map_or(0, |c| c.replica.ack_tick);
-            let changed = replicate::changed_in_interest(
+            visible_set.clear();
+            visible_set.extend(visible.iter().copied());
+            let frame = replicate::build_frame(
                 &mut self.sim,
-                &self.guids,
-                &self.interest,
-                anchor,
-                radius,
-                ack,
+                cx,
+                &mut cache,
+                &mut client.replica,
+                Visible {
+                    ordered: &visible,
+                    set: &visible_set,
+                },
             );
-            let replica = &mut self
-                .clients
-                .get_mut(&session)
-                .expect("session just listed")
-                .replica;
-            frames.push((
-                session,
-                replicate::build_frame(
-                    &mut self.sim,
-                    replicate::FrameContext {
-                        shard,
-                        epoch,
-                        budget,
-                        guids: &self.guids,
-                    },
-                    replica,
-                    &visible,
-                    &changed,
-                ),
-            ));
-        }
-        for (session, frame) in frames {
             let message = match frame {
                 Frame::Snapshot(snapshot) => Message::Snapshot(snapshot),
                 Frame::Delta(delta) => Message::Delta(delta),
-                Frame::Idle => continue,
             };
-            self.send_to(Destination::Client(session), message);
+            self.outbox.push(OutMessage {
+                dest: Destination::Client(client.session),
+                message,
+            });
         }
     }
 
@@ -1268,4 +1441,125 @@ fn offer_token_of(snapshot: &space_protocol::EntitySnapshot) -> String {
         .find(|(id, _)| *id == OWNER_TOKEN_COMPONENT)
         .and_then(|(_, payload)| String::from_utf8(payload.clone()).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client cannot make the shard hold (and feed to the simulation, under
+    /// the shard lock) more inputs than it could ever use: one frame can carry
+    /// tens of thousands, and at most one per tick is ever applied to the one
+    /// ship a session drives.
+    ///
+    /// Mutation this catches: pushing every input of a batch without the
+    /// `MAX_PENDING_INPUTS` bound in `Shard::apply_input`.
+    #[test]
+    fn a_flood_of_inputs_is_capped_between_ticks() {
+        let mut shard = Shard::new(ShardConfig::new(
+            ShardId::new(1),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            NodeRef::new(64, [0, 0, 0]),
+        ));
+        let session = shard
+            .join(&Hello {
+                protocol: space_protocol::PROTOCOL_VERSION,
+                player_token: "flooder".into(),
+            })
+            .expect("join")
+            .session;
+        let ship = shard.ship_of(session).expect("a ship");
+        let flood = InputTick {
+            tick: 1,
+            seq: 1,
+            inputs: vec![
+                PlayerInput {
+                    entity: ship,
+                    thrust: [1.0, 0.0, 0.0],
+                    torque: [0.0; 3],
+                    tick: 1,
+                };
+                23_000
+            ],
+            ack_tick: 0,
+        };
+        shard.apply_input(session, &flood);
+        shard.apply_input(session, &flood);
+        assert_eq!(
+            shard.clients[&session].pending_inputs.len(),
+            MAX_PENDING_INPUTS,
+            "the backlog is bounded however much is sent"
+        );
+
+        // The cap costs a well-behaved input nothing: the tick drains the
+        // backlog and the ship answers.
+        shard.tick();
+        assert!(shard.clients[&session].pending_inputs.is_empty());
+        let state = shard.sim().ship_state(ship).expect("alive");
+        assert!(state.vel[0] > 0.0, "the input was applied: {state:?}");
+    }
+
+    /// An outbox nobody drains stops growing, and what it sheds is old client
+    /// deltas only.
+    ///
+    /// Every client gets a frame every tick, so a caller that steps the shard
+    /// with `tick_n` and never collects the outbox would otherwise leak one
+    /// message per client per tick.
+    ///
+    /// Mutation this catches: removing `trim_outbox` from the replication pass
+    /// (the outbox then holds one frame per tick ever stepped), or letting it
+    /// discard anything but a client delta (the snapshot or the peer message
+    /// would be gone).
+    #[test]
+    fn an_undrained_outbox_is_bounded_and_sheds_only_old_deltas() {
+        let mut config = ShardConfig::new(
+            ShardId::new(1),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            NodeRef::new(64, [0, 0, 0]),
+        );
+        // A small sphere keeps ten thousand ticks cheap; it changes nothing else.
+        config.interest_radius = 100.0;
+        let mut shard = Shard::new(config);
+        let session = shard
+            .join(&Hello {
+                protocol: space_protocol::PROTOCOL_VERSION,
+                player_token: "nobody-listens".into(),
+            })
+            .expect("join")
+            .session;
+        shard.send_to(
+            Destination::Shard(ShardId::new(9)),
+            Message::StaleEpoch(StaleEpoch {
+                seen: 1,
+                current: 2,
+            }),
+        );
+
+        let last = shard.tick_n(MAX_OUTBOX as SimTick * 2 + 500);
+        assert!(
+            shard.outbox.len() <= MAX_OUTBOX + 1,
+            "the outbox must stop growing, got {} messages",
+            shard.outbox.len()
+        );
+        assert!(
+            shard
+                .outbox
+                .iter()
+                .any(|o| matches!(o.message, Message::Snapshot(_))),
+            "the snapshot is never shed"
+        );
+        assert!(
+            shard
+                .outbox
+                .iter()
+                .any(|o| matches!(o.dest, Destination::Shard(_))),
+            "a message for another shard is never shed"
+        );
+        let newest = shard.outbox.last().expect("the outbox is not empty");
+        assert_eq!(newest.dest, Destination::Client(session));
+        assert!(
+            matches!(&newest.message, Message::Delta(d) if d.tick == last),
+            "the newest frame is kept: {newest:?}"
+        );
+    }
 }

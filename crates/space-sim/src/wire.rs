@@ -16,16 +16,38 @@
 //! ```
 //!
 //! Total: 76 bytes. Every `f32` is written as its IEEE-754 bits (not a varint,
-//! not a decimal), so `-0.0`, every finite subnormal and every finite value
-//! survive the round trip exactly. The `pos` field reuses
-//! [`space_protocol::pos`], which validates its `local` on decode. The velocity,
-//! quaternion and angular-velocity fields are plain `f32`s the physics can
-//! legitimately produce any *finite* value of, so they are not range-checked —
-//! but they **are** checked for finiteness on decode: a decoded `ShipState` is
-//! untrusted input (a [`space_protocol::HandoffCommit::state`] arrives from
-//! another shard, a component payload from a client), and a non-finite value
-//! there would poison the integrator permanently, so it is rejected with
-//! [`space_protocol::CodecError::InvalidPayload`] rather than trusted.
+//! not a decimal), so `-0.0`, every finite subnormal and every value the
+//! physics can produce survive the round trip exactly. The `pos` field reuses
+//! [`space_protocol::pos`], which validates its `local` on decode.
+//!
+//! # Validation on decode
+//!
+//! A decoded `ShipState` is untrusted input (a
+//! [`space_protocol::HandoffCommit::state`] arrives from another shard, a
+//! component payload from a client), and it goes straight into the integrator.
+//! Decoding therefore rejects, with
+//! [`space_protocol::CodecError::InvalidPayload`], every state the integrator
+//! could not have produced and could be poisoned by:
+//!
+//! * a **non-finite** component anywhere — a NaN never leaves a float state;
+//! * a quaternion that is **not close to unit** (`|q|²` outside
+//!   [`QUAT_NORM2_MIN`]`..=`[`QUAT_NORM2_MAX`]). [`crate::step_ship`] rotates the
+//!   thrust by the stored quaternion *before* it re-normalises it, and that
+//!   rotation is quadratic in `|q|`: `q = [0, 2e19, 0, 0]` with one tick of
+//!   thrust overflows `f32` to `−inf`, the position becomes NaN on the same
+//!   tick and the velocity on the next;
+//! * a velocity component beyond [`MAX_SPEED`] or an angular-velocity component
+//!   beyond [`MAX_SPIN`] — finite, but absurd. Near `f32::MAX` the angular
+//!   damping term `(drag_ang / mass) · ω` overflows to `±inf` and `ω` is NaN two
+//!   ticks later; a linear velocity that large carries the position across the
+//!   whole cell space in one step.
+//!
+//! The check is a pure *accept or reject*: a state that passes is returned
+//! bit-for-bit, and [`crate::step_ship`] itself is untouched, so the server and
+//! a client that both hold a valid state still integrate it identically. The
+//! bounds are far outside anything the flight model reaches (the placeholder
+//! ship tops out near 120 m/s and 3.3 rad/s, and keeps `|q|²` within about
+//! `1e-6` of 1), so no state produced by the simulation is ever rejected.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +56,27 @@ use crate::ShipState;
 /// Encoded size of a [`ShipState`]: `WorldPos (36) + vel (12) + quat (16) +
 /// ang_vel (12)` = 76 bytes.
 pub const SHIP_STATE_LEN: usize = 36 + 12 + 16 + 12;
+
+/// Smallest squared norm a decoded quaternion may have (see the
+/// [module docs](self)).
+///
+/// The physics keeps `|q|² = 1` to within `f32` rounding; the tolerance here is
+/// wide so a hand-written or slightly drifted quaternion still decodes (the
+/// integrator normalises it on its first step) while a degenerate or huge one —
+/// the kind that scales the thrust rotation — does not.
+pub const QUAT_NORM2_MIN: f32 = 0.5;
+
+/// Largest squared norm a decoded quaternion may have (see [`QUAT_NORM2_MIN`]).
+pub const QUAT_NORM2_MAX: f32 = 2.0;
+
+/// Largest magnitude a decoded linear-velocity component may have, in m/s.
+///
+/// Three times the speed of light: nothing the flight model can reach, and
+/// small enough that every product the integrator forms with it stays finite.
+pub const MAX_SPEED: f32 = 1.0e9;
+
+/// Largest magnitude a decoded angular-velocity component may have, in rad/s.
+pub const MAX_SPIN: f32 = 1.0e6;
 
 /// The wire form of a [`ShipState`].
 ///
@@ -83,6 +126,31 @@ impl ShipStateWire {
                 }
             }
         }
+        // Finite is not enough: a finite state can still drive the integrator to
+        // `inf`/NaN within a tick or two (see the module docs). Reject what the
+        // integrator could never have produced. Nothing is clamped or
+        // normalised here — a state that passes is returned bit-for-bit.
+        for (name, v, limit) in [
+            ("vel", vel.as_slice(), MAX_SPEED),
+            ("ang_vel", ang_vel.as_slice(), MAX_SPIN),
+        ] {
+            for (axis, &f) in v.iter().enumerate() {
+                if f.abs() > limit {
+                    return Err(space_protocol::CodecError::InvalidPayload(format!(
+                        "ShipState {name}[{axis}] = {f} is beyond the ±{limit} limit"
+                    )));
+                }
+            }
+        }
+        // Every component is finite, so the sum is a number; it is `inf` (and so
+        // out of range) when a component is large enough to overflow its square.
+        let norm2 = quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3];
+        if !(QUAT_NORM2_MIN..=QUAT_NORM2_MAX).contains(&norm2) {
+            return Err(space_protocol::CodecError::InvalidPayload(format!(
+                "ShipState quat {quat:?} is not a unit quaternion (|q|² = {norm2}, \
+                 accepted {QUAT_NORM2_MIN}..={QUAT_NORM2_MAX})"
+            )));
+        }
         Ok(ShipState {
             pos: self.pos,
             vel,
@@ -114,8 +182,10 @@ pub fn encode_ship_state(state: &ShipState) -> Vec<u8> {
 /// # Errors
 ///
 /// [`space_protocol::CodecError::InvalidPayload`] when the bytes are not a valid
-/// encoding (wrong length, or a `pos.local` that fails validation — see
-/// [`space_protocol::pos`]).
+/// encoding: wrong length, a `pos.local` that fails validation (see
+/// [`space_protocol::pos`]), or a state the integrator could not have produced —
+/// a non-finite component, a quaternion far from unit, an absurd velocity (see
+/// the [module docs](self)).
 pub fn decode_ship_state(bytes: &[u8]) -> Result<ShipState, space_protocol::CodecError> {
     let (wire, read) = space_protocol::codec::decode_raw::<ShipStateWire>(bytes)?;
     if read != bytes.len() {
@@ -133,7 +203,7 @@ pub fn serialize<S: serde::Serializer>(state: &ShipState, s: S) -> Result<S::Ok,
     ShipStateWire::from_state(state).serialize(s)
 }
 
-/// Deserialize a [`ShipState`] field, rejecting a non-finite field (see
+/// Deserialize a [`ShipState`] field, rejecting an invalid state (see
 /// [`decode_ship_state`]).
 pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ShipState, D::Error> {
     ShipStateWire::deserialize(d)?

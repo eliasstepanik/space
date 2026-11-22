@@ -8,6 +8,19 @@
 //! makes the whole split/merge/rebalance loop verifiable in-sandbox, with no
 //! Docker daemon.
 //!
+//! # Registering with the orchestrator
+//!
+//! A launched shard is an *orchestrated* shard: it dials the control address in
+//! its [`SpawnSpec`], says `ShardHello` with the id the orchestrator allocated
+//! for it, runs the map the `ShardWelcome` hands back and follows every epoch
+//! pushed over that link — the same boot `space-server --orchestrator` does
+//! (`space_server::orchestrated`), built from the same public pieces so the
+//! launcher keeps the task handles its liveness probe needs. A shard that only
+//! binds and ticks, as this launcher used to start, can never ack the
+//! `EpochPrepare` that creates its region, so the split that launched it could
+//! never commit. [`LocalLauncher::detached`] keeps that bare mode for tests of
+//! the launcher mechanics that have no orchestrator to talk to.
+//!
 //! # Liveness
 //!
 //! [`Launcher::poll`] reports a shard dead when its tick loop has stopped
@@ -19,69 +32,164 @@
 //! signal (H15); this probe is the launcher-local half that lets a test prove a
 //! killed shard is detected.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use space_protocol::shard::ShardId;
-use space_server::net::ShardNet;
+use space_protocol::shard::{ShardId, ShardRegion};
+use space_protocol::ShardHello;
+use space_server::net::{OrchestratorLink, ShardNet};
 use space_server::shard::Shard;
 use space_server::ShardConfig;
 use tokio::sync::Mutex;
 
 use super::{LaunchError, Launcher, Poll, ShardHandle, SpawnSpec};
 
-/// A shard the launcher is running: its net front end and the two tasks that
-/// drive it.
+/// A shard the launcher is running: its net front end, the two tasks that
+/// drive it and (unless detached) its control link to the orchestrator.
 struct Running {
     net: Arc<ShardNet>,
     tick: tokio::task::JoinHandle<()>,
     serve: tokio::task::JoinHandle<()>,
+    /// The control connection to the orchestrator (`None` when detached).
+    link: Option<OrchestratorLink>,
     /// The endpoint the shard bound to (resolved after bind).
     endpoint: SocketAddr,
+}
+
+impl Running {
+    /// Stop the shard: its tasks, its control link and its endpoint.
+    fn stop(self) {
+        self.tick.abort();
+        self.serve.abort();
+        if let Some(link) = self.link {
+            link.close();
+        }
+        self.net.close();
+    }
 }
 
 impl std::fmt::Debug for Running {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Running")
             .field("endpoint", &self.endpoint)
+            .field("registered", &self.link.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// Everything the launcher supervises, behind one lock so a `kill` and a
+/// launch finishing can never miss each other.
+#[derive(Debug, Default)]
+struct Table {
+    /// The shards that are up.
+    shards: HashMap<ShardId, Running>,
+    /// Shards whose launch is in flight (still shaking hands).
+    launching: HashSet<ShardId>,
+    /// Shards killed while their launch was in flight: the launch tears the
+    /// shard down the moment it would have registered it.
+    cancelled: HashSet<ShardId>,
 }
 
 /// The in-process launcher: one real [`Shard`] per [`SpawnSpec`], in the
 /// caller's runtime.
 ///
-/// `spawn` binds a [`ShardNet`] on `127.0.0.1:0`, starts the accept loop and the
-/// 30 Hz tick loop, and returns once the endpoint is bound (so the orchestrator
-/// can immediately dial it). `kill` aborts the tasks and closes the endpoint.
-/// `poll` reports `Dead` once the tick task has been aborted.
-#[derive(Debug, Default)]
+/// `spawn` binds a [`ShardNet`] on `127.0.0.1:0`, registers the shard with the
+/// orchestrator at the spec's control address (see the module docs), starts the
+/// accept loop and the 30 Hz tick loop, and returns once the shard is up.
+/// `kill` aborts the tasks and closes the endpoint — or, for a shard still being
+/// launched, makes that launch end in a teardown. `poll` reports `Dead` once the
+/// tick task has been aborted.
+#[derive(Debug)]
 pub struct LocalLauncher {
-    running: Mutex<HashMap<ShardId, Running>>,
+    running: Mutex<Table>,
+    /// Whether a launched shard registers with the orchestrator.
+    registers: bool,
 }
 
-impl LocalLauncher {
-    /// A launcher with nothing running.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            running: Mutex::new(HashMap::new()),
-        }
+impl Default for LocalLauncher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Launcher for LocalLauncher {
-    async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
+impl LocalLauncher {
+    /// A launcher with nothing running, whose shards register with the
+    /// orchestrator at [`SpawnSpec::control_addr`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            running: Mutex::new(Table::default()),
+            registers: true,
+        }
+    }
+
+    /// A launcher whose shards do **not** register with any orchestrator: each
+    /// one just owns the spec's region and serves. For tests of the launcher
+    /// mechanics (bind, liveness, kill) that have no control plane; a detached
+    /// shard can never take part in an epoch.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self {
+            running: Mutex::new(Table::default()),
+            registers: false,
+        }
+    }
+
+    /// Bring one shard up (bound, registered unless detached, serving, ticking).
+    async fn launch(&self, spec: &SpawnSpec) -> Result<Running, LaunchError> {
+        let spawn_error = |e: std::io::Error| LaunchError::Spawn(e.to_string());
         // Bind on loopback, port 0: the launcher never assumes a fixed port.
         let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
-        let net =
-            Arc::new(ShardNet::bind(loopback).map_err(|e| LaunchError::Spawn(e.to_string()))?);
-        let bound = net
-            .local_addr()
-            .map_err(|e| LaunchError::Spawn(e.to_string()))?;
-        let config = ShardConfig::new(spec.shard, bound, spec.region.node);
-        let shard = Arc::new(Mutex::new(Shard::new(config)));
+        let net = Arc::new(ShardNet::bind(loopback).map_err(spawn_error)?);
+        let bound = net.local_addr().map_err(spawn_error)?;
+
+        let (shard, link) = if self.registers {
+            let control = dialable(spec.control_addr);
+            // The id is the one the orchestrator allocated (H9: never one the
+            // shard chose); the hello only confirms it and names the endpoint
+            // the shard really bound.
+            let hello = ShardHello {
+                cluster: spec.cluster.clone(),
+                shard: spec.shard,
+                endpoint: bound,
+                region: Some(ShardRegion::new(spec.region.node, spec.shard, bound)),
+            };
+            let (welcome, conn) = match OrchestratorLink::handshake(control, hello).await {
+                Ok(answer) => answer,
+                Err(err) => {
+                    net.close();
+                    return Err(LaunchError::Spawn(format!(
+                        "{} could not register with the orchestrator at {control}: {err}",
+                        spec.shard
+                    )));
+                }
+            };
+            if welcome.shard != spec.shard {
+                net.close();
+                return Err(LaunchError::Spawn(format!(
+                    "the orchestrator welcomed {} as {}",
+                    spec.shard, welcome.shard
+                )));
+            }
+            let mut shard = Shard::new(ShardConfig::new(welcome.shard, bound, welcome.region.node));
+            shard.set_shard_map(welcome.shard_map.clone());
+            shard.set_endpoint(bound);
+            let shard = Arc::new(Mutex::new(shard));
+            for region in &welcome.shard_map.regions {
+                if region.shard != welcome.shard {
+                    net.set_shard_endpoint(region.shard, region.endpoint).await;
+                }
+            }
+            // Epoch prepares/commits/aborts and map pushes come in over the
+            // link; the shard's acks go out through it.
+            let link = OrchestratorLink::attach(conn, Arc::clone(&shard));
+            net.set_orchestrator_sender(link.tx.clone()).await;
+            (shard, Some(link))
+        } else {
+            let config = ShardConfig::new(spec.shard, bound, spec.region.node);
+            (Arc::new(Mutex::new(Shard::new(config))), None)
+        };
 
         let serve = {
             let net = Arc::clone(&net);
@@ -103,39 +211,83 @@ impl Launcher for LocalLauncher {
                 }
             })
         };
-
-        let handle = ShardHandle {
-            shard: spec.shard,
+        Ok(Running {
+            net,
+            tick,
+            serve,
+            link,
             endpoint: bound,
-            process: format!("in-process:{}", spec.shard.0),
+        })
+    }
+}
+
+/// The address an in-process shard dials to reach `control`.
+///
+/// The orchestrator is this very process, so a wildcard bind address
+/// (`0.0.0.0:7900`, which cannot be dialled — on Windows not at all) means
+/// "loopback, that port".
+fn dialable(control: SocketAddr) -> SocketAddr {
+    if !control.ip().is_unspecified() {
+        return control;
+    }
+    let loopback = match control {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    SocketAddr::new(loopback, control.port())
+}
+
+impl Launcher for LocalLauncher {
+    async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
+        let id = spec.shard;
+        self.running.lock().await.launching.insert(id);
+        // The lock is not held while the shard shakes hands with the
+        // orchestrator: that can take seconds, and `kill`/`poll` must not wait.
+        let launched = self.launch(&spec).await;
+
+        let mut table = self.running.lock().await;
+        table.launching.remove(&id);
+        let cancelled = table.cancelled.remove(&id);
+        let running = launched?;
+        if cancelled {
+            // Killed while it was starting (its split aborted before it had
+            // registered): it must not come up after all.
+            drop(table);
+            running.stop();
+            return Err(LaunchError::Spawn(format!(
+                "{id} was killed while it was starting"
+            )));
+        }
+        let handle = ShardHandle {
+            shard: id,
+            endpoint: running.endpoint,
+            process: format!("in-process:{}", id.0),
         };
-        self.running.lock().await.insert(
-            spec.shard,
-            Running {
-                net,
-                tick,
-                serve,
-                endpoint: bound,
-            },
-        );
+        table.shards.insert(id, running);
         Ok(handle)
     }
 
     async fn kill(&self, shard: ShardId) -> Result<(), LaunchError> {
-        let Some(running) = self.running.lock().await.remove(&shard) else {
-            // Already gone: killing a shard that is not running is a no-op, not
-            // an error — the orchestrator may kill on a path that raced a death.
-            return Ok(());
+        let running = {
+            let mut table = self.running.lock().await;
+            let running = table.shards.remove(&shard);
+            if running.is_none() && table.launching.contains(&shard) {
+                // Still starting: remember the kill; `spawn` carries it out.
+                table.cancelled.insert(shard);
+            }
+            running
         };
-        running.tick.abort();
-        running.serve.abort();
-        running.net.close();
+        // Not running (and not starting): killing it is a no-op, not an error —
+        // the orchestrator may kill on a path that raced a death.
+        if let Some(running) = running {
+            running.stop();
+        }
         Ok(())
     }
 
     async fn poll(&self, shard: ShardId) -> Result<Poll, LaunchError> {
-        let guard = self.running.lock().await;
-        let Some(running) = guard.get(&shard) else {
+        let table = self.running.lock().await;
+        let Some(running) = table.shards.get(&shard) else {
             return Ok(Poll::Dead);
         };
         // The tick loop is the shard's heartbeat: if its task has finished
@@ -169,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_returns_a_reachable_endpoint_and_poll_reports_alive() {
-        let launcher = LocalLauncher::new();
+        let launcher = LocalLauncher::detached();
         let handle = launcher.spawn(spec(1)).await.expect("spawn");
         assert!(handle.endpoint.port() != 0, "a real port was bound");
         assert_eq!(handle.shard, ShardId::new(1));
@@ -179,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_makes_poll_report_dead() {
-        let launcher = LocalLauncher::new();
+        let launcher = LocalLauncher::detached();
         launcher.spawn(spec(2)).await.expect("spawn");
         assert_eq!(launcher.poll(ShardId::new(2)).await.unwrap(), Poll::Alive);
         launcher.kill(ShardId::new(2)).await.expect("kill");
@@ -195,14 +347,14 @@ mod tests {
     #[tokio::test]
     async fn poll_reports_dead_when_a_registered_shards_tick_loop_stops() {
         for abort_tick in [true, false] {
-            let launcher = LocalLauncher::new();
+            let launcher = LocalLauncher::detached();
             let id = ShardId::new(if abort_tick { 30 } else { 31 });
             launcher.spawn(spec(id.0)).await.expect("spawn");
             assert_eq!(launcher.poll(id).await.unwrap(), Poll::Alive);
 
             let task = {
                 let guard = launcher.running.lock().await;
-                let running = guard.get(&id).expect("registered");
+                let running = guard.shards.get(&id).expect("registered");
                 let task = if abort_tick {
                     &running.tick
                 } else {
@@ -222,16 +374,84 @@ mod tests {
 
             assert_eq!(launcher.poll(id).await.unwrap(), Poll::Dead);
             assert!(
-                launcher.running.lock().await.contains_key(&id),
+                launcher.running.lock().await.shards.contains_key(&id),
                 "still registered: the liveness branch fired, not the unknown-shard one"
             );
             launcher.kill(id).await.expect("kill");
         }
     }
 
+    #[test]
+    fn a_wildcard_control_address_is_dialled_on_loopback() {
+        let wildcard: SocketAddr = "0.0.0.0:7900".parse().unwrap();
+        assert_eq!(dialable(wildcard), "127.0.0.1:7900".parse().unwrap());
+        let wildcard6: SocketAddr = "[::]:7900".parse().unwrap();
+        assert_eq!(dialable(wildcard6), "[::1]:7900".parse().unwrap());
+        let concrete: SocketAddr = "10.0.0.2:7900".parse().unwrap();
+        assert_eq!(dialable(concrete), concrete, "a real address is kept");
+    }
+
+    /// A registering launch whose orchestrator never answers fails — and a
+    /// `kill` that arrives while it is still trying is honoured: nothing is
+    /// left running, supervised or half-registered.
+    ///
+    /// (Bounded by the transport's handshake timeout, a few seconds.)
+    #[tokio::test]
+    async fn a_launch_that_cannot_register_fails_and_a_kill_meanwhile_is_honoured() {
+        // A bound UDP socket nobody reads: the handshake gets no answer.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a silent port");
+        let mut spec = spec(40);
+        spec.control_addr = silent.local_addr().expect("silent addr");
+
+        let launcher = Arc::new(LocalLauncher::new());
+        let launch = {
+            let launcher = Arc::clone(&launcher);
+            tokio::spawn(async move { launcher.spawn(spec).await })
+        };
+        // Wait until the launch is in flight, then kill it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !launcher
+                .running
+                .lock()
+                .await
+                .launching
+                .contains(&ShardId::new(40))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the launch starts");
+        assert_eq!(
+            launcher.poll(ShardId::new(40)).await.unwrap(),
+            Poll::Dead,
+            "a shard that is still starting is not alive yet"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            launcher.kill(ShardId::new(40)),
+        )
+        .await
+        .expect("a kill never waits for a launch in flight")
+        .expect("kill");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), launch)
+            .await
+            .expect("the launch gives up")
+            .expect("the launch task did not panic");
+        let err = outcome.expect_err("no orchestrator answered");
+        assert!(matches!(err, LaunchError::Spawn(_)), "{err:?}");
+        let table = launcher.running.lock().await;
+        assert!(table.shards.is_empty(), "nothing was left running");
+        assert!(
+            table.launching.is_empty() && table.cancelled.is_empty(),
+            "and nothing is remembered about the failed launch"
+        );
+    }
+
     #[tokio::test]
     async fn poll_on_an_unknown_shard_is_dead() {
-        let launcher = LocalLauncher::new();
+        let launcher = LocalLauncher::detached();
         assert_eq!(
             launcher.poll(ShardId::new(99)).await.unwrap(),
             Poll::Dead,
@@ -241,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn killing_a_shard_that_is_not_running_is_a_noop() {
-        let launcher = LocalLauncher::new();
+        let launcher = LocalLauncher::detached();
         launcher
             .kill(ShardId::new(123))
             .await
@@ -256,7 +476,7 @@ mod tests {
     /// rather than a mock.
     #[tokio::test]
     async fn a_spawned_shard_answers_a_real_client_connection() {
-        let launcher = LocalLauncher::new();
+        let launcher = LocalLauncher::detached();
         let handle = launcher.spawn(spec(7)).await.expect("spawn");
         let endpoint = space_net::client_endpoint().expect("client endpoint");
         let (conn, welcome) = space_net::connect(

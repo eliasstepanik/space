@@ -1,13 +1,30 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>space viewer</title>
-<style>body{margin:0;background:#111;color:#eee;font:14px monospace}canvas{display:block}</style>
-<!-- Build: see README.md. Serve this directory over http and open
-     index.html?ws=ws://127.0.0.1:8099 (the `space-client --stream` address). -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #eee; font: 14px monospace }
+  /* The canvas element fills the window; its bitmap takes the size of the
+     streamed frame and `object-fit: contain` scales it with the aspect ratio
+     kept (letterboxed), so a stream of any shape is shown undistorted. */
+  canvas { display: block; width: 100vw; height: 100vh; object-fit: contain }
+  /* Connection state, written by the viewer; empty (hidden) while frames flow. */
+  #status { position: fixed; left: 8px; top: 8px; padding: 2px 6px; background: rgba(0, 0, 0, .6) }
+  #status:empty { display: none }
+</style>
+<!-- Build: see README.md. Serve this directory over http and open index.html.
+     The stream address defaults to ws://<the host this page came from>:8099
+     (the `space-client --stream` port); override it with
+     index.html?ws=ws://HOST:PORT. -->
 <canvas id="c" width="640" height="480"></canvas>
+<div id="status">loading the viewer ...</div>
 <script type="module">
-  import init, { start } from "./pkg/space_viewer.js";
-  const url = new URLSearchParams(location.search).get("ws") ?? "ws://127.0.0.1:8099";
-  await init();
-  start("c", url);
+  import init, { start, default_ws_url } from "./pkg/space_viewer.js";
+  const status = document.getElementById("status");
+  try {
+    await init();
+    const url = new URLSearchParams(location.search).get("ws") ?? default_ws_url(location.hostname);
+    start("c", url);
+  } catch (e) {
+    status.textContent = `the viewer could not start: ${e}`;
+  }
 </script>

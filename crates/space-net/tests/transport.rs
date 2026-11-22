@@ -16,6 +16,11 @@
 //! | [`control_stream_round_trips`] | `send_control`/`recv_control` carry a `Redirect` both ways |
 //! | [`disconnect_is_observed`] | after the peer closes, receives return `Ok(None)` and `is_closed()` is true |
 //! | [`oversized_frame_rejected_before_alloc`] | a stream frame declaring a length over `MAX_FRAME_SIZE` errors without a huge allocation |
+//! | [`a_quiet_connection_outlives_the_idle_timeout`] | keep-alive: a link with no application traffic survives past the idle timeout (takes ~12 s) |
+//! | [`connect_gives_up_when_the_server_never_answers_the_hello`] | `connect_within` is bounded by its own limit, not by the idle timeout |
+//! | [`accept_gives_up_on_a_client_that_never_sends_a_hello`] | `accept_incoming_within` is bounded the same way |
+//! | [`a_policy_reject_reaches_the_client_with_its_reason`] | `Conn::reject` drains before closing, so the client sees `Rejected(reason)` |
+//! | [`client_endpoint_for_binds_the_family_it_dials`], [`an_ipv6_server_is_diallable_through_client_endpoint_for`] | the client socket is bound in the address family of its target |
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -413,4 +418,228 @@ async fn reject_reason_survives_the_wire() {
         Message::Reject(r) => assert_eq!(r.reason, reason),
         other => panic!("expected Reject, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------- keep-alive,
+// handshake bounds, policy rejects and address families
+
+/// The keep-alive has to fit inside the idle timeout with room for lost pings,
+/// or a quiet link dies anyway.
+#[test]
+fn keep_alive_fits_inside_the_idle_timeout() {
+    assert!(
+        space_net::KEEP_ALIVE_INTERVAL * 3 <= space_net::IDLE_TIMEOUT,
+        "three pings must fit in one idle timeout"
+    );
+}
+
+/// A connection that carries no application traffic at all stays up past the
+/// idle timeout, and still works afterwards.
+///
+/// This is the shard-to-orchestrator control link (epoch messages only) and
+/// every shard-to-shard link (handoff messages only): both sat silent for longer
+/// than the idle timeout as a matter of course, timed out, and were never
+/// re-opened.
+///
+/// Mutation this catches: `keep_alive_interval(None)` in `transport_config` —
+/// the client then sees the connection closed and the server's receive returns
+/// `Ok(None)` instead of the datagram.
+#[tokio::test]
+async fn a_quiet_connection_outlives_the_idle_timeout() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.send_control(&Message::Welcome(welcome(bound)))
+            .await
+            .expect("welcome");
+        // Says nothing and hears nothing until the client speaks again.
+        conn.recv_datagram().await.expect("recv")
+    });
+
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let (conn, _welcome) = connect(&client, bound, "space.local", &space_net::hello("quiet"))
+        .await
+        .expect("connect");
+    tokio::time::sleep(space_net::IDLE_TIMEOUT + std::time::Duration::from_millis(1_500)).await;
+    assert!(
+        !conn.is_closed(),
+        "a quiet connection must not idle out: {:?}",
+        conn.close_reason()
+    );
+    let msg = input_tick(9);
+    conn.send(&msg)
+        .await
+        .expect("the link still carries traffic");
+    assert_eq!(
+        server_task.await.expect("server task"),
+        Some(msg),
+        "the server must still be listening on the same connection"
+    );
+}
+
+/// A server whose transport answers but whose application never sends a
+/// `Welcome` does not hold `connect` forever.
+///
+/// Mutation this catches: removing the `tokio::time::timeout` from
+/// `connect_within` — with keep-alive on, nothing else ever ends the wait.
+#[tokio::test]
+async fn connect_gives_up_when_the_server_never_answers_the_hello() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        // Complete the QUIC handshake, then sit on the connection.
+        let conn = server
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("handshake");
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        drop(conn);
+    });
+
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let started = std::time::Instant::now();
+    let err = space_net::connect_within(
+        &client,
+        bound,
+        "space.local",
+        &space_net::hello("player-1"),
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    .expect_err("a server that never welcomes must not be waited on forever");
+    assert!(
+        matches!(err, NetError::Handshake(_)),
+        "expected a handshake timeout, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the bound must be the caller-chosen one, not the idle timeout: {:?}",
+        started.elapsed()
+    );
+    server_task.abort();
+}
+
+/// A client that completes the QUIC handshake and never sends a hello does not
+/// hold the accepting task forever.
+///
+/// Mutation this catches: removing the `tokio::time::timeout` from
+/// `accept_incoming_within`.
+#[tokio::test]
+async fn accept_gives_up_on_a_client_that_never_sends_a_hello() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming");
+        let started = std::time::Instant::now();
+        let result =
+            space_net::accept_incoming_within(incoming, std::time::Duration::from_millis(300))
+                .await;
+        (result.map(|_| ()), started.elapsed())
+    });
+
+    // A raw client: transport handshake only, no control stream, no hello.
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("connect")
+        .await
+        .expect("handshake");
+
+    let (result, elapsed) = server_task.await.expect("server task");
+    let err = result.expect_err("a silent client must be given up on");
+    assert!(
+        matches!(err, NetError::Handshake(_)),
+        "expected a handshake timeout, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the accept must give up on its own bound: {elapsed:?}"
+    );
+    drop(conn);
+}
+
+/// A refusal the server decides *after* the version gate (a full shard) reaches
+/// the client with its reason.
+///
+/// Mutation this catches: replacing `Conn::reject` with "write the `Reject`,
+/// drop the connection" — the close then overtakes the stream data and the
+/// client sees a transport error instead of `Rejected(Full)`.
+#[tokio::test]
+async fn a_policy_reject_reaches_the_client_with_its_reason() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.reject(RejectReason::Full).await;
+        // Dropped here, exactly as a serving task that returns would drop it.
+    });
+
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let err = connect(
+        &client,
+        bound,
+        "space.local",
+        &space_net::hello("player-101"),
+    )
+    .await
+    .expect_err("a full server refuses");
+    assert_eq!(
+        err,
+        NetError::Rejected(RejectReason::Full),
+        "the client must learn why it was turned away"
+    );
+    server_task.await.expect("server task");
+}
+
+/// `client_endpoint_for` binds a socket of the family it is asked to dial.
+///
+/// The IPv6 half is skipped on a host without IPv6 (the bind fails there, which
+/// is the right answer for an address that cannot be reached anyway).
+#[tokio::test]
+async fn client_endpoint_for_binds_the_family_it_dials() {
+    let v4: SocketAddr = "127.0.0.1:7777".parse().expect("addr");
+    let endpoint = space_net::client_endpoint_for(v4).expect("an IPv4 client endpoint");
+    assert!(
+        endpoint.local_addr().expect("local addr").is_ipv4(),
+        "an IPv4 target needs an IPv4 socket"
+    );
+
+    let v6: SocketAddr = "[::1]:7777".parse().expect("addr");
+    match space_net::client_endpoint_for(v6) {
+        Ok(endpoint) => assert!(
+            endpoint.local_addr().expect("local addr").is_ipv6(),
+            "an IPv6 target needs an IPv6 socket"
+        ),
+        Err(e) => eprintln!("skipping the IPv6 half: no IPv6 on this host ({e})"),
+    }
+}
+
+/// A server reached over IPv6 loopback through `client_endpoint_for`: the case
+/// `client_endpoint()` cannot serve on Windows, where it binds IPv4 only.
+#[tokio::test]
+async fn an_ipv6_server_is_diallable_through_client_endpoint_for() {
+    let (config, _cert) = space_net::crypto::make_server_config();
+    let Ok(server) = server_endpoint("[::1]:0".parse().expect("addr"), config) else {
+        eprintln!("skipping: no IPv6 loopback on this host");
+        return;
+    };
+    let bound = server.local_addr().expect("local addr");
+    let server_task = tokio::spawn(async move {
+        let (conn, hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.send_control(&Message::Welcome(welcome(bound)))
+            .await
+            .expect("welcome");
+        (conn, hello)
+    });
+
+    let Ok(client) = space_net::client_endpoint_for(bound) else {
+        eprintln!("skipping: cannot bind an IPv6 client socket on this host");
+        return;
+    };
+    let (conn, got) = connect(&client, bound, "space.local", &space_net::hello("v6"))
+        .await
+        .expect("connect over IPv6");
+    assert_eq!(got.session, 42);
+    let (_server_conn, hello) = server_task.await.expect("server task");
+    assert_eq!(hello.player_token, "v6");
+    assert!(!conn.is_closed());
 }

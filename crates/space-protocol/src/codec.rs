@@ -134,18 +134,44 @@ pub fn encode_frame(message: &Message) -> Vec<u8> {
 /// Encode a message into a frame, reporting an oversized payload as
 /// [`CodecError::Oversized`] instead of panicking.
 pub fn try_encode_frame(message: &Message) -> Result<Vec<u8>, CodecError> {
-    let payload = bincode::serde::encode_to_vec(message, BINCODE)
+    // The payload is encoded straight into the frame buffer, behind a header
+    // whose length field is patched in afterwards: one buffer and one pass
+    // instead of encoding into a scratch `Vec` and copying it behind the header.
+    // A replication frame is sized up front so the buffer is allocated once.
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload_size_hint(message));
+    frame.extend_from_slice(&[0u8; 4]);
+    frame.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    bincode::serde::encode_into_std_write(message, &mut frame, BINCODE)
         .map_err(|e| CodecError::InvalidPayload(e.to_string()))?;
-    if payload.len() > MAX_FRAME_SIZE {
+    let payload_len = frame.len() - FRAME_HEADER_LEN;
+    if payload_len > MAX_FRAME_SIZE {
         return Err(CodecError::Oversized {
-            declared: payload.len(),
+            declared: payload_len,
         });
     }
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    frame.extend_from_slice(&payload);
+    frame[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(frame)
+}
+
+/// A capacity hint for `message`'s payload: exact for the two replication
+/// frames (the only large messages on the hot path), a small constant otherwise.
+///
+/// Only a hint — the buffer grows if it is short — so a wrong value costs a
+/// reallocation, never a wrong frame.
+fn payload_size_hint(message: &Message) -> usize {
+    use crate::messages::{EntitySnapshot, ENTITY_GUID_WIRE_LEN};
+    let entities = |list: &[EntitySnapshot]| -> usize {
+        list.iter().map(EntitySnapshot::encoded_len).sum::<usize>()
+    };
+    match message {
+        Message::Snapshot(s) => crate::snapshot::MESSAGE_OVERHEAD + entities(&s.entities),
+        Message::Delta(d) => {
+            crate::snapshot::MESSAGE_OVERHEAD
+                + entities(&d.entities)
+                + d.removed.len() * ENTITY_GUID_WIRE_LEN
+        }
+        _ => 256,
+    }
 }
 
 /// Decode one complete frame.
@@ -235,11 +261,12 @@ pub fn check_hello(h: &crate::Hello) -> Result<(), crate::RejectReason> {
     Ok(())
 }
 
-/// Encoded size of a value under the pinned config.
+/// Encoded size of a value under the pinned config, measured by encoding it.
 ///
-/// [`crate::SnapshotBuilder`] budgets at this granularity, so the number it
-/// compares against the byte budget is the number that will actually go on the
-/// wire (payload bytes, without the frame header).
+/// Test-only: the hot paths compute their sizes instead
+/// ([`crate::EntitySnapshot::encoded_len`], `snapshot::MESSAGE_OVERHEAD`), and
+/// the tests use this to pin those computed sizes to what the codec writes.
+#[cfg(test)]
 pub(crate) fn encoded_len<T: Serialize>(value: &T) -> usize {
     bincode::serde::encode_to_vec(value, BINCODE)
         .map(|v| v.len())

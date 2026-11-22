@@ -210,22 +210,37 @@ fn axis_delta_m(a_cell: i64, b_cell: i64, a_local: f32, b_local: f32) -> f64 {
 
 /// Normalise an absolute metre coordinate (given as cell + value) into the
 /// canonical `cell`/`local` pair.
+///
+/// The range check has to be made on the **`f32`** the position stores, not on
+/// the `f64` intermediate: an `f64` local in `(CELL_HALF - 2^-16, CELL_HALF)`
+/// is in range but rounds *up* to exactly `CELL_HALF` as an `f32` (the largest
+/// `f32` below 512 is `512 - 2^-15`). Returning that would break the half-open
+/// invariant every consumer relies on — the wire codec rejects a
+/// `local >= CELL_HALF` outright — so the rounded value is checked once more
+/// and carried into the next cell, where it is exactly `-CELL_HALF`: the same
+/// point, in its canonical form.
 fn normalise(cell: i64, value_m: f64) -> (i64, f32) {
     // Number of whole cells to carry; `floor` so the result lands in
     // [-CELL_HALF, CELL_HALF).
     let carry = ((value_m + f64::from(CELL_HALF)) / CELL_SIZE).floor();
-    let carry_i = carry as i64;
+    let mut out_cell = cell.wrapping_add(carry as i64);
     let mut local = value_m - carry * CELL_SIZE;
     // Guard the exact boundary and any f64 rounding at huge magnitudes.
     if local >= f64::from(CELL_HALF) {
         local -= CELL_SIZE;
-        return (cell.wrapping_add(carry_i).wrapping_add(1), local as f32);
-    }
-    if local < -f64::from(CELL_HALF) {
+        out_cell = out_cell.wrapping_add(1);
+    } else if local < -f64::from(CELL_HALF) {
         local += CELL_SIZE;
-        return (cell.wrapping_add(carry_i).wrapping_sub(1), local as f32);
+        out_cell = out_cell.wrapping_sub(1);
     }
-    (cell.wrapping_add(carry_i), local as f32)
+    // Round to the stored precision, then re-check the upper bound (see above).
+    // `512.0 - 1024.0` is exact in `f32`, so the carried value is `-CELL_HALF`.
+    let mut stored = local as f32;
+    if stored >= CELL_HALF {
+        stored -= CELL_SIZE as f32;
+        out_cell = out_cell.wrapping_add(1);
+    }
+    (out_cell, stored)
 }
 
 #[cfg(test)]
@@ -309,5 +324,137 @@ mod tests {
     fn cell_key_matches_cell() {
         let p = WorldPos::from_metres([FAR_MM, 0, 0]);
         assert_eq!(p.cell_key(), p.cell);
+    }
+
+    /// Is `p` in canonical form: every `local` in `[-CELL_HALF, CELL_HALF)` and
+    /// a fixed point of normalisation, bit for bit?
+    fn assert_canonical(p: WorldPos, what: &dyn std::fmt::Debug) {
+        for (axis, &local) in p.local.iter().enumerate() {
+            assert!(
+                (-CELL_HALF..CELL_HALF).contains(&local),
+                "{what:?}: local[{axis}] = {local:?} is outside [-{CELL_HALF}, {CELL_HALF})"
+            );
+        }
+        let again = WorldPos::new(p.cell, p.local);
+        assert_eq!(again.cell, p.cell, "{what:?}: not a fixed point");
+        for (axis, (again, local)) in again.local.iter().zip(&p.local).enumerate() {
+            assert_eq!(
+                again.to_bits(),
+                local.to_bits(),
+                "{what:?}: local[{axis}] is not a fixed point"
+            );
+        }
+    }
+
+    /// Regression: an `f64` local just under `+CELL_HALF` is in range but rounds
+    /// *up* to exactly `CELL_HALF` as an `f32`, which the wire codec rejects.
+    ///
+    /// `511 + 0.99999f32` is `512 - 168 * 2^-24` in `f64`; the largest `f32`
+    /// below 512 is `512 - 512 * 2^-24`, so the nearest `f32` is `512.0` itself.
+    /// The position must come out as the same point in canonical form: the next
+    /// cell, at `-CELL_HALF`.
+    #[test]
+    fn offset_never_rounds_local_up_to_cell_half() {
+        let origin = WorldPos::new([0, 0, 0], [511.0, 0.0, 0.0]);
+        let p = origin.offset([0.99999, 0.0, 0.0]);
+        assert_eq!(p.cell, [1, 0, 0]);
+        assert_eq!(p.local, [-CELL_HALF, 0.0, 0.0]);
+        assert_canonical(p, &"511 + 0.99999");
+        // Still the point that was asked for, to f32 resolution.
+        assert!((WorldPos::delta(origin, p)[0] - 0.99999).abs() < 2e-5);
+
+        // The mirror image: `-511 - 1.00001f32` lands a hair below `-CELL_HALF`,
+        // i.e. a hair below the top of the previous cell, and rounds onto the
+        // boundary — which belongs to the upper cell.
+        let origin = WorldPos::new([0, 0, 0], [-511.0, 0.0, 0.0]);
+        let p = origin.offset([-1.00001, 0.0, 0.0]);
+        assert_eq!(p.cell, [0, 0, 0]);
+        assert_eq!(p.local, [-CELL_HALF, 0.0, 0.0]);
+        assert_canonical(p, &"-511 - 1.00001");
+
+        // The same band reached through the `f64` entry point, with and
+        // without a cell carry.
+        let p = WorldPos::from_f64_metres_around(
+            WorldPos::new([7, -3, 0], [0.0; 3]),
+            [511.999_99, -512.000_01, 1_535.999_99],
+        );
+        assert_eq!(p.cell, [8, -3, 2]);
+        assert_eq!(p.local, [-CELL_HALF; 3]);
+        assert_canonical(p, &"f64 band");
+    }
+
+    /// Property: whatever the origin and the offset, the result is canonical.
+    ///
+    /// Two sweeps. The first walks an offset across the cell boundary in steps
+    /// far finer than the 2^-16 m rounding band, from origins on both sides of
+    /// it, so the band is hit hundreds of times. The second is a seeded fuzz
+    /// over origins anywhere in the cell space and offsets from micrometres to
+    /// a million kilometres.
+    #[test]
+    fn offsets_always_stay_in_the_half_open_range() {
+        use crate::hash::splitmix64;
+
+        // Sweep 1: 1e-7 m steps through +-1e-4 m around the boundary.
+        for base in [511.0f32, -513.0, 0.0, 300.25, -511.999_97] {
+            // The offset that puts `base` exactly on the +CELL_HALF boundary.
+            let to_edge = f64::from(CELL_HALF) - f64::from(base);
+            for step in -1000i32..=1000 {
+                let d = to_edge + f64::from(step) * 1e-7;
+                let origin = WorldPos::new([4, -9, 0], [base, 0.0, 0.0]);
+                let p = WorldPos::from_f64_metres_around(origin, [d, -d, 0.0]);
+                assert_canonical(p, &(base, step));
+                let back = WorldPos::delta(origin, p);
+                assert!(
+                    (back[0] - d).abs() < 1e-4 && (back[1] + d).abs() < 1e-4,
+                    "base {base} step {step}: moved by {back:?}, asked for {d}"
+                );
+                // The `f32` entry point takes the same path.
+                assert_canonical(origin.offset([d as f32, -(d as f32), 0.0]), &(base, step));
+            }
+        }
+
+        // Sweep 2: seeded fuzz.
+        let mut state = 0x5EED_0FF5_E700_u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            splitmix64(state)
+        };
+        // Uniform in [-1, 1], from integers only.
+        let unit = |h: u64| (h % 2_000_001) as f64 / 1_000_000.0 - 1.0;
+        for i in 0..200_000u32 {
+            // x spans +-2^61 cells (galactic, yet clear of the i64 wrap so the
+            // round-trip check below stays meaningful), y a million, z a few.
+            let cell = [
+                (next() >> 2) as i64 - (1i64 << 61),
+                (next() % 2_000_001) as i64 - 1_000_000,
+                (next() % 5) as i64 - 2,
+            ];
+            let origin = WorldPos::new(
+                cell,
+                [
+                    (unit(next()) * 512.0) as f32,
+                    (unit(next()) * 512.0) as f32,
+                    (unit(next()) * 512.0) as f32,
+                ],
+            );
+            assert_canonical(origin, &("origin", i));
+            // Offset magnitudes from 1e-6 m to 1e9 m, one decade per iteration.
+            let scale = 10f64.powi((i % 16) as i32 - 6);
+            let d = [
+                unit(next()) * scale,
+                unit(next()) * scale,
+                unit(next()) * scale,
+            ];
+            let p = WorldPos::from_f64_metres_around(origin, d);
+            assert_canonical(p, &(i, d));
+            let back = WorldPos::delta(origin, p);
+            for axis in 0..3 {
+                assert!(
+                    (back[axis] - d[axis]).abs() < 1e-4,
+                    "iteration {i} axis {axis}: moved by {back:?}, asked for {d:?}"
+                );
+            }
+            assert_canonical(origin.offset([d[0] as f32, d[1] as f32, d[2] as f32]), &i);
+        }
     }
 }

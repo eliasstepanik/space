@@ -1,0 +1,7 @@
+# Shell scripts must keep LF line endings even in a Windows checkout with
+# `core.autocrlf=true`: copied to a Linux host with CRLF, `#!/usr/bin/env bash`
+# becomes `bash\r` and the script does not start (deploy/proxy/redeploy.sh).
+#
+# Deliberately NOT a blanket `* text=auto` rule: that would renormalise every
+# file in the tree.
+*.sh text eol=lf

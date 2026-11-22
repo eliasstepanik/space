@@ -224,3 +224,120 @@ async fn capture_frame_returns_a_jpeg_on_a_gpu() {
     assert!(bare.get("base64").is_none() && bare.get("path").is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A `connect` that is still dialling must not make every other tool wait.
+///
+/// Mutation this catches: holding the link mutex across the dial. Against a
+/// shard that does not answer the dial runs to its timeout, and
+/// `client_status`, `send_input`, `capture_frame` and `disconnect` — which all
+/// take the same mutex — hung behind it for the whole time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connect_that_is_still_dialling_does_not_block_the_other_tools() {
+    // A bound UDP socket nobody reads: the QUIC handshake gets no answer.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a silent port");
+    let addr = silent.local_addr().expect("silent addr").to_string();
+    let client = mcp_server(&ClientState::new(out_dir("dialling")));
+
+    let dialling = {
+        let client = client.clone();
+        tokio::spawn(async move { call(&client, "connect", json!({"addr": addr})).await })
+    };
+    // Give the dial time to start (and to take any lock it was going to take).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dialling.is_finished(), "the dial is still in flight");
+
+    let prompt = Duration::from_secs(2);
+    let status = tokio::time::timeout(prompt, call_json(&client, "client_status", json!({})))
+        .await
+        .expect("client_status must not wait for a connect in flight");
+    assert_eq!(status["connected"], false);
+    let refused = tokio::time::timeout(
+        prompt,
+        call(&client, "send_input", json!({"thrust": [0, 0, -1]})),
+    )
+    .await
+    .expect("send_input must not wait for a connect in flight");
+    assert!(refused.unwrap_err().contains("not connected"));
+    let refused = tokio::time::timeout(prompt, call(&client, "disconnect", json!({})))
+        .await
+        .expect("disconnect must not wait for a connect in flight");
+    assert!(refused.unwrap_err().contains("not connected"));
+
+    // The dial itself ends in an error, not a hang.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), dialling)
+        .await
+        .expect("the dial gives up")
+        .expect("the dial did not panic");
+    let err = outcome.expect_err("nobody answered");
+    assert!(err.contains("timed out") || err.contains("failed"), "{err}");
+}
+
+/// `space-mcp-server --no-tick` with a player: the documented deterministic
+/// loop is connect, `advance_ticks`, then look at what replication delivered.
+///
+/// Mutation this catches: `advance_ticks` stepping without flushing. With no
+/// 30 Hz loop nothing else delivers a tick's frames, so the client stayed at
+/// zero frames with no ship for ever (and, never learning its ship, never sent
+/// an input either).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_of_a_no_tick_shard_receives_frames_when_the_shard_is_stepped() {
+    let harness = Arc::new(
+        ShardHarness::boot(([127, 0, 0, 1], 0).into(), false)
+            .await
+            .expect("boot shard"),
+    );
+    let client = mcp_server(&ClientState::new(out_dir("no-tick")));
+    let shard_tools = space_mcp_server::mcp_server(&harness);
+
+    let joined = call_json(
+        &client,
+        "connect",
+        json!({"addr": harness.addr.to_string()}),
+    )
+    .await;
+    assert_eq!(joined["connected"], true);
+    // Nothing has ticked: no frame can have arrived yet.
+    let before = call_json(&client, "client_status", json!({})).await;
+    assert_eq!(before["frames"], 0, "{before}");
+
+    let mut status = Value::Null;
+    for _ in 0..100 {
+        let stepped = call_json(&shard_tools, "advance_ticks", json!({"ticks": 2})).await;
+        assert!(stepped["tick"].as_u64().unwrap() >= 2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        status = call_json(&client, "client_status", json!({})).await;
+        if status["frames"].as_u64().unwrap_or(0) > 0 && status["ship"].is_string() {
+            break;
+        }
+    }
+    assert!(
+        status["frames"].as_u64().unwrap() > 0,
+        "stepping the shard must deliver frames to its client: {status}"
+    );
+    assert!(
+        status["ship"].is_string(),
+        "and the client learns which ship is its own: {status}"
+    );
+    assert_eq!(status["connected"], true);
+
+    call(&client, "disconnect", json!({})).await.unwrap();
+}
+
+/// A named capture is written from the blocking pool, into a directory that is
+/// created on demand, and a failure names the file.
+#[test]
+fn save_capture_creates_the_directory_and_reports_failures() {
+    let dir = out_dir("save").join("nested");
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("frame.jpg");
+    space_mcp_client::save_capture(&path, b"jpeg bytes").expect("saved");
+    assert_eq!(std::fs::read(&path).expect("readable"), b"jpeg bytes");
+    // A path whose "directory" is a file cannot be created.
+    let blocked = path.join("frame.jpg");
+    let err = space_mcp_client::save_capture(&blocked, b"x").expect_err("not a directory");
+    assert!(
+        err.contains("cannot save") && err.contains("frame.jpg"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(out_dir("save"));
+}

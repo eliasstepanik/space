@@ -83,28 +83,49 @@ async fn a_client_is_welcomed_by(endpoint: SocketAddr) {
 }
 
 #[tokio::test]
-async fn two_orchestrated_shards_on_distinct_nodes_are_both_welcomed_and_serve() {
-    // Defect A, the bring-up half: the second shard joins on its own region
-    // (as a split's child or a `--claim-region` shard would), is allocated a
-    // distinct id, and serves.
-    let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("two").await;
+async fn an_anonymous_claim_for_a_node_outside_the_map_is_rejected_and_burns_no_id() {
+    // `space-server --orchestrator … --claim-region <a node nobody carved>`.
+    //
+    // This used to be welcomed ("two orchestrated shards on distinct nodes are
+    // both welcomed and serve"): the orchestrator allocated an id and answered
+    // with the claimed region — but never published it. The shard's own map
+    // (the welcome's) still gave the whole root to shard a, so it handed every
+    // ship it was given straight to a; a second shard could claim the same
+    // node; and each restart burned another id. A region is created by a split
+    // (whose child says hello with the id allocated for it), so the anonymous
+    // claim is now refused, fast and with the reason.
+    let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("claim").await;
     let root = OrchestratorConfig::default().root_node();
     let child = space_world::octree::children(root).expect("root splits")[0];
 
     let a = start_orchestrated(options(&cluster, None), control_addr)
         .await
         .expect("shard a adopts the root");
-    let b = start_orchestrated(options(&cluster, Some(child)), control_addr)
-        .await
-        .expect("shard b is welcomed on a free node");
     assert_eq!(a.shard, ShardId::new(1), "a adopts the reserved root owner");
-    assert_ne!(a.shard, b.shard, "distinct ids");
-    assert_ne!(a.region, b.region, "distinct nodes");
+
+    for attempt in 0..2 {
+        let claim = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_orchestrated(options(&cluster, Some(child)), control_addr),
+        )
+        .await
+        .expect("the rejection arrives promptly");
+        let err = claim.expect_err("a node outside the published map cannot be claimed");
+        assert!(
+            err.contains("rejected") && err.contains("not in the published map"),
+            "attempt {attempt}: the error names the rejection and its reason, got: {err}"
+        );
+    }
+    // The refusals allocated nothing: the counter file still holds the id after
+    // the root owner's (boot allocated 1, so the next id is 2).
+    let persisted = std::fs::read_to_string(&state_path).expect("the counter file exists");
+    assert_eq!(persisted.trim(), "2", "a refused claim must not burn an id");
+
+    // Shard a is unaffected: it still serves, and its map is still the root's.
     a_client_is_welcomed_by(a.endpoint).await;
-    a_client_is_welcomed_by(b.endpoint).await;
+    assert_eq!(a.state.lock().await.shard_map().regions.len(), 1);
 
     a.abort();
-    b.abort();
     orch_task.abort();
     let _ = std::fs::remove_file(&state_path);
 }
@@ -292,5 +313,166 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
 
     shard.abort();
     orch_task.abort();
+    let _ = std::fs::remove_file(&state_path);
+}
+
+/// A split commits **through the real run loop**, with the real local launcher.
+///
+/// Everything in between is production code: `Orchestrator::run_with` over the
+/// QUIC control endpoint, a root shard booted by `start_orchestrated` (what
+/// `space-server --orchestrator` runs), and the child booted by
+/// [`LocalLauncher`]. The only thing the test does by hand is ask for the split
+/// (the admin verb has no wire front end yet); the loop is stopped for that one
+/// call and resumed.
+///
+/// Before the fixes this could not happen at all, for three independent
+/// reasons, each of which this test catches on its own:
+///
+/// * the loop awaited the launch, and the launch (a registering shard) waits
+///   for a `ShardHello` answer only that loop can give;
+/// * the launcher started a bare shard that never dialled the orchestrator, so
+///   the child never registered and never acked;
+/// * the `EpochPrepare` was published before the child existed and never sent
+///   again, so even a registered child had nothing to ack.
+///
+/// Each one leaves the prepare un-acked: the epoch aborts after three seconds
+/// and the map stays at epoch 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
+    use space_orchestrator::launcher::Launcher as _;
+    use space_protocol::{AdminCommand, AdminReply};
+
+    let state_path = std::env::temp_dir().join(format!(
+        "space-orch-boot-split-{}-{}.id",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&state_path);
+    let config = OrchestratorConfig {
+        // Port 0: the loop resolves the port the child has to dial.
+        bind: loopback0(),
+        state_path: state_path.clone(),
+        ..OrchestratorConfig::default()
+    };
+    let cluster = config.cluster.clone();
+    let root_node = config.root_node();
+    let control = boot(config, "secret".into()).expect("boot");
+    let launcher = Arc::new(LocalLauncher::new());
+    let mut orchestrator = Orchestrator::new(control, Arc::clone(&launcher));
+    let server = orchestrator.bind().expect("bind control");
+    let control_addr = server.local_addr().expect("control port");
+
+    // --- the loop runs until the root shard has registered.
+    let root = tokio::select! {
+        ended = orchestrator.run_with(Arc::clone(&server)) => panic!("the loop ended: {ended:?}"),
+        shard = start_orchestrated(options(&cluster, None), control_addr) => {
+            shard.expect("the root shard registers")
+        }
+    };
+    assert_eq!(root.shard, ShardId::new(1));
+    assert_eq!(orchestrator.map().epoch, 1);
+
+    // --- ask for the split (the loop is not running for this one call).
+    let reply = orchestrator.handle_admin(&AdminCommand::ForceSplit(root.shard));
+    assert!(
+        matches!(reply, AdminReply::Accepted { .. }),
+        "the split is accepted: {reply:?}"
+    );
+
+    // --- the loop carries it out: prepare, launch, hello, prepare again, acks,
+    // commit, map push. Done when the *root shard* runs the new map with both
+    // regions at real addresses — i.e. it got the commit and the push.
+    let root_state = Arc::clone(&root.state);
+    let committed = async {
+        loop {
+            {
+                let shard = root_state.lock().await;
+                let map = shard.shard_map();
+                if map.epoch == 2
+                    && map.regions.len() == 2
+                    && map.regions.iter().all(|r| r.endpoint.port() != 0)
+                {
+                    return map.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let root_map = tokio::select! {
+        ended = orchestrator.run_with(Arc::clone(&server)) => panic!("the loop ended: {ended:?}"),
+        map = tokio::time::timeout(Duration::from_secs(10), committed) => {
+            map.expect("the split must commit through the run loop (it aborts after 3 s if the child never acks)")
+        }
+    };
+
+    // The orchestrator published exactly what the root shard runs.
+    assert_eq!(orchestrator.map().epoch, 2, "the split committed");
+    assert_eq!(orchestrator.map(), &root_map);
+    let child_region = orchestrator
+        .map()
+        .regions
+        .iter()
+        .find(|r| r.shard != root.shard)
+        .expect("the child's region is published")
+        .clone();
+    let child = child_region.shard;
+    assert!(child > root.shard, "a fresh, greater id (H9)");
+    assert_eq!(
+        space_world::octree::parent(child_region.node),
+        Some(root_node),
+        "the child owns one octant of the root"
+    );
+    assert!(
+        orchestrator.take_pending_kill().is_empty(),
+        "a committed split kills nobody"
+    );
+
+    // The child is a live shard the launcher supervises, at the published
+    // address, and it follows the committed map too.
+    assert_eq!(
+        launcher.poll(child).await.expect("poll"),
+        space_orchestrator::launcher::Poll::Alive
+    );
+    let client = space_net::client_endpoint().expect("client endpoint");
+    let mut seen = None;
+    for _ in 0..100 {
+        let hello = Hello {
+            protocol: space_protocol::PROTOCOL_VERSION,
+            player_token: "after-the-split".into(),
+        };
+        let (conn, welcome) = space_net::connect(
+            &client,
+            child_region.endpoint,
+            space_server::net::SERVER_NAME,
+            &hello,
+        )
+        .await
+        .expect("the child answers at the address the map names");
+        assert_eq!(welcome.shard, child, "it runs as the id it was allocated");
+        conn.close(0, "probe");
+        if welcome.shard_map.epoch == 2 {
+            seen = Some(welcome.shard_map);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let child_map = seen.expect("the child installs the committed map");
+    assert_eq!(
+        child_map.lookup(&child_region.node.center()),
+        Some(child),
+        "the child knows it owns its octant"
+    );
+    assert_eq!(
+        child_map.lookup(&root_node.center()),
+        root_map.lookup(&root_node.center()),
+        "and agrees with the root shard about everything else"
+    );
+
+    launcher.kill(child).await.expect("kill");
+    root.abort();
+    server.close();
     let _ = std::fs::remove_file(&state_path);
 }

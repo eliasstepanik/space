@@ -25,7 +25,13 @@
 //! 2. [`SimWorld::step`];
 //! 3. refresh the interest grid from the new positions;
 //! 4. detect shard-boundary crossings and start a handoff ([`crate::handoff`]);
-//! 5. build one frame per client ([`crate::replicate::build_frame`]).
+//! 5. build one frame per client ([`crate::replicate::build_frame`]) — every
+//!    tick, even when nothing changed: the frame is also the client's clock.
+//!
+//! The loop itself lives in the front end ([`net`]): tick, then
+//! [`net::ShardNet::flush`], which never waits on a queue, so neither a slow
+//! client nor a dead neighbour can stop the simulation; and
+//! [`net::supervise`] ends the process if the tick loop ever dies.
 //!
 //! # Seamless handoff
 //!

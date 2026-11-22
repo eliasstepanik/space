@@ -21,19 +21,38 @@
 //! # Sessions
 //!
 //! A successful `initialize` mints an `Mcp-Session-Id` (returned as a response
-//! header). Every other request must carry a live one, otherwise `400` with a
-//! JSON-RPC error body.
+//! header). Every other request must carry a live one:
+//!
+//! * **no `Mcp-Session-Id` header** → `400` (the request is malformed);
+//! * **a header naming a session this server does not have** → `404`. That is
+//!   the status the Streamable HTTP transport defines for a session the server
+//!   has terminated, and the one a client reacts to by sending a fresh
+//!   `initialize`. A session is unknown here because it was `DELETE`d, evicted,
+//!   or — the common case — because the server was restarted: sessions live in
+//!   memory, so a client that outlives the server always arrives with a stale
+//!   id. Answering that with `400` (as this used to) tells the client its
+//!   request was wrong, and it has no reason to re-initialise.
+//!
+//! Both carry a JSON-RPC error body.
+//!
+//! At most [`MAX_SESSIONS`] sessions are kept. A client is not obliged to
+//! `DELETE` its session and most never do, so the table fills up over a long
+//! run; when it is full, a new `initialize` **evicts the least recently used
+//! session** instead of being refused (it used to be `503` for every newcomer
+//! until the server was restarted). The evicted client's next request gets the
+//! `404` above and re-initialises.
 //!
 //! # Hardening
 //!
 //! Plain TCP, bound where the caller says (the binaries default to loopback).
 //! A browser `Origin` that is not loopback is `403` (DNS-rebinding guard, per the
 //! spec). Heads are capped at [`MAX_HEAD`] bytes, bodies at [`MAX_BODY`], reads
-//! time out, concurrent connections and sessions are capped. Connections are
-//! one-shot: every response carries `Connection: close`; `Transfer-Encoding`
-//! (chunked bodies) is not supported (`501`).
+//! and the response write time out, concurrent connections and sessions are
+//! capped. Connections are one-shot: every response carries
+//! `Connection: close`; `Transfer-Encoding` (chunked bodies) is not supported
+//! (`501`). A failed `accept` is logged and the server keeps accepting.
 
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +64,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-use crate::jsonrpc::{Parsed, Response, INTERNAL_ERROR, INVALID_REQUEST};
+use crate::jsonrpc::{Parsed, Response, INVALID_REQUEST};
 use crate::server::{is_protocol_level_rejection, McpServer};
 
 /// The single MCP endpoint.
@@ -58,6 +77,17 @@ pub const MAX_BODY: usize = 1 << 20;
 pub const MAX_HEAD: usize = 16 * 1024;
 /// How long a client has to deliver a complete request.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client has to take the response off the socket.
+///
+/// A response larger than the socket buffers (an inline frame capture is a few
+/// megabytes) blocks the write until the client reads. Without a bound, a client
+/// that never reads kept its connection permit for ever, and
+/// [`MAX_CONNECTIONS`] of them stopped the server accepting anyone.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the accept loop pauses after a failed `accept` before trying again
+/// (so a persistent failure, such as running out of descriptors, is not a hot
+/// loop).
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Concurrent connections served at once.
 pub const MAX_CONNECTIONS: usize = 64;
 /// Live sessions kept at once.
@@ -423,10 +453,17 @@ fn origin_allowed(origin: &str) -> bool {
     };
     let authority = rest.split('/').next().unwrap_or("");
     let host = if authority.starts_with('[') {
-        authority
-            .split(']')
-            .next()
-            .map_or("", |h| &authority[..h.len() + 1])
+        // A bracketed IPv6 literal: the host is everything up to and including
+        // the closing bracket, and only a port may follow it. An authority with
+        // no closing bracket is not a host at all (and must not be sliced as if
+        // it had one: that indexed one past the end of the string and panicked
+        // the request's task).
+        match authority.find(']') {
+            Some(end) if matches!(authority.as_bytes().get(end + 1), None | Some(b':')) => {
+                &authority[..=end]
+            }
+            _ => "",
+        }
     } else {
         authority.split(':').next().unwrap_or("")
     };
@@ -435,11 +472,54 @@ fn origin_allowed(origin: &str) -> bool {
 
 // ---------------------------------------------------------------- transport
 
+/// The live sessions, least recently used first.
+///
+/// At most [`MAX_SESSIONS`] entries, so the linear scans are a few hundred
+/// short string compares per request.
+#[derive(Debug, Default)]
+struct Sessions {
+    ids: VecDeque<String>,
+}
+
+impl Sessions {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether `id` is live; a live session becomes the most recently used.
+    fn touch(&mut self, id: &str) -> bool {
+        let Some(at) = self.ids.iter().position(|s| s == id) else {
+            return false;
+        };
+        if let Some(found) = self.ids.remove(at) {
+            self.ids.push_back(found);
+        }
+        true
+    }
+
+    /// End the session `id`. `false` when there was none.
+    fn remove(&mut self, id: &str) -> bool {
+        match self.ids.iter().position(|s| s == id) {
+            Some(at) => self.ids.remove(at).is_some(),
+            None => false,
+        }
+    }
+
+    /// Start the session `id`, evicting the least recently used ones if the
+    /// table is full.
+    fn insert(&mut self, id: String) {
+        while self.ids.len() >= MAX_SESSIONS {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(id);
+    }
+}
+
 /// The HTTP front end for one [`McpServer`].
 #[derive(Debug)]
 pub struct HttpTransport {
     server: Arc<McpServer>,
-    sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<Sessions>,
     counter: AtomicU64,
 }
 
@@ -449,7 +529,7 @@ impl HttpTransport {
     pub fn new(server: Arc<McpServer>) -> Arc<Self> {
         Arc::new(Self {
             server,
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(Sessions::default()),
             counter: AtomicU64::new(0),
         })
     }
@@ -460,7 +540,7 @@ impl HttpTransport {
         self.sessions().len()
     }
 
-    fn sessions(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -476,11 +556,18 @@ impl HttpTransport {
         format!("{:016x}{:016x}", part(), part())
     }
 
-    fn session_ok(&self, request: &Request) -> bool {
-        request
-            .head
-            .header(SESSION_HEADER)
-            .is_some_and(|id| self.sessions().contains(id))
+    /// Check the request's session. `Err` is the response to send instead: see
+    /// the module docs for why a missing header and an unknown id differ.
+    fn check_session(&self, request: &Request, id: Value) -> Result<(), HttpResponse> {
+        match request.head.header(SESSION_HEADER) {
+            None => Err(session_error(400, id, "missing Mcp-Session-Id")),
+            Some(session) if self.sessions().touch(session) => Ok(()),
+            Some(_) => Err(session_error(
+                404,
+                id,
+                "unknown or expired Mcp-Session-Id; send a new initialize",
+            )),
+        }
     }
 
     /// Answer one request. Pure of any socket, so tests call it directly.
@@ -494,14 +581,11 @@ impl HttpTransport {
         }
         match head.method.as_str() {
             "POST" => self.handle_post(&request).await,
-            "DELETE" => {
-                let id = head.header(SESSION_HEADER).unwrap_or("");
-                if self.sessions().remove(id) {
-                    HttpResponse::empty(200)
-                } else {
-                    HttpError::new(400, "missing or unknown Mcp-Session-Id").into_response()
-                }
-            }
+            "DELETE" => match head.header(SESSION_HEADER) {
+                None => session_error(400, Value::Null, "missing Mcp-Session-Id"),
+                Some(id) if self.sessions().remove(id) => HttpResponse::empty(200),
+                Some(_) => session_error(404, Value::Null, "unknown or expired Mcp-Session-Id"),
+            },
             // No server-initiated stream is offered.
             "GET" => HttpError::new(405, "this server does not open a GET event stream")
                 .into_response()
@@ -530,17 +614,19 @@ impl HttpTransport {
         let message = match crate::jsonrpc::parse_message(&request.body) {
             Err(error) => return HttpResponse::json(400, &error),
             Ok(Parsed::ClientResponse) => {
-                return if self.session_ok(request) {
-                    HttpResponse::empty(202)
-                } else {
-                    missing_session(Value::Null)
+                return match self.check_session(request, Value::Null) {
+                    Ok(()) => HttpResponse::empty(202),
+                    Err(refusal) => refusal,
                 };
             }
             Ok(Parsed::Message(message)) => message,
         };
         let is_initialize = message.method == "initialize";
-        if !is_initialize && !self.session_ok(request) {
-            return missing_session(message.id.unwrap_or(Value::Null));
+        if !is_initialize {
+            let id = message.id.clone().unwrap_or(Value::Null);
+            if let Err(refusal) = self.check_session(request, id) {
+                return refusal;
+            }
         }
         let Some(response) = self.server.dispatch(message).await else {
             return HttpResponse::empty(202);
@@ -550,15 +636,10 @@ impl HttpTransport {
             Format::Sse => HttpResponse::sse(&response),
         };
         if is_initialize && response.outcome.is_ok() {
-            let mut sessions = self.sessions();
-            if sessions.len() >= MAX_SESSIONS {
-                return HttpResponse::json(
-                    503,
-                    &Response::err(response.id, INTERNAL_ERROR, "too many sessions"),
-                );
-            }
+            // A full table makes room by dropping its least recently used
+            // session (see the module docs); a newcomer is never turned away.
             let id = self.new_session_id();
-            sessions.insert(id.clone());
+            self.sessions().insert(id.clone());
             http = http.with_header("Mcp-Session-Id", id);
         } else if is_protocol_level_rejection(&response) {
             http.status = 400;
@@ -566,16 +647,30 @@ impl HttpTransport {
         http
     }
 
-    /// Accept connections on `listener` until it errors. Each connection serves
-    /// one request.
+    /// Accept connections on `listener` for as long as the process lives. Each
+    /// connection serves one request.
+    ///
+    /// A failed `accept` does **not** end the loop: it is logged and the server
+    /// goes on accepting after a short pause. `accept` fails for reasons that
+    /// are about one connection or one moment (the peer reset before it was
+    /// accepted, the process is briefly out of descriptors), and returning on
+    /// the first of them used to take the whole MCP server — and the shard or
+    /// client it fronts — down with it.
     ///
     /// # Errors
     ///
-    /// The `accept` error that ended the loop.
+    /// None today (the loop does not end); the `io::Result` is kept for callers.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(err) => {
+                    eprintln!("space-mcp: accept failed ({err}); still listening");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+            };
             let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                 return Ok(());
             };
@@ -595,16 +690,30 @@ impl HttpTransport {
             Ok(Err(e)) => e.into_response(),
             Err(_) => HttpError::new(408, "request timed out").into_response(),
         };
-        let _ = stream.write_all(&response.to_bytes()).await;
-        let _ = stream.shutdown().await;
+        // Dropping the stream closes it, whether or not the write finished.
+        let _ = write_response(&mut stream, &response.to_bytes(), WRITE_TIMEOUT).await;
     }
 }
 
-fn missing_session(id: Value) -> HttpResponse {
-    HttpResponse::json(
-        400,
-        &Response::err(id, INVALID_REQUEST, "missing or unknown Mcp-Session-Id"),
-    )
+/// Write `bytes` to `stream` and shut it down, giving up after `limit`.
+///
+/// Returns whether the whole response went out in time. A client that does not
+/// read must not be able to hold the connection (and its permit) open.
+async fn write_response<S>(stream: &mut S, bytes: &[u8], limit: Duration) -> bool
+where
+    S: AsyncWrite + Unpin,
+{
+    let write = async {
+        stream.write_all(bytes).await?;
+        stream.shutdown().await
+    };
+    matches!(tokio::time::timeout(limit, write).await, Ok(Ok(())))
+}
+
+/// The refusal for a request whose session is missing (`400`) or unknown
+/// (`404`), carrying a JSON-RPC error for the request `id`.
+fn session_error(status: u16, id: Value, message: &str) -> HttpResponse {
+    HttpResponse::json(status, &Response::err(id, INVALID_REQUEST, message))
 }
 
 #[cfg(test)]
@@ -810,6 +919,34 @@ mod tests {
         assert!(!origin_allowed("null"));
     }
 
+    /// Mutation this catches: slicing a bracketed host one past its end. An
+    /// `Origin` with an opening bracket and no closing one panicked the
+    /// connection's task (the client got an empty reply instead of a 403).
+    #[test]
+    fn a_malformed_bracketed_origin_is_refused_not_a_panic() {
+        for origin in [
+            "http://[::1",
+            "http://[",
+            "https://[::1:8080/path",
+            "http://[]",
+            "http://[::1]x",
+            "http://[é",
+        ] {
+            assert!(!origin_allowed(origin), "{origin}");
+        }
+        // The well-formed forms still pass.
+        assert!(origin_allowed("http://[::1]"));
+        assert!(origin_allowed("https://[::1]:8080/path"));
+    }
+
+    #[tokio::test]
+    async fn a_request_with_a_malformed_origin_gets_a_403() {
+        let t = transport();
+        let r = t.handle(post(INIT, &[("origin", "http://[::1")])).await;
+        assert_eq!(r.status, 403);
+        assert_eq!(t.session_count(), 0, "and no session was minted");
+    }
+
     // ---- session enforcement, driven through `handle` (no socket)
 
     fn transport() -> Arc<HttpTransport> {
@@ -861,10 +998,12 @@ mod tests {
         assert_eq!(session.len(), 32);
         assert_eq!(t.session_count(), 1);
 
-        // No header, wrong header: 400 with a JSON-RPC error carrying the id.
-        for headers in [vec![], vec![("mcp-session-id", "bogus")]] {
+        // No header is 400 (a malformed request); a header naming a session
+        // this server does not have is 404 (the client must re-initialise).
+        // Both carry a JSON-RPC error with the request's id.
+        for (headers, status) in [(vec![], 400), (vec![("mcp-session-id", "bogus")], 404)] {
             let r = t.handle(post(LIST, &headers)).await;
-            assert_eq!(r.status, 400);
+            assert_eq!(r.status, status, "{headers:?}");
             let v: Value = serde_json::from_slice(&r.body).unwrap();
             assert_eq!(v["error"]["code"], INVALID_REQUEST);
             assert_eq!(v["id"], 2);
@@ -987,13 +1126,121 @@ mod tests {
         let mut del = post("", &[("mcp-session-id", &session)]);
         del.head.method = "DELETE".into();
         assert_eq!(t.handle(del.clone()).await.status, 200);
-        assert_eq!(t.handle(del).await.status, 400);
+        // The session is gone: naming it again is 404, for DELETE and POST alike.
+        assert_eq!(t.handle(del).await.status, 404);
         assert_eq!(
             t.handle(post(LIST, &[("mcp-session-id", &session)]))
                 .await
                 .status,
-            400
+            404
         );
+        // A DELETE that names no session at all is a malformed request.
+        let mut bare = post("", &[]);
+        bare.head.method = "DELETE".into();
+        assert_eq!(t.handle(bare).await.status, 400);
+    }
+
+    /// A client that outlives the server arrives with a session id the new
+    /// server never issued. It must be told to start over (404), for a request,
+    /// a notification and a client response alike — not that its request was
+    /// malformed.
+    ///
+    /// Mutation this catches: answering an unknown session with 400.
+    #[tokio::test]
+    async fn a_stale_session_from_before_a_restart_is_404_for_every_kind_of_message() {
+        let stale = [("mcp-session-id", "0123456789abcdef0123456789abcdef")];
+        let t = transport();
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let answer = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        for body in [LIST, note, answer] {
+            let r = t.handle(post(body, &stale)).await;
+            assert_eq!(r.status, 404, "{body}");
+            let v: Value = serde_json::from_slice(&r.body).unwrap();
+            assert_eq!(v["error"]["code"], INVALID_REQUEST, "{body}");
+            assert_eq!(t.handle(post(body, &[])).await.status, 400, "{body}");
+        }
+        // And the way out works: a fresh initialize is answered with a session.
+        let init = t.handle(post(INIT, &stale)).await;
+        assert_eq!(init.status, 200);
+        assert!(init.header("mcp-session-id").is_some());
+    }
+
+    async fn initialize(t: &HttpTransport) -> String {
+        let r = t.handle(post(INIT, &[])).await;
+        assert_eq!(r.status, 200, "initialize is never refused");
+        r.header("mcp-session-id").expect("session id").to_owned()
+    }
+
+    async fn list_status(t: &HttpTransport, session: &str) -> u16 {
+        t.handle(post(LIST, &[("mcp-session-id", session)]))
+            .await
+            .status
+    }
+
+    /// Mutation this catches: refusing `initialize` once `MAX_SESSIONS` exist.
+    /// Sessions are only removed by a `DELETE` most clients never send, so the
+    /// table filled up and every later client got a 503 until a restart.
+    #[tokio::test]
+    async fn a_full_session_table_evicts_the_least_recently_used_session() {
+        let t = transport();
+        let first = initialize(&t).await;
+        let second = initialize(&t).await;
+        let mut rest = Vec::new();
+        for _ in 2..MAX_SESSIONS {
+            rest.push(initialize(&t).await);
+        }
+        assert_eq!(t.session_count(), MAX_SESSIONS);
+        // `first` is used again, so it is no longer the least recently used.
+        assert_eq!(list_status(&t, &first).await, 200);
+
+        // One more client: it is welcomed, and the table does not grow.
+        let newcomer = initialize(&t).await;
+        assert_eq!(t.session_count(), MAX_SESSIONS);
+        assert_eq!(list_status(&t, &newcomer).await, 200);
+        // The session that made room is the one idle longest — `second` — and
+        // its owner is told to re-initialise.
+        assert_eq!(list_status(&t, &second).await, 404);
+        assert_eq!(
+            list_status(&t, &first).await,
+            200,
+            "a session in use survives"
+        );
+        assert_eq!(list_status(&t, rest.last().unwrap()).await, 200);
+        // Many more newcomers: never a refusal, never more than the cap.
+        for _ in 0..(2 * MAX_SESSIONS) {
+            initialize(&t).await;
+        }
+        assert_eq!(t.session_count(), MAX_SESSIONS);
+    }
+
+    /// Mutation this catches: writing the response with no bound. A client that
+    /// never reads a response larger than the socket buffers held its
+    /// connection permit for ever.
+    #[tokio::test]
+    async fn a_response_nobody_reads_is_given_up_on() {
+        // A 64-byte pipe whose far end is kept open and never read.
+        let (mut server_side, _client_side) = tokio::io::duplex(64);
+        let big = vec![b'x'; 64 * 1024];
+        let started = std::time::Instant::now();
+        let sent = tokio::time::timeout(
+            Duration::from_secs(10),
+            write_response(&mut server_side, &big, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the write must give up on its own");
+        assert!(!sent, "the response did not go out");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        // A client that does read gets all of it.
+        let (mut server_side, mut client_side) = tokio::io::duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            client_side.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        assert!(write_response(&mut server_side, &big, Duration::from_secs(10)).await);
+        drop(server_side);
+        assert_eq!(reader.await.unwrap().len(), big.len());
     }
 
     // ---- the real socket path

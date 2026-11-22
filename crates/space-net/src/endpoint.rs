@@ -21,8 +21,9 @@
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt};
 use space_protocol::{
@@ -38,7 +39,31 @@ pub const REJECT_CLOSE_CODE: u32 = 0x20;
 
 /// How long a refusing server waits for the client to acknowledge a [`Reject`]
 /// before it closes the connection anyway.
-const REJECT_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+const REJECT_DRAIN: Duration = Duration::from_secs(1);
+
+/// Silence after which a connection is declared dead.
+///
+/// The peer must not have been heard from for this long: with
+/// [`KEEP_ALIVE_INTERVAL`] in force that only happens when the peer (or the
+/// path to it) is really gone, never because the application had nothing to say.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often an otherwise silent connection sends a QUIC `PING`.
+///
+/// A third of [`IDLE_TIMEOUT`], so three consecutive pings have to be lost
+/// before a live peer is mistaken for a dead one. Without it every link that
+/// carries only occasional traffic — a shard's control connection to the
+/// orchestrator (epoch messages only), a shard-to-shard connection (handoff
+/// messages only) — timed out after ten quiet seconds and was never re-opened.
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long [`connect`] and [`accept_incoming`] wait for the whole handshake
+/// (QUIC/TLS plus the hello exchange) before giving up.
+///
+/// The idle timeout used to bound this implicitly. With keep-alive on it no
+/// longer does: a peer whose transport answers but whose application never
+/// sends its half of the hello would hold the caller forever.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a connection could not be established or was refused.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,8 +114,10 @@ impl From<io::Error> for NetError {
 /// * **datagrams enabled** (the quinn default, made explicit here because the
 ///   input path depends on it), with a receive buffer that comfortably holds a
 ///   second of 30 Hz input traffic.
-/// * **no keep-alive**: disconnects are detected by the idle timeout, which
-///   [`Conn::is_closed`] reports.
+/// * **keep-alive every [`KEEP_ALIVE_INTERVAL`], idle timeout
+///   [`IDLE_TIMEOUT`]**: a quiet link stays up, and a dead peer is still
+///   detected by the idle timeout, which [`Conn::is_closed`] reports (a ping
+///   that is never acknowledged does not reset the idle timer).
 #[must_use]
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
@@ -107,10 +134,13 @@ pub fn transport_config() -> Arc<TransportConfig> {
     // which is what the lifecycle tests observe. The timeout must be set
     // explicitly: quinn's default is 30 s, so the comment above was a promise
     // the code did not keep.
-    t.keep_alive_interval(None);
+    //
+    // Keep-alive is what stops *application* silence from looking like a dead
+    // peer (see [`KEEP_ALIVE_INTERVAL`]). Both sides use this config, so either
+    // end's pings keep the link up.
+    t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(10))
-            .expect("10 s fits in a QUIC idle timeout"),
+        quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("10 s fits in a QUIC idle timeout"),
     ));
     Arc::new(t)
 }
@@ -126,7 +156,31 @@ pub fn server_endpoint(bind: SocketAddr, server_config: ServerConfig) -> io::Res
     Endpoint::server(config, bind).map_err(io::Error::other)
 }
 
+/// A client endpoint that can dial `addr`: bound to an ephemeral port on the
+/// wildcard address of **`addr`'s own address family**.
+///
+/// [`client_endpoint`] picks the family by operating system (IPv4 on Windows,
+/// IPv6 elsewhere), which makes an IPv6 target un-diallable on Windows (quinn
+/// refuses it with `InvalidRemoteAddress`) and requires a working IPv6 stack
+/// everywhere else, even to reach `127.0.0.1`. Binding the family of the
+/// address actually being dialled has neither problem, so this is the one to
+/// use whenever the destination is known.
+///
+/// # Errors
+///
+/// [`io::Error`] when the socket cannot be bound.
+pub fn client_endpoint_for(addr: SocketAddr) -> io::Result<Endpoint> {
+    let wildcard = match addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    client_endpoint_on(SocketAddr::new(wildcard, 0))
+}
+
 /// A client endpoint bound to an ephemeral port on the wildcard address.
+///
+/// Prefer [`client_endpoint_for`] when the destination is known: this one
+/// cannot know which address family will be dialled and guesses by platform.
 ///
 /// # Errors
 ///
@@ -232,6 +286,25 @@ impl Conn {
         recv_stream_message(&self.conn).await
     }
 
+    /// Refuse the connection: tell the peer why on the control stream, wait for
+    /// it to read that, then close.
+    ///
+    /// This is what a server calls when its own policy turns a hello away after
+    /// the version gate passed (a full or draining shard). Simply writing a
+    /// [`Reject`] and dropping the connection does **not** work: dropping the
+    /// last handle closes the connection at once, the `CONNECTION_CLOSE` beats
+    /// the stream data, and the peer sees "connection lost" instead of the
+    /// reason. So the reject is written and finished, and the close waits (up to
+    /// a second) for the peer to close first — [`connect`] does exactly that as
+    /// soon as it has read a `Reject`.
+    pub async fn reject(&self, reason: RejectReason) {
+        {
+            let mut send = self.control_send.lock().await;
+            send_reject(&mut send, &reason).await;
+        }
+        drain_then_close(&self.conn, b"rejected").await;
+    }
+
     /// Whether the connection is already gone (locally closed, timed out, or the
     /// peer closed it). This is the disconnect signal a poll loop checks.
     #[must_use]
@@ -259,20 +332,78 @@ fn encode(message: &Message) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
+/// Write a [`Reject`] carrying `reason` on `send` and finish the stream.
+///
+/// Best-effort: the peer may already be gone.
+async fn send_reject(send: &mut SendStream, reason: &RejectReason) {
+    let frame = space_protocol::encode_frame(&Message::Reject(Reject {
+        reason: reason.clone(),
+    }));
+    let _ = send.write_all(&frame).await;
+    let _ = send.finish();
+}
+
+/// Close `conn` after giving the peer a moment to read what was just written.
+///
+/// Closing right after a write would race it: a `CONNECTION_CLOSE` can reach
+/// the peer before the stream data does, and the peer then sees "connection
+/// lost" instead of the message. A client that reads a reject closes the
+/// connection itself (see [`connect`]), so this normally returns immediately;
+/// [`REJECT_DRAIN`] bounds it for a client that never reads.
+async fn drain_then_close(conn: &Connection, why: &[u8]) {
+    let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
+    conn.close(VarInt::from_u32(REJECT_CLOSE_CODE), why);
+}
+
 /// Connect to `addr`, complete the TLS handshake and run the hello exchange.
 ///
 /// On success the returned [`Welcome`] is the server's answer and the connection
-/// is ready for [`Message::InputTick`] traffic.
+/// is ready for [`Message::InputTick`] traffic. The whole exchange is bounded by
+/// [`HANDSHAKE_TIMEOUT`]; see [`connect_within`] for a caller-chosen bound.
 ///
 /// # Errors
 ///
-/// * [`NetError::Handshake`] when QUIC/TLS cannot be established.
+/// * [`NetError::Handshake`] when QUIC/TLS cannot be established, or the server
+///   has not answered the hello within [`HANDSHAKE_TIMEOUT`].
 /// * [`NetError::VersionMismatch`] when the server answers with a
 ///   [`Reject`] carrying [`RejectReason::VersionMismatch`] (the server-side
 ///   check is [`check_hello`]; this is the client's view of it).
 /// * [`NetError::Rejected`] for any other refusal.
 /// * [`NetError::Protocol`] when the first frame is not a `Welcome`/`Reject`.
 pub async fn connect(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+    hello: &Hello,
+) -> Result<(Conn, Welcome), NetError> {
+    connect_within(endpoint, addr, server_name, hello, HANDSHAKE_TIMEOUT).await
+}
+
+/// [`connect`] with a caller-chosen bound on the whole handshake.
+///
+/// Giving up drops the half-open connection, which closes it.
+///
+/// # Errors
+///
+/// As [`connect`]; running out of `limit` is a [`NetError::Handshake`].
+pub async fn connect_within(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+    hello: &Hello,
+    limit: Duration,
+) -> Result<(Conn, Welcome), NetError> {
+    let handshake = connect_unbounded(endpoint, addr, server_name, hello);
+    match tokio::time::timeout(limit, handshake).await {
+        Ok(result) => result,
+        Err(_) => Err(NetError::Handshake(format!(
+            "no welcome from {addr} within {limit:?}"
+        ))),
+    }
+}
+
+/// The handshake itself, with no bound of its own (see [`connect_within`]).
+async fn connect_unbounded(
     endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
@@ -340,23 +471,62 @@ pub async fn accept_connection(accept: quinn::Accept<'_>) -> Result<(Conn, Hello
 
 /// [`accept_connection`] for an already-received [`quinn::Incoming`].
 ///
+/// The handshake and the wait for the client's hello are bounded by
+/// [`HANDSHAKE_TIMEOUT`]; see [`accept_incoming_within`] for a caller-chosen
+/// bound.
+///
 /// # Errors
 ///
 /// As [`accept_connection`].
 pub async fn accept_incoming(incoming: quinn::Incoming) -> Result<(Conn, Hello), NetError> {
+    accept_incoming_within(incoming, HANDSHAKE_TIMEOUT).await
+}
+
+/// The transport half of an accept: the QUIC/TLS handshake, the control stream
+/// and the first frame on it.
+async fn accept_first_frame(
+    incoming: quinn::Incoming,
+) -> Result<(Connection, SendStream, RecvStream, Message), NetError> {
     let conn = incoming
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
     // The control stream is the bi stream the client opened: the server reads the
     // hello from its receive half and answers on its send half, so both sides
     // share one reliable, ordered control channel.
-    let (mut send, mut recv) = conn
+    let (send, mut recv) = conn
         .accept_bi()
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
     let first = read_frame(&mut recv)
         .await?
         .ok_or_else(|| NetError::Protocol("the client sent no hello".into()))?;
+    Ok((conn, send, recv, first))
+}
+
+/// [`accept_incoming`] with a caller-chosen bound on the handshake and on the
+/// wait for the client's hello.
+///
+/// A client that completes the QUIC handshake and then never opens the control
+/// stream (or never finishes its hello) would otherwise hold this task for as
+/// long as it keeps the connection alive. Giving up drops the connection, which
+/// closes it.
+///
+/// # Errors
+///
+/// As [`accept_connection`]; running out of `limit` is a [`NetError::Handshake`].
+pub async fn accept_incoming_within(
+    incoming: quinn::Incoming,
+    limit: Duration,
+) -> Result<(Conn, Hello), NetError> {
+    let (conn, mut send, recv, first) =
+        match tokio::time::timeout(limit, accept_first_frame(incoming)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(NetError::Handshake(format!(
+                    "the peer sent no hello within {limit:?}"
+                )))
+            }
+        };
     let hello = match first {
         Message::Hello(h) => h,
         other => {
@@ -368,23 +538,10 @@ pub async fn accept_incoming(incoming: quinn::Incoming) -> Result<(Conn, Hello),
     // The version gate. Answer the mismatch *before* returning so the client
     // gets a reason instead of a timeout.
     if let Err(reason) = check_hello(&hello) {
-        let frame = space_protocol::encode_frame(&Message::Reject(Reject {
-            reason: reason.clone(),
-        }));
-        // Best-effort: the client may already be gone.
-        let _ = send.write_all(&frame).await;
-        let _ = send.finish();
-        // Closing the connection right here would race the reject frame: a
-        // CONNECTION_CLOSE can reach the peer before the stream data does, and
-        // the peer then sees "connection lost" instead of the reason. A client
-        // that reads the reject closes the connection itself (see [`connect`]),
-        // so this normally returns immediately; the timeout bounds it for a
-        // client that never reads.
-        let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
-        conn.close(
-            VarInt::from_u32(REJECT_CLOSE_CODE),
-            b"protocol version mismatch",
-        );
+        send_reject(&mut send, &reason).await;
+        // Closing the connection right here would race the reject frame (see
+        // [`drain_then_close`]).
+        drain_then_close(&conn, b"protocol version mismatch").await;
         return Err(reject_to_err(reason));
     }
     Ok((

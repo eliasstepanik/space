@@ -17,47 +17,21 @@ use crate::component::{ComponentData, ComponentDef, ComponentId};
 use crate::entity::Entity;
 use crate::storage::Column;
 
-/// Splits `slice` into `N` disjoint mutable references at `indices`.
+/// Splits `slice` into `N` disjoint mutable references at `indices`, in the
+/// order the indices were given.
 ///
-/// Returns `None` if any index is duplicated or out of range. This is the safe
-/// stand-in for the (still unstable in Rust 1.100) `slice::get_many_mut`.
+/// Returns `None` if any index is duplicated or out of range.
+///
+/// This is `slice::get_disjoint_mut` (std, safe, stable since Rust 1.86): no
+/// heap allocation. It sits on the per-row path of every multi-term
+/// [`QueryTerms::get_row`] and of archetype migration, where the hand-rolled
+/// version it replaces allocated three or four `Vec`s per call.
+#[inline]
 pub(crate) fn get_many_mut<T, const N: usize>(
     slice: &mut [T],
     indices: [usize; N],
 ) -> Option<[&mut T; N]> {
-    let mut order: [(usize, usize); N] = std::array::from_fn(|i| (indices[i], i));
-    order.sort_unstable();
-    for w in order.windows(2) {
-        if w[0].0 == w[1].0 {
-            return None;
-        }
-    }
-    if let Some(last) = order.last() {
-        if last.0 >= slice.len() {
-            return None;
-        }
-    }
-    let sorted: Vec<usize> = order.iter().map(|x| x.0).collect();
-    let mut out: Vec<&mut T> = Vec::with_capacity(N);
-    take_sorted(slice, &sorted, 0, &mut out);
-    // `out[j]` corresponds to `order[j]`; result slot `i` is `out[pos_of[i]]`.
-    let mut pos_of = [0usize; N];
-    for (j, &(_, orig)) in order.iter().enumerate() {
-        pos_of[orig] = j;
-    }
-    let mut slots: Vec<Option<&mut T>> = out.into_iter().map(Some).collect();
-    let res: Vec<&mut T> = (0..N).map(|i| slots[pos_of[i]].take().unwrap()).collect();
-    res.try_into().ok()
-}
-
-/// Hands out `&mut` at the sorted positions `sorted` (all `>= base`).
-fn take_sorted<'a, T>(slice: &'a mut [T], sorted: &[usize], base: usize, out: &mut Vec<&'a mut T>) {
-    if let Some((&i, rest)) = sorted.split_first() {
-        let (_head, tail) = slice.split_at_mut(i - base);
-        let (one, tail) = tail.split_at_mut(1);
-        out.push(&mut one[0]);
-        take_sorted(tail, rest, i + 1, out);
-    }
+    slice.get_disjoint_mut(indices).ok()
 }
 
 /// Internal abstraction over a single access kind (`&T` or `&mut T`).
@@ -139,6 +113,9 @@ pub trait QueryTerms {
     /// `true` if any sub-term is `&mut` (decides whether rows get tick-stamped).
     const MUTABLE: bool;
     /// Iterates rows `0..len`, skipping rows where `mask` is `Some(false)`.
+    ///
+    /// The contract every implementation keeps (and [`WithEntity`] relies on):
+    /// `f` is called **exactly once per unmasked row, in ascending row order**.
     ///
     /// `entities` is the archetype's row→[`Entity`] map, parallel to the
     /// columns; only [`WithEntity`] reads it.
@@ -267,16 +244,20 @@ impl<Q: QueryTerms> QueryTerms for WithEntity<Q> {
     ) where
         F: for<'x> FnMut((Q::Item<'x>, Entity)),
     {
-        // The entity of a row is archetype metadata, so the row loop is done
-        // here (one `Q::get_row` per visited row) rather than in `Q::run`, which
-        // borrows whole columns once. The extra per-row column downcast is the
-        // price of the entity term; replication passes are bandwidth-bound, not
-        // downcast-bound.
-        for i in 0..len {
-            if mask.is_none_or(|m| m[i]) {
-                f((Q::get_row(&mut *cols, entities, idx, i), entities[i]));
-            }
-        }
+        // The entity of a row is archetype metadata, not a column, so `Q::run`
+        // cannot hand it out — but it does not have to. Every `run` visits
+        // exactly the unmasked rows, in ascending row order, so the same walk
+        // over the row indices names the row each item belongs to. That keeps
+        // the inner term's own loop (columns borrowed and downcast **once** per
+        // archetype) instead of a `Q::get_row` per row, which re-split and
+        // re-downcast the columns for every single row.
+        let mut rows = (0..len).filter(|&i| mask.is_none_or(|m| m[i]));
+        Q::run(cols, entities, idx, len, mask, &mut |item| {
+            let row = rows
+                .next()
+                .expect("QueryTerms::run visits exactly the unmasked rows, in order");
+            f((item, entities[row]));
+        });
     }
     fn get_row<'a>(
         cols: &'a mut [Column],
@@ -402,6 +383,10 @@ pub struct Query<'w, Q: QueryTerms> {
     changed_after: Option<u64>,
     /// The world tick stamped onto rows a `&mut` query visits.
     tick: u64,
+    /// Scratch for the per-archetype visit mask of a `changed_since` query,
+    /// reused across archetypes (and across `for_each` calls) so the filter
+    /// costs one buffer per query instead of one allocation per archetype.
+    mask: Vec<bool>,
     // lending-iterator cursor
     arch: usize,
     row: usize,
@@ -438,6 +423,7 @@ impl<'w, Q: QueryTerms> Query<'w, Q> {
             plans,
             changed_after: None,
             tick,
+            mask: Vec::new(),
             arch: 0,
             row: 0,
             _q: core::marker::PhantomData,
@@ -468,27 +454,37 @@ impl<'w, Q: QueryTerms> Query<'w, Q> {
     where
         E: for<'x> FnMut(Q::Item<'x>),
     {
-        for a in 0..self.archetypes.len() {
-            let plan = match self.plans[a].clone() {
-                Some(p) => p,
-                None => continue,
+        // Borrow the fields separately: the plans and the mask scratch are read
+        // while one archetype is borrowed mutably, so nothing has to be cloned.
+        let Self {
+            archetypes,
+            plans,
+            changed_after,
+            tick,
+            mask: scratch,
+            ..
+        } = self;
+        for (arch, plan) in archetypes.iter_mut().zip(plans.iter()) {
+            let Some(plan) = plan.as_deref() else {
+                continue;
             };
-            let arch = &mut self.archetypes[a];
             let len = arch.len();
-            // Build the visit mask from the change filter (immutable borrow of
-            // `ticks` ends before the columns are borrowed mutably).
-            let mask: Option<Vec<bool>> = self
-                .changed_after
-                .map(|after| (0..len).map(|i| arch.ticks()[i] > after).collect());
+            // Build the visit mask from the change filter (the immutable borrow
+            // of `ticks` ends before the columns are borrowed mutably).
+            let mask: Option<&[bool]> = match *changed_after {
+                Some(after) => {
+                    scratch.clear();
+                    scratch.extend(arch.ticks().iter().map(|&t| t > after));
+                    Some(scratch.as_slice())
+                }
+                None => None,
+            };
             let (cols, entities) = arch.columns_and_entities_mut();
-            Q::run(cols, entities, &plan, len, mask.as_deref(), &mut |item| {
-                f(item)
-            });
+            Q::run(cols, entities, plan, len, mask, &mut |item| f(item));
             if Q::MUTABLE {
-                let tick = self.tick;
                 for i in 0..len {
-                    if mask.as_ref().is_none_or(|m| m[i]) {
-                        arch.set_tick(i, tick);
+                    if mask.is_none_or(|m| m[i]) {
+                        arch.set_tick(i, *tick);
                     }
                 }
             }
@@ -508,44 +504,80 @@ impl<'w, Q: QueryTerms> Query<'w, Q> {
     /// calling `next` again. A `&mut` query stamps the visited row with the
     /// world's current tick before returning it.
     pub fn next(&mut self) -> Option<Q::Item<'_>> {
-        loop {
+        // Find the next matching row first, touching only the cursor; the
+        // borrow handed back to the caller is taken once, at the end.
+        let (arch_i, row) = loop {
             if self.arch >= self.archetypes.len() {
                 return None;
             }
-            let plan = match &self.plans[self.arch] {
-                Some(p) => p.clone(),
-                None => {
-                    self.arch += 1;
-                    self.row = 0;
-                    continue;
-                }
-            };
-            let len = self.archetypes[self.arch].len();
-            // Advance to the next row passing the change filter.
-            while self.row < len {
-                let keep = match self.changed_after {
-                    None => true,
-                    Some(after) => self.archetypes[self.arch].ticks()[self.row] > after,
-                };
-                if keep {
-                    break;
-                }
-                self.row += 1;
-            }
-            if self.row >= len {
+            if self.plans[self.arch].is_none() {
                 self.arch += 1;
                 self.row = 0;
                 continue;
             }
-            let arch = &mut self.archetypes[self.arch];
-            if Q::MUTABLE {
-                let tick = self.tick;
-                arch.set_tick(self.row, tick);
+            let ticks = self.archetypes[self.arch].ticks();
+            // Advance to the next row passing the change filter.
+            if let Some(after) = self.changed_after {
+                while self.row < ticks.len() && ticks[self.row] <= after {
+                    self.row += 1;
+                }
             }
-            let (cols, entities) = arch.columns_and_entities_mut();
-            let item = Q::get_row(cols, entities, &plan, self.row);
+            if self.row >= ticks.len() {
+                self.arch += 1;
+                self.row = 0;
+                continue;
+            }
+            let found = (self.arch, self.row);
             self.row += 1;
-            return Some(item);
+            break found;
+        };
+        // The plan is borrowed, not cloned: it lives in a different field than
+        // the archetype the item borrows from.
+        let plan = self.plans[arch_i].as_deref()?;
+        let arch = &mut self.archetypes[arch_i];
+        if Q::MUTABLE {
+            arch.set_tick(row, self.tick);
         }
+        let (cols, entities) = arch.columns_and_entities_mut();
+        Some(Q::get_row(cols, entities, plan, row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_many_mut;
+
+    /// The references come back in the order the indices were given (a query's
+    /// terms are not in column order), and they really are disjoint borrows.
+    #[test]
+    fn get_many_mut_keeps_the_requested_order() {
+        let mut v = [10, 20, 30, 40];
+        let [c, a] = get_many_mut(&mut v, [2, 0]).expect("distinct, in range");
+        assert_eq!((*c, *a), (30, 10));
+        *c += 1;
+        *a += 2;
+        assert_eq!(v, [12, 20, 31, 40]);
+
+        let [x, y, z] = get_many_mut(&mut v, [3, 1, 2]).expect("distinct, in range");
+        std::mem::swap(x, y);
+        *z = 0;
+        assert_eq!(v, [12, 40, 0, 20]);
+
+        // No indices at all is trivially fine.
+        let [] = get_many_mut(&mut v, []).expect("nothing requested");
+    }
+
+    /// A duplicated or out-of-range index yields `None`: never two `&mut` to
+    /// one element, never a panic.
+    #[test]
+    fn get_many_mut_rejects_duplicates_and_out_of_range() {
+        let mut v = [1, 2, 3];
+        assert!(get_many_mut(&mut v, [1, 1]).is_none());
+        assert!(get_many_mut(&mut v, [0, 2, 0]).is_none());
+        assert!(get_many_mut(&mut v, [0, 3]).is_none());
+        assert!(get_many_mut(&mut v, [usize::MAX]).is_none());
+        let mut empty: [u8; 0] = [];
+        assert!(get_many_mut(&mut empty, [0]).is_none());
+        assert_eq!(v, [1, 2, 3]);
     }
 }
