@@ -94,8 +94,11 @@ impl ControlPlane {
     ///
     /// A hello naming a different cluster is refused (the caller drops the
     /// connection); a hello claiming a region already owned by another shard is
-    /// refused (the first claim wins); a hello with `ShardId::NONE` gets a fresh
-    /// allocation.
+    /// refused (the first claim wins) — that includes a region-less hello, which
+    /// means "the root"; a hello with `ShardId::NONE` gets a fresh allocation for
+    /// a free node. The one exception is the pre-allocated root owner
+    /// ([`Self::set_unclaimed_root_owner`]): the first anonymous (or by-id) hello
+    /// for the root adopts that id, since no shard was ever launched for it.
     pub fn handle_shard_hello(&mut self, hello: &ShardHello) -> Result<ShardWelcome, String> {
         if hello.cluster != self.config.cluster {
             return Err(format!(
