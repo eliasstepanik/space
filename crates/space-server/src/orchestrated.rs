@@ -159,6 +159,7 @@ pub async fn start_orchestrated(
         shard: welcome.shard,
         region: welcome.region.node,
         endpoint: advertised,
+        state,
         serve,
         ticking,
         link,
