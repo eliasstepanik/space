@@ -1,0 +1,12 @@
+[package]
+name = "space-world"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "World model: positions, implicit octree, LOD selection, deterministic galaxy/star-system generation, server interest queries"
+
+[lints]
+workspace = true
+
+[dev-dependencies]

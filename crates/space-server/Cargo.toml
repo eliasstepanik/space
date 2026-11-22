@@ -1,0 +1,27 @@
+[package]
+name = "space-server"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+description = "Authoritative shard server: 30 Hz SimWorld, interest replication, seamless handoff"
+
+[[bin]]
+name = "space-server"
+path = "src/main.rs"
+
+[dependencies]
+space-world = { workspace = true }
+space-ecs = { workspace = true }
+space-protocol = { workspace = true }
+space-sim = { workspace = true }
+space-net = { path = "../space-net" }
+quinn = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+quinn = { workspace = true }
+
+[lints]
+workspace = true

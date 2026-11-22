@@ -1,0 +1,23 @@
+[package]
+name = "orch-docker"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+
+# Standalone: keep this package out of the root `space` workspace.
+[workspace]
+
+[dependencies]
+# bollard 0.21.1 is the current published release (bollard-stubs
+# =1.53.1-rc.29.3.1, i.e. Docker Engine API v1.53). Default features
+# ("http" + "pipe") give unix-socket and tcp connect support, which is all
+# `connect_with_defaults()` needs.
+bollard = "0.21.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures-util = "0.3"
+serde_json = "1"
+
+[[bin]]
+name = "orch-docker"
+path = "src/main.rs"

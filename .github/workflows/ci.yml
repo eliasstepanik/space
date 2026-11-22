@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Userspace Vulkan stack for the GPU-ish checks below. apt is fine on the
+      # hosted runner (unlike the agent sandbox, where /var/lib/apt is read-only
+      # and `cargo xtask gpu-setup` unpacks pinned .debs instead).
+      - name: Install Vulkan drivers, validation layer and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers \
+            vulkan-validationlayers \
+            vulkan-tools
+      # Report-only guard: does the software (lavapipe) device the runner exposes
+      # support VK_KHR_ray_query? Phase 4/5 ray-query work depends on this being
+      # answerable from CI, but nothing here can run the GPU spikes yet, so this
+      # step records the answer and never fails the build.
+      - name: Vulkan capability report (lavapipe ray_query) — report only
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::vulkaninfo --summary"
+          vulkaninfo --summary || true
+          echo "::endgroup::"
+          vulkaninfo --json > vulkaninfo.json || true
+          if [ -s vulkaninfo.json ]; then
+            python3 - <<'PY' || echo "ray_query: could not be determined from vulkaninfo.json"
+import json
+with open("vulkaninfo.json") as f:
+    info = json.load(f)
+groups = info.get("device_group", [])
+found = False
+for g in groups:
+    for dev in g.get("devices", []):
+        name = dev.get("deviceName", "<unknown>")
+        feats = dev.get("VkPhysicalDeviceFeatures2", {}).get("features", {})
+        rq = feats.get("VkPhysicalDeviceRayQueryFeaturesKHR", {}).get("rayQuery")
+        print(f"device: {name} (apiVersion={dev.get('apiVersion')}) ray_query={rq}")
+        if "llvmpipe" in name.lower() or "lavapipe" in name.lower():
+            found = True
+            print(f"lavapipe ray_query: {rq}")
+if not found:
+    print("lavapipe: no llvmpipe/lavapipe device reported by vulkaninfo")
+PY
+          else
+            echo "vulkaninfo produced no JSON; no Vulkan device on this runner"
+          fi
+      - name: cargo xtask ci
+        run: cargo xtask ci
+      # GPU tests on the runner's software Vulkan device (lavapipe), with the
+      # Khronos validation layer enabled. `SPACE_RENDER_VALIDATION=1` makes
+      # `RenderContext::new` request the layer, and every render test asserts
+      # `validation_messages == 0`, so a layout or barrier regression fails here
+      # rather than shipping. The exact-pixel tests must pass on lavapipe.
+      - name: GPU tests (lavapipe + validation layer)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_LAYER_PATH: /usr/share/vulkan/explicit_layer.d
+          SPACE_RENDER_VALIDATION: "1"
+        run: cargo test -p space-render -p space-client -- --test-threads=1
+      # The `naga < 30` guard lives in `crates/space-render/build.rs`
+      # (`assert_naga_at_least_30`), which runs on every build of the renderer
+      # and fails the build if naga resolves below 30 — naga 24 cannot compile
+      # the WGSL ray-query shaders (see spikes/rq-triangle/README.md). The guard
+      # therefore fires locally and in `cargo xtask ci`, not only in a log line.
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: cargo xtask ci
+        run: cargo xtask ci

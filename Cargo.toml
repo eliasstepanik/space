@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/space-world",
+    "crates/space-ecs",
+    "crates/space-protocol",
+    "crates/space-sim",
+    "crates/space-net",
+    "crates/space-server",
+    "crates/space-render",
+    "crates/space-client",
+    "crates/space-orchestrator",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.100"
+
+# Shared dependencies for workspace members, referenced as `dep.workspace = true`.
+# Space crates are path dependencies so the workspace stays buildable offline;
+# third-party deps must be pure Rust (no C code) — see docs/plan.md.
+[workspace.dependencies]
+# Used by later Phase-1 crates (ecs/protocol/sim/render); declared here so they
+# can be added without touching the shared table again.
+space-world = { path = "crates/space-world" }
+space-ecs = { path = "crates/space-ecs" }
+space-protocol = { path = "crates/space-protocol" }
+space-sim = { path = "crates/space-sim" }
+space-render = { path = "crates/space-render" }
+# Wire format: `serde` (derive) + `bincode` 2.x, both pure Rust.
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+# Phase 2 netcode: quinn (QUIC) + rustls (TLS) + rcgen (self-signed certs), on a
+# multi-threaded tokio runtime.
+#
+# NOTE: the `ring` feature here pulls in *ring*, which compiles hand-written
+# assembly + C at build time. This is the ONE intentional, unavoidable exception
+# to the "100% Rust, no C bindings" rule (see crates/space-net/src/crypto.rs
+# module docs). quinn 0.11 hard-gates its rustls integration behind `rustls-ring`
+# (or `rustls-aws-lc-rs`) and its provider seam can only return `ring` or
+# `aws-lc-rs`; the pure-Rust candidates are not viable (`rustls-post-quantum` is
+# built on the C-based `aws-lc-rs`; `rustls-rustcrypto` has unimplemented QUIC
+# support). Leaving `ring` out fails to build. Revisit if quinn gains a pluggable
+# provider and a pure-Rust provider grows working QUIC support.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+# `quinn::Connection::send_datagram` takes a `bytes::Bytes`.
+bytes = "1"
+# Phase 4 renderer stack (all pure Rust; ash loads Vulkan at runtime).
+# ash 0.38 is what spikes/rq-triangle proved on RADV GFX1151 + lavapipe.
+ash = "0.38"
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+log = "0.4"
+# WGSL -> SPIR-V at build time. naga >= 30 is a hard requirement: naga 24 has a
+# broken rayQueryTerminate in its SPIR-V backend and cannot even parse
+# `enable wgpu_ray_query;` — see spikes/rq-triangle/README.md.
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+winit = "0.30"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+
+
+[workspace.lints.cargo]
+# `space-world` in [workspace.dependencies] is reserved for the later Phase-1
+# crates that build on it.
+unused_workspace_dependencies = "allow"
+
+# The interest-grid benchmark (1M inserts + 1000 sphere queries) must finish in
+# under 2 s in a debug build; the hot loops are a few percent slower at
+# opt-level 0 than at 1, so this crate is built with opt-level 1 even in dev.
+# Scoped to the package so the rest of the workspace (xtask) stays at opt-level 0.
+[profile.dev.package.space-world]
+opt-level = 1
+
+# Same reasoning as above: the archetype ECS benchmarks (1M spawn, 1M-row
+# iteration) are timed in release, but the acceptance tests also run in debug
+# where the column copies dominate.
+[profile.dev.package.space-ecs]
+opt-level = 1
+
+[profile.release]
+lto = "thin"

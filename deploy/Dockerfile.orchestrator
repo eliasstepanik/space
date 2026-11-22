@@ -1,0 +1,40 @@
+# Space orchestrator image: builds `space-orchestrator` (release).
+#
+# Build from the REPOSITORY ROOT (the workspace is the build context):
+#   docker build -f deploy/Dockerfile.orchestrator -t space/orchestrator .
+#
+# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
+# inspection only (docs/plan-phase3.md P3.0).
+#
+# The `--launcher docker` mode is DEFERRED (bollard is not in the offline cargo
+# cache; see launcher/docker.rs), so this image runs `--launcher local`: shards
+# are separate containers that register themselves (see docker-compose.yaml).
+
+# ---- build stage ----------------------------------------------------------
+FROM rust:1.100-bookworm AS build
+WORKDIR /src
+ENV RUSTUP_TOOLCHAIN=1.100.0
+COPY . .
+RUN cargo build --release --locked -p space-orchestrator --bin space-orchestrator
+
+# ---- runtime stage --------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN useradd --create-home --uid 10001 orchestrator \
+ && mkdir -p /var/lib/space && chown orchestrator /var/lib/space
+COPY --from=build /src/target/release/space-orchestrator /usr/local/bin/space-orchestrator
+USER orchestrator
+
+# The control port is QUIC (UDP). It binds the wildcard inside the container;
+# ORCHESTRATOR_CONTROL_ADDR is the `ip:port` shards dial (not resolved as a name).
+# The shard-id counter lives on a volume so a restart resumes above the last id (H9).
+ENV ORCHESTRATOR_BIND=0.0.0.0:7900 \
+    SPACE_CLUSTER=space-local
+VOLUME /var/lib/space
+EXPOSE 7900/udp
+
+ENTRYPOINT ["/bin/sh", "-c", "exec space-orchestrator \
+  --bind \"$ORCHESTRATOR_BIND\" \
+  --control-addr \"${ORCHESTRATOR_CONTROL_ADDR:?set ORCHESTRATOR_CONTROL_ADDR=ip:port}\" \
+  --cluster \"$SPACE_CLUSTER\" \
+  --state /var/lib/space/orchestrator.id \
+  --launcher local", "space-orchestrator"]

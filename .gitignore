@@ -1,0 +1,15 @@
+# Rust
+/target
+**/target
+
+# Copied toolchain (never commit)
+/.sandbox-toolchain/
+
+# Phase-0 spike builds
+/spikes/*/target
+
+# Render/validation artifacts (convention: artifacts/*.png)
+artifacts/*.png
+
+# Local GPU/Vulkan userspace prefix (never commit; ~64 MB of .debs extracted)
+/.local/

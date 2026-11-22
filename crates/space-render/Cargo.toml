@@ -1,0 +1,27 @@
+[package]
+name = "space-render"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "ash/Vulkan renderer: PBR forward pass + ray-query probe GI + LOD integration for the deterministic galaxy"
+
+[dependencies]
+ash = { workspace = true }
+gpu-allocator = { workspace = true }
+log = { workspace = true }
+space-world = { workspace = true }
+# Surface creation from a portable window handle; the window itself is owned by
+# the client, so space-render never depends on winit.
+ash-window = { workspace = true }
+raw-window-handle = { workspace = true }
+
+[build-dependencies]
+# WGSL -> SPIR-V at build time; naga >= 30 (see the workspace comment).
+naga = { workspace = true }
+
+[dev-dependencies]
+raw-window-handle = { workspace = true }
+
+[lints]
+workspace = true
