@@ -1,20 +1,12 @@
 name: CI
 
 # Where the jobs run:
-<<<<<<< HEAD
 #   * Linux jobs (lint, linux, wasm, docker) run BARE on SELF-HOSTED runners
 #     labelled `space-ci` (Linux, x64, dind over TCP) on the maintainer's
 #     `proxy` host. They install Rust via rustup (no job containers), because
 #     the runner's docker-in-docker sidecar cannot mount the runner's tool dirs
 #     into job containers (actions/checkout fails with a missing /__e/node24).
 #     The docker job uses the runner's docker/buildx directly.
-=======
-#   * Linux jobs (lint, linux, wasm, docker) run on SELF-HOSTED runners labelled
-#     `space-ci` (Linux, x64, dind over TCP) on the maintainer's `proxy` host.
-#     The runner is a bare container with docker + basic tools, so toolchains
-#     come from job containers (rust:1.100-bookworm, python:3.12-slim); the
-#     docker job runs directly on the runner and uses its docker/buildx.
->>>>>>> refs/remotes/origin/main
 #   * The Windows job stays on GitHub-hosted `windows-latest`: it cannot run on
 #     the Linux self-hosted runner (assumption: no Windows self-hosted runner).
 
@@ -32,25 +24,16 @@ jobs:
   lint:
     name: Workflow YAML
     runs-on: [self-hosted, linux, x64, space-ci]
-<<<<<<< HEAD
     steps:
       - uses: actions/checkout@v4
       - name: Install PyYAML
         run: python3 -m pip install --user pyyaml || pip3 install --user pyyaml || (apt-get update && apt-get install -y python3-yaml)
-=======
-    container: python:3.12-slim
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install PyYAML
-        run: python3 -m pip install pyyaml
->>>>>>> refs/remotes/origin/main
       - name: Parse .github/workflows and deploy YAML
         run: python3 .github/scripts/check_yaml.py
 
   linux:
     name: Linux
     runs-on: [self-hosted, linux, x64, space-ci]
-<<<<<<< HEAD
     steps:
       - uses: actions/checkout@v4
       # Bare runner has no Rust; bootstrap rustup, then `rustup toolchain
@@ -63,25 +46,12 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # Cache only the cargo registry/git downloads (real host paths on the
       # bare runner); target/ is too big to be worth caching.
-=======
-    # Bare runner has no Rust; the image matches rust-toolchain.toml (1.100.0).
-    container: rust:1.100-bookworm
-    steps:
-      - uses: actions/checkout@v4
-      # Cache only the cargo registry/git downloads (CARGO_HOME of the rust
-      # image is /usr/local/cargo); target/ is too big to be worth caching.
->>>>>>> refs/remotes/origin/main
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
-<<<<<<< HEAD
             ~/.cargo/registry
             ~/.cargo/git
-=======
-            /usr/local/cargo/registry
-            /usr/local/cargo/git
->>>>>>> refs/remotes/origin/main
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
@@ -91,19 +61,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-<<<<<<< HEAD
       # Userspace Vulkan stack for the GPU-ish checks below. The bare runner
       # runs as root on Ubuntu jammy, so apt works directly (no sudo). (The
       # agent sandbox has a read-only /var/lib/apt, where `cargo xtask
       # gpu-setup` unpacks pinned .debs instead.) python3 is for the
       # ray_query report script.
-=======
-      # Userspace Vulkan stack for the GPU-ish checks below. The job container
-      # runs as root on Debian bookworm, so apt works directly (no sudo). (The
-      # agent sandbox has a read-only /var/lib/apt, where `cargo xtask
-      # gpu-setup` unpacks pinned .debs instead.) python3 is for the
-      # ray_query report script; the rust image does not ship it.
->>>>>>> refs/remotes/origin/main
       - name: Install Vulkan drivers, validation layer and tools
         run: |
           apt-get update
@@ -169,24 +131,16 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-<<<<<<< HEAD
       - name: cargo run -p xtask -- ci
         run: cargo run -p xtask -- ci
 
   # The browser viewer is a wasm cdylib; the xtask ci only checks it as a
-=======
-      - name: cargo xtask ci
-        run: cargo xtask ci
-
-  # The browser viewer is a wasm cdylib; `cargo xtask ci` only checks it as a
->>>>>>> refs/remotes/origin/main
   # native rlib, so build it for the real target too. Build only: there is no
   # browser in this job (wasm-bindgen glue is a manual step, see
   # crates/space-viewer/README.md).
   wasm:
     name: Wasm viewer
     runs-on: [self-hosted, linux, x64, space-ci]
-<<<<<<< HEAD
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (rustup, idempotent)
@@ -195,11 +149,6 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-=======
-    container: rust:1.100-bookworm
-    steps:
-      - uses: actions/checkout@v4
->>>>>>> refs/remotes/origin/main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - name: Add wasm32 target
