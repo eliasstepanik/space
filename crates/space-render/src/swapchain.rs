@@ -13,6 +13,11 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use crate::gpu::{RenderContext, RenderError};
 use crate::passes::FrameGpu;
 
+/// Upper bound for every blocking Vulkan wait in `present` (acquire, fences),
+/// in nanoseconds. Finite so a stuck GPU/compositor surfaces as an error
+/// instead of freezing the window's event loop.
+const PRESENT_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// A window a swapchain can be created for.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowHandles {
@@ -289,7 +294,13 @@ impl Swapchain {
         };
         let present_ready = unsafe {
             ctx.device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
+                // Created SIGNALED: the first `present` waits on this fence before
+                // anything has been submitted, so an unsignaled fence would block
+                // the main thread forever (the "not responding" freeze).
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
                 .map_err(|e| RenderError::new(format!("create_fence: {e}")))?
         };
         // One primary command buffer for the whole lifetime of the swapchain:
@@ -350,7 +361,7 @@ impl Swapchain {
                 .acquire_next_image2(
                     &vk::AcquireNextImageInfoKHR::default()
                         .swapchain(self.handle)
-                        .timeout(u64::MAX)
+                        .timeout(PRESENT_TIMEOUT_NS)
                         .semaphore(self.image_ready)
                         .fence(vk::Fence::null()),
                 )
@@ -361,7 +372,7 @@ impl Swapchain {
         }
         unsafe {
             ctx.device
-                .wait_for_fences(&[self.present_ready], true, u64::MAX)
+                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
                 .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
             ctx.device
                 .reset_fences(&[self.present_ready])
@@ -470,7 +481,7 @@ impl Swapchain {
                 .image_indices(std::slice::from_ref(&index));
             let result = self.swapchain_ext.queue_present(ctx.queue, &present);
             ctx.device
-                .wait_for_fences(&[self.present_ready], true, u64::MAX)
+                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
                 .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
             match result {
                 Ok(false) | Ok(true) => Ok(()),

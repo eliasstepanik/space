@@ -323,6 +323,8 @@ struct App {
     scene: Option<Scene>,
     options: RenderOptions,
     failed: bool,
+    /// Frames presented so far (logged so a hang is visible).
+    frames: u64,
 }
 
 impl App {
@@ -348,6 +350,7 @@ impl App {
             scene: None,
             options: demo_options(config.quality),
             failed: false,
+            frames: 0,
         })
     }
 }
@@ -404,9 +407,14 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let winit::keyboard::Key::Character(c) = &event.logical_key {
-                    if c.as_str() == "Escape" || c.as_str() == "q" {
+                    if c.as_str() == "q" {
                         event_loop.exit();
                     }
+                }
+                if event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                {
+                    event_loop.exit();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -425,6 +433,10 @@ impl ApplicationHandler for App {
                             self.failed = true;
                             event_loop.exit();
                         } else {
+                            self.frames += 1;
+                            if self.frames <= 3 || self.frames.is_multiple_of(300) {
+                                eprintln!("space-client: presented frame {}", self.frames);
+                            }
                             let _ = window;
                         }
                     }
