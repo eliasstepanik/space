@@ -215,8 +215,7 @@ fn galaxy_scene_at(camera: &CameraPose) -> Scene {
         da.total_cmp(&db)
     });
     selected.truncate(MAX_SELECTED);
-    let sc = Scene::from_selection(&galaxy, camera, &selected);
-    sc
+    Scene::from_selection(&galaxy, camera, &selected)
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
