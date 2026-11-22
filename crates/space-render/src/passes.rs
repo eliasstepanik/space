@@ -17,7 +17,8 @@ use ash::vk;
 
 use crate::alloc::{Buffer, Image, SharedAllocator};
 use crate::gpu::{RenderError, RenderOptions};
-use crate::params::{self, ForwardParams, GiParams, RqParams, ToneParams};
+use crate::params::{self, ForwardParams, GiParams, PostParams, RqParams, ToneParams};
+use crate::quality::FEATURE_REFRACT;
 use crate::scene::Scene;
 
 /// SPIR-V modules compiled by `build.rs` (naga >= 30).
@@ -966,6 +967,12 @@ pub struct FrameGpu {
     #[allow(dead_code)]
     pub(crate) depth: Image,
     pub(crate) depth_view: vk::ImageView,
+    /// Material channel: `rg8unorm`, r = metallic, g = roughness.
+    #[allow(dead_code)]
+    pub(crate) material: Image,
+    pub(crate) material_view: vk::ImageView,
+    /// SSR / refraction resources; `None` when the preset needs no post pass.
+    pub(crate) post: Option<PostGpu>,
     pub(crate) out: Image,
     pub(crate) out_view: vk::ImageView,
     pub(crate) framebuffer: vk::Framebuffer,
@@ -988,6 +995,21 @@ pub struct FrameGpu {
     pub(crate) cmd_frame: vk::CommandBuffer,
     pub(crate) fence: vk::Fence,
     pub(crate) device: ash::Device,
+}
+
+/// Per-frame resources that exist only when the post pass runs.
+pub(crate) struct PostGpu {
+    /// Composited HDR colour the tone map reads instead of the raw HDR target.
+    #[allow(dead_code)]
+    pub out: Image,
+    pub out_view: vk::ImageView,
+    /// Glass colour (rgb lit, a = transmission) + framebuffer; refraction only.
+    #[allow(dead_code)]
+    pub glass: Option<Image>,
+    pub glass_view: Option<vk::ImageView>,
+    pub glass_framebuffer: Option<vk::Framebuffer>,
+    pub params: Buffer,
+    pub set: vk::DescriptorSet,
 }
 
 fn aspect_for(format: vk::Format) -> vk::ImageAspectFlags {
@@ -1094,8 +1116,17 @@ pub(crate) fn create_frame(
         width,
         height,
         depth_format,
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         "depth-image",
+    )?;
+    let (material, material_view) = make_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R8G8_UNORM,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        "material-image",
     )?;
     let (out, out_view) = make_image(
         device,
@@ -1111,13 +1142,60 @@ pub(crate) fn create_frame(
             .create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
                     .render_pass(pipelines.render_pass)
-                    .attachments(&[hdr_view, depth_view])
+                    .attachments(&[hdr_view, material_view, depth_view])
                     .width(width)
                     .height(height)
                     .layers(1),
                 None,
             )
             .map_err(|e| RenderError::new(format!("framebuffer: {e}")))?
+    };
+
+    // Post pass resources (SSR + refraction): only when the preset needs them
+    // (and never for the raw ray-query probe frame).
+    let features = options.preset.features();
+    let want_post = features.needs_post() && !options.ray_probe;
+    let want_glass = want_post && features.flags() & FEATURE_REFRACT != 0;
+    let post_images = if want_post {
+        let (img, view) = make_image(
+            device,
+            allocator,
+            width,
+            height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            "post-image",
+        )?;
+        let glass = if want_glass {
+            let (gimg, gview) = make_image(
+                device,
+                allocator,
+                width,
+                height,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                "glass-image",
+            )?;
+            let fb = unsafe {
+                device
+                    .create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(pipelines.render_pass_glass)
+                            .attachments(&[gview, depth_view])
+                            .width(width)
+                            .height(height)
+                            .layers(1),
+                        None,
+                    )
+                    .map_err(|e| RenderError::new(format!("glass framebuffer: {e}")))?
+            };
+            Some((gimg, gview, fb))
+        } else {
+            None
+        };
+        Some((img, view, glass))
+    } else {
+        None
     };
 
     // GI probe texture: grid x (grid*6) rgba16f, plus a 1x1 dummy used when
@@ -1208,17 +1286,29 @@ pub(crate) fn create_frame(
         gpu_allocator::MemoryLocation::CpuToGpu,
         "rq-params",
     )?;
+    let post_params = if want_post {
+        Some(Buffer::new(
+            device,
+            allocator,
+            std::mem::size_of::<PostParams>() as u64,
+            ubo_usage,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+            "post-params",
+        )?)
+    } else {
+        None
+    };
 
     // ---- descriptors -----------------------------------------------------------
     let pool = unsafe {
         device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(4)
+                    .max_sets(5)
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            descriptor_count: 4,
+                            descriptor_count: 5,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1226,7 +1316,7 @@ pub(crate) fn create_frame(
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::SAMPLED_IMAGE,
-                            descriptor_count: 2,
+                            descriptor_count: 6,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::SAMPLER,
@@ -1234,7 +1324,7 @@ pub(crate) fn create_frame(
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_IMAGE,
-                            descriptor_count: 3,
+                            descriptor_count: 4,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -1343,7 +1433,8 @@ pub(crate) fn create_frame(
                     .dst_binding(0)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                     .image_info(&[img_info(
-                        hdr_view,
+                        // With the post pass the tone map reads its output.
+                        post_images.as_ref().map_or(hdr_view, |(_, v, _)| *v),
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     )]),
                 vk::WriteDescriptorSet::default()
@@ -1384,6 +1475,81 @@ pub(crate) fn create_frame(
         );
     }
 
+    let post = match (post_images, post_params) {
+        (Some((out_img, out_view_p, glass)), Some(params_buf)) => {
+            let set = alloc_set(pipelines.post_set_layout)?;
+            let (glass_img, glass_view, glass_fb) = match glass {
+                Some((i, v, f)) => (Some(i), Some(v), Some(f)),
+                None => (None, None, None),
+            };
+            // Without refraction the glass binding is a never-read placeholder
+            // (the shader only loads it with FEATURE_REFRACT set).
+            let glass_bound = glass_view.unwrap_or(dummy_view);
+            unsafe {
+                device.update_descriptor_sets(
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(&[ub(
+                                &params_buf,
+                                std::mem::size_of::<PostParams>() as u64,
+                            )]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(1)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&[img_info(
+                                hdr_view,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(2)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&[img_info(
+                                depth_view,
+                                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                            )]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(3)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&[img_info(
+                                material_view,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(4)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(&[img_info(
+                                glass_bound,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(5)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(&[img_info(out_view_p, vk::ImageLayout::GENERAL)]),
+                    ],
+                    &[],
+                );
+            }
+            Some(PostGpu {
+                out: out_img,
+                out_view: out_view_p,
+                glass: glass_img,
+                glass_view,
+                glass_framebuffer: glass_fb,
+                params: params_buf,
+                set,
+            })
+        }
+        _ => None,
+    };
+
     let cmds = unsafe {
         device
             .allocate_command_buffers(
@@ -1412,6 +1578,9 @@ pub(crate) fn create_frame(
         hdr_view,
         depth,
         depth_view,
+        material,
+        material_view,
+        post,
         out,
         out_view,
         framebuffer,
