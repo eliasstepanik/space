@@ -17,7 +17,7 @@
 //! | [`disconnect_is_observed`] | after the peer closes, receives return `Ok(None)` and `is_closed()` is true |
 //! | [`oversized_frame_rejected_before_alloc`] | a stream frame declaring a length over `MAX_FRAME_SIZE` errors without a huge allocation |
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_net::{
     accept_connection, client_endpoint_on, connect, server_endpoint, MessageClass, NetError,
@@ -28,9 +28,10 @@ use space_protocol::{
 };
 use space_world::WorldPos;
 
-/// Loopback address both endpoints use.
+/// Loopback address both endpoints use. IPv4 on purpose: quinn binds IPv6
+/// sockets dual-stack, which Windows rejects with WSAEINVAL (10022).
 fn addr() -> SocketAddr {
-    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
 /// A shard map with one region covering the whole world (depth 0), owned by

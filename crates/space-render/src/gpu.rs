@@ -394,15 +394,28 @@ impl RenderContext {
             ray_query_support.complete()
         );
 
+        // The renderer always builds a BLAS (`SceneGpu::upload`), so it cannot run
+        // without `VK_KHR_acceleration_structure`. ash panics (and aborts) when
+        // loading that extension's entry points on a device that lacks it, so
+        // report the device as unusable instead; callers/tests treat an `Err`
+        // from `new` as "no usable Vulkan device" and skip.
+        let has_accel_structure =
+            ray_query_support.acceleration_structure && ray_query_support.deferred_host_operations;
+        if !has_accel_structure {
+            return Err(RenderError::new(format!(
+                "{device_name} lacks VK_KHR_acceleration_structure (+ deferred_host_operations)"
+            )));
+        }
+
         // ---- device extensions + features --------------------------------------
         let mut required: Vec<&CStr> = vec![
             vk::KHR_BUFFER_DEVICE_ADDRESS_NAME,
             vk::KHR_GET_MEMORY_REQUIREMENTS2_NAME,
+            vk::KHR_ACCELERATION_STRUCTURE_NAME,
+            vk::KHR_DEFERRED_HOST_OPERATIONS_NAME,
         ];
         if ray_query_support.complete() {
             required.push(vk::KHR_RAY_QUERY_NAME.as_ref());
-            required.push(vk::KHR_ACCELERATION_STRUCTURE_NAME.as_ref());
-            required.push(vk::KHR_DEFERRED_HOST_OPERATIONS_NAME.as_ref());
         }
         let ext_names: Vec<*const c_char> = required.iter().map(|c| c.as_ptr()).collect();
 
@@ -411,11 +424,11 @@ impl RenderContext {
             .acceleration_structure(true);
         let mut bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
-        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_features);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut bda_features)
+            .push_next(&mut as_features);
         if ray_query_support.complete() {
-            features2 = features2
-                .push_next(&mut rq_features)
-                .push_next(&mut as_features);
+            features2 = features2.push_next(&mut rq_features);
         }
 
         let queue_props =

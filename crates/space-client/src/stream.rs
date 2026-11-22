@@ -424,8 +424,8 @@ mod tests {
     /// loudly when no Vulkan device is available.
     #[test]
     fn stream_loop_delivers_frames_and_applies_viewer_input() {
-        if RenderContext::new(&ContextOptions::default()).is_err() {
-            eprintln!("SKIP: no Vulkan device");
+        if let Err(e) = RenderContext::new(&ContextOptions::default()) {
+            eprintln!("SKIP: no usable Vulkan device ({e}); needs VK_KHR_acceleration_structure");
             return;
         }
         let rt = tokio::runtime::Builder::new_multi_thread()

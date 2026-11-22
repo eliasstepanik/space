@@ -438,9 +438,14 @@ mod tests {
     /// loudly when no Vulkan device is available.
     #[test]
     fn demo_renders_lit_pixels() {
-        let Ok(ctx) = RenderContext::new(&ContextOptions::default()) else {
-            eprintln!("SKIP: no Vulkan device");
-            return;
+        let ctx = match RenderContext::new(&ContextOptions::default()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!(
+                    "SKIP: no usable Vulkan device ({e}); needs VK_KHR_acceleration_structure"
+                );
+                return;
+            }
         };
         // Same guard as the space-render GPU tests: with the var set the layer
         // must really be active, or `validation_messages == 0` below is vacuous.
