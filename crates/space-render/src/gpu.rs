@@ -444,12 +444,14 @@ impl RenderContext {
             // Without VK_KHR_swapchain enabled on the *device*, the swapchain entry
             // points are not valid for it and `vkCreateSwapchainKHR` fails with
             // VK_ERROR_INITIALIZATION_FAILED (seen on NVIDIA/Windows).
-            let available = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                .map_err(|e| RenderError::new(format!("enumerate_device_extension_properties: {e}")))?;
-            if !available
-                .iter()
-                .any(|p| carray_to_string(&p.extension_name) == vk::KHR_SWAPCHAIN_NAME.to_string_lossy())
-            {
+            let available =
+                unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                    .map_err(|e| {
+                        RenderError::new(format!("enumerate_device_extension_properties: {e}"))
+                    })?;
+            if !available.iter().any(|p| {
+                carray_to_string(&p.extension_name) == vk::KHR_SWAPCHAIN_NAME.to_string_lossy()
+            }) {
                 return Err(RenderError::new(format!(
                     "{device_name} lacks VK_KHR_swapchain, which the windowed path requires"
                 )));
