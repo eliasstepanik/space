@@ -657,3 +657,240 @@ fn fog_shifts_distant_pixels_toward_fog_colour() {
         );
     }
 }
+
+// ---- Phase 5b: screen-space reflections + refraction ---------------------------
+
+/// Render `scene` at `size`x`size` with `preset` (GI off, CI probe quality),
+/// asserting zero validation messages.
+fn render_preset(
+    ctx: &mut RenderContext,
+    scene: &Scene,
+    size: u32,
+    preset: QualityPreset,
+) -> space_render::FrameOutput {
+    let opts = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset,
+        ..Default::default()
+    };
+    let out = ctx
+        .render_frame(scene, size, size, &opts)
+        .expect("post-pass render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    out
+}
+
+/// Pixel-count and centroid `(x, y)` of the pixels in rows `rows` for which
+/// `pred(rgb)` holds.
+fn centroid(
+    out: &space_render::FrameOutput,
+    rows: std::ops::Range<u32>,
+    pred: impl Fn([u16; 3]) -> bool,
+) -> Option<(usize, f64, f64)> {
+    let (mut n, mut sx, mut sy) = (0usize, 0.0f64, 0.0f64);
+    for y in rows {
+        for x in 0..out.width {
+            let p = pixel(out, x, y);
+            if pred([p[0], p[1], p[2]]) {
+                n += 1;
+                sx += f64::from(x) + 0.5;
+                sy += f64::from(y) + 0.5;
+            }
+        }
+    }
+    (n > 0).then(|| (n, sx / n as f64, sy / n as f64))
+}
+
+/// Camera at the origin looking down -Z, 60 degree fov, square aspect.
+fn post_camera() -> space_render::CameraPose {
+    space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 0.05,
+        far: 1.0e5,
+    }
+}
+
+fn emissive_sphere(center: [f32; 3], radius: f32, rgb: [f32; 3]) -> GpuInstance {
+    GpuInstance {
+        center: [center[0], center[1], center[2], radius],
+        albedo: [0.0, 0.0, 0.0, 0.0],
+        emissive: [rgb[0], rgb[1], rgb[2], 1.0],
+        roughness: 0.5,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    }
+}
+
+/// A smooth metallic floor (a huge flat box whose top face is the plane
+/// y = -1) and a bright red sphere (radius 0.5) hovering at (0, -0.4, -6).
+///
+/// Mirror geometry: the plane reflects the sphere to a mirrored sphere centred
+/// at (0, -1.6, -6), which the 60-degree camera sees at NDC y = -0.462 — row
+/// ~93.6 of a 128-pixel frame, x = 64 — below the directly seen sphere
+/// (rows ~62..80). The floor has no light and no emission, so without SSR it
+/// is black everywhere.
+fn mirror_scene(roughness: f32) -> Scene {
+    let floor = GpuInstance {
+        center: [0.0, -101.0, 0.0, 100.0],
+        albedo: [0.8, 0.8, 0.8, 1.0], // metallic = 1
+        emissive: [0.0, 0.0, 0.0, 0.0],
+        roughness,
+        shape: space_render::SHAPE_BOX,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    Scene::from_instances(
+        post_camera(),
+        vec![floor, emissive_sphere([0.0, -0.4, -6.0], 0.5, [6.0, 0.3, 0.3])],
+    )
+}
+
+/// A reflection pixel: clearly red.
+fn is_red(p: [u16; 3]) -> bool {
+    p[0] > 60 && p[0] > 3 * p[1].max(p[2]).max(1)
+}
+
+/// SSR: High and Medium show the red sphere's reflection exactly where mirror
+/// geometry predicts; Low and Ci (post pass skipped) show a black floor; a floor
+/// rougher than the preset's threshold (0.4: High 0.5 reflects, Medium 0.3
+/// does not) is gated by the roughness limit; and floor pixels whose mirror ray
+/// finds nothing are unchanged (a miss never darkens).
+/// Mutation: rendering with `QualityPreset::Ci` (post pass off) is the "off"
+/// side of every assertion below, so removing the post dispatch must fail them.
+#[test]
+fn ssr_reflects_a_bright_object_where_mirror_geometry_predicts() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let smooth = mirror_scene(0.1);
+
+    let ci = render_preset(&mut ctx, &smooth, size, QualityPreset::Ci);
+    let low = render_preset(&mut ctx, &smooth, size, QualityPreset::Low);
+    let medium = render_preset(&mut ctx, &smooth, size, QualityPreset::Medium);
+    let high = render_preset(&mut ctx, &smooth, size, QualityPreset::High);
+    assert_eq!(ci.pixels, low.pixels, "Low and Ci both skip the post pass");
+
+    // Rows >= 83 only contain the floor (the direct sphere ends near row 80).
+    let reflection_rows = 83..size;
+    assert!(
+        centroid(&ci, reflection_rows.clone(), is_red).is_none(),
+        "no SSR => the floor reflects nothing"
+    );
+    // The direct sphere is there in every preset (sanity for the geometry).
+    let direct = centroid(&ci, 0..83, is_red).expect("direct sphere visible");
+    assert!(
+        (direct.1 - 64.0).abs() < 2.0 && (direct.2 - 71.0).abs() < 3.0,
+        "direct sphere centroid {direct:?}"
+    );
+
+    for (name, out) in [("medium", &medium), ("high", &high)] {
+        let (n, cx, cy) = centroid(out, reflection_rows.clone(), is_red)
+            .unwrap_or_else(|| panic!("{name}: no reflection of the red sphere"));
+        eprintln!("{name}: reflection n={n} centroid=({cx:.1},{cy:.1})");
+        assert!(n >= 40, "{name}: reflection too small ({n} px)");
+        assert!(
+            (cx - 64.0).abs() <= 2.5 && (cy - 93.6).abs() <= 4.0,
+            "{name}: reflection centroid ({cx:.1},{cy:.1}) vs mirror prediction (64, 93.6)"
+        );
+        // Floor pixels away from the mirror image stay as without SSR.
+        for (x, y) in [(10, 110), (118, 110), (30, 100), (64, 120)] {
+            assert_eq!(
+                pixel(out, x, y),
+                pixel(&ci, x, y),
+                "{name}: floor pixel ({x},{y}) must not change"
+            );
+        }
+    }
+    // The direct (non-reflective) sphere pixels are untouched by SSR.
+    assert_eq!(pixel(&high, 64, 71), pixel(&ci, 64, 71));
+
+    // Roughness gate: 0.4 is within High's limit (0.5) but not Medium's (0.3).
+    let rough = mirror_scene(0.4);
+    let rough_medium = render_preset(&mut ctx, &rough, size, QualityPreset::Medium);
+    let rough_high = render_preset(&mut ctx, &rough, size, QualityPreset::High);
+    assert!(
+        centroid(&rough_medium, reflection_rows.clone(), is_red).is_none(),
+        "roughness 0.4 > Medium limit 0.3: no SSR"
+    );
+    assert!(
+        centroid(&rough_high, reflection_rows, is_red).is_some(),
+        "roughness 0.4 <= High limit 0.5: SSR"
+    );
+}
+
+/// A transmissive ball lens (radius 2, centre (0, 0, -4)) in front of a green
+/// marker sphere (radius 0.6, centre (1.0, 0, -9)) that sits entirely behind it
+/// on screen. Without refraction the lens is an opaque black ball that hides the
+/// marker; with refraction the marker shows through, displaced from where it
+/// appears with no lens at all.
+fn refraction_scene(with_glass: bool) -> Scene {
+    let mut instances = vec![emissive_sphere([1.0, 0.0, -9.0], 0.6, [0.2, 6.0, 0.2])];
+    if with_glass {
+        instances.push(GpuInstance {
+            center: [0.0, 0.0, -4.0, 2.0],
+            albedo: [0.0, 0.0, 0.0, 0.0],
+            emissive: [0.0, 0.0, 0.0, 0.0],
+            roughness: 0.5,
+            shape: space_render::SHAPE_SPHERE,
+            transmission: 1.0,
+            _pad1: 0.0,
+        });
+    }
+    Scene::from_instances(post_camera(), instances)
+}
+
+fn is_green(p: [u16; 3]) -> bool {
+    p[1] > 40 && p[1] > 3 * p[0].max(p[2]).max(1)
+}
+
+/// Refraction: the marker seen through the lens is displaced, in the direction
+/// a convex lens magnifies (away from the lens centre), relative to the same
+/// scene without the lens; with refraction off (Low/Ci) the lens is opaque and
+/// the marker is hidden.
+/// Mutation: `QualityPreset::Ci` (no glass pass, no post pass) is the "off" side.
+#[test]
+fn refraction_displaces_the_background_seen_through_glass() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let glass = refraction_scene(true);
+    let bare = refraction_scene(false);
+
+    let reference = render_preset(&mut ctx, &bare, size, QualityPreset::High);
+    let (ref_n, ref_x, ref_y) =
+        centroid(&reference, 0..size, is_green).expect("marker visible without glass");
+
+    // Refraction off: the opaque black lens hides the marker completely.
+    for preset in [QualityPreset::Ci, QualityPreset::Low] {
+        let off = render_preset(&mut ctx, &glass, size, preset);
+        assert!(
+            centroid(&off, 0..size, is_green).is_none(),
+            "{preset}: opaque lens must hide the marker"
+        );
+        assert!(
+            pixel(&off, 64, 64).iter().take(3).all(|&c| c < 8),
+            "{preset}: unlit opaque lens is black"
+        );
+    }
+
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_preset(&mut ctx, &glass, size, preset);
+        let (n, x, y) = centroid(&out, 0..size, is_green)
+            .unwrap_or_else(|| panic!("{preset}: marker not visible through the glass"));
+        eprintln!(
+            "{preset}: marker n={n} centroid=({x:.2},{y:.2}); reference n={ref_n} ({ref_x:.2},{ref_y:.2})"
+        );
+        assert!(
+            x > ref_x + 1.0,
+            "{preset}: marker should be displaced outward (+x) by the lens: {x:.2} vs {ref_x:.2}"
+        );
+        assert!(
+            (y - ref_y).abs() < 1.0,
+            "{preset}: no vertical displacement expected: {y:.2} vs {ref_y:.2}"
+        );
+    }
+}
