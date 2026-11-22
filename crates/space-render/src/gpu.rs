@@ -185,6 +185,14 @@ pub struct ContextOptions {
     pub validation: Option<bool>,
     /// Prefer a discrete/ray-query-capable device (default true).
     pub prefer_ray_query: bool,
+    /// The display the context will present to, for the windowed path. When
+    /// set, the instance enables the surface extensions that display needs
+    /// (`VK_KHR_surface` plus `VK_KHR_win32_surface` / `VK_KHR_xlib_surface` /
+    /// `VK_KHR_xcb_surface` / `VK_KHR_wayland_surface`, as
+    /// `ash_window::enumerate_required_extensions` reports). Without them
+    /// `ash_window::create_surface` aborts on a null entry point. `None` (the
+    /// default) is the headless path and enables no surface extension.
+    pub window_display: Option<RawDisplayHandle>,
 }
 
 impl Default for ContextOptions {
@@ -192,6 +200,7 @@ impl Default for ContextOptions {
         Self {
             validation: None,
             prefer_ray_query: true,
+            window_display: None,
         }
     }
 }
