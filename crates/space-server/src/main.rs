@@ -329,17 +329,7 @@ async fn run(options: Options) -> Result<(), String> {
 /// region and map it hands back, and follow every epoch it publishes. The boot
 /// itself lives in [`space_server::orchestrated`] so tests can run it in-process.
 async fn run_orchestrated(options: Options, orch_addr: SocketAddr) -> Result<(), String> {
-    space_server::orchestrated::run_orchestrated(
-        space_server::orchestrated::OrchestratedOptions {
-            shard: options.shard,
-            bind: options.bind,
-            advertise: options.advertise,
-            claim_region: options.claim_region,
-            cluster: options.cluster,
-        },
-        orch_addr,
-    )
-    .await
+    space_server::orchestrated::run_orchestrated(options.orchestrated(), orch_addr).await
 }
 
 #[cfg(test)]
