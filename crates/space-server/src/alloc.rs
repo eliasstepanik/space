@@ -17,6 +17,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use space_protocol::ShardId;
 
+/// The shard-id space is used up: ids are never reused, so there is nothing to
+/// hand out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdSpaceExhausted {
+    /// The counter value that could not be allocated.
+    pub next: u64,
+}
+
+impl core::fmt::Display for IdSpaceExhausted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "shard id space exhausted at {}: ids are never reused",
+            self.next
+        )
+    }
+}
+
+impl std::error::Error for IdSpaceExhausted {}
+
 /// A process-wide, monotonic shard-id counter.
 ///
 /// Cloning shares the counter (it is `Arc`-free by design: hand it by reference).
