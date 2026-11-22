@@ -483,13 +483,50 @@ mod tests {
             .propose(next, vec![(child, shard(3))], &[(shard(1), 10)], 10)
             .expect("propose");
         for s in prepare.to {
-            let _ = pub_.ack(s, 10);
+            let _ = pub_.ack(s, 2, 10);
         }
         pub_.reset();
         // Immediately after a commit at tick 10, a new propose is gated until
         // the minimum interval has passed.
         assert!(!pub_.can_propose(10, 90), "no commit inside the interval");
         assert!(pub_.can_propose(100, 90), "the interval has passed");
+    }
+
+    #[test]
+    fn an_ack_for_a_different_epoch_cannot_commit_the_staged_epoch() {
+        let mut pub_ = EpochPublisher::new(map_with_two());
+        let mut next = pub_.published().clone();
+        next.epoch = 2;
+        let child = space_world::octree::children(NodeRef::new(40, [0, 0, 0])).unwrap()[5];
+        next.regions.push(region(41, child.index, 3));
+        let prepare = pub_
+            .propose(next, vec![(child, shard(3))], &[(shard(1), 10)], 10)
+            .expect("propose");
+        assert!(prepare.to.len() >= 2, "test needs two awaited shards");
+        let mut shards = prepare.to.clone();
+        let stale = shards.remove(0);
+
+        // Every other shard acks the right epoch; only `stale` is outstanding.
+        for s in shards {
+            assert!(pub_.ack(s, 2, 11).is_none(), "not the last ack yet");
+        }
+        // `stale` acks epoch N-1: ignored, still preparing, still awaited.
+        assert!(
+            pub_.ack(stale, 1, 12).is_none(),
+            "a mismatched ack must not commit"
+        );
+        match pub_.phase() {
+            Phase::Preparing { awaiting, .. } => {
+                assert!(awaiting.contains(&stale), "the shard is still awaited");
+            }
+            other => panic!("expected Preparing, got {other:?}"),
+        }
+        assert_eq!(pub_.published().epoch, 1, "nothing was published");
+
+        // The same shard acking the staged epoch commits it.
+        let commit = pub_.ack(stale, 2, 13).expect("the matching ack commits");
+        assert!(matches!(commit.message, Message::EpochCommit(_)));
+        assert_eq!(pub_.published().epoch, 2);
     }
 
     #[test]
