@@ -25,7 +25,7 @@ use crate::ids::PersistentShardIdAllocator;
 pub fn boot(config: OrchestratorConfig, peer_token: String) -> Result<ControlPlane, String> {
     let mut ids = PersistentShardIdAllocator::open(&config.state_path, config.first_shard_id)
         .map_err(|e| e.to_string())?;
-    let root_owner = ids.allocate();
+    let root_owner = ids.allocate().map_err(|e| e.to_string())?;
     let map = ShardMap::new(
         1,
         vec![ShardRegion::new(
