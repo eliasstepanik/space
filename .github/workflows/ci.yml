@@ -33,25 +33,42 @@ jobs:
 
   linux:
     name: Linux
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, space-ci]
+    # Bare runner has no Rust; the image matches rust-toolchain.toml (1.100.0).
+    container: rust:1.100-bookworm
     steps:
       - uses: actions/checkout@v4
+      # Cache only the cargo registry/git downloads (CARGO_HOME of the rust
+      # image is /usr/local/cargo); target/ is too big to be worth caching.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # Userspace Vulkan stack for the GPU-ish checks below. apt is fine on the
-      # hosted runner (unlike the agent sandbox, where /var/lib/apt is read-only
-      # and `cargo xtask gpu-setup` unpacks pinned .debs instead).
+      # Userspace Vulkan stack for the GPU-ish checks below. The job container
+      # runs as root on Debian bookworm, so apt works directly (no sudo). (The
+      # agent sandbox has a read-only /var/lib/apt, where `cargo xtask
+      # gpu-setup` unpacks pinned .debs instead.) python3 is for the
+      # ray_query report script; the rust image does not ship it.
       - name: Install Vulkan drivers, validation layer and tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libvulkan1 \
             mesa-vulkan-drivers \
             vulkan-validationlayers \
-            vulkan-tools
+            vulkan-tools \
+            python3
       # Report-only guard: does the software (lavapipe) device the runner exposes
       # support VK_KHR_ray_query? Phase 4/5 ray-query work depends on this being
       # answerable from CI, but nothing here can run the GPU spikes yet, so this
