@@ -152,24 +152,80 @@ impl Swapchain {
             })
             .ok_or_else(|| RenderError::new("surface offers no usable format"))?
             .format;
-        let extent = if capabilities.current_extent.width != u32::MAX {
+        // `current_extent` is authoritative unless it is the (MAX, MAX) sentinel;
+        // otherwise clamp the request into the supported range (never below 1x1,
+        // and tolerate a driver reporting max < min).
+        let extent = if capabilities.current_extent.width != u32::MAX
+            && capabilities.current_extent.height != u32::MAX
+        {
             capabilities.current_extent
         } else {
             vk::Extent2D {
-                width: width.clamp(
-                    capabilities.min_image_extent.width,
-                    capabilities.max_image_extent.width,
+                width: width.max(1).clamp(
+                    capabilities.min_image_extent.width.max(1),
+                    capabilities
+                        .max_image_extent
+                        .width
+                        .max(capabilities.min_image_extent.width.max(1)),
                 ),
-                height: height.clamp(
-                    capabilities.min_image_extent.height,
-                    capabilities.max_image_extent.height,
+                height: height.max(1).clamp(
+                    capabilities.min_image_extent.height.max(1),
+                    capabilities
+                        .max_image_extent
+                        .height
+                        .max(capabilities.min_image_extent.height.max(1)),
                 ),
             }
         };
-        let image_count = capabilities
-            .min_image_count
-            .max(2)
-            .min(capabilities.max_image_count.max(2));
+        if extent.width == 0 || extent.height == 0 {
+            // A minimised window reports a 0x0 current extent; a swapchain cannot
+            // be created for it.
+            unsafe { surface_ext.destroy_surface(surface, None) };
+            return Err(RenderError::new(
+                "create_swapchain: surface extent is 0x0 (window minimised or not yet laid out)",
+            ));
+        }
+        // max_image_count == 0 means "no limit".
+        let mut image_count = capabilities.min_image_count.max(2);
+        if capabilities.max_image_count != 0 {
+            image_count = image_count.min(capabilities.max_image_count);
+        }
+        // The blit needs TRANSFER_DST on the swapchain images.
+        if !capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_DST)
+        {
+            unsafe { surface_ext.destroy_surface(surface, None) };
+            return Err(RenderError::new(
+                "create_swapchain: surface does not support TRANSFER_DST image usage",
+            ));
+        }
+        // composite_alpha must be one of the supported bits.
+        let composite_alpha = [
+            vk::CompositeAlphaFlagsKHR::OPAQUE,
+            vk::CompositeAlphaFlagsKHR::INHERIT,
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+        ]
+        .into_iter()
+        .find(|c| capabilities.supported_composite_alpha.contains(*c))
+        .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
+        // The queue must be able to present to this surface.
+        let can_present = unsafe {
+            surface_ext
+                .get_physical_device_surface_support(
+                    ctx.physical_device,
+                    ctx.queue_family(),
+                    surface,
+                )
+                .unwrap_or(false)
+        };
+        if !can_present {
+            unsafe { surface_ext.destroy_surface(surface, None) };
+            return Err(RenderError::new(
+                "create_swapchain: the render queue family cannot present to this surface",
+            ));
+        }
         let swapchain_ext = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
         let handle = unsafe {
             swapchain_ext
