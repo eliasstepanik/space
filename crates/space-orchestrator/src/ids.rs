@@ -100,14 +100,27 @@ impl FileCounterSink {
         Self { path: path.into() }
     }
 
-    /// Read a counter file; `Ok(None)` when it does not exist (the reader
-    /// tolerates a missing file — see the module docs).
+    /// The sibling temp file `persist` writes before the rename.
+    fn tmp_path(path: &Path) -> PathBuf {
+        path.with_extension("tmp")
+    }
+
+    /// Read a counter file; `Ok(None)` when neither it nor its `.tmp` sibling
+    /// exists. When the main file is missing but the `.tmp` file exists, the
+    /// `.tmp` file is read instead (it holds the last written value).
     ///
     /// # Errors
     ///
     /// [`InitError::Corrupt`] for non-numeric content, [`InitError::Io`] for a
     /// read failure other than "not found".
     pub fn read(path: &Path) -> Result<Option<u64>, InitError> {
+        match Self::read_one(path)? {
+            Some(v) => Ok(Some(v)),
+            None => Self::read_one(&Self::tmp_path(path)),
+        }
+    }
+
+    fn read_one(path: &Path) -> Result<Option<u64>, InitError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let trimmed = text.trim();
