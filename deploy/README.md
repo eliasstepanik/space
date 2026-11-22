@@ -7,6 +7,7 @@
 | `Dockerfile.orchestrator` | `space/orchestrator` | `space-orchestrator --launcher local` (QUIC/UDP 7900) |
 | `Dockerfile.client` | `space/client` | `space-client --stream` (ws://, TCP 8099), optionally `--server <shard>` |
 | `docker-compose.yaml` | | orchestrator + one shard; the client behind profile `stream` |
+| `proxy/` | `ghcr.io/eliasstepanik/space-*` | production compose + `redeploy.sh` for the proxy host |
 
 All builds use the **repository root** as context.
 
