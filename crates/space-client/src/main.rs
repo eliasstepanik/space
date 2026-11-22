@@ -507,6 +507,19 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if let Some(live) = self.live.as_ref() {
+                    if live.link.is_closed() {
+                        eprintln!("space-client: lost the server connection");
+                        self.failed = true;
+                        event_loop.exit();
+                        return;
+                    }
+                    // Live scene from the replica, rebuilt each frame.
+                    if let Some(swapchain) = self.swapchain.as_ref() {
+                        let (sw, sh) = swapchain.extent();
+                        self.scene = Some(live.scene(sw, sh));
+                    }
+                }
                 let (Some(window), Some(swapchain), Some(scene)) = (
                     self.window.as_ref(),
                     self.swapchain.as_ref(),
