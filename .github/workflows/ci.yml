@@ -34,18 +34,24 @@ jobs:
   linux:
     name: Linux
     runs-on: [self-hosted, linux, x64, space-ci]
-    # Bare runner has no Rust; the image matches rust-toolchain.toml (1.100.0).
-    container: rust:1.100-bookworm
     steps:
       - uses: actions/checkout@v4
-      # Cache only the cargo registry/git downloads (CARGO_HOME of the rust
-      # image is /usr/local/cargo); target/ is too big to be worth caching.
+      # Bare runner has no Rust; bootstrap rustup, then `rustup toolchain
+      # install` below reads rust-toolchain.toml (1.100.0).
+      - name: Install Rust (rustup, idempotent)
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Cache only the cargo registry/git downloads (real host paths on the
+      # bare runner); target/ is too big to be worth caching.
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            /usr/local/cargo/registry
-            /usr/local/cargo/git
+            ~/.cargo/registry
+            ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
