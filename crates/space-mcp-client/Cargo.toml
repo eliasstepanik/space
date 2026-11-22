@@ -1,0 +1,28 @@
+[package]
+name = "space-mcp-client"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "MCP server (stdio / Streamable HTTP) that drives a space client: connect, send input, capture a rendered frame"
+
+[[bin]]
+name = "space-mcp-client"
+path = "src/main.rs"
+
+[dependencies]
+space-mcp = { path = "../space-mcp" }
+space-client = { path = "../space-client" }
+space-render = { workspace = true }
+space-stream = { workspace = true, features = ["net"] }
+space-world = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+space-server = { path = "../space-server" }
+space-protocol = { workspace = true }
+space-sim = { workspace = true }
+
+[lints]
+workspace = true
