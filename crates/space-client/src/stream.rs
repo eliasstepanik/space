@@ -100,7 +100,9 @@ impl InputState {
     /// The proxy never torques the ship, so the ship's body frame stays the
     /// world frame and the view direction only picks the thrust direction.
     pub fn thrust(&self) -> [f32; 3] {
-        let axis = |pos: Key, neg: Key| f32::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)));
+        let axis = |pos: Key, neg: Key| {
+            f32::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)))
+        };
         let (fwd, right, up) = (
             axis(Key::Forward, Key::Back),
             axis(Key::Right, Key::Left),
@@ -132,7 +134,11 @@ impl InputState {
 
 /// Drain viewer input into `input` and, when connected, hand the resulting
 /// thrust to the server link. Returns how many viewer events were applied.
-pub fn pump_input(client: &StreamClient, input: &mut InputState, link: Option<&ServerLink>) -> usize {
+pub fn pump_input(
+    client: &StreamClient,
+    input: &mut InputState,
+    link: Option<&ServerLink>,
+) -> usize {
     let events = client.poll_input();
     for event in &events {
         input.apply(*event);

@@ -376,7 +376,10 @@ mod tests {
         let start = replica.offset();
         assert!(start[2] < 0.0, "forward is -Z: {start:?}");
         assert!(start[0].abs() < 1e-3, "no sideways drift: {start:?}");
-        assert!(server_state.vel[2] < 0.0, "server velocity: {server_state:?}");
+        assert!(
+            server_state.vel[2] < 0.0,
+            "server velocity: {server_state:?}"
+        );
 
         link.close();
         ticker.abort();

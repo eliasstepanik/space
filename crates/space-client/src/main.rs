@@ -112,9 +112,7 @@ fn parse_args() -> Config {
                 }
             },
             "--server" => {
-                let addr = args
-                    .next()
-                    .and_then(|a| a.to_socket_addrs().ok()?.next());
+                let addr = args.next().and_then(|a| a.to_socket_addrs().ok()?.next());
                 match addr {
                     Some(addr) => config.server = Some(addr),
                     None => {
