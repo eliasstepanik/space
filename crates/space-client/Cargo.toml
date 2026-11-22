@@ -10,6 +10,10 @@ description = "Native client: winit window + space-render, offline demo of the d
 space-render = { workspace = true }
 space-world = { workspace = true }
 space-stream = { workspace = true, features = ["net"] }
+space-net = { path = "../space-net" }
+space-protocol = { workspace = true }
+space-sim = { workspace = true }
+space-ecs = { workspace = true }
 tokio = { workspace = true }
 winit = { workspace = true }
 raw-window-handle = { workspace = true }
@@ -17,6 +21,7 @@ log = { workspace = true }
 env_logger = "0.11"
 
 [dev-dependencies]
+space-server = { path = "../space-server" }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 

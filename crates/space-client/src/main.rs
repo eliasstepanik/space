@@ -13,11 +13,15 @@
 //!   each frame and serve it to browser viewers over `ws://` (see [`stream`]).
 //!   Without the flag nothing below changes.
 //!
-//! The game-server networking (`space-net`) is deliberately *not* a dependency of
-//! this binary yet; the stream seam is documented in [`stream`].
+//! * **multiplayer streaming** (`--stream ADDR --server ADDR`): the same, but the
+//!   process is also a normal `space-net` player on the authoritative shard;
+//!   viewer input becomes the player's input and the replicated state drives the
+//!   camera (see [`link`] and [`stream`]).
 
+mod link;
 mod stream;
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use space_render::{
@@ -50,6 +54,8 @@ struct Config {
     quality: QualityPreset,
     /// `--stream ADDR`: serve rendered frames to viewers on this `ws://` address.
     stream: Option<String>,
+    /// `--server ADDR`: with `--stream`, play on this authoritative shard.
+    server: Option<SocketAddr>,
     /// `--frames N`: stop streaming after N frames (default: run until killed).
     frames: Option<u64>,
 }
@@ -62,6 +68,7 @@ fn parse_args() -> Config {
         out: None,
         quality: QualityPreset::default(),
         stream: None,
+        server: None,
         frames: None,
     };
     let mut args = std::env::args().skip(1);
@@ -104,6 +111,18 @@ fn parse_args() -> Config {
                     std::process::exit(2);
                 }
             },
+            "--server" => {
+                let addr = args
+                    .next()
+                    .and_then(|a| a.to_socket_addrs().ok()?.next());
+                match addr {
+                    Some(addr) => config.server = Some(addr),
+                    None => {
+                        eprintln!("space-client: --server needs a host:port, e.g. 127.0.0.1:7000");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--frames" => match args.next().and_then(|n| n.parse().ok()) {
                 Some(n) => config.frames = Some(n),
                 None => {
@@ -122,13 +141,17 @@ fn parse_args() -> Config {
             }
         }
     }
+    if config.server.is_some() && config.stream.is_none() {
+        eprintln!("space-client: --server is only supported together with --stream");
+        std::process::exit(2);
+    }
     config
 }
 
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
-               [--quality high|medium|low|ci] [--stream ADDR [--frames N]]\n\
+               [--quality high|medium|low|ci] [--stream ADDR [--server ADDR] [--frames N]]\n\
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
@@ -139,6 +162,9 @@ fn print_usage() {
         \x20 --stream ADDR  serve frames as JPEG over ws://ADDR (plain ws://, no TLS)\n\
         \x20              to the space-viewer wasm page; viewer input drives the camera\n\
         \x20              (scene: demo, or --galaxy)\n\
+        \x20 --server ADDR  with --stream, join the authoritative shard at ADDR as a\n\
+        \x20              normal player (viewer input drives the ship; replication\n\
+        \x20              drives the camera); default: offline, no server\n\
         \x20 --frames N   with --stream, exit after N frames\n\
         \n\
         With neither --demo nor --galaxy a winit window is opened."
@@ -259,6 +285,7 @@ impl App {
                 out: None,
                 quality: config.quality,
                 stream: None,
+                server: None,
                 frames: None,
             },
             window: None,

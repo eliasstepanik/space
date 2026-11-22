@@ -4,15 +4,15 @@
 //! # Multiplayer seam
 //!
 //! A browser viewer is not a peer of the authoritative server. This process is
-//! the *proxy client*: it is the player the server knows (connecting through the
-//! ordinary `space-net` client path, like a windowed client), and the viewer is
-//! only its remote screen and controller. Viewer input arrives through
-//! [`StreamClient::poll_input`] and is applied to the proxy's own [`InputState`]
-//! by [`InputState::apply`] — the one place client input is handled — so from
-//! there it follows the same route to the server as local input would. No new
-//! server protocol is involved. (This binary does not yet open that `space-net`
-//! connection itself: today the offline demo/galaxy scene is rendered, driven by
-//! the same input state.)
+//! the *proxy client*: with `--server ADDR` it connects to the shard as an
+//! ordinary player through the `space-net` client path ([`crate::link`]), and
+//! the viewer is only its remote screen and controller. Viewer input arrives
+//! through [`StreamClient::poll_input`], is applied to the proxy's
+//! [`InputState`] by [`InputState::apply`] and, by [`pump_input`], turned into
+//! thrust sent to the server as `InputTick`s. The server's replicated ship
+//! position then drives the camera of the scene that is rendered, JPEG-encoded
+//! and streamed back. Without `--server` the proxy stays offline and moves the
+//! camera locally, exactly as before.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use space_stream::protocol::{FLAG_DOWNSCALED, FLAG_KEYFRAME};
 use space_stream::{JpegEncoder, Key, StreamClient, StreamServer, ViewerInput};
 use space_world::WorldPos;
 
+use crate::link::ServerLink;
 use crate::{demo_options, Config, Mode};
 
 /// Target stream frame rate.
@@ -92,6 +93,32 @@ impl InputState {
         self.offset[1] += step * up;
     }
 
+    /// Thrust intent for the server, each axis in `-1..=1`, in the world frame.
+    ///
+    /// Same mapping as [`InputState::step`] (held keys along the view's forward
+    /// and right axes, plus up/down), normalised so diagonals are not faster.
+    /// The proxy never torques the ship, so the ship's body frame stays the
+    /// world frame and the view direction only picks the thrust direction.
+    pub fn thrust(&self) -> [f32; 3] {
+        let axis = |pos: Key, neg: Key| f32::from(i8::from(self.is_held(pos)) - i8::from(self.is_held(neg)));
+        let (fwd, right, up) = (
+            axis(Key::Forward, Key::Back),
+            axis(Key::Right, Key::Left),
+            axis(Key::Up, Key::Down),
+        );
+        let (f, r) = (self.forward(), self.right());
+        let mut t = [0.0; 3];
+        for i in 0..3 {
+            t[i] = fwd * f[i] + right * r[i];
+        }
+        t[1] += up;
+        let len = t.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if len > 1.0 {
+            t = t.map(|v| v / len);
+        }
+        t
+    }
+
     /// The camera for this input, relative to the scene's `base` camera.
     pub fn camera(&self, base: &CameraPose) -> CameraPose {
         CameraPose {
@@ -101,6 +128,19 @@ impl InputState {
             ..*base
         }
     }
+}
+
+/// Drain viewer input into `input` and, when connected, hand the resulting
+/// thrust to the server link. Returns how many viewer events were applied.
+pub fn pump_input(client: &StreamClient, input: &mut InputState, link: Option<&ServerLink>) -> usize {
+    let events = client.poll_input();
+    for event in &events {
+        input.apply(*event);
+    }
+    if let Some(link) = link {
+        link.set_thrust(input.thrust());
+    }
+    events.len()
 }
 
 /// Build the scene as seen by `input`.
@@ -130,10 +170,14 @@ fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> S
 /// Render → JPEG → push, applying viewer input, until `stop` is set or
 /// `max_frames` frames were streamed. While no viewer is connected nothing is
 /// rendered. Returns the final input state.
+///
+/// With a `link` the camera offset is the server's replicated ship position;
+/// without one the offset is integrated locally from the viewer's keys.
 pub fn stream_loop(
     ctx: &RenderContext,
     config: &Config,
     client: &StreamClient,
+    link: Option<&ServerLink>,
     stop: &AtomicBool,
     max_frames: Option<u64>,
 ) -> Result<InputState, RenderError> {
@@ -154,10 +198,11 @@ pub fn stream_loop(
     let mut streamed = 0u64;
     while !stop.load(Ordering::Relaxed) && max_frames.is_none_or(|m| streamed < m) {
         let start = Instant::now();
-        for event in client.poll_input() {
-            input.apply(event);
+        pump_input(client, &mut input, link);
+        match link {
+            Some(link) => input.offset = link.offset(),
+            None => input.step(start.duration_since(last).as_secs_f32().min(0.25), speed),
         }
-        input.step(start.duration_since(last).as_secs_f32().min(0.25), speed);
         last = start;
         if client.viewer_count() == 0 {
             std::thread::sleep(IDLE_POLL);
@@ -187,6 +232,19 @@ pub fn run_stream(config: &Config, addr: &str) -> Result<(), RenderError> {
     let (server, client) = rt
         .block_on(StreamServer::bind(addr))
         .map_err(|e| RenderError::new(format!("stream bind {addr}: {e}")))?;
+    let link = match config.server {
+        Some(server) => {
+            let link = rt
+                .block_on(ServerLink::connect(server))
+                .map_err(|e| RenderError::new(format!("server {server}: {e}")))?;
+            eprintln!(
+                "space-client: connected to {server} as session {}",
+                link.replica().session
+            );
+            Some(link)
+        }
+        None => None,
+    };
     let ctx = RenderContext::new(&ContextOptions::default())?;
     eprintln!(
         "space-client: device {:?}; streaming {}x{} on ws://{} (plain ws://, no TLS)",
@@ -196,7 +254,7 @@ pub fn run_stream(config: &Config, addr: &str) -> Result<(), RenderError> {
         server.local_addr()
     );
     let stop = AtomicBool::new(false);
-    stream_loop(&ctx, config, &client, &stop, config.frames)?;
+    stream_loop(&ctx, config, &client, link.as_ref(), &stop, config.frames)?;
     drop(server);
     Ok(())
 }
@@ -297,13 +355,14 @@ mod tests {
             out: None,
             quality: space_render::QualityPreset::Ci,
             stream: None,
+            server: None,
             frames: None,
         };
         let worker = {
             let (client, stop) = (Arc::clone(&client), Arc::clone(&stop));
             std::thread::spawn(move || {
                 let ctx = RenderContext::new(&ContextOptions::default()).unwrap();
-                stream_loop(&ctx, &config, &client, &stop, None)
+                stream_loop(&ctx, &config, &client, None, &stop, None)
             })
         };
 
