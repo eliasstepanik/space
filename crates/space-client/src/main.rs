@@ -396,8 +396,8 @@ fn main() {
     let config = parse_args();
     let result = match (&config.stream, config.mode) {
         (Some(addr), _) => stream::run_stream(&config, addr),
-        (None, Mode::Demo | Mode::Galaxy => run_offscreen(&config),
-        Mode::Window => run_window(&config),
+        (None, Mode::Demo | Mode::Galaxy) => run_offscreen(&config),
+        (None, Mode::Window) => run_window(&config),
     };
     if let Err(e) = result {
         eprintln!("space-client: {e}");
