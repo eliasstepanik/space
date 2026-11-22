@@ -23,7 +23,8 @@
 //! * **No clock.** The only time source is [`SimWorld::tick`], advanced by
 //!   [`SimWorld::step`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use space_ecs::{Component, ComponentDef, Entity, WithEntity, World};
 use space_protocol::{EntityGuid, PlayerInput, ShardId};
@@ -87,14 +88,23 @@ pub struct SimWorld {
     tick: SimTick,
     /// guid → entity, for input routing only (never iterated).
     by_guid: HashMap<EntityGuid, Entity>,
-    /// Every ship ever spawned, in spawn order; `state_hash` sorts this copy.
-    ships: Vec<Entity>,
-    /// Inputs waiting for the tick they were generated for, keyed by
-    /// [`PlayerInput::tick`].
+    /// The ships spawned through [`SimWorld::spawn_ship`] and not yet despawned
+    /// through [`SimWorld::despawn_ship`], as `(index, generation)`.
     ///
-    /// A `BTreeMap` (not a `HashMap`) so draining and the stale-drop sweep are
-    /// deterministic in tick order.
-    input_buf: BTreeMap<SimTick, Vec<PlayerInput>>,
+    /// An ordered set, so it is *always* in the canonical order
+    /// ([`SimWorld::ships`], [`SimWorld::state_hash`]) — nothing has to be
+    /// sorted per call — and a despawn is a lookup, not a scan. An entity
+    /// despawned behind this world's back (through [`SimWorld::world_mut`]) can
+    /// linger here, which is why every reader still filters on liveness.
+    ships: BTreeSet<(u32, u32)>,
+    /// Inputs waiting for the tick they were generated for, keyed by
+    /// [`PlayerInput::tick`], then by the entity they drive (at most one input
+    /// per entity per tick, see [`SimWorld::apply_inputs`]).
+    ///
+    /// `BTreeMap`s (not `HashMap`s) so draining and the stale-drop sweep are
+    /// deterministic in tick order, and so filing an input is a keyed lookup
+    /// rather than a scan of everything already filed for that tick.
+    input_buf: BTreeMap<SimTick, BTreeMap<EntityGuid, PlayerInput>>,
     /// Highest input tick applied per [`Owner`] session — the `input_ack` a
     /// snapshot/delta carries (see [`SimWorld::input_ack`]).
     input_ack: HashMap<u64, SimTick>,
@@ -145,7 +155,7 @@ impl SimWorld {
             shard,
             tick: start_tick,
             by_guid: HashMap::new(),
-            ships: Vec::new(),
+            ships: BTreeSet::new(),
             input_buf: BTreeMap::new(),
             input_ack: HashMap::new(),
         }
@@ -183,10 +193,7 @@ impl SimWorld {
     /// Number of live ships.
     #[must_use]
     pub fn ship_count(&self) -> usize {
-        self.ships
-            .iter()
-            .filter(|&&e| self.world.entity_is_alive(e))
-            .count()
+        self.live_ships().count()
     }
 
     /// The live ships, sorted by [`Entity`] — the same order
@@ -197,14 +204,16 @@ impl SimWorld {
     /// entities happened to be created.
     #[must_use]
     pub fn ships(&self) -> Vec<Entity> {
-        let mut out: Vec<Entity> = self
-            .ships
+        self.live_ships().collect()
+    }
+
+    /// The live ships in canonical order: ascending `(index, generation)`,
+    /// which is the order the set is kept in.
+    fn live_ships(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.ships
             .iter()
-            .copied()
+            .map(|&(index, generation)| Entity::new(index, generation))
             .filter(|&e| self.world.entity_is_alive(e))
-            .collect();
-        out.sort_unstable_by_key(|&e| (e.index(), e.generation()));
-        out
     }
 
     /// The entity `guid` maps to, if it is still alive here.
@@ -236,7 +245,7 @@ impl SimWorld {
             Component::new(&authority),
         ]);
         self.by_guid.insert(guid, entity);
-        self.ships.push(entity);
+        self.ships.insert((entity.index(), entity.generation()));
         entity
     }
 
@@ -247,7 +256,7 @@ impl SimWorld {
         match self.by_guid.remove(&guid) {
             Some(entity) => {
                 let removed = self.world.despawn(entity);
-                self.ships.retain(|&e| e != entity);
+                self.ships.remove(&(entity.index(), entity.generation()));
                 removed
             }
             None => false,
@@ -327,14 +336,23 @@ impl SimWorld {
             if input.tick > self.tick.saturating_add(MAX_INPUT_LEAD) {
                 continue;
             }
-            let bucket = self.input_buf.entry(input.tick).or_default();
-            match bucket.iter().position(|e| e.entity == input.entity) {
-                Some(i) => {
-                    if input_bits(input) > input_bits(&bucket[i]) {
-                        bucket[i] = *input;
+            // Keyed by entity, so filing is a lookup: with one input per ship
+            // per tick a linear scan of the bucket made a tick's worth of
+            // inputs quadratic in the number of ships.
+            match self
+                .input_buf
+                .entry(input.tick)
+                .or_default()
+                .entry(input.entity)
+            {
+                Entry::Occupied(mut filed) => {
+                    if input_bits(input) > input_bits(filed.get()) {
+                        *filed.get_mut() = *input;
                     }
                 }
-                None => bucket.push(*input),
+                Entry::Vacant(slot) => {
+                    slot.insert(*input);
+                }
             }
         }
     }
@@ -355,7 +373,7 @@ impl SimWorld {
     /// it (see [`MAX_INPUT_LEAD`]).
     #[must_use]
     pub fn buffered_input_count(&self) -> usize {
-        self.input_buf.values().map(Vec::len).sum()
+        self.input_buf.values().map(BTreeMap::len).sum()
     }
 
     /// Drain the buffered batch for `next_tick`, resolve it to entities and apply
@@ -368,7 +386,7 @@ impl SimWorld {
         // Resolve, then sort so application order is canonical (independent of the
         // order the inputs were buffered in).
         let mut resolved: Vec<(u32, u32, PlayerInput)> = Vec::with_capacity(inputs.len());
-        for input in &inputs {
+        for input in inputs.values() {
             if let Some(entity) = self.entity_of(input.entity) {
                 resolved.push((entity.index(), entity.generation(), *input));
             }
@@ -636,13 +654,8 @@ impl SimWorld {
     pub fn serialize_state(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_int(&mut out, i128::from(self.tick), 8);
-        let mut entities: Vec<Entity> = self
-            .ships
-            .iter()
-            .copied()
-            .filter(|&e| self.world.entity_is_alive(e))
-            .collect();
-        entities.sort_unstable_by_key(|&e| (e.index(), e.generation()));
+        // Already in the canonical order (ascending index, then generation).
+        let entities = self.ships();
         put_int(
             &mut out,
             i128::try_from(entities.len()).unwrap_or(i128::MAX),
@@ -955,6 +968,114 @@ mod tests {
             a.ship_state(guid(1)).unwrap().vel,
             b.ship_state(guid(1)).unwrap().vel
         );
+    }
+
+    /// Filing keeps exactly one input per entity per tick — the one with the
+    /// greatest bit pattern — whatever order a tick's inputs arrive in, and the
+    /// step then behaves exactly as if only the winners had been sent. (The
+    /// bucket is a map keyed by entity now; this pins the merge rule the old
+    /// linear scan implemented.)
+    #[test]
+    fn one_input_per_entity_per_tick_whatever_the_arrival_order() {
+        const SHIPS: u64 = 64;
+        let world = || {
+            let mut sim = SimWorld::new(ShardId(1));
+            for serial in 1..=SHIPS {
+                sim.spawn_ship(guid(serial), serial, ShipState::IDENTITY);
+            }
+            sim
+        };
+        // Three candidates per ship; the largest positive thrust has the
+        // greatest bits. The winner differs per ship so a mix-up would show.
+        let candidates = |serial: u64| -> [PlayerInput; 3] {
+            let top = 0.25 + (serial % 3) as f32 * 0.25;
+            [
+                input(serial, [top * 0.5, 0.0, 0.0]),
+                input(serial, [top, 0.0, 0.0]),
+                input(serial, [0.0, 0.0, 0.0]),
+            ]
+        };
+        let all: Vec<PlayerInput> = (1..=SHIPS).flat_map(&candidates).collect();
+        let winners: Vec<PlayerInput> = (1..=SHIPS).map(|s| candidates(s)[1]).collect();
+
+        let mut in_order = world();
+        in_order.apply_inputs(1, &all);
+        let mut reversed = world();
+        let backwards: Vec<PlayerInput> = all.iter().rev().copied().collect();
+        // Split over two calls, as two clients' batches would be.
+        reversed.apply_inputs(1, &backwards[..100]);
+        reversed.apply_inputs(1, &backwards[100..]);
+        let mut only_winners = world();
+        only_winners.apply_inputs(1, &winners);
+
+        for sim in [&in_order, &reversed, &only_winners] {
+            assert_eq!(sim.buffered_input_count() as u64, SHIPS);
+        }
+        for sim in [&mut in_order, &mut reversed, &mut only_winners] {
+            sim.step();
+            assert_eq!(sim.buffered_input_count(), 0);
+        }
+        assert_eq!(in_order.state_hash(), only_winners.state_hash());
+        assert_eq!(reversed.state_hash(), only_winners.state_hash());
+        // And the winner really was applied: every ship moved.
+        for serial in 1..=SHIPS {
+            let s = in_order.ship_state(guid(serial)).unwrap();
+            assert!(s.vel[0] > 0.0, "ship {serial} did not thrust: {:?}", s.vel);
+        }
+    }
+
+    /// The live-ship list is always in canonical `(index, generation)` order —
+    /// through despawns, recycled indices and an entity despawned behind the
+    /// world's back — and agrees with `ship_count`.
+    #[test]
+    fn ships_are_listed_in_entity_order_through_despawns_and_reuse() {
+        let key = |e: space_ecs::Entity| (e.index(), e.generation());
+        let mut sim = SimWorld::new(ShardId(1));
+        let mut live: Vec<(u64, space_ecs::Entity)> = Vec::new();
+        for serial in 1..=20u64 {
+            live.push((
+                serial,
+                sim.spawn_ship(guid(serial), serial, ShipState::IDENTITY),
+            ));
+        }
+        // Despawn in a scrambled order, so the free list is scrambled too.
+        for serial in [7u64, 19, 2, 11, 14, 3] {
+            assert!(sim.despawn_ship(guid(serial)));
+            live.retain(|(s, _)| *s != serial);
+        }
+        // Respawn: the new ships reuse those indices with a new generation.
+        for serial in 21..=30u64 {
+            live.push((
+                serial,
+                sim.spawn_ship(guid(serial), serial, ShipState::IDENTITY),
+            ));
+        }
+        assert!(
+            live.iter().any(|(_, e)| e.generation() > 0),
+            "the test must recycle at least one index"
+        );
+
+        let check = |sim: &SimWorld, live: &[(u64, space_ecs::Entity)]| {
+            let listed = sim.ships();
+            assert!(
+                listed.windows(2).all(|w| key(w[0]) < key(w[1])),
+                "ships() must be strictly ascending: {listed:?}"
+            );
+            let mut expected: Vec<space_ecs::Entity> = live.iter().map(|(_, e)| *e).collect();
+            expected.sort_unstable_by_key(|&e| key(e));
+            assert_eq!(listed, expected);
+            assert_eq!(sim.ship_count(), expected.len());
+        };
+        check(&sim, &live);
+
+        // An entity despawned through the raw ECS world is filtered out.
+        let (gone_serial, gone) = live[4];
+        assert!(sim.world_mut().despawn(gone));
+        live.retain(|(s, _)| *s != gone_serial);
+        check(&sim, &live);
+        // ...and despawning it properly afterwards is a no-op that still tidies up.
+        assert!(!sim.despawn_ship(guid(gone_serial)));
+        check(&sim, &live);
     }
 
     // B2: the guid-keyed hash is independent of ECS index / spawn order, while

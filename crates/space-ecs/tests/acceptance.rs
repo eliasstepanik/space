@@ -639,6 +639,192 @@ fn component_info_get_rejects_out_of_range_id() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. the entity term over multi-term queries; the duplicate-id guard
+// ---------------------------------------------------------------------------
+
+/// `WithEntity` over a multi-term query pairs every row with *its own* entity —
+/// across several archetypes, with a `changed_since` mask that skips rows, and
+/// with a `&mut` term — and the lending `next()` walks exactly the sequence
+/// `for_each` does.
+///
+/// `WithEntity::run` no longer fetches each row separately; it rides the inner
+/// term's column loop and names the row from the same mask, so this pins the
+/// pairing down where a slip would show: rows skipped in the middle, and
+/// archetypes whose columns sit in a different order than the query's terms.
+#[test]
+fn with_entity_pairs_each_row_with_its_own_entity() {
+    let key = |e: Entity| (e.index(), e.generation());
+    let mut w = new_world();
+    // (entity, position.x, velocity.x): both values are unique per entity.
+    let mut all: Vec<(Entity, f32, f32)> = Vec::new();
+    for i in 0..60u32 {
+        let (p, v) = (pos(i as f32), vel(1000.0 + i as f32));
+        let e = match i % 3 {
+            0 => w.spawn(&[Component::new(&p), Component::new(&v)]),
+            1 => w.spawn(&[
+                Component::new(&p),
+                Component::new(&v),
+                Component::new(&Health(i as i32)),
+            ]),
+            _ => w.spawn(&[
+                Component::new(&v),
+                Component::new(&Name(i)),
+                Component::new(&p),
+            ]),
+        };
+        all.push((e, p.x, v.x));
+    }
+    // An archetype the query must skip (no Velocity), and an emptied one.
+    w.spawn(&[Component::new(&pos(-1.0))]);
+    let gone = w.spawn(&[Component::new(&pos(-2.0)), Component::new(&Ai(1))]);
+    w.despawn(gone);
+
+    // --- unfiltered: every row, each with its own entity --------------------
+    let mut seen: Vec<(Entity, f32, f32)> = Vec::new();
+    {
+        let mut q = w.query::<WithEntity<(&Position, &Velocity)>>();
+        q.for_each(|((p, v), e)| seen.push((e, p.x, v.x)));
+    }
+    let mut via_next: Vec<(Entity, f32, f32)> = Vec::new();
+    {
+        let mut q = w.query::<WithEntity<(&Position, &Velocity)>>();
+        while let Some(((p, v), e)) = q.next() {
+            via_next.push((e, p.x, v.x));
+        }
+    }
+    assert_eq!(seen, via_next, "next() and for_each walk the same rows");
+    seen.sort_unstable_by_key(|r| key(r.0));
+    assert_eq!(seen, all);
+
+    // --- changed_since: only the touched rows, still correctly paired -------
+    for _ in 0..4 {
+        w.tick();
+    }
+    let touched: Vec<Entity> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 7 == 0 || *i == all.len() - 1)
+        .map(|(_, r)| r.0)
+        .collect();
+    for &e in &touched {
+        w.get_mut::<Position>(e).unwrap().x += 0.5;
+    }
+    let expected: Vec<(Entity, f32, f32)> = all
+        .iter()
+        .filter(|r| touched.contains(&r.0))
+        .map(|&(e, px, vx)| (e, px + 0.5, vx))
+        .collect();
+    let mut changed: Vec<(Entity, f32, f32)> = Vec::new();
+    {
+        let mut q = w
+            .query::<WithEntity<(&Position, &Velocity)>>()
+            .changed_since(3);
+        q.for_each(|((p, v), e)| changed.push((e, p.x, v.x)));
+    }
+    let mut changed_next: Vec<(Entity, f32, f32)> = Vec::new();
+    {
+        let mut q = w
+            .query::<WithEntity<(&Position, &Velocity)>>()
+            .changed_since(3);
+        while let Some(((p, v), e)) = q.next() {
+            changed_next.push((e, p.x, v.x));
+        }
+    }
+    assert_eq!(changed, changed_next);
+    changed.sort_unstable_by_key(|r| key(r.0));
+    assert_eq!(changed, expected);
+
+    // --- a `&mut` term: the write lands on the entity the closure was told --
+    {
+        let mut q = w
+            .query::<WithEntity<(&mut Position, &Velocity)>>()
+            .changed_since(3);
+        q.for_each(|((p, v), e)| p.y = v.x + e.index() as f32);
+    }
+    for &(e, _, vx) in &all {
+        let want = if touched.contains(&e) {
+            vx + e.index() as f32
+        } else {
+            0.0
+        };
+        assert_eq!(w.get::<Position>(e).unwrap().y, want, "entity {e}");
+    }
+
+    // --- three terms under the entity term (one archetype matches) ----------
+    let mut with_health: Vec<(Entity, i32, f32)> = Vec::new();
+    {
+        let mut q = w.query::<WithEntity<(&Velocity, &Health, &Position)>>();
+        q.for_each(|((v, h, _p), e)| with_health.push((e, h.0, v.x)));
+    }
+    assert_eq!(with_health.len(), 20);
+    for (e, health, vx) in with_health {
+        let i = all.iter().position(|r| r.0 == e).expect("a spawned entity");
+        assert_eq!((health, vx), (i as i32, all[i].2), "entity {e}");
+    }
+}
+
+/// Duplicate component ids in a spawn are rejected in **every** build, before
+/// the world is touched.
+///
+/// The check used to be a `debug_assert!`: a release build went on to create an
+/// archetype with two columns for one id, filled only the first, and panicked
+/// half-way through the entity's first despawn. Now the spawn itself panics, and
+/// — because the check runs first — leaves no entity slot, archetype or row
+/// behind.
+#[test]
+fn spawn_rejects_duplicate_component_ids_and_leaves_the_world_intact() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let mut w = new_world();
+    let a = w.spawn(&[Component::new(&pos(1.0)), Component::new(&vel(1.0))]);
+
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        w.spawn(&[
+            Component::new(&pos(2.0)),
+            Component::new(&vel(2.0)),
+            Component::new(&pos(3.0)),
+        ])
+    }));
+    let payload = attempt.expect_err("a spawn with a duplicate component id must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("duplicate component ids"),
+        "unexpected panic message: {message:?}"
+    );
+
+    // Nothing was created or consumed by the failed spawn.
+    assert_eq!(w.len(), 1);
+    let b = w.spawn(&[Component::new(&pos(4.0)), Component::new(&vel(4.0))]);
+    assert_eq!(
+        b.index(),
+        a.index() + 1,
+        "the failed spawn must not consume an entity slot"
+    );
+    let mut rows = 0;
+    {
+        let mut q = w.query::<(&Position, &Velocity)>();
+        q.for_each(|_| rows += 1);
+    }
+    assert_eq!(rows, 2);
+    // Every row can still be removed (the corrupt archetype could not).
+    assert!(w.despawn(a));
+    assert!(w.despawn(b));
+    assert_eq!(w.len(), 0);
+
+    // The deferred path goes through the same check.
+    let mut cb = CommandBuffer::new();
+    cb.spawn(vec![
+        Component::new(&pos(1.0)).to_owned_component(),
+        Component::new(&pos(2.0)).to_owned_component(),
+    ]);
+    assert!(catch_unwind(AssertUnwindSafe(|| w.run(&mut cb))).is_err());
+    assert_eq!(w.len(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // 10. benchmarks (release only)
 // ---------------------------------------------------------------------------
 #[cfg(not(debug_assertions))]

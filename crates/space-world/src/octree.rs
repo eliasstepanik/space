@@ -92,23 +92,42 @@ impl NodeRef {
         ]
     }
 
-    /// The centre of this node, as a world position.
+    /// The geometric centre of this node, as a world position: the midpoint
+    /// of [`node_bounds`], equidistant from both corners on every axis.
+    ///
+    /// A cell's `local` is measured from the *centre* of the cell, so a node of
+    /// `2^k` cells (`k >= 1`) starting at cell `L` spans
+    /// `[L·1024 − 512, (L + 2^k)·1024 − 512)` metres and its midpoint is the
+    /// **boundary** between its two middle cells: cell `L + 2^(k−1)` at
+    /// `local = −CELL_HALF`. Only a single-cell node ([`MAX_DEPTH`]) has its
+    /// centre at a cell centre (`local = 0`). The root spans cells
+    /// `i64::MIN ..= i64::MAX`, so its midpoint is the lower corner of cell 0.
     #[must_use]
     pub fn center(&self) -> WorldPos {
         if self.depth == 0 {
-            return WorldPos::ZERO;
+            return WorldPos {
+                cell: [0; 3],
+                local: [-CELL_HALF; 3],
+            };
         }
         let lower = self.lower_cell();
         let shift = 64u32 - u32::from(self.depth);
-        // Half the node width in cells; 0 for a single-cell node.
-        let half = if shift == 0 { 0 } else { 1i64 << (shift - 1) };
+        if shift == 0 {
+            // A single cell: its centre is the cell centre.
+            return WorldPos {
+                cell: lower,
+                local: [0.0; 3],
+            };
+        }
+        // Half the node width in cells.
+        let half = 1i64 << (shift - 1);
         WorldPos {
             cell: [
                 lower[0].wrapping_add(half),
                 lower[1].wrapping_add(half),
                 lower[2].wrapping_add(half),
             ],
-            local: [0.0; 3],
+            local: [-CELL_HALF; 3],
         }
     }
 }
@@ -309,6 +328,46 @@ mod tests {
             ));
             assert!(WorldPos::delta(pmin, kmin)[0] >= 0.0);
         }
+    }
+
+    /// `center()` is the midpoint of `node_bounds`: exactly half a node from
+    /// the lower corner on every axis, at every depth.
+    ///
+    /// It used to return the *centre of the middle cell* (`local = 0`), which is
+    /// half a cell (512 m) past the midpoint for every node of two cells or
+    /// more.
+    #[test]
+    fn center_is_the_midpoint_of_the_bounds() {
+        for depth in 1..=MAX_DEPTH {
+            // Nodes on both sides of the origin, including the two that touch it.
+            for cell in [[0i64, 0, 0], [-1, -1, -1], [3, -2, 77], [-900, 12_345, -6]] {
+                let node = NodeRef::containing_cell(depth, cell);
+                let (min, _max) = node_bounds(node);
+                let center = node.center();
+                let half = NodeRef::size_m(depth) / 2.0;
+                let from_min = WorldPos::delta(min, center);
+                assert_eq!(from_min, [half; 3], "depth {depth} cell {cell:?}");
+                assert!(contains(node, center), "depth {depth} cell {cell:?}");
+                // Canonical form: a fixed point of normalisation.
+                assert_eq!(WorldPos::new(center.cell, center.local), center);
+            }
+        }
+        // The exact representation, at the three interesting widths.
+        // Two cells [0, 1]: the midpoint is the boundary between them.
+        let two = NodeRef::new(63, [0, 0, 0]).center();
+        assert_eq!((two.cell, two.local), ([1; 3], [-512.0; 3]));
+        // One cell: its own centre.
+        let one = NodeRef::new(MAX_DEPTH, [5, -5, 0]).center();
+        assert_eq!((one.cell, one.local), ([5, -5, 0], [0.0; 3]));
+        // The root spans cells i64::MIN..=i64::MAX: the midpoint is the lower
+        // corner of cell 0, half the cell space from the root's lower corner.
+        let root = NodeRef::ROOT.center();
+        assert_eq!((root.cell, root.local), ([0; 3], [-512.0; 3]));
+        let (root_min, _) = node_bounds(NodeRef::ROOT);
+        assert_eq!(
+            WorldPos::delta(root_min, root),
+            [NodeRef::size_m(0) / 2.0; 3]
+        );
     }
 
     #[test]

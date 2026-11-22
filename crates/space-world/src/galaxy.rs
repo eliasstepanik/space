@@ -94,7 +94,14 @@ impl Galaxy {
     fn density_permille(&self, pos: WorldPos) -> Option<u64> {
         let x = pos.cell[0];
         let z = pos.cell[2];
-        // Integer radius, scaled by 1024 to keep precision after the division.
+        // Outside the disc on one axis alone means outside the disc: `r >= |x|`.
+        // Rejecting that here keeps the wide arithmetic below off the hot path
+        // of a LOD walk (most traversed nodes lie far outside the disc) and
+        // keeps the squares from overflowing for cells near `i64::MIN`.
+        let limit = (DISC_CELLS * 2).unsigned_abs();
+        if x.unsigned_abs() > limit || z.unsigned_abs() > limit {
+            return None;
+        }
         let r2 = (x as i128) * (x as i128) + (z as i128) * (z as i128);
         let r = isqrt(r2);
         if r > i128::from(DISC_CELLS) * 2 {
@@ -255,6 +262,44 @@ mod tests {
             assert!(a >= prev, "x={x}");
             prev = a;
         }
+    }
+
+    /// Nodes at the very edge of the cell space are simply outside the disc:
+    /// the density test must not overflow its squares on them.
+    #[test]
+    fn star_at_handles_the_edge_of_the_cell_space() {
+        let g = Galaxy::new(7);
+        for index in [
+            [i64::MIN, 0, i64::MIN],
+            [i64::MAX, 0, i64::MAX],
+            [i64::MIN, i64::MIN, 0],
+            [0, 0, i64::MAX],
+        ] {
+            assert_eq!(g.star_at(NodeRef::new(64, index)), None, "{index:?}");
+        }
+    }
+
+    /// The per-axis early-out agrees with the radial test at the disc edge:
+    /// on the axis, the last cell inside (`2 * DISC_CELLS`) has a density and
+    /// the next one has none.
+    #[test]
+    fn disc_edge_is_where_the_radial_test_puts_it() {
+        use crate::cell::CellCoord;
+        let g = Galaxy::new(1);
+        let edge = super::DISC_CELLS * 2;
+        for sign in [1, -1] {
+            let inside = CellCoord([sign * edge, 0, 0]).to_octree_node(64);
+            let outside = CellCoord([sign * (edge + 1), 0, 0]).to_octree_node(64);
+            assert!(g.density_permille(inside.center()).is_some());
+            assert!(g.density_permille(outside.center()).is_none());
+            let inside = CellCoord([0, 0, sign * edge]).to_octree_node(64);
+            let outside = CellCoord([0, 0, sign * (edge + 1)]).to_octree_node(64);
+            assert!(g.density_permille(inside.center()).is_some());
+            assert!(g.density_permille(outside.center()).is_none());
+        }
+        // Off the axes the corner of the per-axis box is still outside the disc.
+        let corner = CellCoord([edge, 0, edge]).to_octree_node(64);
+        assert!(g.density_permille(corner.center()).is_none());
     }
 
     #[test]

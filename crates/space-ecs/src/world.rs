@@ -213,6 +213,23 @@ impl World {
     /// assert_eq!(w.get::<A>(e).unwrap().0, 5);
     /// ```
     pub fn spawn(&mut self, components: &[Component<'_>]) -> Entity {
+        // Build the sorted component set first, and validate it before the
+        // world is touched at all.
+        let mut ids: Vec<ComponentId> = components.iter().map(|c| c.id()).collect();
+        ids.sort_unstable();
+        // A hard assert, not a `debug_assert!`: with a duplicate id a release
+        // build would go on to create an archetype with more columns than
+        // component ids (see `Archetype::new`), fill only the first of them and
+        // then panic on the entity's first despawn or migration — half-way
+        // through the removal and far from the cause. The check is a scan of a
+        // handful of ids, and it runs before an entity slot, a column factory or
+        // an archetype exists for this spawn, so a caught panic leaves the world
+        // exactly as it was.
+        assert!(
+            ids.windows(2).all(|w| w[0] != w[1]),
+            "spawn called with duplicate component ids: {ids:?}"
+        );
+
         let index = match self.free.pop() {
             Some(i) => i,
             None => {
@@ -228,26 +245,21 @@ impl World {
         let generation = self.locations[index as usize].generation;
         let entity = Entity::new(index, generation);
 
-        // Build the sorted component set and register column factories.
-        let mut ids: Vec<ComponentId> = Vec::with_capacity(components.len());
+        // Register the column factories.
         for c in components {
             self.column_factories
                 .entry(c.id())
                 .or_insert(c.column_factory());
-            ids.push(c.id());
         }
-        ids.sort_unstable();
-        debug_assert!(
-            ids.windows(2).all(|w| w[0] != w[1]),
-            "spawn called with duplicate component ids"
-        );
 
         let arch = self.archetype_for(&ids);
         let tick = self.tick;
-        // Push values in column order, then record the row meta.
+        // Push values in column order, then record the row meta. The archetype's
+        // component set is exactly `ids` (sorted and, as asserted, unique), so
+        // column `i` holds component `ids[i]`.
         {
             let arch = &mut self.archetypes[arch];
-            for (col_i, &id) in arch.components().to_vec().iter().enumerate() {
+            for (col_i, &id) in ids.iter().enumerate() {
                 let comp = components.iter().find(|c| c.id() == id).unwrap();
                 arch.column_mut(col_i).push_dyn(comp.data());
             }

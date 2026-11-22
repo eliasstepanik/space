@@ -29,12 +29,22 @@ pub struct Archetype {
 }
 
 impl Archetype {
-    /// Creates an archetype for `components` (need not be sorted/unique).
+    /// Creates an archetype for `components` with one column per component.
+    ///
+    /// # Panics
+    /// If `columns` does not hold exactly one column per *distinct* component
+    /// id. This is checked in every build: an archetype with a surplus column
+    /// looks fine until a row is removed, when the never-filled column panics
+    /// half-way through the removal.
     pub(crate) fn new(components: &[ComponentId], columns: Vec<Column>) -> Self {
         let mut components = components.to_vec();
         components.sort_unstable();
         components.dedup();
-        debug_assert_eq!(components.len(), columns.len());
+        assert_eq!(
+            components.len(),
+            columns.len(),
+            "an archetype needs exactly one column per distinct component id"
+        );
         Self {
             components,
             columns,

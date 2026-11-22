@@ -25,10 +25,11 @@
 //!
 //! * **Coverage** — every candidate node is either selected itself or has a
 //!   selected descendant, so the selected set tiles the traversed region.
-//! * **Bounded** — `select(...).len() <= [MAX_SELECTED]` for any camera.
-//!   [`LodSelector::candidates`] never produces more than `MAX_SELECTED`
-//!   candidate leaves, and a REPLACE selection is an antichain of that tree,
-//!   which cannot be larger than its leaf set.
+//! * **Bounded** — `select(...).len() <= [MAX_SELECTED]` for any camera and any
+//!   candidate list. [`LodSelector::candidates`] never produces more than
+//!   `MAX_SELECTED` candidate leaves (its traversal frontier is budgeted, so
+//!   the work it does is bounded too), and a REPLACE selection is an antichain
+//!   of that tree, which cannot be larger than its leaf set.
 //! * **Monotonicity** — for a fixed candidate tree, moving the camera closer can
 //!   only keep or deepen the node covering a region: SSE is monotonically
 //!   non-increasing in distance, so a node that was refined stays refined.
@@ -37,7 +38,7 @@ use std::collections::BinaryHeap;
 use std::collections::HashSet;
 
 use crate::octree::{self, NodeRef, MAX_DEPTH};
-use crate::pos::WorldPos;
+use crate::pos::{WorldPos, CELL_HALF};
 
 /// Hard upper bound on the number of nodes [`LodSelector::select`] returns.
 ///
@@ -100,7 +101,9 @@ impl LodSelector {
     /// Geometric (world-space) error of a node at `depth`, in metres.
     #[must_use]
     pub fn geometric_error(&self, depth: u8) -> f64 {
-        NodeRef::size_m(depth) / f64::from(1u32 << self.split_levels.min(62))
+        // `split_levels` is a public field: clamp it so the shift cannot
+        // overflow (2^62 already makes the error vanish).
+        NodeRef::size_m(depth) / (1u64 << self.split_levels.min(62)) as f64
     }
 
     /// Projected screen-space error of `node`, in pixels.
@@ -112,10 +115,44 @@ impl LodSelector {
     }
 
     fn sse(&self, node: NodeRef, camera: WorldPos, fov_y: f32) -> f64 {
-        let dist = self.distance_to_node(node, camera);
-        let half_fov = f64::from(fov_y) * 0.5;
-        let denom = 2.0 * dist * half_fov.tan().max(1e-9);
-        self.geometric_error(node.depth) * f64::from(self.screen_height_px) / denom.max(1e-6)
+        self.sse_in(&self.view(camera, [0.0; 3], fov_y), node)
+    }
+
+    /// The per-camera constants of a traversal.
+    fn view(&self, camera: WorldPos, dir: [f32; 3], fov_y: f32) -> View {
+        let tan_y = (f64::from(fov_y) * 0.5).tan().max(1e-9);
+        let dir = dir.map(f64::from);
+        let dir_len = norm(dir);
+        // A degenerate direction never culls.
+        let basis = (dir_len != 0.0).then(|| {
+            let f = [dir[0] / dir_len, dir[1] / dir_len, dir[2] / dir_len];
+            // Orthonormal camera basis, built from the axis least aligned with f.
+            let helper = if f[0].abs() <= f[1].abs() && f[0].abs() <= f[2].abs() {
+                [1.0, 0.0, 0.0]
+            } else if f[1].abs() <= f[2].abs() {
+                [0.0, 1.0, 0.0]
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+            let r = cross(helper, f);
+            let r_len = norm(r);
+            let r = [r[0] / r_len, r[1] / r_len, r[2] / r_len];
+            (f, r, cross(f, r))
+        });
+        View {
+            camera,
+            basis,
+            tan_y,
+            tan_x: tan_y * f64::from(self.aspect),
+            screen_height_px: f64::from(self.screen_height_px),
+        }
+    }
+
+    /// Projected screen-space error of `node` for `view`, in pixels.
+    fn sse_in(&self, view: &View, node: NodeRef) -> f64 {
+        let dist = self.distance_to_node(node, view.camera);
+        let denom = 2.0 * dist * view.tan_y;
+        self.geometric_error(node.depth) * view.screen_height_px / denom.max(1e-6)
     }
 
     /// Distance from `camera` to the closest point of `node`'s bounding box,
@@ -126,7 +163,11 @@ impl LodSelector {
     }
 
     fn distance_to_node(&self, node: NodeRef, camera: WorldPos) -> f64 {
-        let (min, _max) = octree::node_bounds(node);
+        // The node's lower corner (what `octree::node_bounds` returns as `min`).
+        let min = WorldPos {
+            cell: node.lower_cell(),
+            local: [-CELL_HALF; 3],
+        };
         let size = NodeRef::size_m(node.depth);
         let d = WorldPos::delta(min, camera);
         let mut sum = 0.0f64;
@@ -142,44 +183,33 @@ impl LodSelector {
     /// infinite-far-plane view frustum.
     ///
     /// Errs towards keeping nodes, so coverage is never lost to rounding.
-    fn frustum_test(&self, node: NodeRef, camera: WorldPos, dir: [f32; 3], fov_y: f32) -> bool {
-        let dir_len = (f64::from(dir[0]) * f64::from(dir[0])
-            + f64::from(dir[1]) * f64::from(dir[1])
-            + f64::from(dir[2]) * f64::from(dir[2]))
-        .sqrt();
-        if dir_len == 0.0 {
-            return true; // degenerate direction: never cull
-        }
-        let f = [
-            f64::from(dir[0]) / dir_len,
-            f64::from(dir[1]) / dir_len,
-            f64::from(dir[2]) / dir_len,
-        ];
-        // Orthonormal camera basis, built from the axis least aligned with f.
-        let helper = if f[0].abs() <= f[1].abs() && f[0].abs() <= f[2].abs() {
-            [1.0, 0.0, 0.0]
-        } else if f[1].abs() <= f[2].abs() {
-            [0.0, 1.0, 0.0]
-        } else {
-            [0.0, 0.0, 1.0]
+    fn in_frustum(view: &View, node: NodeRef) -> bool {
+        let Some((f, r, u)) = view.basis else {
+            return true;
         };
-        let r = cross(helper, f);
-        let r_len = norm(r);
-        let r = [r[0] / r_len, r[1] / r_len, r[2] / r_len];
-        let u = cross(f, r);
-        let c = WorldPos::delta(camera, node.center());
+        let c = WorldPos::delta(view.camera, node.center());
         let cz = dot(c, f);
         let radius = NodeRef::size_m(node.depth) * (3.0f64).sqrt() * 0.5;
         if cz + radius < 0.0 {
             return false; // entirely behind the camera
         }
-        let tan_y = (f64::from(fov_y) * 0.5).tan().max(1e-9);
-        let tan_x = tan_y * f64::from(self.aspect);
         let reach = cz + radius;
         let cx = dot(c, r).abs();
         let cy = dot(c, u).abs();
-        cx <= reach * tan_x + radius && cy <= reach * tan_y + radius
+        cx <= reach * view.tan_x + radius && cy <= reach * view.tan_y + radius
     }
+}
+
+/// The per-camera constants of a traversal, computed once instead of per node.
+struct View {
+    camera: WorldPos,
+    /// Orthonormal (forward, right, up); `None` for a zero view direction,
+    /// which never culls.
+    basis: Option<([f64; 3], [f64; 3], [f64; 3])>,
+    /// `tan(fov_y / 2)`, floored away from zero.
+    tan_y: f64,
+    tan_x: f64,
+    screen_height_px: f64,
 }
 
 /// Cross product.
@@ -243,14 +273,17 @@ impl LodSelector {
     /// The traversal is best-first on screen-space error (nearest / coarsest
     /// first), so the node budget is spent where the error is worst. A node is
     /// a leaf (not subdivided) when its SSE fits the budget, it is at
-    /// `max_depth`, it is frustum-culled, or the leaf budget [`MAX_SELECTED`] is
-    /// reached. The list is a *proper* octree fragment — an internal node is
-    /// present together with the children the traversal kept — so
-    /// [`LodSelector::select`] can walk it.
+    /// `max_depth`, it is frustum-culled, or subdividing it would push the
+    /// frontier past the leaf budget [`MAX_SELECTED`]. The list is a *proper*
+    /// octree fragment — an internal node is present together with the
+    /// children the traversal kept — so [`LodSelector::select`] can walk it.
     ///
-    /// The number of leaves never exceeds [`MAX_SELECTED`] (plus the at-most-7
-    /// overshoot of the final subdivision), which is what lets
-    /// [`LodSelector::select`] stay within its bound without dropping coverage.
+    /// The budget counts the whole frontier — the leaves already emitted plus
+    /// every node still queued, each of which ends up as at least one leaf —
+    /// so the number of leaves never exceeds [`MAX_SELECTED`] *and* the
+    /// traversal stops subdividing as soon as that many are in sight. (Counting
+    /// only emitted leaves let it subdivide every over-budget node of a deep
+    /// band first: millions of nodes for a camera looking into open space.)
     #[must_use]
     pub fn candidates(&self, camera: WorldPos, dir: [f32; 3], fov_y: f32) -> Vec<NodeRef> {
         self.candidates_from(octree::node_at(camera, self.min_depth), camera, dir, fov_y)
@@ -266,22 +299,65 @@ impl LodSelector {
         dir: [f32; 3],
         fov_y: f32,
     ) -> Vec<NodeRef> {
+        let mut out = Vec::new();
+        self.traverse(root, camera, dir, fov_y, |node, _selected| out.push(node));
+        out
+    }
+
+    /// The selection for the camera the traversal runs for, in one pass:
+    /// exactly `select(&candidates_from(root, camera, dir, fov_y), camera,
+    /// fov_y)`, without materialising the candidate tree and walking it a
+    /// second time. This is what a renderer that builds and selects for the
+    /// same camera every frame should call.
+    #[must_use]
+    pub fn select_from(
+        &self,
+        root: NodeRef,
+        camera: WorldPos,
+        dir: [f32; 3],
+        fov_y: f32,
+    ) -> Vec<NodeRef> {
+        let mut selected = Vec::new();
+        self.traverse(root, camera, dir, fov_y, |node, is_selected| {
+            if is_selected {
+                selected.push(node);
+            }
+        });
+        selected.sort_unstable_by_key(|n| (n.depth, n.index));
+        selected
+    }
+
+    /// The budgeted best-first traversal behind [`LodSelector::candidates_from`]
+    /// and [`LodSelector::select_from`]. `visit(node, selected)` is called once
+    /// per traversed node; `selected` is true for the nodes a REPLACE selection
+    /// with the same camera picks: the leaves, and any subdivided node all of
+    /// whose children were frustum-culled.
+    fn traverse(
+        &self,
+        root: NodeRef,
+        camera: WorldPos,
+        dir: [f32; 3],
+        fov_y: f32,
+        mut visit: impl FnMut(NodeRef, bool),
+    ) {
+        let view = self.view(camera, dir, fov_y);
         let budget = f64::from(self.max_error_px);
-        let mut out: Vec<NodeRef> = Vec::new();
         let mut leaves = 0usize;
         let mut heap: BinaryHeap<QueueItem> = BinaryHeap::new();
-        if self.frustum_test(root, camera, dir, fov_y) {
+        if Self::in_frustum(&view, root) {
             heap.push(QueueItem {
-                sse_bits: self.sse(root, camera, fov_y).to_bits(),
+                sse_bits: self.sse_in(&view, root).to_bits(),
                 node: root,
             });
         }
         while let Some(item) = heap.pop() {
-            // Refine only while there is leaf budget left; otherwise this node
-            // becomes a (coarse) leaf, which keeps the leaf count bounded.
+            // Refine only while the frontier (emitted leaves + queued nodes +
+            // this node's up-to-8 children) fits the leaf budget; otherwise
+            // this node becomes a (coarse) leaf. Invariant: `leaves +
+            // heap.len() <= MAX_SELECTED`.
             let refine = item.node.depth < self.max_depth
                 && item.sse_bits > budget.to_bits()
-                && leaves < MAX_SELECTED;
+                && leaves + heap.len() + 8 <= MAX_SELECTED;
             let kids = if refine {
                 octree::children(item.node)
             } else {
@@ -289,24 +365,31 @@ impl LodSelector {
             };
             match kids {
                 Some(kids) => {
-                    out.push(item.node);
+                    let mut kept = 0;
                     for kid in kids {
-                        if !self.frustum_test(kid, camera, dir, fov_y) {
+                        if !Self::in_frustum(&view, kid) {
                             continue;
                         }
+                        kept += 1;
                         heap.push(QueueItem {
-                            sse_bits: self.sse(kid, camera, fov_y).to_bits(),
+                            sse_bits: self.sse_in(&view, kid).to_bits(),
                             node: kid,
                         });
                     }
+                    // With every child culled nothing below covers this node:
+                    // it is a leaf of the candidate tree after all (and counts
+                    // against the budget like one), and a selection takes it.
+                    if kept == 0 {
+                        leaves += 1;
+                    }
+                    visit(item.node, kept == 0);
                 }
                 None => {
-                    out.push(item.node);
+                    visit(item.node, true);
                     leaves += 1;
                 }
             }
         }
-        out
     }
 
     /// REPLACE refinement over a candidate tree: return the deepest nodes whose
@@ -318,9 +401,11 @@ impl LodSelector {
     /// camera distance, and therefore monotone.
     ///
     /// Guarantees: `result.len() <= MAX_SELECTED`, and every candidate leaf is
-    /// either selected itself or has a selected ancestor (coverage). When the
-    /// budget is reached the traversal stops refining and selects the current
-    /// node coarsely instead of dropping it, so coverage is never lost.
+    /// either selected itself or has a selected ancestor (coverage). A node
+    /// whose children would not fit the budget any more is selected coarsely
+    /// instead of being refined, so coverage is never lost. (A candidate tree
+    /// from [`LodSelector::candidates`] has at most `MAX_SELECTED` leaves, so
+    /// for it that cutoff never triggers.)
     #[must_use]
     pub fn select(&self, candidates: &[NodeRef], camera: WorldPos, fov_y: f32) -> Vec<NodeRef> {
         let set: HashSet<NodeRef> = candidates.iter().copied().collect();
@@ -329,25 +414,32 @@ impl LodSelector {
         }
         let root = candidates_root(candidates);
         let budget = f64::from(self.max_error_px);
+        let view = self.view(camera, [0.0; 3], fov_y);
         let mut selected = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let kids: Vec<NodeRef> = if selected.len() >= MAX_SELECTED {
-                // Out of budget: select this node coarsely (coverage preserved).
-                Vec::new()
-            } else {
-                match octree::children(node) {
-                    Some(k) => k.into_iter().filter(|k| set.contains(k)).collect(),
-                    None => Vec::new(),
+            // The children present in the candidate tree, without allocating.
+            let mut kids = [node; 8];
+            let mut kid_count = 0;
+            for kid in octree::children(node).into_iter().flatten() {
+                if set.contains(&kid) {
+                    kids[kid_count] = kid;
+                    kid_count += 1;
                 }
-            };
-            let must_select = kids.is_empty()
+            }
+            // Everything selected or still on the stack ends up as at least
+            // one selected node, so refining is only allowed while that total
+            // stays within the bound. Invariant: `selected.len() + stack.len()
+            // <= MAX_SELECTED`.
+            let fits = selected.len() + stack.len() + kid_count <= MAX_SELECTED;
+            let must_select = kid_count == 0
+                || !fits
                 || node.depth >= self.max_depth
-                || self.sse(node, camera, fov_y) <= budget;
+                || self.sse_in(&view, node) <= budget;
             if must_select {
                 selected.push(node);
             } else {
-                stack.extend(kids);
+                stack.extend_from_slice(&kids[..kid_count]);
             }
         }
         selected.sort_unstable_by_key(|n| (n.depth, n.index));
@@ -378,4 +470,128 @@ fn common_ancestor(a: NodeRef, b: NodeRef) -> NodeRef {
         y = octree::parent(y).unwrap_or(y);
     }
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOV: f32 = std::f32::consts::FRAC_PI_3;
+
+    /// Cameras around the origin of a deep band, looking various ways: the
+    /// configuration the client renders the galaxy with.
+    fn cameras() -> Vec<(WorldPos, [f32; 3])> {
+        let at = |m: [f64; 3]| WorldPos::from_f64_metres_around(WorldPos::ZERO, m);
+        vec![
+            (at([0.0, 0.0, -5.0e4]), [0.0, 0.0, 1.0]),
+            (at([1.0e3, 2.0e2, -4.0e4]), [0.2, 0.0, 0.98]),
+            (at([3.0e3, 1.0e2, 2.0e3]), [0.0, 0.0, 1.0]),
+            (at([-7.0e5, 3.0e4, 9.0e5]), [0.6, -0.1, -0.8]),
+            (at([12.0, -40.0, 7.0]), [0.0, 1.0, 0.0]),
+        ]
+    }
+
+    /// The eight depth-`depth` nodes meeting at the world origin.
+    fn roots(depth: u8) -> impl Iterator<Item = NodeRef> {
+        (0..8i64).map(move |o| NodeRef::new(depth, [-(o & 1), -((o >> 1) & 1), -((o >> 2) & 1)]))
+    }
+
+    /// Looking into open space through a deep band must not walk the whole
+    /// band: the leaf budget bounds the frontier, so the candidate list stays
+    /// within a small multiple of `MAX_SELECTED`. (It used to be ~800 000
+    /// nodes per root for the first camera here.)
+    #[test]
+    fn deep_band_traversal_is_bounded_by_the_leaf_budget() {
+        let sel = LodSelector::new(30, 63, 8.0);
+        for (camera, dir) in cameras() {
+            for root in roots(sel.min_depth) {
+                let candidates = sel.candidates_from(root, camera, dir, FOV);
+                let set: HashSet<NodeRef> = candidates.iter().copied().collect();
+                assert_eq!(set.len(), candidates.len(), "no node is visited twice");
+                let leaves = candidates
+                    .iter()
+                    .filter(|n| {
+                        octree::children(**n)
+                            .is_none_or(|kids| kids.iter().all(|k| !set.contains(k)))
+                    })
+                    .count();
+                assert!(leaves <= MAX_SELECTED, "{leaves} leaves");
+                // Every refinement that keeps a child adds at least one leaf
+                // per level of the band at worst; in practice ~8/7 nodes per
+                // leaf. Two per leaf is a comfortable, still tight ceiling.
+                assert!(
+                    candidates.len() <= 2 * MAX_SELECTED,
+                    "{} candidates for {root:?}",
+                    candidates.len()
+                );
+            }
+        }
+    }
+
+    /// `select_from` is `select` over `candidates_from`, node for node.
+    #[test]
+    fn select_from_matches_select_over_the_candidates() {
+        for sel in [
+            LodSelector::new(30, 63, 8.0),
+            LodSelector::new(54, 58, 32.0),
+        ] {
+            for (camera, dir) in cameras() {
+                for root in roots(sel.min_depth) {
+                    let candidates = sel.candidates_from(root, camera, dir, FOV);
+                    let two_pass = sel.select(&candidates, camera, FOV);
+                    let one_pass = sel.select_from(root, camera, dir, FOV);
+                    assert_eq!(one_pass, two_pass, "{root:?} from {camera:?}");
+                    assert!(one_pass.len() <= MAX_SELECTED);
+                }
+            }
+        }
+    }
+
+    /// `select` stays within `MAX_SELECTED` for *any* candidate list, not only
+    /// one produced by `candidates`: here a complete 5-level tree (32 768
+    /// leaves) with a camera close enough that every node wants refining.
+    #[test]
+    fn select_is_bounded_for_an_oversized_candidate_tree() {
+        let sel = LodSelector::new(50, 55, 0.001);
+        let root = NodeRef::new(50, [0, 0, 0]);
+        let mut tree = vec![root];
+        let mut level = vec![root];
+        for _ in 0..5 {
+            level = level
+                .iter()
+                .flat_map(|n| octree::children(*n).into_iter().flatten())
+                .collect();
+            tree.extend_from_slice(&level);
+        }
+        assert_eq!(level.len(), 32_768);
+        let camera = root.center();
+        let selected = sel.select(&tree, camera, FOV);
+        assert!(selected.len() <= MAX_SELECTED, "{}", selected.len());
+        // Coverage: every leaf is selected or has a selected ancestor.
+        let chosen: HashSet<NodeRef> = selected.iter().copied().collect();
+        for leaf in &level {
+            let mut node = *leaf;
+            let mut covered = chosen.contains(&node);
+            while !covered {
+                match octree::parent(node) {
+                    Some(parent) if parent.depth >= root.depth => {
+                        node = parent;
+                        covered = chosen.contains(&node);
+                    }
+                    _ => break,
+                }
+            }
+            assert!(covered, "{leaf:?} lost its cover");
+        }
+    }
+
+    /// A huge public `split_levels` must not overflow the error shift.
+    #[test]
+    fn geometric_error_tolerates_any_split_level() {
+        let mut sel = LodSelector::new(50, 60, 16.0);
+        sel.split_levels = 40;
+        assert!(sel.geometric_error(50) > 0.0);
+        sel.split_levels = u32::MAX;
+        assert!(sel.geometric_error(50) > 0.0);
+    }
 }
