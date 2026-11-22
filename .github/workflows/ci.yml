@@ -131,10 +131,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: cargo xtask ci
-        run: cargo xtask ci
+      - name: cargo run -p xtask -- ci
+        run: cargo run -p xtask -- ci
 
-  # The browser viewer is a wasm cdylib; `cargo xtask ci` only checks it as a
+  # The browser viewer is a wasm cdylib; the xtask ci only checks it as a
   # native rlib, so build it for the real target too. Build only: there is no
   # browser in this job (wasm-bindgen glue is a manual step, see
   # crates/space-viewer/README.md).
