@@ -2208,10 +2208,14 @@ name = "space-client"
 version = "0.0.0"
 dependencies = [
  "env_logger",
+ "futures-util",
  "log",
  "raw-window-handle",
  "space-render",
+ "space-stream",
  "space-world",
+ "tokio",
+ "tokio-tungstenite",
  "winit",
 ]
 
