@@ -279,7 +279,7 @@ mod tests {
             PersistentShardIdAllocator::with_sink(1, Box::new(MemoryCounterSink::default()));
         let mut seen = Vec::new();
         for _ in 0..1_000 {
-            seen.push(alloc.allocate());
+            seen.push(alloc.allocate().unwrap());
         }
         for pair in seen.windows(2) {
             assert!(pair[0] < pair[1], "{pair:?} is not strictly increasing");
