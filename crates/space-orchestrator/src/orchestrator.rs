@@ -168,7 +168,7 @@ impl<L: Launcher> Orchestrator<L> {
 
     /// Record an `EpochAck` carried on the wire (the shard fills `shard`).
     pub fn handle_epoch_ack_message(&mut self, ack: &EpochAck) {
-        self.handle_epoch_ack(ack.shard);
+        self.handle_epoch_ack(ack.shard, ack.epoch);
     }
 
     /// Handle an `AdminCommand`, returning the reply to send.
