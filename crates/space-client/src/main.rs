@@ -401,21 +401,77 @@ mod tests {
 
     /// The windowed path renders through `render_frame_gpu` with the same
     /// options as the offline demo: every preset (including the SSR/refraction
-    /// presets) must render cleanly through it and carry the preset into the
-    /// frame, with zero validation messages.
+    /// presets) must render cleanly through it, carry the preset into the frame
+    /// with zero validation messages, produce the same pixels as the offscreen
+    /// path, and actually *differ* per preset: High/Medium show the SSR
+    /// reflection and fog that Low/Ci (identical to each other) do not, and
+    /// High's denser fog differs from Medium's.
     #[test]
     fn every_preset_renders_through_the_swapchain_frame_path() {
         let Ok(ctx) = RenderContext::new(&ContextOptions::default()) else {
             eprintln!("SKIP: no Vulkan device");
             return;
         };
+        assert!(
+            std::env::var("SPACE_RENDER_VALIDATION").as_deref() != Ok("1")
+                || ctx.validation_active(),
+            "SPACE_RENDER_VALIDATION=1 but VK_LAYER_KHRONOS_validation is not active"
+        );
         let size = 64;
-        let scene = demo_scene(size, size);
-        for preset in QualityPreset::ALL {
+        let camera = CameraPose {
+            position: WorldPos::ZERO,
+            forward: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            fov_y: std::f32::consts::FRAC_PI_3,
+            aspect: 1.0,
+            near: 0.05,
+            far: 1.0e5,
+        };
+        let instance = |center: [f32; 4], albedo: [f32; 4], emissive: [f32; 4], shape| {
+            space_render::GpuInstance {
+                center,
+                albedo,
+                emissive,
+                roughness: 0.1,
+                shape,
+                transmission: 0.0,
+                _pad1: 0.0,
+            }
+        };
+        // SSR scene: a smooth metallic floor under a bright red sphere.
+        let mirror = Scene::from_instances(
+            camera,
+            vec![
+                instance(
+                    [0.0, -101.0, 0.0, 100.0],
+                    [0.8, 0.8, 0.8, 1.0],
+                    [0.0; 4],
+                    space_render::SHAPE_BOX,
+                ),
+                instance(
+                    [0.0, -0.4, -6.0, 0.5],
+                    [0.0; 4],
+                    [6.0, 0.0, 0.0, 1.0],
+                    space_render::SHAPE_SPHERE,
+                ),
+            ],
+        );
+        // Fog scene: a big bright sphere 800 m away.
+        let far = Scene::from_instances(
+            camera,
+            vec![instance(
+                [0.0, 0.0, -800.0, 100.0],
+                [1.0, 1.0, 1.0, 0.0],
+                [4.0, 4.0, 4.0, 1.0],
+                space_render::SHAPE_SPHERE,
+            )],
+        );
+
+        let render = |scene: &Scene, preset: QualityPreset| {
             let options = demo_options(preset);
             assert_eq!(options.preset, preset);
             let (out, frame) = ctx
-                .render_frame_gpu(&scene, size, size, &options)
+                .render_frame_gpu(scene, size, size, &options)
                 .expect("frame render");
             drop(frame);
             assert_eq!(out.validation_messages, 0, "{preset}");
@@ -423,6 +479,19 @@ mod tests {
                 out.pixels.as_chunks::<4>().0.iter().any(|px| px[0] > 8),
                 "{preset}: nothing rendered"
             );
+            // The swapchain-path frame is the offscreen frame.
+            let offscreen = ctx
+                .render_offscreen(scene, size, size, &options)
+                .expect("offscreen render");
+            assert_eq!(out.pixels, offscreen.pixels, "{preset}: frame path != offscreen");
+            out.pixels
+        };
+        for scene in [&mirror, &far] {
+            let [high, medium, low, ci] = QualityPreset::ALL.map(|p| render(scene, p));
+            assert_eq!(low, ci, "Low and Ci have every optional feature off");
+            assert_ne!(high, ci, "High must differ from Ci");
+            assert_ne!(medium, ci, "Medium must differ from Ci");
+            assert_ne!(high, medium, "High and Medium must differ");
         }
     }
 
