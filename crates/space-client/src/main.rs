@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use space_render::{
     demo_scene, CameraPose, ContextOptions, Quality, QualityPreset, RenderContext, RenderError,
-    RenderOptions, Scene, Swapchain, WindowHandles,
+    RenderOptions, Scene, SceneLight, Swapchain, WindowHandles,
 };
 use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 use winit::application::ApplicationHandler;
@@ -173,14 +173,25 @@ fn galaxy_scene(width: u32, height: u32) -> Scene {
     galaxy_scene_at(&galaxy_camera(width, height))
 }
 
+/// Where the player spawns in the galaxy scene (the base camera's position).
+const GALAXY_SPAWN_M: [f64; 3] = [0.0, 0.0, -5.0e4];
+/// The spawn view direction (the stream starts turned to face the galaxy, +Z).
+const GALAXY_SPAWN_FORWARD: [f32; 3] = [0.0, 0.0, 1.0];
+/// The spawn cube sits this far in front of the spawn point, metres.
+const SPAWN_CUBE_DISTANCE_M: f64 = 12.0;
+/// Distance from the spawn cube's centre to each face, metres.
+const SPAWN_CUBE_HALF_M: f32 = 2.0;
+/// The spawn cube's colour (linear rgb): magenta, absent from the star field.
+const SPAWN_CUBE_COLOR: [f32; 3] = [1.0, 0.05, 0.8];
+
 /// The galaxy scene's base camera.
 fn galaxy_camera(width: u32, height: u32) -> CameraPose {
     // Same camera as the `lod_galaxy_renders` GPU test: pulled back along -Z and
     // looking back (+Z) at the galaxy's centre at the origin, so the LOD selector
     // refines a dense band of the octree around the camera.
     CameraPose {
-        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [0.0, 0.0, -5.0e4]),
-        forward: [0.0, 0.0, 1.0],
+        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, GALAXY_SPAWN_M),
+        forward: GALAXY_SPAWN_FORWARD,
         up: [0.0, 1.0, 0.0],
         fov_y: std::f32::consts::FRAC_PI_3,
         aspect: width as f32 / height as f32,
@@ -214,8 +225,28 @@ fn galaxy_scene_at(camera: &CameraPose) -> Scene {
         );
         da.total_cmp(&db)
     });
-    selected.truncate(MAX_SELECTED);
-    Scene::from_selection(&galaxy, camera, &selected)
+    // Leave room for the spawn cube.
+    selected.truncate(MAX_SELECTED - 1);
+    let mut scene = Scene::from_selection(&galaxy, camera, &selected);
+    // A lit cube a short distance in front of the spawn point, in world space so
+    // it stays put when the camera moves.
+    let spawn = WorldPos::from_f64_metres_around(WorldPos::ZERO, GALAXY_SPAWN_M);
+    let cube = WorldPos::from_f64_metres_around(
+        spawn,
+        GALAXY_SPAWN_FORWARD.map(|c| f64::from(c) * SPAWN_CUBE_DISTANCE_M),
+    );
+    let d = WorldPos::delta(camera.position, cube);
+    scene.push_box(
+        [d[0] as f32, d[1] as f32, d[2] as f32],
+        SPAWN_CUBE_HALF_M,
+        SPAWN_CUBE_COLOR,
+    );
+    let light = WorldPos::from_f64_metres_around(cube, [4.0, 5.0, -6.0]);
+    scene.with_lights(vec![SceneLight {
+        position: light,
+        color: [1.0, 1.0, 1.0],
+        intensity: 60.0,
+    }])
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
@@ -609,6 +640,19 @@ mod tests {
     fn galaxy_scene_is_bounded() {
         let scene = galaxy_scene(64, 64);
         assert!(scene.instances.len() <= space_world::MAX_SELECTED);
+    }
+
+    /// The spawn cube is the last instance: a box straight ahead (+Z) of the
+    /// spawn camera at `SPAWN_CUBE_DISTANCE_M`.
+    #[test]
+    fn galaxy_scene_has_a_cube_in_front_of_the_spawn_camera() {
+        let scene = galaxy_scene(64, 64);
+        let cube = scene.instances.last().expect("cube instance");
+        assert_eq!(cube.shape, space_render::SHAPE_BOX);
+        assert_eq!(scene.instances.len(), scene.meshes.len());
+        assert!(cube.center[0].abs() < 1e-3 && cube.center[1].abs() < 1e-3);
+        assert!((f64::from(cube.center[2]) - SPAWN_CUBE_DISTANCE_M).abs() < 1e-3);
+        assert_eq!(cube.center[3], SPAWN_CUBE_HALF_M);
     }
 
     /// `write_ppm` emits a valid P6 header and one RGB triple per pixel.
