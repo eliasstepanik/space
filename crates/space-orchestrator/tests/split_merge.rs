@@ -181,14 +181,16 @@ fn a_split_stages_a_spawn_and_the_commit_publishes_the_child_region() {
         if !spawns.is_empty() {
             staged_child = Some(spawns[0].shard);
             // Ack the prepare so the epoch commits.
-            let recipients: Vec<ShardId> = orch
+            let recipients: Vec<(ShardId, u64)> = orch
                 .drain_outbox()
                 .into_iter()
-                .filter(|(_, m)| matches!(m, Message::EpochPrepare(_)))
-                .map(|(to, _)| to)
+                .filter_map(|(to, m)| match m {
+                    Message::EpochPrepare(p) => Some((to, p.epoch)),
+                    _ => None,
+                })
                 .collect();
-            for r in recipients {
-                orch.handle_epoch_ack(r);
+            for (r, epoch) in recipients {
+                orch.handle_epoch_ack(r, epoch);
             }
             break;
         }
@@ -230,14 +232,16 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
                 kills.contains(&shard(2)),
                 "the cold child is staged for kill"
             );
-            let recipients: Vec<ShardId> = orch
+            let recipients: Vec<(ShardId, u64)> = orch
                 .drain_outbox()
                 .into_iter()
-                .filter(|(_, m)| matches!(m, Message::EpochPrepare(_)))
-                .map(|(to, _)| to)
+                .filter_map(|(to, m)| match m {
+                    Message::EpochPrepare(p) => Some((to, p.epoch)),
+                    _ => None,
+                })
                 .collect();
-            for r in recipients {
-                orch.handle_epoch_ack(r);
+            for (r, epoch) in recipients {
+                orch.handle_epoch_ack(r, epoch);
             }
             break;
         }
