@@ -107,7 +107,7 @@ mod tests {
         let alloc = ShardIdAllocator::new(1);
         let mut seen = Vec::new();
         for _ in 0..1_000 {
-            seen.push(alloc.allocate());
+            seen.push(alloc.allocate().expect("id space not exhausted"));
         }
         // Strictly increasing, no duplicates — including after the "holder" of
         // an id is gone, because there is nothing that hands an id back.
