@@ -340,6 +340,56 @@ mod tests {
         assert_eq!(s.thrust(), [0.0; 3]);
     }
 
+    /// A viewer that disconnects while holding a key must not leave the ship
+    /// thrusting: once `viewer_count()` is 0 the pump releases every held key.
+    #[test]
+    fn held_keys_are_released_when_the_last_viewer_disconnects() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+            let addr = server.local_addr();
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp)
+                .await
+                .unwrap();
+            ws.send(Message::Binary(key(Key::Forward, true).encode().into()))
+                .await
+                .unwrap();
+
+            let mut input = InputState::default();
+            let mut thrusting = false;
+            for _ in 0..200 {
+                pump_input(&client, &mut input, None);
+                if input.thrust() != [0.0; 3] {
+                    thrusting = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(thrusting, "the held key never produced thrust");
+            assert_eq!(client.viewer_count(), 1);
+            pump_input(&client, &mut input, None);
+            assert_ne!(input.thrust(), [0.0; 3], "still held while connected");
+
+            // The viewer vanishes without sending a key-up.
+            drop(ws);
+            for _ in 0..200 {
+                if client.viewer_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(client.viewer_count(), 0, "viewer slot never freed");
+            pump_input(&client, &mut input, None);
+            assert_eq!(input.thrust(), [0.0; 3], "ship keeps thrusting");
+            drop(server);
+        });
+    }
+
     #[test]
     fn view_pitch_is_clamped_and_pointer_recorded() {
         let mut s = InputState::default();
