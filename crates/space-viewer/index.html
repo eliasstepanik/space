@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>space viewer</title>
+<style>body{margin:0;background:#111;color:#eee;font:14px monospace}canvas{display:block}</style>
+<!-- Build: see README.md. Serve this directory over http and open
+     index.html?ws=ws://127.0.0.1:8099 (the `space-client --stream` address). -->
+<canvas id="c" width="640" height="480"></canvas>
+<script type="module">
+  import init, { start } from "./pkg/space_viewer.js";
+  const url = new URLSearchParams(location.search).get("ws") ?? "ws://127.0.0.1:8099";
+  await init();
+  start("c", url);
+</script>
