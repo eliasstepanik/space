@@ -425,6 +425,10 @@ impl ApplicationHandler for App {
                             self.failed = true;
                             event_loop.exit();
                         } else {
+                            self.frames += 1;
+                            if self.frames <= 3 || self.frames % 300 == 0 {
+                                eprintln!("space-client: presented frame {}", self.frames);
+                            }
                             let _ = window;
                         }
                     }
