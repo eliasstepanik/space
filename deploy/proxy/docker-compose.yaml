@@ -102,8 +102,6 @@ services:
       space:
         ipv4_address: 172.29.0.13
     restart: unless-stopped
-=======
->>>>>>> refs/remotes/origin/main
 
 networks:
   space:
