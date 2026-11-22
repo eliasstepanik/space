@@ -500,12 +500,13 @@ mod tests {
         };
         let (first, second) = (hello(9_000), hello(9_001));
         plane.handle_shard_hello(&first).expect("first adopts");
+        let after_adoption = plane.ids.peek();
         assert!(
             plane.handle_shard_hello(&second).is_err(),
             "the root is already claimed by a live shard"
         );
         // The refusal burned no id.
-        assert_eq!(plane.ids.peek(), 1);
+        assert_eq!(plane.ids.peek(), after_adoption);
     }
 
     #[test]
