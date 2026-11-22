@@ -289,7 +289,13 @@ impl Swapchain {
         };
         let present_ready = unsafe {
             ctx.device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
+                // Created SIGNALED: the first `present` waits on this fence before
+                // anything has been submitted, so an unsignaled fence would block
+                // the main thread forever (the "not responding" freeze).
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
                 .map_err(|e| RenderError::new(format!("create_fence: {e}")))?
         };
         // One primary command buffer for the whole lifetime of the swapchain:
