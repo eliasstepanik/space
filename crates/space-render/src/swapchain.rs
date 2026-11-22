@@ -356,7 +356,7 @@ impl Swapchain {
                 .acquire_next_image2(
                     &vk::AcquireNextImageInfoKHR::default()
                         .swapchain(self.handle)
-                        .timeout(u64::MAX)
+                        .timeout(PRESENT_TIMEOUT_NS)
                         .semaphore(self.image_ready)
                         .fence(vk::Fence::null()),
                 )
