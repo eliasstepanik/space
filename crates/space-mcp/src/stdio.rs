@@ -66,24 +66,36 @@ mod tests {
         ));
         let server = McpServer::new("t", "0", registry);
         let input = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#, "\n",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello"}}"#, "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello"}}"#,
+            "\n",
             "garbage\n",
             r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#,
         );
         let mut out = Vec::new();
-        serve_stdio(&server, input.as_bytes(), &mut out).await.unwrap();
+        serve_stdio(&server, input.as_bytes(), &mut out)
+            .await
+            .unwrap();
         let text = String::from_utf8(out).unwrap();
-        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         // The notification and the blank line produce no output.
         assert_eq!(lines.len(), 5, "{text}");
         assert_eq!(lines[0]["result"]["serverInfo"]["name"], "t");
         assert_eq!(lines[1]["result"]["tools"][0]["name"], "hello");
         assert_eq!(lines[2]["result"]["content"][0]["text"], "hello");
         assert_eq!(lines[3]["error"]["code"], -32700);
-        assert_eq!((lines[4]["id"].clone(), lines[4]["result"].clone()), (json!(4), json!({})));
+        assert_eq!(
+            (lines[4]["id"].clone(), lines[4]["result"].clone()),
+            (json!(4), json!({}))
+        );
     }
 }

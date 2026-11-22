@@ -21,7 +21,11 @@ pub struct McpServer {
 impl McpServer {
     /// A server called `name` (reported in `serverInfo`) offering `registry`.
     #[must_use]
-    pub fn new(name: impl Into<String>, version: impl Into<String>, registry: ToolRegistry) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        registry: ToolRegistry,
+    ) -> Self {
         Self {
             name: name.into(),
             version: version.into(),
@@ -156,7 +160,11 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_without_params_is_invalid_params() {
-        let v = rpc(&server(), r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
+        let v = rpc(
+            &server(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        )
+        .await;
         assert_eq!(v["error"]["code"], INVALID_PARAMS);
     }
 
@@ -175,7 +183,11 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_names_descriptions_and_schemas() {
-        let v = rpc(&server(), r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#).await;
+        let v = rpc(
+            &server(),
+            r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#,
+        )
+        .await;
         assert_eq!(v["id"], "a");
         let tools = v["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -242,7 +254,11 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_is_32601_and_bad_json_is_32700() {
-        let v = rpc(&server(), r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#).await;
+        let v = rpc(
+            &server(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#,
+        )
+        .await;
         assert_eq!(v["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(v["id"], 1);
         let v = rpc(&server(), "{oops").await;

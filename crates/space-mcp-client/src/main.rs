@@ -21,7 +21,8 @@ fn main() -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    let (transport, rest) = space_mcp::parse_transport(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let (transport, rest) =
+        space_mcp::parse_transport(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     let mut out_dir = std::env::temp_dir();
     let mut rest = rest.into_iter();
     while let Some(arg) = rest.next() {
@@ -39,5 +40,8 @@ fn main() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    runtime.block_on(space_mcp::run(mcp_server(&ClientState::new(out_dir)), transport))
+    runtime.block_on(space_mcp::run(
+        mcp_server(&ClientState::new(out_dir)),
+        transport,
+    ))
 }

@@ -71,7 +71,9 @@ impl Response {
     pub fn to_value(&self) -> Value {
         match &self.outcome {
             Ok(result) => json!({"jsonrpc": "2.0", "id": self.id, "result": result}),
-            Err(e) => json!({"jsonrpc": "2.0", "id": self.id, "error": {"code": e.code, "message": e.message}}),
+            Err(e) => {
+                json!({"jsonrpc": "2.0", "id": self.id, "error": {"code": e.code, "message": e.message}})
+            }
         }
     }
 
@@ -146,7 +148,10 @@ pub fn parse_message(bytes: &[u8]) -> Result<Parsed, Response> {
         return Err(invalid(id.unwrap_or(Value::Null), "missing method"));
     };
     let Value::String(method) = method else {
-        return Err(invalid(id.unwrap_or(Value::Null), "method must be a string"));
+        return Err(invalid(
+            id.unwrap_or(Value::Null),
+            "method must be a string",
+        ));
     };
     Ok(Parsed::Message(Incoming {
         id,

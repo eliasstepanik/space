@@ -22,8 +22,8 @@ use space_stream::protocol::{FLAG_DOWNSCALED, FLAG_KEYFRAME};
 use space_stream::{JpegEncoder, Key, StreamClient, StreamServer, ViewerInput};
 use space_world::WorldPos;
 
-use space_client::link::ServerLink;
 use crate::{demo_options, Config, Mode};
+use space_client::link::ServerLink;
 
 /// Target stream frame rate.
 const FRAME_BUDGET: Duration = Duration::from_millis(33);

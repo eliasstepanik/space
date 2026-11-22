@@ -361,5 +361,9 @@ fn advance_ticks(h: Arc<ShardHarness>, args: Value) -> BoxFuture<Result<String, 
 /// The complete MCP server for `harness`.
 #[must_use]
 pub fn mcp_server(harness: &Arc<ShardHarness>) -> McpServer {
-    McpServer::new("space-mcp-server", env!("CARGO_PKG_VERSION"), registry(harness))
+    McpServer::new(
+        "space-mcp-server",
+        env!("CARGO_PKG_VERSION"),
+        registry(harness),
+    )
 }

@@ -161,7 +161,8 @@ pub struct Request {
 ///
 /// `400` for anything malformed, `505` for an HTTP version other than 1.0/1.1.
 pub fn parse_head(head: &[u8]) -> Result<RequestHead, HttpError> {
-    let text = std::str::from_utf8(head).map_err(|_| HttpError::new(400, "request is not UTF-8"))?;
+    let text =
+        std::str::from_utf8(head).map_err(|_| HttpError::new(400, "request is not UTF-8"))?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
@@ -422,7 +423,10 @@ fn origin_allowed(origin: &str) -> bool {
     };
     let authority = rest.split('/').next().unwrap_or("");
     let host = if authority.starts_with('[') {
-        authority.split(']').next().map_or("", |h| &authority[..h.len() + 1])
+        authority
+            .split(']')
+            .next()
+            .map_or("", |h| &authority[..h.len() + 1])
     } else {
         authority.split(':').next().unwrap_or("")
     };
@@ -517,8 +521,11 @@ impl HttpTransport {
             return HttpError::new(415, "Content-Type must be application/json").into_response();
         }
         let Some(format) = negotiate(head.header("accept")) else {
-            return HttpError::new(406, "Accept must allow application/json or text/event-stream")
-                .into_response();
+            return HttpError::new(
+                406,
+                "Accept must allow application/json or text/event-stream",
+            )
+            .into_response();
         };
         let message = match crate::jsonrpc::parse_message(&request.body) {
             Err(error) => return HttpResponse::json(400, &error),
@@ -616,7 +623,10 @@ mod tests {
         assert_eq!((h.method.as_str(), h.target.as_str()), ("POST", "/mcp?x=1"));
         assert_eq!(h.path(), "/mcp");
         assert_eq!(h.header("host"), Some("localhost"));
-        assert_eq!(h.header("accept"), Some("application/json, text/event-stream"));
+        assert_eq!(
+            h.header("accept"),
+            Some("application/json, text/event-stream")
+        );
         assert_eq!(h.content_length(), Ok(Some(12)));
     }
 
@@ -639,7 +649,11 @@ mod tests {
 
     #[test]
     fn content_length_is_validated() {
-        let cl = |v: &str| head(&format!("POST /mcp HTTP/1.1\r\nContent-Length: {v}")).unwrap().content_length();
+        let cl = |v: &str| {
+            head(&format!("POST /mcp HTTP/1.1\r\nContent-Length: {v}"))
+                .unwrap()
+                .content_length()
+        };
         assert_eq!(cl("0"), Ok(Some(0)));
         assert_eq!(cl("-1").unwrap_err().status, 400);
         assert_eq!(cl("1x").unwrap_err().status, 400);
@@ -688,9 +702,12 @@ mod tests {
     #[tokio::test]
     async fn oversized_bodies_are_rejected_before_being_read() {
         // Only the head is sent: a 413 means the body was never awaited.
-        let e = read(b"POST /mcp HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n", MAX_BODY)
-            .await
-            .unwrap_err();
+        let e = read(
+            b"POST /mcp HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n",
+            MAX_BODY,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.status, 413);
         let ok = read(b"POST /mcp HTTP/1.1\r\nContent-Length: 0\r\n\r\n", MAX_BODY).await;
         assert!(ok.unwrap().unwrap().body.is_empty());
@@ -701,7 +718,10 @@ mod tests {
         assert_eq!(read(b"", 10).await.unwrap(), None);
         assert_eq!(read(b"POST /mcp HTT", 10).await.unwrap_err().status, 400);
         assert_eq!(
-            read(b"POST /mcp HTTP/1.1\r\n\r\n", 10).await.unwrap_err().status,
+            read(b"POST /mcp HTTP/1.1\r\n\r\n", 10)
+                .await
+                .unwrap_err()
+                .status,
             411
         );
         assert_eq!(
@@ -711,10 +731,16 @@ mod tests {
                 .status,
             400
         );
-        let huge = format!("GET /mcp HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD + 100));
+        let huge = format!(
+            "GET /mcp HTTP/1.1\r\nX: {}\r\n\r\n",
+            "a".repeat(MAX_HEAD + 100)
+        );
         assert_eq!(read(huge.as_bytes(), 10).await.unwrap_err().status, 431);
         let no_terminator = format!("GET /mcp HTTP/1.1\r\nX: {}", "a".repeat(MAX_HEAD + 100));
-        assert_eq!(read(no_terminator.as_bytes(), 10).await.unwrap_err().status, 431);
+        assert_eq!(
+            read(no_terminator.as_bytes(), 10).await.unwrap_err().status,
+            431
+        );
     }
 
     #[tokio::test]
@@ -755,7 +781,10 @@ mod tests {
         let bytes = String::from_utf8(HttpResponse::json(200, &r).to_bytes()).unwrap();
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         assert!(bytes.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"));
-        assert!(bytes.contains(&format!("Content-Length: {}\r\n", body.len())), "{bytes}");
+        assert!(
+            bytes.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{bytes}"
+        );
         assert!(bytes.ends_with(&format!("\r\n\r\n{body}")), "{bytes}");
     }
 
@@ -796,9 +825,16 @@ mod tests {
     fn post(body: &str, headers: &[(&str, &str)]) -> Request {
         let mut h = vec![
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("accept".to_owned(), "application/json, text/event-stream".to_owned()),
+            (
+                "accept".to_owned(),
+                "application/json, text/event-stream".to_owned(),
+            ),
         ];
-        h.extend(headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())));
+        h.extend(
+            headers
+                .iter()
+                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned())),
+        );
         Request {
             head: RequestHead {
                 method: "POST".into(),
@@ -818,7 +854,10 @@ mod tests {
         let init = t.handle(post(INIT, &[])).await;
         assert_eq!(init.status, 200);
         assert_eq!(init.header("content-type"), Some("application/json"));
-        let session = init.header("mcp-session-id").expect("session id").to_owned();
+        let session = init
+            .header("mcp-session-id")
+            .expect("session id")
+            .to_owned();
         assert_eq!(session.len(), 32);
         assert_eq!(t.session_count(), 1);
 
@@ -845,7 +884,12 @@ mod tests {
         let t = transport();
         let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         assert_eq!(t.handle(post(note, &[])).await.status, 400);
-        let session = t.handle(post(INIT, &[])).await.header("mcp-session-id").unwrap().to_owned();
+        let session = t
+            .handle(post(INIT, &[]))
+            .await
+            .header("mcp-session-id")
+            .unwrap()
+            .to_owned();
         let r = t.handle(post(note, &[("mcp-session-id", &session)])).await;
         assert_eq!((r.status, r.body.len()), (202, 0));
     }
@@ -855,7 +899,9 @@ mod tests {
         let t = transport();
         let mut req = post(INIT, &[]);
         req.head.headers.retain(|(n, _)| n != "accept");
-        req.head.headers.push(("accept".into(), "text/event-stream".into()));
+        req.head
+            .headers
+            .push(("accept".into(), "text/event-stream".into()));
         let r = t.handle(req).await;
         assert_eq!(r.header("content-type"), Some("text/event-stream"));
         assert!(r.header("mcp-session-id").is_some());
@@ -870,14 +916,28 @@ mod tests {
         // bad JSON → 400 + -32700
         let r = t.handle(post("{nope", &[])).await;
         assert_eq!(r.status, 400);
-        assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"], -32700);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"],
+            -32700
+        );
         // unknown method after init is a JSON-RPC error inside a 200
-        let session = t.handle(post(INIT, &[])).await.header("mcp-session-id").unwrap().to_owned();
+        let session = t
+            .handle(post(INIT, &[]))
+            .await
+            .header("mcp-session-id")
+            .unwrap()
+            .to_owned();
         let r = t
-            .handle(post(r#"{"jsonrpc":"2.0","id":3,"method":"x/y"}"#, &[("mcp-session-id", &session)]))
+            .handle(post(
+                r#"{"jsonrpc":"2.0","id":3,"method":"x/y"}"#,
+                &[("mcp-session-id", &session)],
+            ))
             .await;
         assert_eq!(r.status, 200);
-        assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"], -32601);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"],
+            -32601
+        );
         // wrong path / method / content type / accept / origin
         let mut wrong_path = post(INIT, &[]);
         wrong_path.head.target = "/other".into();
@@ -889,24 +949,51 @@ mod tests {
         let mut put = post("", &[]);
         put.head.method = "PUT".into();
         assert_eq!(t.handle(put).await.status, 405);
-        assert_eq!(t.handle(post(INIT, &[("content-type", "text/plain")])).await.status, 415);
+        assert_eq!(
+            t.handle(post(INIT, &[("content-type", "text/plain")]))
+                .await
+                .status,
+            415
+        );
         let mut html = post(INIT, &[]);
         html.head.headers.retain(|(n, _)| n != "accept");
-        html.head.headers.push(("accept".into(), "text/html".into()));
+        html.head
+            .headers
+            .push(("accept".into(), "text/html".into()));
         assert_eq!(t.handle(html).await.status, 406);
-        assert_eq!(t.handle(post(INIT, &[("origin", "http://evil.example")])).await.status, 403);
-        assert_eq!(t.handle(post(INIT, &[("origin", "http://localhost:5173")])).await.status, 200);
+        assert_eq!(
+            t.handle(post(INIT, &[("origin", "http://evil.example")]))
+                .await
+                .status,
+            403
+        );
+        assert_eq!(
+            t.handle(post(INIT, &[("origin", "http://localhost:5173")]))
+                .await
+                .status,
+            200
+        );
     }
 
     #[tokio::test]
     async fn delete_ends_a_session() {
         let t = transport();
-        let session = t.handle(post(INIT, &[])).await.header("mcp-session-id").unwrap().to_owned();
+        let session = t
+            .handle(post(INIT, &[]))
+            .await
+            .header("mcp-session-id")
+            .unwrap()
+            .to_owned();
         let mut del = post("", &[("mcp-session-id", &session)]);
         del.head.method = "DELETE".into();
         assert_eq!(t.handle(del.clone()).await.status, 200);
         assert_eq!(t.handle(del).await.status, 400);
-        assert_eq!(t.handle(post(LIST, &[("mcp-session-id", &session)])).await.status, 400);
+        assert_eq!(
+            t.handle(post(LIST, &[("mcp-session-id", &session)]))
+                .await
+                .status,
+            400
+        );
     }
 
     // ---- the real socket path
@@ -933,9 +1020,16 @@ mod tests {
         let resp = raw(addr, req.as_bytes()).await;
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Mcp-Session-Id: "), "{resp}");
-        assert!(resp.contains("\"protocolVersion\":\"2025-06-18\""), "{resp}");
+        assert!(
+            resp.contains("\"protocolVersion\":\"2025-06-18\""),
+            "{resp}"
+        );
 
-        let resp = raw(addr, b"POST /mcp HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n").await;
+        let resp = raw(
+            addr,
+            b"POST /mcp HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n",
+        )
+        .await;
         assert!(resp.starts_with("HTTP/1.1 413 "), "{resp}");
         let resp = raw(addr, b"GARBAGE\r\n\r\n").await;
         assert!(resp.starts_with("HTTP/1.1 400 "), "{resp}");

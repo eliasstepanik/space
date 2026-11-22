@@ -50,11 +50,10 @@ pub fn parse_transport(args: &[String]) -> Result<(Transport, Vec<String>), Stri
         let chosen = match arg.as_str() {
             "--stdio" => Transport::Stdio,
             "--http" => {
-                let addr = iter.next().ok_or("--http needs an address, e.g. 127.0.0.1:8765")?;
-                Transport::Http(
-                    addr.parse()
-                        .map_err(|e| format!("--http {addr:?}: {e}"))?,
-                )
+                let addr = iter
+                    .next()
+                    .ok_or("--http needs an address, e.g. 127.0.0.1:8765")?;
+                Transport::Http(addr.parse().map_err(|e| format!("--http {addr:?}: {e}"))?)
             }
             _ => {
                 rest.push(arg.clone());
@@ -82,7 +81,10 @@ pub async fn run(server: McpServer, transport: Transport) -> Result<(), String> 
                 .await
                 .map_err(|e| format!("bind {addr}: {e}"))?;
             let bound = listener.local_addr().map_err(|e| e.to_string())?;
-            eprintln!("MCP Streamable HTTP listening on http://{bound}{}", http::MCP_PATH);
+            eprintln!(
+                "MCP Streamable HTTP listening on http://{bound}{}",
+                http::MCP_PATH
+            );
             http::HttpTransport::new(Arc::new(server))
                 .serve(listener)
                 .await
@@ -107,9 +109,15 @@ mod tests {
         );
         assert_eq!(
             parse_transport(&args(&["--http", "127.0.0.1:9", "--x"])),
-            Ok((Transport::Http("127.0.0.1:9".parse().unwrap()), args(&["--x"])))
+            Ok((
+                Transport::Http("127.0.0.1:9".parse().unwrap()),
+                args(&["--x"])
+            ))
         );
-        assert_eq!(parse_transport(&args(&["--stdio"])).unwrap().0, Transport::Stdio);
+        assert_eq!(
+            parse_transport(&args(&["--stdio"])).unwrap().0,
+            Transport::Stdio
+        );
     }
 
     #[test]

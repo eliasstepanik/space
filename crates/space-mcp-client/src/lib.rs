@@ -376,5 +376,9 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
 /// The complete MCP server for `state`.
 #[must_use]
 pub fn mcp_server(state: &Arc<ClientState>) -> McpServer {
-    McpServer::new("space-mcp-client", env!("CARGO_PKG_VERSION"), registry(state))
+    McpServer::new(
+        "space-mcp-client",
+        env!("CARGO_PKG_VERSION"),
+        registry(state),
+    )
 }
