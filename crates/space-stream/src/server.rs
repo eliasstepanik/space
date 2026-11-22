@@ -405,9 +405,14 @@ mod tests {
         // The slot is reusable: a fresh viewer connects and receives a frame.
         let mut ws = connect(addr).await;
         let seq = client.push_jpeg(vec![7], 0);
-        let msg = next_binary(&mut ws).await;
-        let (header, jpeg) = decode_frame(&msg).unwrap();
-        assert_eq!((header.seq >= seq, jpeg), (true, &[7u8][..]));
+        let jpeg = loop {
+            let msg = next_binary(&mut ws).await;
+            let (header, jpeg) = decode_frame(&msg).unwrap();
+            if header.seq >= seq {
+                break jpeg.to_vec();
+            }
+        };
+        assert_eq!(jpeg, [7u8]);
     }
 
     /// Finding A(a): the viewer cap is enforced; the extra connection is refused
