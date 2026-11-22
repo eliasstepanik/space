@@ -272,9 +272,13 @@ struct App {
 }
 
 impl App {
-    fn new(config: &Config) -> Result<Self, RenderError> {
+    fn new(config: &Config, display: RawDisplayHandle) -> Result<Self, RenderError> {
+        let options = ContextOptions {
+            window_display: Some(display),
+            ..ContextOptions::default()
+        };
         Ok(Self {
-            ctx: RenderContext::new(&ContextOptions::default())?,
+            ctx: RenderContext::new(&options)?,
             config: Config {
                 mode: Mode::Window,
                 width: config.width,
