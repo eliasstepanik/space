@@ -164,6 +164,11 @@ pub mod web {
                     bitmap.close();
                 });
                 let _ = promise.then(&on_bitmap);
+                // The promise outlives this scope: dropping the closure here
+                // would make JS call a freed closure ("closure invoked after
+                // being dropped") and nothing would ever be drawn. A `once`
+                // closure frees itself after its single call.
+                on_bitmap.forget();
             });
             ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             on_message.forget();
