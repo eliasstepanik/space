@@ -735,6 +735,14 @@ fn build_uniforms(
         gi_grid_size_x: options.quality.grid,
         gi_grid_size_y: options.quality.grid,
         _pad1: 0.0,
+        fog: [
+            quality::FOG_COLOR[0],
+            quality::FOG_COLOR[1],
+            quality::FOG_COLOR[2],
+            features.fog_density,
+        ],
+        features: features.flags(),
+        _pad2: [0; 3],
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {
         // World-space light -> camera-relative f32 offset.
