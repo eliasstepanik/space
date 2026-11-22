@@ -13,7 +13,9 @@
 //!   [`quality`]) skipped entirely on the `Ci`/`Low` presets,
 //! * an **ACES tone map** into an 8-bit image,
 //! * LOD integration: the scene is built from `space-world`'s deterministic
-//!   galaxy through its LOD selector (≤ [`space_world::MAX_SELECTED`] nodes).
+//!   galaxy through its LOD selector (≤ [`space_world::MAX_SELECTED`] nodes),
+//! * **mesh models** ([`mesh`]): triangle meshes loaded from `.glb` files,
+//!   drawn through the same shading as the procedural spheres and boxes.
 //!
 //! WGSL is compiled to SPIR-V at build time with naga ≥ 30 (see `build.rs`);
 //! the ray-query shaders need `enable wgpu_ray_query;`, which naga 24 cannot
@@ -39,6 +41,7 @@
 
 pub mod alloc;
 pub mod gpu;
+pub mod mesh;
 pub mod params;
 pub mod passes;
 pub mod quality;
@@ -46,24 +49,30 @@ pub mod scene;
 pub mod swapchain;
 
 pub use gpu::{
-    validation_message_count, ContextOptions, FrameOutput, Quality, RayQuerySupport, RenderContext,
-    RenderError, RenderOptions,
+    skip_or_require_gpu, validation_message_count, ContextOptions, FrameOutput, Quality,
+    RayQuerySupport, RenderContext, RenderError, RenderOptions, MAX_FRAME_DIMENSION, MAX_GI_GRID,
+};
+pub use mesh::{
+    rotation_y, sample_ship, MeshData, MeshError, MeshMaterial, MeshPart, MeshVertex,
+    ModelInstance, IDENTITY_ROTATION,
 };
 pub use params::{
-    Camera, ForwardParams, GiParams, GpuInstance, Light, PostParams, RqParams, ToneParams,
+    Camera, ForwardParams, GiParams, GpuInstance, Light, MeshInstanceGpu, PostParams, RqParams,
+    ToneParams,
 };
 pub use quality::{ParsePresetError, QualityPreset, RenderFeatures};
 pub use scene::{
     cube_mesh, icosphere_mesh, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH, SHAPE_BOX,
     SHAPE_SPHERE, STAR_RADIUS_M,
 };
-pub use swapchain::{Swapchain, WindowHandles};
+pub use swapchain::{PresentOutcome, Swapchain, SwapchainConfig, WindowHandles};
 
 /// The renderer interface the client and any capture tool code against.
 ///
-/// It exists so the swapchain path (winit window) and the headless offscreen
-/// path (tests, pixel streaming) are interchangeable, and so a caller can be
-/// written without a single Vulkan type in its signature.
+/// It exists so a headless caller (tests, pixel streaming, capture tools) can
+/// be written without a single Vulkan type in its signature. The windowed
+/// path is [`RenderContext::render_to_swapchain`], which presents instead of
+/// reading pixels back.
 pub trait Renderer {
     /// Human-readable name of the backing device.
     fn device_name(&self) -> &str;
@@ -103,9 +112,10 @@ impl Renderer for RenderContext {
     }
 }
 
-/// A deterministic test scene (one sphere plus one cube), centred `distance` metres in front of
-/// a camera looking down `-Z`. Shared by the GPU tests and the client's
-/// `--demo` mode so both exercise the same pixels.
+/// A deterministic test scene: one emissive sphere `distance` metres in front
+/// of a camera looking down `-Z`, plus one magenta cube ahead and to the left
+/// of it. Shared by the GPU tests and the client's `--demo` mode so both
+/// exercise the same pixels.
 #[must_use]
 pub fn demo_scene(width: u32, height: u32) -> Scene {
     let distance = 6.0;

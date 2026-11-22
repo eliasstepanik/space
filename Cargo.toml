@@ -75,7 +75,11 @@ raw-window-handle = "0.6"
 # pulled in for the stream path (ws:// only; wss:// would need `ring`, the
 # sanctioned exception above, and is deferred). `futures-util` (already in the
 # lock via tokio-tungstenite) provides the Sink/Stream extension traits.
-jpeg-encoder = { version = "0.7", default-features = false, features = ["std"] }
+# `simd` switches jpeg-encoder's colour conversion and forward DCT to AVX2 when
+# the CPU has it (runtime-detected, scalar fallback otherwise). It is still pure
+# Rust: the feature adds no dependency and no build script, it only lets the
+# crate use `core::arch` intrinsics (so it drops its own `forbid(unsafe_code)`).
+jpeg-encoder = { version = "0.7", default-features = false, features = ["std", "simd"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
@@ -101,6 +105,16 @@ opt-level = 1
 # where the column copies dominate.
 [profile.dev.package.space-ecs]
 opt-level = 1
+
+# The pixel-stream frame path (box downscale + JPEG encode) runs once per frame.
+# At opt-level 0 it alone costs more than the 33 ms frame budget, so a plain
+# `cargo run -p space-client -- --stream ...` could not hold its frame rate.
+# Both crates are small and rarely edited, so the extra compile time is paid once.
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+
+[profile.dev.package.space-stream]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

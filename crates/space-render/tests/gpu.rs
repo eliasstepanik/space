@@ -7,7 +7,7 @@
 
 use space_render::{
     validation_message_count, ContextOptions, GpuInstance, Quality, QualityPreset, RenderContext,
-    RenderError, RenderOptions, Renderer, Scene,
+    RenderOptions, Renderer, Scene,
 };
 use space_world::WorldPos;
 
@@ -44,14 +44,16 @@ fn context() -> Option<RenderContext> {
             );
             Some(ctx)
         }
-        Err(RenderError { message, .. }) => {
-            eprintln!("SKIP: no Vulkan device ({message}); see spikes/ENVIRONMENT.md");
+        Err(error) => {
+            // Skips (see spikes/ENVIRONMENT.md), or fails with SPACE_REQUIRE_GPU=1.
+            space_render::skip_or_require_gpu(&error);
             None
         }
     }
 }
 
-/// A single emissive sphere dead-centre in front of the camera, plus one light.
+/// The shared demo scene: an emissive sphere dead-centre in front of the
+/// camera, a magenta cube ahead and to the left of it, and one light.
 fn sphere_scene(width: u32, height: u32) -> Scene {
     space_render::demo_scene(width, height)
 }
@@ -110,7 +112,8 @@ fn forward_pass_draws_the_sphere() {
         .render_frame(&sphere_scene(size, size), size, size, &ci_options())
         .expect("forward render");
     assert_eq!(out.validation_messages, 0, "validation messages seen");
-    assert_eq!(out.instance_count, 1);
+    // The demo scene is the sphere plus the spawn cube.
+    assert_eq!(out.instance_count, 2);
     let centre = pixel(&out, size / 2, size / 2);
     assert!(
         centre[0] > 200 && centre[1] > 200 && centre[2] > 200,
@@ -168,6 +171,294 @@ fn ray_query_hits_the_sphere() {
         corner[2] > 60 && corner[0] < 40,
         "corner should be the blue miss colour, got {corner:?}"
     );
+}
+
+/// The rasterised sphere (generated in the vertex shader from its own vertex
+/// and face tables) and the ray-traced sphere (the BLAS built from
+/// `icosphere_mesh`) are the same solid: seen off-axis, so that every part of
+/// the mesh contributes to the outline, the lit pixels of the forward pass and
+/// the hit pixels of the ray probe coincide. The same holds for the cube.
+/// A wrong vertex or face in either table moves one outline but not the other.
+#[test]
+fn rasterised_and_ray_traced_shapes_have_the_same_outline() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128u32;
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 0.05,
+        far: 1.0e5,
+    };
+    for (shape, name) in [
+        (space_render::SHAPE_SPHERE, "sphere"),
+        (space_render::SHAPE_BOX, "cube"),
+    ] {
+        // Up and to the right of the view axis, so it is seen from below-left.
+        let scene = Scene::from_instances(
+            camera,
+            vec![GpuInstance {
+                center: [1.6, 1.1, -4.5, 1.0],
+                albedo: [1.0, 1.0, 1.0, 0.0],
+                emissive: [4.0, 4.0, 4.0, 1.0],
+                roughness: 0.5,
+                shape,
+                transmission: 0.0,
+                _pad1: 0.0,
+            }],
+        );
+        let raster = ctx
+            .render_frame(&scene, size, size, &ci_options())
+            .expect("forward render");
+        let traced = ctx
+            .render_frame(
+                &scene,
+                size,
+                size,
+                &RenderOptions {
+                    ray_probe: true,
+                    ..ci_options()
+                },
+            )
+            .expect("ray-probe render");
+        assert_eq!(raster.validation_messages, 0, "{name}: forward");
+        assert_eq!(traced.validation_messages, 0, "{name}: ray probe");
+        let lit: Vec<bool> = raster
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[0] > 8)
+            .collect();
+        // Hit colour is magenta, miss colour dark blue: red tells them apart.
+        let hit: Vec<bool> = traced
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[0] > 128)
+            .collect();
+        let covered = lit.iter().filter(|&&l| l).count();
+        let differing = lit.iter().zip(&hit).filter(|(l, h)| l != h).count();
+        eprintln!("{name}: {covered} lit pixels, {differing} differ from the ray-traced outline");
+        assert!(covered > 400, "{name}: too small to compare ({covered})");
+        // Only outline pixels may differ (rasterisation and ray casting resolve
+        // an edge crossing a pixel differently): a couple of percent at most.
+        assert!(
+            differing * 40 < covered,
+            "{name}: rasterised and ray-traced outlines differ in {differing} of {covered} pixels"
+        );
+    }
+}
+
+/// The mesh pipeline (vertex buffers, as used for GLB models) is the same
+/// renderer as the procedural shapes: a cube given as a *mesh* — the vertices
+/// of `cube_mesh` with flat normals, one material part — placed, scaled and
+/// lit like a procedural box instance renders the same image. That pins the
+/// model matrix, the normal transform, the material record and the vertex
+/// layout all at once. A second render through a GLB round trip of the same
+/// mesh proves the loader feeds the pipeline the same data.
+#[test]
+fn a_mesh_cube_renders_like_the_procedural_box() {
+    use space_render::{MeshData, MeshMaterial, MeshPart, MeshVertex, ModelInstance};
+    use std::sync::Arc;
+
+    let Some(mut ctx) = context() else { return };
+    let size = 128u32;
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 0.05,
+        far: 1.0e5,
+    };
+    let (center, half) = ([0.9f32, -0.6, -5.0], 1.25f32);
+    let material = MeshMaterial {
+        base_color: [0.8, 0.3, 0.1],
+        metallic: 0.0,
+        roughness: 0.45,
+        emissive: [0.02, 0.03, 0.05],
+    };
+    let light = space_render::SceneLight {
+        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [3.0, 4.0, 1.0]),
+        color: [1.0, 1.0, 1.0],
+        intensity: 60.0,
+    };
+
+    // The procedural box.
+    let boxed = Scene::from_instances(
+        camera,
+        vec![GpuInstance {
+            center: [center[0], center[1], center[2], half],
+            albedo: [0.8, 0.3, 0.1, material.metallic],
+            emissive: [0.02, 0.03, 0.05, 1.0],
+            roughness: material.roughness,
+            shape: space_render::SHAPE_BOX,
+            transmission: 0.0,
+            _pad1: 0.0,
+        }],
+    )
+    .with_lights(vec![light]);
+
+    // The same cube as a mesh: `cube_mesh` is six faces of six vertices, in
+    // the order +x, -x, +y, -y, +z, -z.
+    let normals = [
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    let vertices: Vec<MeshVertex> = space_render::cube_mesh()
+        .iter()
+        .enumerate()
+        .map(|(i, &position)| MeshVertex {
+            position,
+            normal: normals[i / 6],
+        })
+        .collect();
+    let cube = MeshData {
+        indices: (0..vertices.len() as u32).collect(),
+        vertices,
+        parts: vec![MeshPart {
+            first_index: 0,
+            index_count: 36,
+            material,
+        }],
+        bounds_min: [-1.0; 3],
+        bounds_max: [1.0; 3],
+    };
+    let scene_with = |mesh: MeshData| {
+        let mut scene = Scene::from_instances(camera, Vec::new()).with_lights(vec![light]);
+        scene.models.push(ModelInstance {
+            mesh: Arc::new(mesh),
+            position: center,
+            rotation: space_render::IDENTITY_ROTATION,
+            scale: half,
+        });
+        scene
+    };
+
+    let reference = ctx
+        .render_frame(&boxed, size, size, &ci_options())
+        .expect("box render");
+    let meshed = ctx
+        .render_frame(&scene_with(cube.clone()), size, size, &ci_options())
+        .expect("mesh render");
+    let from_glb = MeshData::from_glb(&cube.to_glb()).expect("round trip");
+    let loaded = ctx
+        .render_frame(&scene_with(from_glb), size, size, &ci_options())
+        .expect("glb mesh render");
+    for out in [&reference, &meshed, &loaded] {
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+    }
+    let lit = lit_pixels(&reference);
+    assert!(
+        lit > 1500,
+        "the reference box is too small to compare ({lit})"
+    );
+    let differing = |a: &space_render::FrameOutput, b: &space_render::FrameOutput| {
+        a.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.pixels.as_chunks::<4>().0)
+            .filter(|(x, y)| (0..3).any(|c| x[c].abs_diff(y[c]) > 2))
+            .count()
+    };
+    let (mesh_diff, glb_diff) = (differing(&reference, &meshed), differing(&meshed, &loaded));
+    eprintln!("mesh cube: {lit} lit pixels, {mesh_diff} differ from the box, {glb_diff} after GLB");
+    assert!(
+        mesh_diff * 200 < lit,
+        "the mesh cube differs from the procedural box in {mesh_diff} of {lit} pixels"
+    );
+    assert_eq!(glb_diff, 0, "the GLB round trip changed the rendered image");
+
+    // MUTATION CHECK: without the mesh the frame is black, so the pixels above
+    // really come from the mesh pipeline. And a model that is no longer in the
+    // scene is no longer drawn (its buffers are dropped from the cache).
+    let empty = Scene::from_instances(camera, Vec::new()).with_lights(vec![light]);
+    let blank = ctx
+        .render_frame(&empty, size, size, &ci_options())
+        .expect("empty render");
+    assert_eq!(brightness_sum(&blank), 0);
+}
+
+/// The sample ship — six material parts in one vertex/index buffer — renders
+/// through the mesh pipeline with every preset, including the post pass
+/// (reflections/refraction read the mesh's depth, material and normal like
+/// any other surface), and its emissive engine part shows up blue.
+#[test]
+fn the_sample_ship_renders_with_every_preset() {
+    use space_render::{rotation_y, sample_ship, ModelInstance};
+    use std::sync::Arc;
+
+    let Some(mut ctx) = context() else { return };
+    let size = 128u32;
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 0.05,
+        far: 1.0e5,
+    };
+    let ship = Arc::new(sample_ship());
+    let mut scene =
+        Scene::from_instances(camera, Vec::new()).with_lights(vec![space_render::SceneLight {
+            position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [3.0, 4.0, 2.0]),
+            color: [1.0, 1.0, 1.0],
+            intensity: 80.0,
+        }]);
+    // Seen from behind and above, so the engine glow faces the camera.
+    scene.models.push(ModelInstance {
+        mesh: ship,
+        position: [0.0, -0.8, -7.0],
+        rotation: rotation_y(0.5),
+        scale: 1.0,
+    });
+    for preset in QualityPreset::ALL {
+        let out = ctx
+            .render_frame(
+                &scene,
+                size,
+                size,
+                &RenderOptions {
+                    preset,
+                    ..ci_options()
+                },
+            )
+            .expect("ship render");
+        assert_eq!(out.validation_messages, 0, "{preset}");
+        assert!(
+            lit_pixels(&out) > 400,
+            "{preset}: {} lit pixels",
+            lit_pixels(&out)
+        );
+        let blue_glow = out
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            // Radiance (0.6, 2.2, 6.0) tone-maps to a near-white blue: bright,
+            // with blue clearly above red.
+            .filter(|p| p[2] > 230 && p[2] > p[0].saturating_add(25))
+            .count();
+        assert!(
+            blue_glow > 10,
+            "{preset}: engine glow missing ({blue_glow} px)"
+        );
+    }
 }
 
 /// MUTATION CHECK for the ray-query test: with an empty scene every pixel must
@@ -416,11 +707,22 @@ fn lod_galaxy_renders() {
     );
     let sum = brightness_sum(&out);
     // GOLDEN, not a floor: a bare `> N` would also pass for a *different but
-    // still bright* LOD selection. The value below is byte-identical on both CI
-    // devices (RADV GFX1151 and lavapipe), so it pins the exact selection the
-    // renderer drew. The ±0.1% band only absorbs a future driver's tonemap
-    // rounding; any wrong LOD selection moves the sum by far more than that.
-    const GALAXY_BRIGHTNESS: u64 = 74_732;
+    // still bright* LOD selection, so this pins the exact selection (2135
+    // instances) and the exact star geometry the renderer drew. The ±0.1% band
+    // only absorbs a future driver's tonemap rounding; any wrong LOD selection
+    // moves the sum by far more than that.
+    //
+    // History of the value (each step re-measured on an NVIDIA RTX 4080 SUPER;
+    // the first was also byte-identical on RADV GFX1151 and lavapipe):
+    //  * 74_732, 2104 instances — the original.
+    //  * 76_185 — the icosphere fixed: four of its vertices sat at radius 0.74
+    //    and three faces named the wrong vertices, so every star was dented
+    //    and holed.
+    //  * 83_903, 2135 instances — `NodeRef::center()` fixed (it was 512 m off
+    //    per axis below depth 64, which moved every star and skewed the LOD
+    //    frustum cull), and stars more than a few pixels across drawn as
+    //    tessellated spheres instead of bare icosahedra.
+    const GALAXY_BRIGHTNESS: u64 = 83_903;
     let band = GALAXY_BRIGHTNESS / 1_000; // 0.1%
     assert!(
         sum.abs_diff(GALAXY_BRIGHTNESS) <= band,
@@ -548,6 +850,286 @@ fn brdf_analytic_light_lights_the_sphere() {
         0,
         "zeroing the light count must leave a non-emissive scene black"
     );
+}
+
+/// The metallic-roughness model behaves like one. Three unlit-by-emission
+/// spheres under one point light:
+///
+/// * a **smooth dielectric** has a small, intense highlight on top of its
+///   diffuse colour;
+/// * the same material made **rough** has a much dimmer highlight (the same
+///   energy spread over a wide lobe) and keeps its diffuse colour;
+/// * a **smooth metal** has no diffuse term at all: away from its highlight it
+///   is black, and its highlight is tinted by its base colour.
+///
+/// Mutation: with the light removed (`mutate_zero_light_count`) all three are
+/// black, so every pixel asserted on comes from the BRDF.
+#[test]
+fn pbr_roughness_and_metalness_shape_the_highlight() {
+    let Some(mut ctx) = context() else { return };
+    let (width, height) = (192u32, 64u32);
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: 0.5,
+        aspect: width as f32 / height as f32,
+        near: 0.05,
+        far: 1.0e3,
+    };
+    let sphere = |x: f32, albedo: [f32; 3], metallic: f32, roughness: f32| GpuInstance {
+        center: [x, 0.0, -9.0, 1.0],
+        albedo: [albedo[0], albedo[1], albedo[2], metallic],
+        emissive: [0.0, 0.0, 0.0, 1.0],
+        roughness,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let red = [0.8, 0.1, 0.1];
+    let gold = [1.0, 0.78, 0.34];
+    let scene = Scene::from_instances(
+        camera,
+        vec![
+            // One sphere centred in each third of the frame: the frame is
+            // 2 * 9 * tan(0.25) * 3 = 13.8 m wide at their distance.
+            sphere(-4.6, red, 0.0, 0.15),
+            sphere(0.0, red, 0.0, 0.9),
+            sphere(4.6, gold, 1.0, 0.15),
+        ],
+    )
+    // Above and behind the camera: every sphere has its highlight facing us.
+    .with_lights(vec![space_render::SceneLight {
+        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [0.0, 6.0, 2.0]),
+        color: [1.0, 1.0, 1.0],
+        intensity: 400.0,
+    }]);
+    let out = ctx
+        .render_frame(&scene, width, height, &ci_options())
+        .expect("pbr render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+
+    // Per sphere (a third of the frame each): the brightest pixel, and the
+    // mean colour of the lit-side pixels well away from the highlight.
+    let stats = |column: u32| {
+        let (x0, x1) = (column * width / 3, (column + 1) * width / 3);
+        let mut peak = [0u16; 4];
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in x0..x1 {
+                let p = pixel(&out, x, y);
+                if p[0] + p[1] + p[2] > peak[0] + peak[1] + peak[2] {
+                    peak = p;
+                }
+                if p[0] + p[1] + p[2] > 0 {
+                    pixels.push(p);
+                }
+            }
+        }
+        // The dimmer half of the sphere's pixels: the body, not the highlight.
+        pixels.sort_by_key(|p| p[0] + p[1] + p[2]);
+        let mean_of = |set: &[[u16; 4]]| {
+            let n = set.len().max(1) as u32;
+            [0, 1, 2].map(|c| set.iter().map(|p| u32::from(p[c])).sum::<u32>() / n)
+        };
+        let body = mean_of(&pixels[..pixels.len() / 2]);
+        // The highlight's skirt: bright, but not clipped by the tone map, so
+        // it still shows the highlight's colour.
+        let skirt: Vec<[u16; 4]> = pixels
+            .iter()
+            .copied()
+            .filter(|p| (90..240).contains(&p[0]))
+            .collect();
+        (peak, body, mean_of(&skirt), pixels.len())
+    };
+    let (smooth_peak, smooth_body, _, smooth_n) = stats(0);
+    let (rough_peak, rough_body, _, rough_n) = stats(1);
+    let (metal_peak, metal_body, metal_skirt, metal_n) = stats(2);
+    eprintln!(
+        "smooth plastic: peak {smooth_peak:?} body {smooth_body:?} ({smooth_n} px)\n\
+         rough plastic:  peak {rough_peak:?} body {rough_body:?} ({rough_n} px)\n\
+         smooth gold:    peak {metal_peak:?} body {metal_body:?} skirt {metal_skirt:?} \
+         ({metal_n} px)"
+    );
+    // The same diffuse lobe lights both plastics: about as many lit pixels
+    // (the off-axis sphere is stretched a little by the perspective).
+    assert!(
+        smooth_n > 300 && smooth_n.abs_diff(rough_n) * 4 < rough_n,
+        "the two plastic spheres should be lit alike: {smooth_n} vs {rough_n} px"
+    );
+    // Roughness: the smooth highlight is far brighter than the rough one, and
+    // bright in every channel (a dielectric's highlight is the light's
+    // colour); the rough sphere's brightest pixel is still its red diffuse.
+    assert!(
+        smooth_peak[1] > 150,
+        "a smooth dielectric has a white-ish highlight"
+    );
+    assert!(
+        rough_peak[1] + 60 < smooth_peak[1],
+        "roughness must dim the highlight: {rough_peak:?} vs {smooth_peak:?}"
+    );
+    assert!(
+        rough_peak[0] > 2 * rough_peak[1],
+        "rough plastic stays red: {rough_peak:?}"
+    );
+    // Diffuse: both dielectrics show their base colour over the lit body.
+    for (name, body) in [("smooth", smooth_body), ("rough", rough_body)] {
+        assert!(
+            body[0] > 40 && body[0] > 3 * body[1].max(1),
+            "{name} plastic body should be red, got {body:?}"
+        );
+    }
+    // Metal: no diffuse — most of the lit sphere is (nearly) black, far darker
+    // than the plastic body — and the highlight carries the gold tint.
+    assert!(
+        metal_body[0] * 4 < smooth_body[0],
+        "a metal has no diffuse term: body {metal_body:?} vs plastic {smooth_body:?}"
+    );
+    assert!(
+        metal_peak[0] > 200,
+        "a smooth metal has a strong highlight: {metal_peak:?}"
+    );
+    assert!(
+        metal_skirt[0] > metal_skirt[2] + 25,
+        "a gold highlight is tinted gold (red well above blue), got {metal_skirt:?}"
+    );
+
+    // MUTATION CHECK: no light, no pixels.
+    let dark = ctx
+        .render_frame(
+            &scene,
+            width,
+            height,
+            &RenderOptions {
+                mutate_zero_light_count: true,
+                ..ci_options()
+            },
+        )
+        .expect("unlit render");
+    assert_eq!(
+        brightness_sum(&dark),
+        0,
+        "everything above came from the light"
+    );
+}
+
+/// Astronomical distances in one frame: a 1 m box 6 m away, an Earth-sized
+/// sphere 25 000 km behind it, and a Sun-sized sphere one astronomical unit
+/// behind that — eleven orders of magnitude of depth with a 1 m near plane.
+/// Each must be drawn, and each nearer body must hide the farther one where
+/// they overlap. (With a conventional depth buffer everything past ~17 000 km
+/// lands exactly on the far plane: the planet and the star are not drawn, or
+/// z-fight. See `mat4_perspective_reversed`.)
+#[test]
+fn bodies_at_astronomical_distances_are_drawn_and_depth_sorted() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128u32;
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 1.0,
+        far: 1.0e13,
+    };
+    let body = |center: [f32; 3], radius: f32, emissive: [f32; 3], shape| GpuInstance {
+        center: [center[0], center[1], center[2], radius],
+        albedo: [0.0, 0.0, 0.0, 0.0],
+        emissive: [emissive[0], emissive[1], emissive[2], 1.0],
+        roughness: 0.8,
+        shape,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let (blue, white, magenta) = ([0.0, 0.0, 6.0], [6.0, 6.0, 6.0], [6.0, 0.0, 6.0]);
+    const EARTH_RADIUS: f32 = 6.371e6;
+    const EARTH_DISTANCE: f32 = 2.5e7;
+    const SUN_RADIUS: f32 = 6.9634e8;
+    const AU: f32 = 1.495_978_7e11;
+    // The star is listed first and the box last, so draw order cannot be what
+    // sorts them. The planet covers the centre of the frame, the star is far
+    // larger in the sky than the gap the planet leaves... so it is offset to
+    // peek out on the right: its left part is behind the planet.
+    let sun_offset = 0.33 * AU;
+    let scene = Scene::from_instances(
+        camera,
+        vec![
+            body(
+                [sun_offset, 0.0, -AU],
+                40.0 * SUN_RADIUS,
+                white,
+                space_render::SHAPE_SPHERE,
+            ),
+            body(
+                [0.0, 0.0, -EARTH_DISTANCE],
+                EARTH_RADIUS,
+                blue,
+                space_render::SHAPE_SPHERE,
+            ),
+            body([0.0, 0.0, -6.0], 0.5, magenta, space_render::SHAPE_BOX),
+        ],
+    );
+    let out = ctx
+        .render_frame(&scene, size, size, &ci_options())
+        .expect("astronomical render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+
+    let is = |p: [u16; 4], what: &str| match what {
+        "magenta" => p[0] > 200 && p[2] > 200 && p[1] < 60,
+        "blue" => p[2] > 200 && p[0] < 60 && p[1] < 60,
+        "white" => p[0] > 200 && p[1] > 200 && p[2] > 200,
+        _ => p[0] < 8 && p[1] < 8 && p[2] < 8,
+    };
+    let count = |what: &str| {
+        (0..size)
+            .flat_map(|y| (0..size).map(move |x| (x, y)))
+            .filter(|&(x, y)| is(pixel(&out, x, y), what))
+            .count()
+    };
+    let (magenta_n, blue_n, white_n) = (count("magenta"), count("blue"), count("white"));
+    eprintln!("box {magenta_n} px, planet {blue_n} px, star {white_n} px");
+    // All three are there.
+    assert!(
+        magenta_n > 100,
+        "the 1 m box 6 m away is missing ({magenta_n} px)"
+    );
+    assert!(
+        blue_n > 1000,
+        "the planet 25 000 km away is missing ({blue_n} px)"
+    );
+    assert!(
+        white_n > 300,
+        "the star 1 AU away is missing ({white_n} px)"
+    );
+    // Nearest wins: the box in front of the planet at the centre...
+    let centre = pixel(&out, size / 2, size / 2);
+    assert!(
+        is(centre, "magenta"),
+        "the box must hide the planet, got {centre:?}"
+    );
+    // ...the planet in front of the star just right of the box (the star's
+    // disc extends to there, but it is 1 AU behind)...
+    let on_planet = pixel(&out, size / 2 + 22, size / 2);
+    assert!(
+        is(on_planet, "blue"),
+        "the planet must hide the star, got {on_planet:?}"
+    );
+    // ...and the star where it clears the planet's limb.
+    let on_star = pixel(&out, size - 6, size / 2);
+    assert!(
+        is(on_star, "white"),
+        "the star must show past the planet, got {on_star:?}"
+    );
+
+    // Depth ordering, not draw order: reversing the instances draws the same
+    // picture.
+    let mut reversed = Scene::from_instances(camera, scene.instances.clone());
+    reversed.instances.reverse();
+    let again = ctx
+        .render_frame(&reversed, size, size, &ci_options())
+        .expect("reversed render");
+    assert_eq!(out.pixels, again.pixels, "draw order changed the image");
 }
 
 /// One emissive sphere of `radius` at `distance` metres straight ahead.

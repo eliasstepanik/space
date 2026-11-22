@@ -89,6 +89,24 @@ pub enum Key {
 }
 
 impl Key {
+    /// Number of distinct keys.
+    pub const COUNT: usize = 6;
+
+    /// Every key, in wire-id order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Forward,
+        Self::Back,
+        Self::Left,
+        Self::Right,
+        Self::Up,
+        Self::Down,
+    ];
+
+    /// Dense index `0..Key::COUNT` (the wire id minus one), for per-key tables.
+    pub const fn index(self) -> usize {
+        self as usize - 1
+    }
+
     fn from_id(id: u8) -> Option<Self> {
         Some(match id {
             1 => Self::Forward,
@@ -123,7 +141,13 @@ impl Key {
 /// |---|---|
 /// | `Pointer` | `1, x: f32, y: f32, buttons: u8` (10) |
 /// | `Key`     | `2, key: u8, down: u8` (3) |
-/// | `View`    | `3, yaw: f32, pitch: f32` (9) |
+/// | `Turn`    | `3, dyaw: f32, dpitch: f32` (9) |
+///
+/// Tag 3 carried an *absolute* `View { yaw, pitch }` before; the layout is
+/// unchanged but the meaning is now relative. A viewer cannot know the proxy's
+/// current view direction (it only receives pixels), so an absolute angle made
+/// the camera snap to the viewer's private idea of "yaw 0" on the first drag,
+/// on every page reload and whenever a second viewer touched the mouse.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewerInput {
     /// Pointer position, normalised to `0..=1` over the canvas, and the DOM
@@ -131,8 +155,10 @@ pub enum ViewerInput {
     Pointer { x: f32, y: f32, buttons: u8 },
     /// A key went down (`true`) or up (`false`).
     Key { key: Key, down: bool },
-    /// Absolute view direction in radians (yaw about +Y, pitch up).
-    View { yaw: f32, pitch: f32 },
+    /// Rotate the view by this many radians since the previous `Turn`
+    /// (`dyaw` about +Y, positive turns left; positive `dpitch` looks up).
+    /// The receiver owns the absolute yaw/pitch and their limits.
+    Turn { dyaw: f32, dpitch: f32 },
 }
 
 impl ViewerInput {
@@ -151,10 +177,10 @@ impl ViewerInput {
                 out.push(key as u8);
                 out.push(u8::from(down));
             }
-            Self::View { yaw, pitch } => {
+            Self::Turn { dyaw, dpitch } => {
                 out.push(3);
-                out.extend_from_slice(&yaw.to_be_bytes());
-                out.extend_from_slice(&pitch.to_be_bytes());
+                out.extend_from_slice(&dyaw.to_be_bytes());
+                out.extend_from_slice(&dpitch.to_be_bytes());
             }
         }
         out
@@ -200,9 +226,9 @@ impl ViewerInput {
                 )
             }
             3 => (
-                Self::View {
-                    yaw: f32_at(0)?,
-                    pitch: f32_at(4)?,
+                Self::Turn {
+                    dyaw: f32_at(0)?,
+                    dpitch: f32_at(4)?,
                 },
                 8,
             ),
@@ -270,9 +296,9 @@ mod tests {
                 key: Key::Down,
                 down: false,
             },
-            ViewerInput::View {
-                yaw: -1.5,
-                pitch: 0.5,
+            ViewerInput::Turn {
+                dyaw: -1.5,
+                dpitch: 0.5,
             },
         ];
         for c in cases {
@@ -293,14 +319,43 @@ mod tests {
             .encode(),
             [2, 3, 1]
         );
+        // Tag 3 is the relative `Turn`: tag, then `dyaw` and `dpitch` as
+        // big-endian f32 (the layout the absolute `View` used to have).
         assert_eq!(
-            ViewerInput::View {
-                yaw: 1.0,
-                pitch: 0.0
+            ViewerInput::Turn {
+                dyaw: 1.0,
+                dpitch: 0.0
             }
             .encode(),
             [3, 0x3f, 0x80, 0, 0, 0, 0, 0, 0]
         );
+        assert_eq!(
+            ViewerInput::Turn {
+                dyaw: 0.0,
+                dpitch: -2.0
+            }
+            .encode(),
+            [3, 0, 0, 0, 0, 0xc0, 0, 0, 0]
+        );
+        assert_eq!(
+            ViewerInput::decode(&[3, 0xbf, 0x80, 0, 0, 0x3f, 0, 0, 0]),
+            Ok(ViewerInput::Turn {
+                dyaw: -1.0,
+                dpitch: 0.5
+            })
+        );
+    }
+
+    #[test]
+    fn key_indices_are_dense_and_match_the_wire_ids() {
+        assert_eq!(Key::ALL.len(), Key::COUNT);
+        for (i, key) in Key::ALL.into_iter().enumerate() {
+            assert_eq!(key.index(), i);
+            assert_eq!(key as usize, i + 1);
+            assert_eq!(Key::from_id(key as u8), Some(key));
+        }
+        assert_eq!(Key::from_id(0), None);
+        assert_eq!(Key::from_id(Key::COUNT as u8 + 1), None);
     }
 
     #[test]

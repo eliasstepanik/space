@@ -89,16 +89,24 @@ impl Buffer {
 
     /// Copy `data` into the (CPU-mapped) allocation and flush if needed.
     pub fn write(&self, data: &[u8]) -> Result<(), crate::RenderError> {
+        if data.is_empty() {
+            // Nothing to copy, and a zero-sized flush range is not legal.
+            return Ok(());
+        }
         let alloc = self.allocation();
         let ptr = alloc
             .mapped_ptr()
             .ok_or_else(|| crate::RenderError::with_name(self.name, "not CPU-mapped"))?;
-        assert!(
-            data.len() <= alloc.size() as usize,
-            "write of {} bytes into a {}-byte allocation",
-            data.len(),
-            alloc.size()
-        );
+        if data.len() as u64 > alloc.size() {
+            return Err(crate::RenderError::with_name(
+                self.name,
+                format!(
+                    "write of {} bytes into a {}-byte allocation",
+                    data.len(),
+                    alloc.size()
+                ),
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast().as_ptr(), data.len());
         }
@@ -121,7 +129,20 @@ impl Buffer {
     /// Read `data.len()` bytes back from a CPU-visible allocation, invalidating
     /// the mapped range first when it is not host-coherent.
     pub fn read(&self, out: &mut [u8]) -> Result<(), crate::RenderError> {
+        if out.is_empty() {
+            return Ok(());
+        }
         let alloc = self.allocation();
+        if out.len() as u64 > alloc.size() {
+            return Err(crate::RenderError::with_name(
+                self.name,
+                format!(
+                    "read of {} bytes from a {}-byte allocation",
+                    out.len(),
+                    alloc.size()
+                ),
+            ));
+        }
         if !alloc
             .memory_properties()
             .contains(vk::MemoryPropertyFlags::HOST_COHERENT)

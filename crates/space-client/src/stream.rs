@@ -22,13 +22,17 @@ use space_stream::protocol::{FLAG_DOWNSCALED, FLAG_KEYFRAME};
 use space_stream::{JpegEncoder, Key, StreamClient, StreamServer, ViewerInput};
 use space_world::WorldPos;
 
-use crate::{demo_options, Config, Mode};
+use crate::{scene_options, scenes, Config, Mode};
 use space_client::link::ServerLink;
 
 /// Target stream frame rate.
 const FRAME_BUDGET: Duration = Duration::from_millis(33);
 /// Poll interval while no viewer is connected (nothing is rendered).
 const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// The view cannot pitch past this, radians (89 degrees): straight up or down
+/// would make the camera's up vector degenerate.
+const MAX_PITCH: f32 = 1.553_343;
 
 /// The proxy client's input state: where the (viewer-driven) camera is and
 /// which way it looks. Local and viewer input both end up here.
@@ -51,9 +55,12 @@ impl InputState {
     pub fn apply(&mut self, input: ViewerInput) {
         match input {
             ViewerInput::Key { key, down } => self.held[key as usize - 1] = down,
-            ViewerInput::View { yaw, pitch } => {
-                self.yaw = yaw;
-                self.pitch = pitch.clamp(-1.553_343, 1.553_343);
+            // Relative: the proxy owns the absolute angles, so a viewer that
+            // (re)connects, or a second viewer, turns the view from where it
+            // is instead of snapping it to that viewer's own idea of it.
+            ViewerInput::Turn { dyaw, dpitch } => {
+                self.yaw = (self.yaw + dyaw).rem_euclid(std::f32::consts::TAU);
+                self.pitch = (self.pitch + dpitch).clamp(-MAX_PITCH, MAX_PITCH);
             }
             ViewerInput::Pointer { x, y, buttons } => self.pointer = Some((x, y, buttons)),
         }
@@ -161,10 +168,21 @@ pub fn pump_input(
     events.len()
 }
 
-/// The input a stream starts with. The galaxy's base camera sits at -Z looking
-/// at the origin (+Z), but yaw 0 looks down -Z, so a galaxy stream starts turned
-/// half a revolution to face its centre; a viewer's `View` event overrides it.
-fn initial_input(mode: Mode) -> InputState {
+/// Free-camera speed for a scene, metres/second, scaled with it: the galaxy
+/// spans ~1e5 m, the demo ~6 m.
+pub(crate) fn scene_speed(mode: Mode) -> f64 {
+    match mode {
+        Mode::Galaxy => 5.0e3,
+        // About a third of an Earth radius per second.
+        Mode::Solar => 2.0e6,
+        Mode::Demo | Mode::Materials | Mode::Window => 3.0,
+    }
+}
+
+/// The input a session starts with. The galaxy's base camera sits at -Z looking
+/// at the origin (+Z), but yaw 0 looks down -Z, so a galaxy session starts
+/// turned half a revolution to face its centre.
+pub(crate) fn initial_input(mode: Mode) -> InputState {
     let mut input = InputState::default();
     if mode == Mode::Galaxy {
         input.yaw = std::f32::consts::PI;
@@ -173,23 +191,29 @@ fn initial_input(mode: Mode) -> InputState {
 }
 
 /// Build the scene as seen by `input`.
-fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> Scene {
-    if mode == Mode::Galaxy {
-        let camera = input.camera(&crate::galaxy_camera(width, height));
-        return crate::galaxy_scene_at(&camera);
+pub(crate) fn scene_for_input(mode: Mode, input: &InputState, width: u32, height: u32) -> Scene {
+    match mode {
+        Mode::Galaxy => {
+            let camera = input.camera(&crate::galaxy_camera(width, height));
+            return crate::galaxy_scene_at(&camera);
+        }
+        Mode::Materials => {
+            let camera = input.camera(&scenes::materials_camera(width, height));
+            return scenes::materials_scene(&camera);
+        }
+        Mode::Solar => {
+            let camera = input.camera(&scenes::solar_camera(width, height));
+            return scenes::solar_scene(&camera);
+        }
+        Mode::Demo | Mode::Window => {}
     }
     // The demo scene is camera-relative around the origin: re-base it onto the
-    // moved camera by shifting every instance and mesh by -offset.
+    // moved camera by shifting every instance by -offset.
     let mut scene = space_render::demo_scene(width, height);
     scene.camera = input.camera(&scene.camera);
     let off = input.offset.map(|v| v as f32);
     for inst in &mut scene.instances {
         for (c, o) in inst.center.iter_mut().zip(off) {
-            *c -= o;
-        }
-    }
-    for v in scene.meshes.iter_mut().flatten() {
-        for (c, o) in v.iter_mut().zip(off) {
             *c -= o;
         }
     }
@@ -215,13 +239,8 @@ pub fn stream_loop(
     if encoder.downscale() > 1 {
         flags |= FLAG_DOWNSCALED;
     }
-    // Scale movement with the scene: the galaxy spans ~1e5 m, the demo ~6 m.
-    let speed = if config.mode == Mode::Galaxy {
-        5.0e3
-    } else {
-        3.0
-    };
-    let options = demo_options(config.quality);
+    let speed = scene_speed(config.mode);
+    let options = scene_options(config.mode, config.quality);
     let mut input = initial_input(config.mode);
     let mut last = Instant::now();
     let mut streamed = 0u64;
@@ -240,7 +259,10 @@ pub fn stream_loop(
             std::thread::sleep(IDLE_POLL);
             continue;
         }
-        let scene = scene_for_input(config.mode, &input, config.width, config.height);
+        let mut scene = scene_for_input(config.mode, &input, config.width, config.height);
+        if let Some(model) = &config.model {
+            model.add_to(&mut scene);
+        }
         let out = ctx.render_offscreen(&scene, config.width, config.height, &options)?;
         let jpeg = encoder
             .encode(&out.pixels, out.width, out.height)
@@ -318,9 +340,9 @@ mod tests {
             "released key stops motion"
         );
 
-        s.apply(ViewerInput::View {
-            yaw: std::f32::consts::FRAC_PI_2,
-            pitch: 0.0,
+        s.apply(ViewerInput::Turn {
+            dyaw: std::f32::consts::FRAC_PI_2,
+            dpitch: 0.0,
         });
         let f = s.forward();
         assert!((f[0] + 1.0).abs() < 1e-6 && f[2].abs() < 1e-6, "{f:?}");
@@ -421,16 +443,19 @@ mod tests {
         let ctx = match RenderContext::new(&ContextOptions::default()) {
             Ok(ctx) => ctx,
             Err(e) => {
-                eprintln!(
-                    "SKIP: no usable Vulkan device ({e}); needs VK_KHR_acceleration_structure"
-                );
+                space_render::skip_or_require_gpu(&e);
                 return;
             }
         };
         let (w, h) = (128u32, 96u32);
         let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), w, h);
         let out = ctx
-            .render_offscreen(&scene, w, h, &demo_options(space_render::QualityPreset::Ci))
+            .render_offscreen(
+                &scene,
+                w,
+                h,
+                &scene_options(Mode::Galaxy, space_render::QualityPreset::Ci),
+            )
             .expect("galaxy render");
         assert_eq!((out.width, out.height), (w, h));
         // Lit pixel counts per quadrant: [top-left, top-right, bottom-left, bottom-right].
@@ -482,11 +507,37 @@ mod tests {
     #[test]
     fn view_pitch_is_clamped_and_pointer_recorded() {
         let mut s = InputState::default();
-        s.apply(ViewerInput::View {
-            yaw: 0.0,
-            pitch: 9.0,
+        s.apply(ViewerInput::Turn {
+            dyaw: 0.0,
+            dpitch: 9.0,
         });
         assert!(s.pitch < std::f32::consts::FRAC_PI_2);
+        // Turns accumulate, and the yaw wraps instead of growing without bound.
+        let mut t = InputState::default();
+        for _ in 0..5 {
+            t.apply(ViewerInput::Turn {
+                dyaw: 2.0,
+                dpitch: -0.1,
+            });
+        }
+        assert!(
+            (t.yaw - (10.0 - std::f32::consts::TAU)).abs() < 1e-5,
+            "{}",
+            t.yaw
+        );
+        assert!((t.pitch + 0.5).abs() < 1e-6);
+        // A turn starts from wherever the view already is (the galaxy session
+        // starts half a turn round): no snap back to the viewer's zero.
+        let mut g = initial_input(Mode::Galaxy);
+        g.apply(ViewerInput::Turn {
+            dyaw: 0.001,
+            dpitch: 0.0,
+        });
+        assert!(
+            g.forward()[2] > 0.99,
+            "still facing the galaxy: {:?}",
+            g.forward()
+        );
         s.apply(ViewerInput::Pointer {
             x: 0.5,
             y: 0.25,
@@ -505,7 +556,7 @@ mod tests {
         let moved = scene_for_input(Mode::Demo, &s, 32, 32);
         // Camera moved 1 m toward the sphere, so it is 1 m closer.
         assert!((moved.instances[0].center[2] - (base.instances[0].center[2] + 1.0)).abs() < 1e-6);
-        assert_eq!(moved.meshes.len(), base.meshes.len());
+        assert_eq!(moved.instances.len(), base.instances.len());
     }
 
     /// End to end with a real render: the stream loop renders the demo scene,
@@ -514,7 +565,7 @@ mod tests {
     #[test]
     fn stream_loop_delivers_frames_and_applies_viewer_input() {
         if let Err(e) = RenderContext::new(&ContextOptions::default()) {
-            eprintln!("SKIP: no usable Vulkan device ({e}); needs VK_KHR_acceleration_structure");
+            space_render::skip_or_require_gpu(&e);
             return;
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -529,11 +580,8 @@ mod tests {
             mode: Mode::Demo,
             width: 64,
             height: 48,
-            out: None,
             quality: space_render::QualityPreset::Ci,
-            stream: None,
-            server: None,
-            frames: None,
+            ..Config::default()
         };
         let worker = {
             let (client, stop) = (Arc::clone(&client), Arc::clone(&stop));
@@ -549,9 +597,9 @@ mod tests {
             let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp)
                 .await
                 .unwrap();
-            let view = ViewerInput::View {
-                yaw: 0.5,
-                pitch: 0.0,
+            let view = ViewerInput::Turn {
+                dyaw: 0.5,
+                dpitch: 0.0,
             };
             ws.send(Message::Binary(view.encode().into()))
                 .await

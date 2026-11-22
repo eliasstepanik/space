@@ -5,16 +5,21 @@
 // Inputs (all read with textureLoad, no samplers):
 //   scene_tex    rgba16f  opaque HDR scene (already fogged by the forward pass,
 //                          so reflected/refracted samples carry fog with them)
-//   depth_tex    d32f     depth: nearest surface, glass included. Vulkan 0..1,
-//                          the same view_proj as the forward pass.
-//   material_tex rg8      r = metallic, g = roughness (opaque surfaces only)
+//   depth_tex    d32f     depth: nearest surface, glass included. Reversed
+//                          (1 at the near plane, towards 0 with distance,
+//                          exactly 0 = nothing drawn), the same view_proj as
+//                          the forward pass.
+//   material_tex rgba16f  r = metallic, g = roughness, ba = the nearest
+//                          surface's shading normal (octahedral), glass included
 //   glass_tex    rgba16f  rgb = lit glass colour, a = transmission (0 = no
 //                          glass at this pixel); read only with FEATURE_REFRACT
 // Output: out_image (rgba16f) = composited HDR colour for the tone map.
 //
 // Everything is in camera-relative world space (camera at the origin). Surface
-// normals are rebuilt from the depth buffer's neighbouring pixels (face
-// normals, picking the smaller-delta neighbour on each axis at silhouettes).
+// normals are the forward pass's interpolated shading normals from the
+// material buffer, so a tessellated sphere reflects and refracts as a smooth
+// sphere. (Rebuilding them from depth gave one normal per triangle: mirror
+// balls showed their facets as shards.)
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -63,7 +68,9 @@ fn load_depth(p: vec2<i32>) -> f32 {
 fn world_at(p: vec2<i32>, d: f32) -> vec3<f32> {
     let uv = (vec2<f32>(p) + vec2<f32>(0.5)) / vec2<f32>(post.image_size);
     let h = post.camera.inv_view_proj * vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, d, 1.0);
-    return h.xyz / h.w;
+    // An empty pixel (d = 0) is infinitely far away: h.w is 0. Keep the result
+    // finite (just very far) so a silhouette neighbour cannot inject inf/NaN.
+    return h.xyz / max(h.w, 1e-12);
 }
 
 // Distance along the view axis (clip w) of the surface stored at NDC `ndc_xy`
@@ -73,25 +80,19 @@ fn view_depth(ndc_xy: vec2<f32>, d: f32) -> f32 {
     return 1.0 / max(h.w, 1e-9);
 }
 
-fn pick_shorter(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
-    let la = dot(a, a);
-    let lb = dot(b, b);
-    if la < 1e-12 { return b; }
-    if lb < 1e-12 { return a; }
-    if lb < la { return b; }
-    return a;
+// Inverse of `oct_encode` in forward.wgsl.
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    var n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    let t = max(-n.z, 0.0);
+    n.x = n.x + select(t, -t, n.x >= 0.0);
+    n.y = n.y + select(t, -t, n.y >= 0.0);
+    return normalize(n);
 }
 
-// Face normal from depth, oriented towards the camera. `view` is the incoming
-// camera -> surface direction.
-fn surface_normal(p: vec2<i32>, pos: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
-    let pr = world_at(p + vec2<i32>(1, 0), load_depth(p + vec2<i32>(1, 0)));
-    let pl = world_at(p + vec2<i32>(-1, 0), load_depth(p + vec2<i32>(-1, 0)));
-    let pd = world_at(p + vec2<i32>(0, 1), load_depth(p + vec2<i32>(0, 1)));
-    let pu = world_at(p + vec2<i32>(0, -1), load_depth(p + vec2<i32>(0, -1)));
-    let dx = pick_shorter(pr - pos, pos - pl);
-    let dy = pick_shorter(pd - pos, pos - pu);
-    var n = normalize(cross(dx, dy));
+// Shading normal of the surface at pixel `p`, oriented towards the camera.
+// `view` is the incoming camera -> surface direction.
+fn surface_normal(p: vec2<i32>, view: vec3<f32>) -> vec3<f32> {
+    var n = oct_decode(textureLoad(material_tex, p, 0).ba);
     if dot(n, view) > 0.0 {
         n = -n;
     }
@@ -204,7 +205,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     var color = textureLoad(scene_tex, p, 0).rgb;
     let d = load_depth(p);
-    if d < 1.0 {
+    // Reversed depth: 0 is the clear value, i.e. no surface at this pixel.
+    if d > 0.0 {
         let pos = world_at(p, d);
         let view = normalize(pos - post.camera.position.xyz);
 
@@ -215,7 +217,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is_glass = true;
                 // Refraction: continue the refracted ray `refract_distance`
                 // behind the surface and look the scene up where it lands.
-                let n = surface_normal(p, pos, view);
+                let n = surface_normal(p, view);
                 let t = refract(view, n, post.refract_eta);
                 let q = pos + t * post.refract_distance;
                 let hq = post.camera.view_proj * vec4(q, 1.0);
@@ -227,7 +229,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         // Behind the glass? Another glass pixel always is (the
                         // HDR target holds the opaque scene there); an opaque
                         // pixel must be farther than the glass surface.
-                        let behind = textureLoad(glass_tex, pq, 0).a > 0.0 || load_depth(pq) >= d;
+                        // (Reversed depth: farther means a smaller value.)
+                        let behind = textureLoad(glass_tex, pq, 0).a > 0.0 || load_depth(pq) <= d;
                         if behind {
                             bg = textureLoad(scene_tex, pq, 0).rgb;
                         }
@@ -243,7 +246,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let metallic = mat.x;
             let roughness = mat.y;
             if metallic >= METALLIC_MIN && roughness <= post.ssr_max_roughness {
-                let n = surface_normal(p, pos, view);
+                let n = surface_normal(p, view);
                 let r = reflect(view, n);
                 let hit = trace_ssr(pos, n, r, roughness);
                 if hit.confidence > 0.0 {

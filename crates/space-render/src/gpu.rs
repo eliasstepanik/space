@@ -1,5 +1,8 @@
-//! ash/Vulkan context: instance + device creation and headless offscreen
-//! rendering (render to image, read back).
+//! ash/Vulkan context: instance + device creation and the two ways to render a
+//! frame — headless ([`RenderContext::render_offscreen`]: render to an image,
+//! read it back) and into a window
+//! ([`RenderContext::render_to_swapchain`]: render, blit into the swapchain
+//! image, present; nothing is read back).
 //!
 //! Device selection prefers a device with the full ray-query chain
 //! (`VK_KHR_ray_query` + `VK_KHR_acceleration_structure` +
@@ -8,16 +11,29 @@
 
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use raw_window_handle::RawDisplayHandle;
 
 use crate::alloc::SharedAllocator;
-use crate::params;
+use crate::mesh::{MeshData, ModelInstance};
+use crate::params::{self, GpuInstance, MeshInstanceGpu};
+use crate::passes::{
+    DrawRun, FrameDraw, FrameGpu, FrameKey, FrameTarget, InstanceBuffer, MeshDraw, MeshGpu,
+    ShapeBlas, Tlas,
+};
 use crate::quality::{self, QualityPreset};
-use crate::scene::Scene;
+use crate::scene::{sphere_level_for, sphere_vertex_count, Scene, SHAPE_BOX, SPHERE_LEVELS};
+use crate::swapchain::{PresentOutcome, Swapchain, PRESENT_TIMEOUT_NS};
+
+/// Largest frame edge the renderer accepts, in pixels: a sanity bound that
+/// every desktop GPU's `maxImageDimension2D` covers.
+pub const MAX_FRAME_DIMENSION: u32 = 16_384;
+
+/// Largest GI probe grid edge (the probe texture is `grid x 6*grid`).
+pub const MAX_GI_GRID: u32 = 1_024;
 
 /// Validation layer name (NUL-terminated for the Vulkan API).
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -57,6 +73,26 @@ unsafe extern "system" fn debug_callback(
     VALIDATION_MESSAGES.fetch_add(1, Ordering::SeqCst);
     eprintln!("VALIDATION: {msg}");
     vk::FALSE
+}
+
+/// For GPU tests: fail instead of skipping when no usable Vulkan device is
+/// found and `SPACE_REQUIRE_GPU=1` is set.
+///
+/// The GPU tests skip (loudly, but green) on a machine without a device that
+/// has `VK_KHR_acceleration_structure`, so that the suite runs anywhere. On a
+/// runner that is *supposed* to have one, that turns "nothing was rendered"
+/// into a passing job; setting the variable there makes the skip a failure.
+/// Call it on the skip path with the context creation error.
+///
+/// # Panics
+///
+/// When `SPACE_REQUIRE_GPU=1`.
+pub fn skip_or_require_gpu(error: &RenderError) {
+    assert!(
+        std::env::var("SPACE_REQUIRE_GPU").as_deref() != Ok("1"),
+        "SPACE_REQUIRE_GPU=1 but no usable Vulkan device: {error}"
+    );
+    eprintln!("SKIP: no usable Vulkan device ({error}); needs VK_KHR_acceleration_structure");
 }
 
 /// Validation messages (warning+) recorded by the debug messenger so far.
@@ -116,6 +152,10 @@ pub struct RenderOptions {
     /// callers stay deterministic; the client opts in to its own preset.
     pub preset: QualityPreset,
     pub exposure: f32,
+    /// Multiplier on the preset's fog density (default 1). The presets' fog is
+    /// tuned for scenes metres to kilometres across; a scene at astronomical
+    /// scale sets this to 0, or every body would be solid fog colour.
+    pub fog_scale: f32,
     /// MUTATION SWITCH: skip the forward draw entirely (the render pass is
     /// still begun and ended, so only the draw is removed). Any pixel test
     /// that depends on geometry must fail with this set.
@@ -141,6 +181,7 @@ impl Default for RenderOptions {
             quality: Quality::DEFAULT,
             preset: QualityPreset::Ci,
             exposure: 1.0,
+            fog_scale: 1.0,
             mutate_skip_forward_draw: false,
             mutate_skip_gi_dispatch: false,
             mutate_zero_light_count: false,
@@ -258,12 +299,35 @@ pub(crate) fn carray_to_string(array: &[std::ffi::c_char]) -> String {
 
 // ---- context ----------------------------------------------------------------
 
-/// The ash/Vulkan context: instance, device, gpu-allocator, pipelines and the
-/// command pool every offscreen frame records into.
+/// GPU objects kept between frames (see [`crate::passes`]). Rendering a
+/// steady stream of frames of one size and feature set allocates nothing: the
+/// frame's images, buffers, descriptor sets and command buffer, the instance
+/// buffer and the acceleration structures are all reused.
+#[derive(Default)]
+struct RenderCache {
+    frame: Option<(FrameKey, FrameGpu)>,
+    instances: Option<InstanceBuffer<GpuInstance>>,
+    /// One record per drawn mesh part.
+    mesh_records: Option<InstanceBuffer<MeshInstanceGpu>>,
+    /// Uploaded mesh models, by the address of their shared `MeshData` (the
+    /// `Arc` kept alongside pins that address for as long as the entry lives).
+    meshes: std::collections::HashMap<usize, (Arc<MeshData>, MeshGpu)>,
+    /// The unit sphere/cube BLASes; built on the first frame that traces rays.
+    shapes: Option<ShapeBlas>,
+    tlas: Option<Tlas>,
+    /// The frame's instances grouped by detail level (scratch, reused).
+    ordered: Vec<GpuInstance>,
+}
+
+/// The ash/Vulkan context: instance, device, gpu-allocator, pipelines, the
+/// command pool every frame records into and the frame resources it reuses.
 ///
-/// Drop order is explicit (frames are owned by the caller and must be dropped
-/// first): pipelines + command pool, then the allocator, then the device and
-/// instance.
+/// Rendering takes `&self`: the reused resources sit behind a mutex, so one
+/// context renders one frame at a time.
+///
+/// Drop order is explicit: the cached frame resources, then pipelines +
+/// command pool, then the allocator, then the device and instance. A
+/// [`Swapchain`] created from the context must be dropped before it.
 pub struct RenderContext {
     pub(crate) entry: ash::Entry,
     pub(crate) instance: ash::Instance,
@@ -278,6 +342,7 @@ pub struct RenderContext {
     pub(crate) allocator: Option<SharedAllocator>,
     pub(crate) pipelines: crate::passes::Pipelines,
     pub(crate) cmd_pool: vk::CommandPool,
+    cache: Mutex<RenderCache>,
     device_name: String,
     ray_query: RayQuerySupport,
     /// True only when `VK_LAYER_KHRONOS_validation` was actually enabled on the
@@ -533,6 +598,7 @@ impl RenderContext {
             allocator: Some(allocator),
             pipelines,
             cmd_pool,
+            cache: Mutex::new(RenderCache::default()),
             device_name,
             ray_query: ray_query_support,
             validation_active: with_debug_utils,
@@ -619,48 +685,304 @@ impl RenderContext {
         height: u32,
         options: &RenderOptions,
     ) -> Result<FrameOutput, RenderError> {
-        let (output, frame) = self.render_frame_gpu(scene, width, height, options)?;
-        drop(frame);
-        Ok(output)
+        let before = validation_message_count();
+        let options = self.checked_options(width, height, options)?;
+        let mut cache = self.cache();
+        let pixels = self.render_readback(&mut cache, scene, width, height, &options);
+        if pixels.is_err() {
+            self.discard_frame(&mut cache);
+        }
+        Ok(FrameOutput {
+            width,
+            height,
+            pixels: pixels?,
+            validation_messages: validation_message_count().wrapping_sub(before),
+            instance_count: scene.instances.len(),
+        })
     }
 
-    /// Same as [`RenderContext::render_offscreen`] but hands back the live frame
-    /// so a swapchain path can copy its `out` image before it is destroyed.
-    pub fn render_frame_gpu(
+    /// Render one frame of `scene` at the swapchain's size straight into its
+    /// next image and queue it for presentation. Nothing is read back to the
+    /// CPU, and the call does not wait for the GPU to finish the frame (the
+    /// next call does, so at most one frame is in flight).
+    ///
+    /// On [`PresentOutcome::OutOfDate`] nothing was presented; on that and on
+    /// [`PresentOutcome::Suboptimal`] call [`Swapchain::recreate`] before
+    /// rendering again. `swapchain` must have been created from this context.
+    pub fn render_to_swapchain(
         &self,
+        scene: &Scene,
+        swapchain: &Swapchain,
+        options: &RenderOptions,
+    ) -> Result<PresentOutcome, RenderError> {
+        let (width, height) = swapchain.extent();
+        let options = self.checked_options(width, height, options)?;
+        let mut cache = self.cache();
+        let outcome = self.render_present(&mut cache, scene, swapchain, &options);
+        if outcome.is_err() {
+            self.discard_frame(&mut cache);
+        }
+        outcome
+    }
+
+    fn cache(&self) -> MutexGuard<'_, RenderCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The options a `width` x `height` frame actually renders with, or why it
+    /// cannot be rendered at all.
+    fn checked_options(
+        &self,
+        width: u32,
+        height: u32,
+        options: &RenderOptions,
+    ) -> Result<RenderOptions, RenderError> {
+        let valid = 1..=MAX_FRAME_DIMENSION;
+        if !valid.contains(&width) || !valid.contains(&height) {
+            return Err(RenderError::new(format!(
+                "frame size {width}x{height} is outside 1..={MAX_FRAME_DIMENSION} pixels per side"
+            )));
+        }
+        let mut options = *options;
+        if options.ray_probe && !self.ray_query.complete() {
+            return Err(RenderError::new(format!(
+                "{} lacks VK_KHR_ray_query, which the ray probe needs",
+                self.device_name
+            )));
+        }
+        if options.gi_enabled && !self.ray_query.complete() {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                log::warn!("GI requested but the device lacks ray query; rendering without GI");
+            });
+            options.gi_enabled = false;
+        }
+        if options.gi_enabled && !(1..=MAX_GI_GRID).contains(&options.quality.grid) {
+            return Err(RenderError::new(format!(
+                "GI probe grid {} is outside 1..={MAX_GI_GRID}",
+                options.quality.grid
+            )));
+        }
+        Ok(options)
+    }
+
+    fn render_readback(
+        &self,
+        cache: &mut RenderCache,
         scene: &Scene,
         width: u32,
         height: u32,
         options: &RenderOptions,
-    ) -> Result<(FrameOutput, crate::passes::FrameGpu), RenderError> {
-        let before = validation_message_count();
-        let mut options = *options;
-        if options.gi_enabled && !self.ray_query.complete() {
-            log::warn!("GI requested but the device lacks ray query; rendering without GI");
-            options.gi_enabled = false;
-        }
-        let gi_dispatch = options.gi_enabled && !options.mutate_skip_gi_dispatch;
+    ) -> Result<Vec<u8>, RenderError> {
+        self.ensure_frame(cache, FrameKey::new(width, height, options), u64::MAX)?;
+        let frame = self.record_frame(cache, scene, options, FrameTarget::Readback)?;
+        frame.submit(self.queue, None, None)?;
+        frame.wait(u64::MAX)?;
+        frame.read_pixels()
+    }
 
-        let scene_gpu =
-            crate::passes::SceneGpu::upload(&self.device, &self.accel, self.allocator()?, scene)?;
-        let frame = crate::passes::create_frame(
+    fn render_present(
+        &self,
+        cache: &mut RenderCache,
+        scene: &Scene,
+        swapchain: &Swapchain,
+        options: &RenderOptions,
+    ) -> Result<PresentOutcome, RenderError> {
+        let (width, height) = swapchain.extent();
+        // This also waits for the previous frame's submission, after which the
+        // swapchain's acquire semaphore is free to be signalled again.
+        self.ensure_frame(
+            cache,
+            FrameKey::new(width, height, options),
+            PRESENT_TIMEOUT_NS,
+        )?;
+        let Some((index, suboptimal)) = swapchain.acquire()? else {
+            return Ok(PresentOutcome::OutOfDate);
+        };
+        let target = FrameTarget::Present(swapchain.image(index));
+        let frame = self.record_frame(cache, scene, options, target)?;
+        frame.submit(
+            self.queue,
+            // The swapchain image is first touched by the blit, in the
+            // TRANSFER stage; everything before it may run before the image
+            // has been acquired.
+            Some((swapchain.image_ready(), vk::PipelineStageFlags::TRANSFER)),
+            Some(swapchain.present_done(index)),
+        )?;
+        let outcome = swapchain.present(self.queue, index)?;
+        Ok(match outcome {
+            PresentOutcome::Presented if suboptimal => PresentOutcome::Suboptimal,
+            other => other,
+        })
+    }
+
+    /// Make the cached frame match `key`, waiting (up to `timeout_ns`) for its
+    /// previous submission first. On return nothing is pending on the frame,
+    /// so its buffers, descriptor sets and command buffer may be rewritten.
+    fn ensure_frame(
+        &self,
+        cache: &mut RenderCache,
+        key: FrameKey,
+        timeout_ns: u64,
+    ) -> Result<(), RenderError> {
+        if let Some((have, frame)) = &cache.frame {
+            frame.wait(timeout_ns)?;
+            if *have == key {
+                return Ok(());
+            }
+        }
+        // Free the old frame's memory before allocating its replacement.
+        cache.frame = None;
+        let frame = FrameGpu::new(
             &self.device,
-            &self.accel,
             self.allocator()?,
             &self.pipelines,
-            &scene_gpu,
-            self.queue,
             self.cmd_pool,
-            width,
-            height,
-            &options,
-            vk::Format::D32_SFLOAT,
+            key,
         )?;
+        cache.frame = Some((key, frame));
+        Ok(())
+    }
 
-        // Uniform data is written straight into the CPU-mapped uniform buffers;
-        // each submission below is fenced, so the writes are visible in order.
+    /// Drop the cached frame after a failed render: its fence may never be
+    /// signalled, so reusing it could wait forever.
+    fn discard_frame(&self, cache: &mut RenderCache) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        cache.frame = None;
+    }
+
+    /// Upload `scene` into the cached buffers, write the frame's uniforms and
+    /// record its command buffer. [`RenderContext::ensure_frame`] must have
+    /// succeeded for this frame.
+    fn record_frame<'c>(
+        &self,
+        cache: &'c mut RenderCache,
+        scene: &Scene,
+        options: &RenderOptions,
+        target: FrameTarget,
+    ) -> Result<&'c FrameGpu, RenderError> {
+        let allocator = self.allocator()?;
+        let count = u32::try_from(scene.instances.len())
+            .map_err(|_| RenderError::new("the scene has more than u32::MAX instances"))?;
+        let grown = |min: u32| count.max(min).checked_next_power_of_two().unwrap_or(count);
+
+        if cache
+            .instances
+            .as_ref()
+            .is_none_or(|b| b.capacity() < count)
+        {
+            cache.instances = None;
+            cache.instances = Some(InstanceBuffer::new(
+                &self.device,
+                allocator,
+                grown(64),
+                "render-instances",
+            )?);
+        }
+
+        // Mesh models: upload any model seen for the first time, drop the ones
+        // this scene no longer uses (nothing is pending, so that is safe), and
+        // lay out one record + one indexed draw per material part.
+        let in_use: std::collections::HashSet<usize> =
+            scene.models.iter().map(|m| mesh_key(&m.mesh)).collect();
+        cache.meshes.retain(|key, _| in_use.contains(key));
+        let mut mesh_records = Vec::new();
+        let mut mesh_draws = Vec::new();
+        for model in &scene.models {
+            let key = mesh_key(&model.mesh);
+            let gpu = match cache.meshes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => &entry.into_mut().1,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let gpu = MeshGpu::upload(
+                        &self.device,
+                        allocator,
+                        self.queue,
+                        self.cmd_pool,
+                        &model.mesh,
+                    )?;
+                    &entry.insert((Arc::clone(&model.mesh), gpu)).1
+                }
+            };
+            for part in &model.mesh.parts {
+                mesh_draws.push(MeshDraw {
+                    vertices: gpu.vertices.handle,
+                    indices: gpu.indices.handle,
+                    first_index: part.first_index,
+                    index_count: part.index_count,
+                    record: mesh_records.len() as u32,
+                });
+                mesh_records.push(mesh_record(model, &part.material));
+            }
+        }
+        let record_count = mesh_records.len() as u32;
+        if cache
+            .mesh_records
+            .as_ref()
+            .is_none_or(|b| b.capacity() < record_count)
+        {
+            cache.mesh_records = None;
+            cache.mesh_records = Some(InstanceBuffer::new(
+                &self.device,
+                allocator,
+                record_count
+                    .max(16)
+                    .checked_next_power_of_two()
+                    .unwrap_or(record_count),
+                "mesh-records",
+            )?);
+        }
+        // Acceleration structures only for a frame that actually traces rays.
+        let traces_rays = options.gi_enabled || options.ray_probe;
+        if traces_rays {
+            if cache.shapes.is_none() {
+                cache.shapes = Some(ShapeBlas::build(
+                    &self.device,
+                    &self.accel,
+                    allocator,
+                    self.queue,
+                    self.cmd_pool,
+                )?);
+            }
+            if cache.tlas.as_ref().is_none_or(|t| t.capacity() < count) {
+                cache.tlas = None;
+                cache.tlas = Some(Tlas::new(&self.device, &self.accel, allocator, grown(16))?);
+            }
+        }
+
+        // Group the instances by detail level: one instanced draw per level.
+        let frame_height = cache.frame.as_ref().map_or(1, |(key, _)| key.height);
+        let runs = group_by_detail(scene, frame_height, &mut cache.ordered);
+
+        let cache: &'c RenderCache = cache;
+        let (Some((key, frame)), Some(instances), Some(mesh_buffer)) =
+            (&cache.frame, &cache.instances, &cache.mesh_records)
+        else {
+            return Err(RenderError::new("no frame resources to record into"));
+        };
+        instances.write(&cache.ordered)?;
+        mesh_buffer.write(&mesh_records)?;
+        let tlas = match (traces_rays, &cache.shapes, &cache.tlas) {
+            (true, Some(shapes), Some(tlas)) => {
+                tlas.write_instances(shapes, &cache.ordered)?;
+                Some(tlas)
+            }
+            _ => None,
+        };
+        frame.bind_scene(
+            &self.device,
+            &instances.buffer,
+            &mesh_buffer.buffer,
+            tlas.map(|t| t.handle),
+        );
+
+        // Uniform data is written straight into the CPU-mapped uniform
+        // buffers; nothing is pending on the frame, so the GPU is not reading
+        // them.
+        let (width, height) = (key.width, key.height);
         let (forward_params, gi_params, tone_params) =
-            build_uniforms(scene, width, height, &options);
+            build_uniforms(scene, width, height, options);
         frame
             .forward_params
             .write(params::as_bytes(&forward_params))?;
@@ -668,74 +990,128 @@ impl RenderContext {
             frame.gi_params.write(params::as_bytes(&gi))?;
         }
         frame.tone_params.write(params::as_bytes(&tone_params))?;
-        if let Some(post) = &frame.post {
-            let post_params = build_post_params(&forward_params, width, height, &options);
-            post.params.write(params::as_bytes(&post_params))?;
+        if let Some(post) = frame.post_params() {
+            let post_params = build_post_params(&forward_params, width, height, options);
+            post.write(params::as_bytes(&post_params))?;
         }
         if options.ray_probe {
             let rq = rq_uniforms(scene, width, height);
             frame.rq_params.write(params::as_bytes(&rq))?;
         }
 
-        let (vertices, _indices) = scene.triangle_soup();
-        let max_vertex = vertices.len().saturating_sub(1) as u32;
-        frame.record_build_blas(
-            &self.device,
-            &self.accel,
-            &scene_gpu,
-            scene_gpu.vertices.device_address(),
-            scene_gpu.indices.device_address(),
-            max_vertex,
-        )?;
-        crate::passes::FrameGpu::submit(
-            &self.device,
-            self.queue,
-            frame.cmd_build_blas,
-            frame.fence,
-        )?;
-
-        if self.ray_query.complete() {
-            frame.record_build_tlas(
-                &self.device,
-                &self.accel,
-                &scene_gpu,
-                scene_gpu.tlas_instance_addr(),
-            )?;
-            crate::passes::FrameGpu::submit(
-                &self.device,
-                self.queue,
-                frame.cmd_build_tlas,
-                frame.fence,
-            )?;
-        }
-
-        frame.record_frame(
+        frame.record(
             &self.device,
             &self.pipelines,
-            &scene_gpu,
-            &options,
-            gi_dispatch,
+            &FrameDraw {
+                instance_count: count,
+                runs: &runs,
+                meshes: &mesh_draws,
+                tlas,
+                gi_dispatch: options.gi_enabled && !options.mutate_skip_gi_dispatch,
+            },
+            options,
+            target,
         )?;
-        crate::passes::FrameGpu::submit(&self.device, self.queue, frame.cmd_frame, frame.fence)?;
-
-        let pixels = frame.read_pixels()?;
-        let output = FrameOutput {
-            width,
-            height,
-            pixels,
-            validation_messages: validation_message_count() - before,
-            instance_count: scene.instances.len(),
-        };
-        Ok((output, frame))
+        Ok(frame)
     }
+}
+
+/// Cache key of a shared mesh: the address of its `MeshData`.
+fn mesh_key(mesh: &Arc<MeshData>) -> usize {
+    Arc::as_ptr(mesh) as usize
+}
+
+/// The GPU record of one part of `model`: its placement and `material`.
+fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> MeshInstanceGpu {
+    let row = |r: usize| {
+        let [x, y, z] = model.rotation[r];
+        [
+            x * model.scale,
+            y * model.scale,
+            z * model.scale,
+            model.position[r],
+        ]
+    };
+    let [r, g, b] = material.base_color;
+    let [er, eg, eb] = material.emissive;
+    MeshInstanceGpu {
+        model_x: row(0),
+        model_y: row(1),
+        model_z: row(2),
+        albedo: [r, g, b, material.metallic],
+        emissive: [er, eg, eb, material.roughness],
+    }
+}
+
+/// The sphere detail level an instance is drawn at: from the radius of its
+/// silhouette in pixels on a frame `height` pixels tall. Boxes have one mesh.
+fn detail_level(instance: &GpuInstance, focal_px: f32) -> u32 {
+    if instance.shape == SHAPE_BOX {
+        return 0;
+    }
+    let [x, y, z, radius] = instance.center;
+    let distance = (x * x + y * y + z * z).sqrt();
+    // Angular radius of a sphere seen from outside is asin(r / d); r / d is
+    // the same to first order and saturates (inf) once the camera is inside.
+    let radius_px = radius.abs() / (distance - radius.abs()).max(1e-6) * focal_px;
+    sphere_level_for(radius_px)
+}
+
+/// Copy `scene`'s instances into `ordered`, grouped by detail level (highest
+/// first, scene order kept within a level), and return the instanced draw for
+/// each level. `ordered` is what gets uploaded: instance indices on the GPU
+/// (including ray-query hits) refer to it.
+fn group_by_detail(
+    scene: &Scene,
+    frame_height: u32,
+    ordered: &mut Vec<GpuInstance>,
+) -> [DrawRun; SPHERE_LEVELS as usize] {
+    // Pixels per unit of tan(angle): height / (2 tan(fov_y / 2)).
+    let focal_px = frame_height as f32 / (2.0 * (scene.camera.fov_y * 0.5).tan()).max(1e-6);
+    let levels: Vec<u32> = scene
+        .instances
+        .iter()
+        .map(|instance| detail_level(instance, focal_px))
+        .collect();
+    let mut counts = [0u32; SPHERE_LEVELS as usize];
+    for &level in &levels {
+        counts[level as usize] += 1;
+    }
+    // Highest detail first: slot `s` holds level `SPHERE_LEVELS - 1 - s`.
+    let mut runs = [DrawRun::default(); SPHERE_LEVELS as usize];
+    let mut first = 0;
+    for (slot, run) in runs.iter_mut().enumerate() {
+        let level = SPHERE_LEVELS - 1 - slot as u32;
+        *run = DrawRun {
+            first_instance: first,
+            instance_count: counts[level as usize],
+            vertex_count: sphere_vertex_count(level),
+            first_vertex: level << 24,
+        };
+        first += counts[level as usize];
+    }
+    ordered.clear();
+    ordered.resize(scene.instances.len(), GpuInstance::default());
+    let mut next = runs.map(|run| run.first_instance as usize);
+    for (instance, &level) in scene.instances.iter().zip(&levels) {
+        let slot = (SPHERE_LEVELS - 1 - level) as usize;
+        ordered[next[slot]] = *instance;
+        next[slot] += 1;
+    }
+    runs
 }
 
 impl Drop for RenderContext {
     fn drop(&mut self) {
-        // Everything the caller allocated (frames, scenes) is dropped before
-        // we get here; only long-lived objects remain.
         unsafe {
             let _ = self.device.device_wait_idle();
+        }
+        // The cached frame resources own buffers, images and a command
+        // buffer: they go before the command pool and the allocator.
+        drop(std::mem::take(
+            self.cache.get_mut().unwrap_or_else(PoisonError::into_inner),
+        ));
+        unsafe {
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.pipelines.destroy(&self.device);
             if let Some((du, messenger)) = &self.debug {
@@ -775,6 +1151,12 @@ fn build_uniforms(
     let inv_view_proj = scene.inv_view_proj().unwrap_or(view_proj);
     let tan_half_fov = (cam.fov_y * 0.5).tan();
     let features = options.preset.features();
+    let fog_density = features.fog_density * options.fog_scale.max(0.0);
+    let mut feature_flags = features.flags();
+    // No fog at all (also for a NaN density) clears the feature bit.
+    if fog_density.is_nan() || fog_density <= 0.0 {
+        feature_flags &= !quality::FEATURE_FOG;
+    }
 
     let mut forward = params::ForwardParams {
         camera: params::Camera {
@@ -801,9 +1183,9 @@ fn build_uniforms(
             quality::FOG_COLOR[0],
             quality::FOG_COLOR[1],
             quality::FOG_COLOR[2],
-            features.fog_density,
+            fog_density,
         ],
-        features: features.flags(),
+        features: feature_flags,
         _pad2: [0; 3],
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {

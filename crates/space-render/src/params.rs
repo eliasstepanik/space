@@ -63,6 +63,22 @@ pub struct GpuInstance {
     pub _pad1: f32,
 }
 
+/// `MeshInstance` in `shaders/forward.wgsl` (80 bytes): one drawn part of a
+/// mesh model.
+/// Offsets: 0 model_x, 16 model_y, 32 model_z, 48 albedo, 64 emissive -> 80.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeshInstanceGpu {
+    /// Rows of the 3x4 model -> camera-relative world matrix.
+    pub model_x: [f32; 4],
+    pub model_y: [f32; 4],
+    pub model_z: [f32; 4],
+    /// rgb + metallic in .w.
+    pub albedo: [f32; 4],
+    /// rgb radiance + roughness in .w.
+    pub emissive: [f32; 4],
+}
+
 /// `Camera` in `shaders/forward.wgsl` (160 bytes: two `mat4x4` at 64 bytes
 /// each plus two `vec4`s).
 #[repr(C)]
@@ -159,10 +175,48 @@ pub(crate) mod bytemuck_free {
 
 use bytemuck_free::pod_bytes;
 
+/// Marker for the uniform/storage mirrors in this module: `repr(C)`, made only
+/// of `f32`/`u32` members, with no padding bytes — so viewing one as bytes is
+/// always sound. Sealed to this module's structs.
+pub trait GpuPod: Copy + sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! gpu_pod {
+    ($($ty:ty),* $(,)?) => {
+        $(impl sealed::Sealed for $ty {} impl GpuPod for $ty {})*
+    };
+}
+
+gpu_pod!(
+    RqParams,
+    GiParams,
+    GpuInstance,
+    MeshInstanceGpu,
+    Camera,
+    Light,
+    ForwardParams,
+    PostParams,
+    ToneParams,
+);
+
 /// Bytes of `value`, for buffer uploads.
-pub fn as_bytes<T>(value: &T) -> &[u8] {
-    // SAFETY: every public struct in this module is repr(C) f32/u32 POD.
+pub fn as_bytes<T: GpuPod>(value: &T) -> &[u8] {
+    // SAFETY: `GpuPod` types are repr(C) f32/u32 plain data without padding.
     unsafe { pod_bytes(value) }
+}
+
+/// Byte view of a whole slice of plain-old-data values.
+///
+/// # Safety
+/// `T` must be `repr(C)` plain data with no padding bytes and no invalid bit
+/// patterns (every [`GpuPod`] type, and Vulkan's instance record, qualify).
+pub(crate) unsafe fn slice_bytes<T: Copy>(values: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +281,17 @@ mod tests {
             shape => GPUINSTANCE_SHAPE,
             transmission => GPUINSTANCE_TRANSMISSION,
         } size = GPUINSTANCE_SIZE);
+    }
+
+    #[test]
+    fn mesh_instance_matches_wgsl() {
+        assert_layout!(MeshInstanceGpu {
+            model_x => MESHINSTANCEGPU_MODEL_X,
+            model_y => MESHINSTANCEGPU_MODEL_Y,
+            model_z => MESHINSTANCEGPU_MODEL_Z,
+            albedo => MESHINSTANCEGPU_ALBEDO,
+            emissive => MESHINSTANCEGPU_EMISSIVE,
+        } size = MESHINSTANCEGPU_SIZE);
     }
 
     #[test]

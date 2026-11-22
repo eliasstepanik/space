@@ -36,6 +36,8 @@ use tokio::sync::Mutex;
 
 /// Longest `send_input` hold.
 pub const MAX_HOLD_MS: u64 = 10_000;
+/// How long `connect` waits for the shard to answer.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Smallest and largest frame edge `capture_frame` renders.
 pub const FRAME_EDGE: std::ops::RangeInclusive<u64> = 16..=1920;
 /// JPEG quality of captured frames.
@@ -84,11 +86,6 @@ fn scene_at(offset: [f64; 3], width: u32, height: u32) -> Scene {
     let off = offset.map(|v| v as f32);
     for inst in &mut scene.instances {
         for (c, o) in inst.center.iter_mut().zip(off) {
-            *c -= o;
-        }
-    }
-    for v in scene.meshes.iter_mut().flatten() {
-        for (c, o) in v.iter_mut().zip(off) {
             *c -= o;
         }
     }
@@ -146,6 +143,20 @@ pub fn render_jpeg(
         height: jpeg.height,
         device: ctx.device_name().to_owned(),
     })
+}
+
+/// Write a captured frame to `path`, creating its directory. Blocking.
+///
+/// # Errors
+///
+/// A message naming the file when the directory or the file cannot be written.
+pub fn save_capture(path: &std::path::Path, jpeg: &[u8]) -> Result<(), String> {
+    let written = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::create_dir_all(dir),
+        _ => Ok(()),
+    }
+    .and_then(|()| std::fs::write(path, jpeg));
+    written.map_err(|e| format!("cannot save {}: {e}", path.display()))
 }
 
 /// A file name that is safe to create under the output directory.
@@ -249,20 +260,31 @@ pub fn registry(state: &Arc<ClientState>) -> ToolRegistry {
 }
 
 async fn connect(state: &ClientState, args: &Value) -> Result<String, String> {
+    const ALREADY: &str = "already connected; call disconnect first";
     let addr = arg_str(args, "addr")?;
-    let mut slot = state.link.lock().await;
-    if slot.as_ref().is_some_and(|l| !l.is_closed()) {
-        return Err("already connected; call disconnect first".into());
+    let connected = |slot: &Option<ServerLink>| slot.as_ref().is_some_and(|l| !l.is_closed());
+    if connected(&*state.link.lock().await) {
+        return Err(ALREADY.into());
     }
+    // The link mutex is **not** held while resolving and dialling: that takes
+    // up to ten seconds against a shard that does not answer, and every other
+    // tool (`client_status`, `send_input`, `capture_frame`, `disconnect`) needs
+    // the same mutex — over HTTP they all hung behind one slow `connect`.
     let target = tokio::net::lookup_host(addr)
         .await
         .map_err(|e| format!("cannot resolve {addr:?}: {e}"))?
         .next()
         .ok_or_else(|| format!("{addr:?} resolved to no address"))?;
-    let link = tokio::time::timeout(Duration::from_secs(10), ServerLink::connect(target))
+    let link = tokio::time::timeout(CONNECT_TIMEOUT, ServerLink::connect(target))
         .await
         .map_err(|_| format!("connecting to {target} timed out"))?
         .map_err(|e| format!("connect to {target} failed: {e}"))?;
+    let mut slot = state.link.lock().await;
+    if connected(&slot) {
+        // Another `connect` got there first while this one was dialling; one
+        // player, one link. (Dropping `link` closes it.)
+        return Err(ALREADY.into());
+    }
     let session = link.replica().session;
     *slot = Some(link);
     pretty(&json!({"connected": true, "addr": target.to_string(), "session": session}))
@@ -356,9 +378,19 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
         None => ([0.0; 3], false),
     };
     let render = Arc::clone(&state.render);
-    let capture = tokio::task::spawn_blocking(move || render_jpeg(&render, offset, width, height))
-        .await
-        .map_err(|e| format!("render task failed: {e}"))??;
+    // Rendering, encoding **and** writing the file all block, so they all run
+    // on the blocking pool; the file write used to happen on an async worker.
+    let save_to = name.as_ref().map(|name| state.out_dir.join(name));
+    let saving = save_to.clone();
+    let capture = tokio::task::spawn_blocking(move || {
+        let capture = render_jpeg(&render, offset, width, height)?;
+        if let Some(path) = saving {
+            save_capture(&path, &capture.jpeg)?;
+        }
+        Ok::<Capture, String>(capture)
+    })
+    .await
+    .map_err(|e| format!("render task failed: {e}"))??;
     let mut reply = json!({
         "format": "jpeg",
         "width": capture.width,
@@ -368,11 +400,7 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
         "connected": connected,
         "camera_offset_m": offset,
     });
-    if let Some(name) = name {
-        let path = state.out_dir.join(&name);
-        std::fs::create_dir_all(&state.out_dir)
-            .and_then(|()| std::fs::write(&path, &capture.jpeg))
-            .map_err(|e| format!("cannot save {name}: {e}"))?;
+    if let Some(path) = save_to {
         reply["path"] = json!(path.display().to_string());
     }
     if inline {
