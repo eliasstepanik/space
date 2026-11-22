@@ -220,12 +220,23 @@ impl EpochPublisher {
 
     /// Record an `EpochAck`. When the last one lands, returns the `EpochCommit`
     /// to broadcast and swaps the staged map in.
+    ///
+    /// An ack only counts toward the epoch it acknowledges: while preparing, an
+    /// ack whose `ack_epoch` differs from the staged epoch is ignored (returns
+    /// `None`, `awaiting` untouched).
+    ///
+    /// Known limit (accepted): a late ack carrying the *same* epoch number
+    /// issued after an abort is indistinguishable from a fresh one — the epoch
+    /// number is the only discriminator — and still counts.
     #[must_use]
-    pub fn ack(&mut self, shard: ShardId, tick: u64) -> Option<Outbound> {
+    pub fn ack(&mut self, shard: ShardId, ack_epoch: u64, tick: u64) -> Option<Outbound> {
         let (epoch, commit_now) = match &mut self.phase {
             Phase::Preparing {
                 epoch, awaiting, ..
             } => {
+                if ack_epoch != *epoch {
+                    return None;
+                }
                 awaiting.remove(&shard);
                 (*epoch, awaiting.is_empty())
             }
