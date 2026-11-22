@@ -300,8 +300,8 @@ mod tests {
         // the returned id.
         let sink = Box::<MemoryCounterSink>::default();
         let mut alloc = PersistentShardIdAllocator::with_sink(7, sink);
-        assert_eq!(alloc.allocate(), ShardId::new(7));
-        assert_eq!(alloc.allocate(), ShardId::new(8));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(7)));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(8)));
         // Rebuild the sink view through peek: after two allocations the counter
         // sits at 9 and both persists wrote 8 then 9.
         assert_eq!(alloc.peek(), 9);
