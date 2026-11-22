@@ -411,7 +411,8 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                 }
-                if event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                if event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
                 {
                     event_loop.exit();
                 }
