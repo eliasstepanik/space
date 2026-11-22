@@ -204,6 +204,9 @@ pub fn stream_loop(
     let mut streamed = 0u64;
     while !stop.load(Ordering::Relaxed) && max_frames.is_none_or(|m| streamed < m) {
         let start = Instant::now();
+        if link.is_some_and(ServerLink::is_closed) {
+            return Err(RenderError::new("lost the server connection"));
+        }
         pump_input(client, &mut input, link);
         match link {
             Some(link) => input.offset = link.offset(),
