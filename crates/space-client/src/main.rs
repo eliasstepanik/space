@@ -429,6 +429,7 @@ impl App {
             options: demo_options(config.quality),
             failed: false,
             frames: 0,
+            live,
         })
     }
 }
