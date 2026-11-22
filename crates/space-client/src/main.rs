@@ -420,7 +420,7 @@ mod tests {
             drop(frame);
             assert_eq!(out.validation_messages, 0, "{preset}");
             assert!(
-                out.pixels.chunks_exact(4).any(|px| px[0] > 8),
+                out.pixels.as_chunks::<4>().0.iter().any(|px| px[0] > 8),
                 "{preset}: nothing rendered"
             );
         }
