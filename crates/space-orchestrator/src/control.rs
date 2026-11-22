@@ -441,7 +441,10 @@ mod tests {
 
     #[test]
     fn a_hello_with_no_id_gets_a_fresh_allocation_and_the_current_map() {
+        // The orchestrator pre-allocated root owner 1 at startup; the first
+        // region-less hello adopts it (no fresh allocation burns an id).
         let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
         let hello = ShardHello {
             cluster: plane.config.cluster.clone(),
             shard: ShardId::NONE,
@@ -449,14 +452,78 @@ mod tests {
             region: None,
         };
         let welcome = plane.handle_shard_hello(&hello).expect("welcome");
-        assert_eq!(welcome.shard, ShardId::new(1), "first allocated id");
+        assert_eq!(welcome.shard, ShardId::new(1), "adopted the root owner");
         assert_eq!(welcome.region.shard, welcome.shard);
+        assert_eq!(welcome.region.endpoint, addr(9_000));
+        assert_eq!(plane.unclaimed_root_owner(), None, "now claimed");
         assert_eq!(
             welcome.shard_map,
             *plane.map(),
             "the welcome carries the current map"
         );
+        let root = welcome
+            .shard_map
+            .regions
+            .iter()
+            .find(|r| r.shard == ShardId::new(1))
+            .expect("root region");
+        assert_eq!(
+            root.endpoint,
+            addr(9_000),
+            "the map names the live shard's endpoint, not the placeholder"
+        );
         assert_eq!(welcome.peer_token, "secret");
+    }
+
+    #[test]
+    fn a_second_region_less_hello_for_the_root_is_refused() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        let hello = |port| ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::NONE,
+            endpoint: addr(port),
+            region: None,
+        };
+        let (first, second) = (hello(9_000), hello(9_001));
+        plane.handle_shard_hello(&first).expect("first adopts");
+        assert!(
+            plane.handle_shard_hello(&second).is_err(),
+            "the root is already claimed by a live shard"
+        );
+        // The refusal burned no id.
+        assert_eq!(plane.ids.peek(), 1);
+    }
+
+    #[test]
+    fn a_no_region_hello_claiming_a_non_root_id_is_refused_when_the_root_is_owned() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        let hello = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(2),
+            endpoint: addr(9_000),
+            region: None,
+        };
+        assert!(plane.handle_shard_hello(&hello).is_err());
+        assert_eq!(
+            plane.unclaimed_root_owner(),
+            Some(ShardId::new(1)),
+            "a refused hello leaves the reservation intact"
+        );
+    }
+
+    #[test]
+    fn confirming_a_known_id_reserves_it_in_the_allocator() {
+        let mut plane = plane();
+        let hello = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(1),
+            endpoint: addr(9_000),
+            region: None,
+        };
+        plane.handle_shard_hello(&hello).expect("owner confirms");
+        assert_eq!(plane.ids.peek(), 2, "id 1 can never be allocated again");
     }
 
     #[test]
