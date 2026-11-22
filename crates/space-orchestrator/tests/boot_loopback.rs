@@ -1,9 +1,9 @@
 //! The booted cluster serves real clients (Phase 3 remediation, FIX 1).
 //!
-//! Boots the orchestrator through its real wiring ([`boot`] + [`Orchestrator::bind`]
-//! + [`Orchestrator::run_with`]) and ONE orchestrated shard through
-//! [`space_server::orchestrated::start_orchestrated`] — the same function the
-//! `space-server --orchestrator` binary runs — in-process on loopback. A real
+//! Boots the orchestrator through its real wiring (`boot`, then
+//! `Orchestrator::bind` and `Orchestrator::run_with`) and ONE orchestrated shard
+//! through [`space_server::orchestrated::start_orchestrated`] — the same function
+//! the `space-server --orchestrator` binary runs — in-process on loopback. A real
 //! QUIC client then connects to that shard and must receive frames for its own
 //! ship and never be redirected to the control port.
 //!
