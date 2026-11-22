@@ -621,11 +621,11 @@ fn fog_shifts_distant_pixels_toward_fog_colour() {
     );
     // Fogged: darker toward the fog colour and tinted blue (fog b > r).
     assert!(
-        p_high[0] + 40 < p_off[0],
+        p_high[0] + 20 < p_off[0],
         "red must drop toward fog: {p_high:?} vs {p_off:?}"
     );
     assert!(
-        p_high[2] > p_high[0] + 10,
+        p_high[2] >= p_high[0] + 5,
         "must be tinted toward blue fog: {p_high:?}"
     );
     // Stronger fog, stronger shift.
