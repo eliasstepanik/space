@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 
 use space_render::{
-    demo_scene, CameraPose, ContextOptions, Quality, RenderContext, RenderError, RenderOptions,
-    Scene, Swapchain, WindowHandles,
+    demo_scene, CameraPose, ContextOptions, Quality, QualityPreset, RenderContext, RenderError,
+    RenderOptions, Scene, Swapchain, WindowHandles,
 };
 use space_world::{Galaxy, LodSelector, WorldPos};
 use winit::application::ApplicationHandler;
@@ -41,6 +41,7 @@ struct Config {
     width: u32,
     height: u32,
     out: Option<PathBuf>,
+    quality: QualityPreset,
 }
 
 fn parse_args() -> Config {
@@ -49,6 +50,7 @@ fn parse_args() -> Config {
         width: 640,
         height: 480,
         out: None,
+        quality: QualityPreset::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -73,6 +75,16 @@ fn parse_args() -> Config {
             "--out" => {
                 config.out = args.next().map(PathBuf::from);
             }
+            "--quality" => {
+                let value = args.next().unwrap_or_default();
+                match value.parse() {
+                    Ok(preset) => config.quality = preset,
+                    Err(e) => {
+                        eprintln!("space-client: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -90,11 +102,13 @@ fn parse_args() -> Config {
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
+               [--quality high|medium|low|ci]\n\
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
         \x20 --size WxH frame size in pixels (default 640x480)\n\
         \x20 --out FILE write the frame to FILE (PPM); default demo.ppm / galaxy.ppm\n\
+        \x20 --quality P quality preset: high (default), medium, low or ci (fog etc.)\n\
         \n\
         With neither --demo nor --galaxy a winit window is opened."
     );
@@ -136,11 +150,13 @@ fn write_ppm(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> st
     std::fs::write(path, out)
 }
 
-/// The CI-cheap, deterministic render options used by the offline demo.
-fn demo_options() -> RenderOptions {
+/// The CI-cheap, deterministic render options used by the offline demo; the
+/// preset selects the optional render features (fog, ...).
+fn demo_options(preset: QualityPreset) -> RenderOptions {
     RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+        preset,
         ..Default::default()
     }
 }
@@ -153,7 +169,12 @@ fn run_offscreen(config: &Config) -> Result<(), RenderError> {
         ctx.ray_query_support().complete()
     );
     let scene = scene_for(config.mode, config.width, config.height);
-    let out = ctx.render_offscreen(&scene, config.width, config.height, &demo_options())?;
+    let out = ctx.render_offscreen(
+        &scene,
+        config.width,
+        config.height,
+        &demo_options(config.quality),
+    )?;
     let default = match config.mode {
         Mode::Galaxy => PathBuf::from("galaxy.ppm"),
         _ => PathBuf::from("demo.ppm"),
@@ -193,11 +214,12 @@ impl App {
                 width: config.width,
                 height: config.height,
                 out: None,
+                quality: config.quality,
             },
             window: None,
             swapchain: None,
             scene: None,
-            options: demo_options(),
+            options: demo_options(config.quality),
             failed: false,
         })
     }
@@ -360,7 +382,7 @@ mod tests {
         let size = 64;
         let scene = demo_scene(size, size);
         let out = ctx
-            .render_offscreen(&scene, size, size, &demo_options())
+            .render_offscreen(&scene, size, size, &demo_options(QualityPreset::Ci))
             .expect("demo render");
         assert_eq!(out.validation_messages, 0);
         let lit = out

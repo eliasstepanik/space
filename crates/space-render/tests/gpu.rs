@@ -6,8 +6,8 @@
 //! lavapipe) — the exact-pixel tests must pass on lavapipe.
 
 use space_render::{
-    validation_message_count, ContextOptions, GpuInstance, Quality, RenderContext, RenderError,
-    RenderOptions, Renderer, Scene,
+    validation_message_count, ContextOptions, GpuInstance, Quality, QualityPreset, RenderContext,
+    RenderError, RenderOptions, Renderer, Scene,
 };
 use space_world::WorldPos;
 
@@ -16,6 +16,8 @@ fn ci_options() -> RenderOptions {
     RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+        // Fog off: the golden/pixel tests must not depend on fog.
+        preset: QualityPreset::Ci,
         ..Default::default()
     }
 }
@@ -388,6 +390,8 @@ fn lod_galaxy_renders() {
     let opts = RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+        // Fog off: the golden/pixel tests must not depend on fog.
+        preset: QualityPreset::Ci,
         ..Default::default()
     };
     let out = ctx
@@ -504,6 +508,8 @@ fn brdf_analytic_light_lights_the_sphere() {
     let opts = RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+        // Fog off: the golden/pixel tests must not depend on fog.
+        preset: QualityPreset::Ci,
         ..Default::default()
     };
     let out = ctx
@@ -541,4 +547,113 @@ fn brdf_analytic_light_lights_the_sphere() {
         0,
         "zeroing the light count must leave a non-emissive scene black"
     );
+}
+
+/// One emissive sphere of `radius` at `distance` metres straight ahead.
+fn fog_scene(distance: f32, radius: f32) -> Scene {
+    let camera = space_render::CameraPose {
+        position: WorldPos::ZERO,
+        forward: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        fov_y: std::f32::consts::FRAC_PI_3,
+        aspect: 1.0,
+        near: 0.05,
+        far: 1.0e5,
+    };
+    Scene::from_instances(
+        camera,
+        vec![GpuInstance {
+            center: [0.0, 0.0, -distance, radius],
+            albedo: [1.0, 1.0, 1.0, 0.0],
+            emissive: [4.0, 4.0, 4.0, 1.0],
+            roughness: 0.5,
+            shape: space_render::SHAPE_SPHERE,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }],
+    )
+}
+
+/// Fog: a distant white sphere shifts toward the (blue-ish) fog colour with
+/// fog on, is monotone in preset strength, leaves a near sphere and the empty
+/// background alone, and is identical for presets with fog off.
+/// Mutation: `QualityPreset::Ci` (fog off) must make the shift assertions fail,
+/// which is what the "off" renders below are compared against.
+#[test]
+fn fog_shifts_distant_pixels_toward_fog_colour() {
+    let Some(mut ctx) = context() else { return };
+    let size = 64;
+    let mut render = |scene: &Scene, preset: QualityPreset| {
+        let opts = RenderOptions {
+            gi_enabled: false,
+            quality: Quality::CI,
+            preset,
+            ..Default::default()
+        };
+        let out = ctx
+            .render_frame(scene, size, size, &opts)
+            .expect("fog render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        out
+    };
+    let c = size / 2;
+
+    // Far sphere: 800 m away, radius 100 m (covers the image centre).
+    let far = fog_scene(800.0, 100.0);
+    let off = render(&far, QualityPreset::Ci);
+    let low = render(&far, QualityPreset::Low);
+    let medium = render(&far, QualityPreset::Medium);
+    let high = render(&far, QualityPreset::High);
+    assert_eq!(off.pixels, low.pixels, "Low and Ci both have fog off");
+
+    let p_off = pixel(&off, c, c);
+    let p_med = pixel(&medium, c, c);
+    let p_high = pixel(&high, c, c);
+    eprintln!("fog centre pixel: off={p_off:?} medium={p_med:?} high={p_high:?}");
+    // Unfogged the emissive sphere saturates to neutral white.
+    assert!(
+        p_off[0].abs_diff(p_off[2]) <= 2,
+        "unfogged must be neutral: {p_off:?}"
+    );
+    assert!(
+        p_off[0] >= 200,
+        "unfogged sphere should be bright: {p_off:?}"
+    );
+    // Fogged: darker toward the fog colour and tinted blue (fog b > r).
+    assert!(
+        p_high[0] + 40 < p_off[0],
+        "red must drop toward fog: {p_high:?} vs {p_off:?}"
+    );
+    assert!(
+        p_high[2] > p_high[0] + 10,
+        "must be tinted toward blue fog: {p_high:?}"
+    );
+    // Stronger fog, stronger shift.
+    assert!(
+        p_med[0] <= p_off[0] && p_high[0] <= p_med[0],
+        "monotone: {p_off:?} {p_med:?} {p_high:?}"
+    );
+    assert!(
+        p_med[0] < p_off[0],
+        "medium fog must also shift: {p_med:?} vs {p_off:?}"
+    );
+
+    // The empty background is not fogged.
+    assert_eq!(
+        pixel(&off, 0, 0),
+        pixel(&high, 0, 0),
+        "background must be unchanged"
+    );
+
+    // A near sphere (6 m) is effectively unaffected by fog.
+    let near = fog_scene(6.0, 1.0);
+    let near_off = render(&near, QualityPreset::Ci);
+    let near_high = render(&near, QualityPreset::High);
+    let (a, b) = (pixel(&near_off, c, c), pixel(&near_high, c, c));
+    for ch in 0..3 {
+        assert!(
+            a[ch].abs_diff(b[ch]) <= 2,
+            "near pixel moved by fog: {a:?} vs {b:?}"
+        );
+    }
 }
