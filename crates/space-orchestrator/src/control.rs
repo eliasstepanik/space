@@ -124,6 +124,11 @@ impl ControlPlane {
                     .any(|r| r.node == node && r.shard == *owner)
         });
         let shard = if let Some(owner) = adoptable {
+            // The owner was allocated at startup, so this is normally a no-op;
+            // it keeps the "every confirmed id is reserved" invariant local.
+            self.ids
+                .reserve(owner)
+                .map_err(|e| format!("could not persist the reservation of {}: {e}", owner.0))?;
             self.unclaimed_root_owner = None;
             let mut endpoints = std::collections::BTreeMap::new();
             endpoints.insert(owner, hello.endpoint);
