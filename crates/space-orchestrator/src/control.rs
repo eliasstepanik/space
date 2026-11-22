@@ -134,32 +134,17 @@ impl ControlPlane {
             endpoints.insert(owner, hello.endpoint);
             self.publisher.set_endpoints(&endpoints);
             owner
-        } else {
+        } else if let Some(owner) = self.incumbent_for_restart(hello, node) {
             // The same process re-saying hello (it crashed and restarted with
             // no id): a NONE hello whose endpoint is the one the node's owner
             // already holds *is* that owner. Same id back, no allocation, no
             // reservation; the endpoint is refreshed (a no-op by construction,
             // but it keeps the published map the single source of truth).
-            let incumbent = self
-                .map()
-                .regions
-                .iter()
-                .find(|r| r.node == node)
-                .filter(|r| hello.shard == ShardId::NONE && r.endpoint == hello.endpoint)
-                .map(|r| r.shard);
-            if let Some(owner) = incumbent {
-                let mut endpoints = std::collections::BTreeMap::new();
-                endpoints.insert(owner, hello.endpoint);
-                self.publisher.set_endpoints(&endpoints);
-                let region = ShardRegion::new(node, owner, hello.endpoint);
-                return Ok(ShardWelcome {
-                    shard: owner,
-                    region,
-                    shard_map: self.map().clone(),
-                    peer_token: self.peer_token.clone(),
-                });
-            }
-            // The first claim on a node wins; a conflicting claim (including a
+            let mut endpoints = std::collections::BTreeMap::new();
+            endpoints.insert(owner, hello.endpoint);
+            self.publisher.set_endpoints(&endpoints);
+            owner
+        } else { claim on a node wins; a conflicting claim (including a
             // second region-less hello for the root) is refused, and refused
             // before any id is allocated or reserved.
             if self
