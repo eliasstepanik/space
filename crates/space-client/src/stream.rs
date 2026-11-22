@@ -312,6 +312,23 @@ mod tests {
     }
 
     #[test]
+    fn thrust_follows_held_keys_and_view_and_is_normalised() {
+        let mut s = InputState::default();
+        assert_eq!(s.thrust(), [0.0; 3]);
+        s.apply(key(Key::Forward, true));
+        let t = s.thrust();
+        assert!((t[2] + 1.0).abs() < 1e-6 && t[0].abs() < 1e-6, "{t:?}");
+        s.apply(key(Key::Right, true));
+        s.apply(key(Key::Up, true));
+        let len = s.thrust().iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "diagonal thrust is unit: {len}");
+        s.apply(key(Key::Forward, false));
+        s.apply(key(Key::Right, false));
+        s.apply(key(Key::Up, false));
+        assert_eq!(s.thrust(), [0.0; 3]);
+    }
+
+    #[test]
     fn view_pitch_is_clamped_and_pointer_recorded() {
         let mut s = InputState::default();
         s.apply(ViewerInput::View {
