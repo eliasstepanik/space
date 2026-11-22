@@ -103,34 +103,55 @@ impl ControlPlane {
                 hello.cluster, self.config.cluster
             ));
         }
-        let shard = if hello.shard == ShardId::NONE {
-            self.ids.allocate()
-        } else {
-            // A relaunch (or an orchestrated child booting with the id the
-            // orchestrator allocated for it): confirm the id. The endpoint may
-            // legitimately differ from a placeholder the split staged, so the
-            // known-id path always confirms and lets the region endpoint be
-            // refreshed below.
-            hello.shard
-        };
-        let region = match &hello.region {
-            Some(claimed) => {
-                // The first claim on a node wins; a conflicting claim is refused.
-                if self
+        // Resolve the node first: a hello with no region means "the root".
+        let node = hello
+            .region
+            .as_ref()
+            .map_or_else(|| self.config.root_node(), |claimed| claimed.node);
+
+        // Adopt the pre-allocated root owner: the orchestrator reserved that id
+        // at startup, but nothing launches a shard for it, so the first live
+        // shard asking for the root (anonymously, or by that id) becomes it.
+        let adoptable = self.unclaimed_root_owner.filter(|owner| {
+            (hello.shard == ShardId::NONE || hello.shard == *owner)
+                && self
                     .map()
                     .regions
                     .iter()
-                    .any(|r| r.node == claimed.node && r.shard != shard)
-                {
-                    return Err(format!(
-                        "region at depth {} is already owned",
-                        claimed.node.depth
-                    ));
-                }
-                ShardRegion::new(claimed.node, shard, hello.endpoint)
+                    .any(|r| r.node == node && r.shard == *owner)
+        });
+        let shard = if let Some(owner) = adoptable {
+            self.unclaimed_root_owner = None;
+            let mut endpoints = std::collections::BTreeMap::new();
+            endpoints.insert(owner, hello.endpoint);
+            self.publisher.set_endpoints(&endpoints);
+            owner
+        } else {
+            // The first claim on a node wins; a conflicting claim (including a
+            // second region-less hello for the root) is refused, and refused
+            // before any id is allocated or reserved.
+            if self
+                .map()
+                .regions
+                .iter()
+                .any(|r| r.node == node && r.shard != hello.shard)
+            {
+                return Err(format!("region at depth {} is already owned", node.depth));
             }
-            None => ShardRegion::new(self.config.root_node(), shard, hello.endpoint),
+            if hello.shard == ShardId::NONE {
+                self.ids.allocate()
+            } else {
+                // A relaunch (or an orchestrated child booting with the id the
+                // orchestrator allocated for it): confirm the id and make sure
+                // the allocator never hands it out again. The endpoint may
+                // legitimately differ from a placeholder the split staged, so
+                // the known-id path always confirms and lets the region
+                // endpoint be refreshed below.
+                self.ids.reserve(hello.shard);
+                hello.shard
+            }
         };
+        let region = ShardRegion::new(node, shard, hello.endpoint);
         Ok(ShardWelcome {
             shard,
             region,
