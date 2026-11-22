@@ -126,19 +126,28 @@ mod tests {
         // A restart resumes from the persisted value: the first id after the
         // restart is strictly greater than the last one before it.
         let before = ShardIdAllocator::new(10);
-        let last = before.allocate();
+        let last = before.allocate().expect("allocate");
         assert_eq!(last, ShardId::new(10));
         let after = ShardIdAllocator::new(before.peek());
-        assert_eq!(after.allocate(), ShardId::new(11));
+        assert_eq!(after.allocate(), Ok(ShardId::new(11)));
     }
 
     #[test]
     fn the_reserved_none_id_is_never_handed_out() {
         let alloc = ShardIdAllocator::new(u64::from(u32::MAX - 1));
-        assert_eq!(alloc.allocate(), ShardId::new(u32::MAX - 1));
-        assert!(
-            std::panic::catch_unwind(|| alloc.allocate()).is_err(),
-            "allocating past u32::MAX must fail loudly, not wrap"
-        );
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(u32::MAX - 1)));
+        // Past the limit: an Err (no panic, no wrap), and the counter stays put.
+        let at = alloc.peek();
+        assert!(alloc.allocate().is_err(), "must fail, not wrap");
+        assert!(alloc.allocate().is_err(), "and keep failing");
+        assert_eq!(alloc.peek(), at, "a failed allocation does not advance");
+    }
+
+    #[test]
+    fn a_poisoned_counter_is_an_error_not_a_panic() {
+        let alloc = ShardIdAllocator::new(u64::from(u32::MAX));
+        assert!(alloc.allocate().is_err());
+        let alloc = ShardIdAllocator::new(u64::MAX);
+        assert!(alloc.allocate().is_err());
     }
 }
