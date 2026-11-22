@@ -39,19 +39,25 @@ impl ShardIdAllocator {
 
     /// Allocate the next id.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the counter would pass [`u32::MAX`] or reach
-    /// [`ShardId::NONE`], the reserved "no shard" id. Both are world-lifetime
-    /// limits, not runtime conditions; wrapping would reuse ids.
-    #[must_use]
-    pub fn allocate(&self) -> ShardId {
-        let id = self.next.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            id <= u64::from(u32::MAX) && u32::try_from(id).unwrap_or(u32::MAX) != u32::MAX,
-            "shard id space exhausted at {id}: ids are never reused, so the world cannot continue"
-        );
-        ShardId::new(u32::try_from(id).expect("checked above"))
+    /// [`IdSpaceExhausted`] if the counter would pass [`u32::MAX`] or reach
+    /// [`ShardId::NONE`], the reserved "no shard" id. Wrapping would reuse ids,
+    /// so the allocator refuses instead; the counter is left unchanged. (It used
+    /// to panic, which let one poisoned counter crash the orchestrator.)
+    pub fn allocate(&self) -> Result<ShardId, IdSpaceExhausted> {
+        let id = self
+            .next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                u32::try_from(id)
+                    .ok()
+                    .filter(|v| *v != u32::MAX)
+                    .map(|_| id + 1)
+            })
+            .map_err(|next| IdSpaceExhausted { next })?;
+        u32::try_from(id)
+            .map(ShardId::new)
+            .map_err(|_| IdSpaceExhausted { next: id })
     }
 
     /// The id the next [`allocate`](Self::allocate) call returns.
