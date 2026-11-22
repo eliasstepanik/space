@@ -20,14 +20,14 @@ services:
     environment:
       <<: *cluster
       ORCHESTRATOR_BIND: 0.0.0.0:7900
-      ORCHESTRATOR_CONTROL_ADDR: 172.31.0.10:7900
+      ORCHESTRATOR_CONTROL_ADDR: 172.29.0.10:7900
     volumes:
       - orchestrator-state:/var/lib/space
     ports:
       - "${ORCHESTRATOR_PORT:-7900}:7900/udp"
     networks:
       space:
-        ipv4_address: 172.31.0.10
+        ipv4_address: 172.29.0.10
     restart: unless-stopped
 
   shard-a:
@@ -37,14 +37,14 @@ services:
       - orchestrator
     environment:
       <<: *cluster
-      ORCHESTRATOR_ADDR: 172.31.0.10:7900
+      ORCHESTRATOR_ADDR: 172.29.0.10:7900
       SHARD_BIND: 0.0.0.0:7870
-      SHARD_ADVERTISE: 172.31.0.11:7870
+      SHARD_ADVERTISE: 172.29.0.11:7870
     ports:
       - "${SHARD_PORT:-7871}:7870/udp"
     networks:
       space:
-        ipv4_address: 172.31.0.11
+        ipv4_address: 172.29.0.11
     restart: unless-stopped
 
   client:
@@ -55,13 +55,13 @@ services:
       - shard-a
     environment:
       STREAM_BIND: 0.0.0.0:8099
-      SPACE_SERVER: 172.31.0.11:7870
+      SPACE_SERVER: 172.29.0.11:7870
       CLIENT_ARGS: "--galaxy"
     ports:
       - "${STREAM_PORT:-8099}:8099/tcp"
     networks:
       space:
-        ipv4_address: 172.31.0.12
+        ipv4_address: 172.29.0.12
     restart: unless-stopped
 
 volumes:
@@ -73,5 +73,5 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: 172.31.0.0/24
-          gateway: 172.31.0.1
+        - subnet: 172.29.0.0/24
+          gateway: 172.29.0.1
