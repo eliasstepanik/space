@@ -623,6 +623,116 @@ mod tests {
     }
 
     #[test]
+    fn a_none_re_hello_with_the_owners_endpoint_gets_the_same_id_back() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        let hello = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::NONE,
+            endpoint: addr(9_000),
+            region: None,
+        };
+        let first = plane.handle_shard_hello(&hello).expect("adopts");
+        let counter = plane.ids.peek();
+        // The shard crashes and restarts with no id: same process, same endpoint.
+        let again = plane.handle_shard_hello(&hello).expect("idempotent");
+        assert_eq!(again.shard, first.shard, "same id back");
+        assert_eq!(again.region.endpoint, addr(9_000));
+        assert_eq!(plane.ids.peek(), counter, "no allocation, no reservation");
+        assert_eq!(plane.map().regions.len(), 1);
+    }
+
+    #[test]
+    fn a_none_re_hello_with_a_different_endpoint_on_an_owned_node_is_refused() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        let hello = |port| ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::NONE,
+            endpoint: addr(port),
+            region: None,
+        };
+        let (first, other) = (hello(9_000), hello(9_001));
+        plane.handle_shard_hello(&first).expect("adopts");
+        let counter = plane.ids.peek();
+        assert!(plane.handle_shard_hello(&other).is_err());
+        assert_eq!(plane.ids.peek(), counter);
+        let root = plane.map().regions[0].clone();
+        assert_eq!(root.endpoint, addr(9_000), "the owner's endpoint is intact");
+    }
+
+    #[test]
+    fn a_claim_of_an_implausible_id_is_refused_and_does_not_poison_the_counter() {
+        let mut plane = plane();
+        plane.set_unclaimed_root_owner(ShardId::new(1));
+        plane
+            .handle_shard_hello(&ShardHello {
+                cluster: plane.config.cluster.clone(),
+                shard: ShardId::NONE,
+                endpoint: addr(9_000),
+                region: None,
+            })
+            .expect("adopts the root");
+        let counter = plane.ids.peek();
+        let child = space_world::octree::children(plane.config.root_node()).expect("splits")[0];
+        let poison = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(u32::MAX - 1),
+            endpoint: addr(9_001),
+            region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+        };
+        assert!(plane.handle_shard_hello(&poison).is_err(), "never issued");
+        assert_eq!(plane.ids.peek(), counter, "the counter did not move");
+        // A legitimate anonymous hello still allocates normally.
+        let ok = ShardHello {
+            shard: ShardId::NONE,
+            ..poison
+        };
+        let welcome = plane.handle_shard_hello(&ok).expect("allocates");
+        assert_eq!(u64::from(welcome.shard.0), counter);
+    }
+
+    #[test]
+    fn a_claim_of_an_already_issued_id_is_still_confirmed() {
+        // Counter at 5: ids 1..=4 were issued; a restart-with-known-id claim for
+        // 3 on a free node is the legitimate case and must still work.
+        let config = OrchestratorConfig::default();
+        let root = config.root_node();
+        let map = ShardMap::new(1, vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))]);
+        let ids = PersistentShardIdAllocator::with_sink(5, Box::new(MemoryCounterSink::default()));
+        let mut plane = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+        let child = space_world::octree::children(root).expect("splits")[0];
+        let claim = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::new(3),
+            endpoint: addr(9_001),
+            region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+        };
+        assert_eq!(plane.handle_shard_hello(&claim).expect("ok").shard, ShardId::new(3));
+        assert_eq!(plane.ids.peek(), 5, "an issued id does not move the counter");
+    }
+
+    #[test]
+    fn a_hello_is_refused_not_panicked_when_the_id_space_is_exhausted() {
+        let config = OrchestratorConfig::default();
+        let root = config.root_node();
+        let map = ShardMap::new(1, vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))]);
+        let ids = PersistentShardIdAllocator::with_sink(
+            u64::from(u32::MAX),
+            Box::new(MemoryCounterSink::default()),
+        );
+        let mut plane = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+        let child = space_world::octree::children(root).expect("splits")[0];
+        let hello = ShardHello {
+            cluster: plane.config.cluster.clone(),
+            shard: ShardId::NONE,
+            endpoint: addr(9_001),
+            region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+        };
+        assert!(plane.handle_shard_hello(&hello).is_err());
+    }
+
+    #[test]
     fn a_hello_naming_another_cluster_is_refused() {
         let mut plane = plane();
         let hello = ShardHello {
