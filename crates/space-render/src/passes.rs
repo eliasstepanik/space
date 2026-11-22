@@ -6,7 +6,12 @@
 //!
 //! A. build BLAS (device-side) + zero the probe texture
 //! B. build TLAS (device-side)
-//! C. GI probe compute -> forward render pass (HDR) -> tone map -> readback
+//! C. GI probe compute -> forward render pass (HDR + material) -> [glass
+//!    render pass] -> [post compute: SSR + refraction] -> tone map -> readback
+//!
+//! The bracketed passes only exist when the quality preset enables SSR or
+//! refraction (`RenderFeatures::needs_post`); otherwise the frame is exactly
+//! the pre-Phase-5b one.
 
 use ash::vk;
 
@@ -22,6 +27,9 @@ pub(crate) struct Shaders {
     pub tonemap: Vec<u32>,
     pub forward_vs: Vec<u32>,
     pub forward_fs: Vec<u32>,
+    pub forward_glass_vs: Vec<u32>,
+    pub forward_glass_fs: Vec<u32>,
+    pub post: Vec<u32>,
 }
 
 impl Shaders {
@@ -41,6 +49,15 @@ impl Shaders {
             tonemap: words(include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.spv"))),
             forward_vs: words(include_bytes!(concat!(env!("OUT_DIR"), "/forward_vs.spv"))),
             forward_fs: words(include_bytes!(concat!(env!("OUT_DIR"), "/forward_fs.spv"))),
+            forward_glass_vs: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_glass_vs.spv"
+            ))),
+            forward_glass_fs: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_glass_fs.spv"
+            ))),
+            post: words(include_bytes!(concat!(env!("OUT_DIR"), "/post.spv"))),
         }
     }
 }
@@ -84,11 +101,18 @@ pub(crate) struct Pipelines {
     pub tone_set_layout: vk::DescriptorSetLayout,
     pub rq_layout: vk::PipelineLayout,
     pub rq_set_layout: vk::DescriptorSetLayout,
+    pub post_layout: vk::PipelineLayout,
+    pub post_set_layout: vk::DescriptorSetLayout,
+    /// Opaque pass: HDR colour + material (rg8) + depth.
     pub render_pass: vk::RenderPass,
+    /// Glass pass: glass colour (rgba16f) + the opaque pass's depth (LOAD).
+    pub render_pass_glass: vk::RenderPass,
     pub graphics: vk::Pipeline,
+    pub graphics_glass: vk::Pipeline,
     pub gi_pipeline: vk::Pipeline,
     pub tone_pipeline: vk::Pipeline,
     pub rq_pipeline: vk::Pipeline,
+    pub post_pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
 }
 
@@ -131,6 +155,91 @@ impl<'a> Created<'a> {
     }
 }
 
+impl Created<'_> {
+    /// The forward graphics pipeline (no vertex input, dynamic viewport/scissor,
+    /// depth test + write) with `colour_attachments` identical blend-off targets.
+    fn graphics_pipeline(
+        &self,
+        vs: (vk::ShaderModule, &'static std::ffi::CStr),
+        fs: (vk::ShaderModule, &'static std::ffi::CStr),
+        layout: vk::PipelineLayout,
+        render_pass: vk::RenderPass,
+        colour_attachments: usize,
+    ) -> Result<vk::Pipeline, RenderError> {
+        let blend_attachments = vec![
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA);
+            colour_attachments
+        ];
+        unsafe {
+            self.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::VERTEX)
+                                .module(vs.0)
+                                .name(vs.1),
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::FRAGMENT)
+                                .module(fs.0)
+                                .name(fs.1),
+                        ])
+                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                        .input_assembly_state(
+                            &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        )
+                        .viewport_state(
+                            &vk::PipelineViewportStateCreateInfo::default()
+                                .viewport_count(1)
+                                .scissor_count(1),
+                        )
+                        .rasterization_state(
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .depth_clamp_enable(false)
+                                .rasterizer_discard_enable(false)
+                                .polygon_mode(vk::PolygonMode::FILL)
+                                .cull_mode(vk::CullModeFlags::NONE)
+                                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                                .depth_bias_enable(false)
+                                .line_width(1.0),
+                        )
+                        .multisample_state(
+                            &vk::PipelineMultisampleStateCreateInfo::default()
+                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                        )
+                        .depth_stencil_state(
+                            &vk::PipelineDepthStencilStateCreateInfo::default()
+                                .depth_test_enable(true)
+                                .depth_write_enable(true)
+                                .depth_compare_op(vk::CompareOp::LESS),
+                        )
+                        .color_blend_state(
+                            &vk::PipelineColorBlendStateCreateInfo::default()
+                                .logic_op_enable(false)
+                                .logic_op(vk::LogicOp::COPY)
+                                .attachments(&blend_attachments),
+                        )
+                        .dynamic_state(
+                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+                                vk::DynamicState::VIEWPORT,
+                                vk::DynamicState::SCISSOR,
+                            ]),
+                        )
+                        .layout(layout)
+                        .render_pass(render_pass)
+                        .subpass(0)],
+                    None,
+                )
+                .map(|mut v| v.remove(0))
+                .map_err(|(_, e)| RenderError::new(format!("graphics pipeline: {e}")))
+        }
+    }
+}
+
 fn binding(
     binding: u32,
     ty: vk::DescriptorType,
@@ -157,7 +266,10 @@ impl Pipelines {
         let m_tone = c.module(&shaders.tonemap, "tonemap")?;
         let m_vs = c.module(&shaders.forward_vs, "forward_vs")?;
         let m_fs = c.module(&shaders.forward_fs, "forward_fs")?;
-        modules.extend_from_slice(&[m_rq, m_gi, m_tone, m_vs, m_fs]);
+        let m_gvs = c.module(&shaders.forward_glass_vs, "forward_glass_vs")?;
+        let m_gfs = c.module(&shaders.forward_glass_fs, "forward_glass_fs")?;
+        let m_post = c.module(&shaders.post, "post")?;
+        modules.extend_from_slice(&[m_rq, m_gi, m_tone, m_vs, m_fs, m_gvs, m_gfs, m_post]);
 
         // ---- descriptor set layouts ------------------------------------------
         let forward_set_layout = unsafe {
@@ -287,12 +399,40 @@ impl Pipelines {
                 .map_err(|e| RenderError::new(format!("rq set layout: {e}")))?
         };
 
-        let layouts = [
-            forward_set_layout,
-            gi_set_layout,
-            tone_set_layout,
-            rq_set_layout,
-        ];
+        // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out
+        let post_set_layout = unsafe {
+            let sampled = |b| {
+                binding(
+                    b,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    1,
+                    vk::ShaderStageFlags::COMPUTE,
+                )
+            };
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                        binding(
+                            0,
+                            vk::DescriptorType::UNIFORM_BUFFER,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                        sampled(1),
+                        sampled(2),
+                        sampled(3),
+                        sampled(4),
+                        binding(
+                            5,
+                            vk::DescriptorType::STORAGE_IMAGE,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                    ]),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("post set layout: {e}")))?
+        };
         let pl = |layout: &vk::PipelineLayoutCreateInfo<'_>, name: &str| unsafe {
             device
                 .create_pipeline_layout(layout, None)
@@ -318,132 +458,156 @@ impl Pipelines {
                 .set_layouts(std::slice::from_ref(&rq_set_layout)),
             "rq pipeline layout",
         )?;
-        let _ = layouts;
+        let post_layout = pl(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&post_set_layout)),
+            "post pipeline layout",
+        )?;
 
-        // ---- render pass: HDR colour + depth ---------------------------------
+        // ---- render passes ------------------------------------------------------
+        // Opaque pass: attachment 0 = HDR colour, 1 = material (rg8), 2 = depth.
+        // Depth is STOREd and ends in a read-only layout so the post pass can
+        // sample it.
+        let color_ref = |attachment: u32| {
+            vk::AttachmentReference::default()
+                .attachment(attachment)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        };
+        let color_attachment = |format: vk::Format| {
+            vk::AttachmentDescription::default()
+                .format(format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        };
+        let fragment_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+        let attachment_writes = vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        let attachment_rw = attachment_writes
+            | vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ;
         let render_pass = unsafe {
+            let color_refs = [color_ref(0), color_ref(1)];
+            let depth_ref = vk::AttachmentReference::default()
+                .attachment(2)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             device
                 .create_render_pass(
                     &vk::RenderPassCreateInfo::default()
                         .attachments(&[
+                            color_attachment(vk::Format::R16G16B16A16_SFLOAT),
+                            color_attachment(vk::Format::R8G8_UNORM),
                             vk::AttachmentDescription::default()
-                                .format(vk::Format::R16G16B16A16_SFLOAT)
+                                .format(vk::Format::D32_SFLOAT)
                                 .samples(vk::SampleCountFlags::TYPE_1)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
                                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                            vk::AttachmentDescription::default()
-                                .format(vk::Format::D32_SFLOAT)
-                                .samples(vk::SampleCountFlags::TYPE_1)
-                                .load_op(vk::AttachmentLoadOp::CLEAR)
-                                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                                .initial_layout(vk::ImageLayout::UNDEFINED)
                                 // `separateDepthStencilLayouts` is not enabled,
-                                // so the combined layout is the only legal one.
-                                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                                // so the combined layouts are the only legal ones.
+                                .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL),
                         ])
                         .subpasses(&[vk::SubpassDescription::default()
                             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                            .color_attachments(&[vk::AttachmentReference::default()
-                                .attachment(0)
-                                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)])
-                            .depth_stencil_attachment(
-                                &vk::AttachmentReference::default()
-                                    .attachment(1)
-                                    .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-                            )])
-                        .dependencies(&[vk::SubpassDependency::default()
-                            .src_subpass(vk::SUBPASS_EXTERNAL)
-                            .dst_subpass(0)
-                            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                            .src_access_mask(vk::AccessFlags::empty())
-                            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                            .dst_access_mask(
-                                vk::AccessFlags::COLOR_ATTACHMENT_READ
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                            )]),
+                            .color_attachments(&color_refs)
+                            .depth_stencil_attachment(&depth_ref)])
+                        .dependencies(&[
+                            vk::SubpassDependency::default()
+                                .src_subpass(vk::SUBPASS_EXTERNAL)
+                                .dst_subpass(0)
+                                .src_stage_mask(fragment_stages)
+                                .src_access_mask(vk::AccessFlags::empty())
+                                .dst_stage_mask(fragment_stages)
+                                .dst_access_mask(attachment_rw),
+                            // Attachment writes -> the post / tone compute reads.
+                            vk::SubpassDependency::default()
+                                .src_subpass(0)
+                                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                                .src_stage_mask(fragment_stages)
+                                .src_access_mask(attachment_writes)
+                                .dst_stage_mask(vk::PipelineStageFlags::COMPUTE_SHADER)
+                                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                        ]),
                     None,
                 )
                 .map_err(|e| RenderError::new(format!("render pass: {e}")))?
         };
-
-        // ---- graphics pipeline -------------------------------------------------
-        let graphics = unsafe {
+        // Glass pass: attachment 0 = glass colour (rgb lit, a = transmission),
+        // 1 = the opaque pass's depth, LOADed so glass is occluded by opaque
+        // geometry and writes its own depth where it is nearest.
+        let render_pass_glass = unsafe {
+            let color_refs = [color_ref(0)];
+            let depth_ref = vk::AttachmentReference::default()
+                .attachment(1)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             device
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&[
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::VERTEX)
-                                .module(m_vs)
-                                .name(c"vs_main"),
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::FRAGMENT)
-                                .module(m_fs)
-                                .name(c"fs_main"),
+                .create_render_pass(
+                    &vk::RenderPassCreateInfo::default()
+                        .attachments(&[
+                            color_attachment(vk::Format::R16G16B16A16_SFLOAT),
+                            vk::AttachmentDescription::default()
+                                .format(vk::Format::D32_SFLOAT)
+                                .samples(vk::SampleCountFlags::TYPE_1)
+                                .load_op(vk::AttachmentLoadOp::LOAD)
+                                .store_op(vk::AttachmentStoreOp::STORE)
+                                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                                .initial_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                                .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL),
                         ])
-                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                        .input_assembly_state(
-                            &vk::PipelineInputAssemblyStateCreateInfo::default()
-                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-                        )
-                        .viewport_state(
-                            &vk::PipelineViewportStateCreateInfo::default()
-                                .viewport_count(1)
-                                .scissor_count(1),
-                        )
-                        .rasterization_state(
-                            &vk::PipelineRasterizationStateCreateInfo::default()
-                                .depth_clamp_enable(false)
-                                .rasterizer_discard_enable(false)
-                                .polygon_mode(vk::PolygonMode::FILL)
-                                .cull_mode(vk::CullModeFlags::NONE)
-                                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                                .depth_bias_enable(false)
-                                .line_width(1.0),
-                        )
-                        .multisample_state(
-                            &vk::PipelineMultisampleStateCreateInfo::default()
-                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                        )
-                        .depth_stencil_state(
-                            &vk::PipelineDepthStencilStateCreateInfo::default()
-                                .depth_test_enable(true)
-                                .depth_write_enable(true)
-                                .depth_compare_op(vk::CompareOp::LESS),
-                        )
-                        .color_blend_state(
-                            &vk::PipelineColorBlendStateCreateInfo::default()
-                                .logic_op_enable(false)
-                                .logic_op(vk::LogicOp::COPY)
-                                .attachments(&[vk::PipelineColorBlendAttachmentState::default()
-                                    .blend_enable(false)
-                                    .color_write_mask(vk::ColorComponentFlags::RGBA)]),
-                        )
-                        .dynamic_state(
-                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
-                                vk::DynamicState::VIEWPORT,
-                                vk::DynamicState::SCISSOR,
-                            ]),
-                        )
-                        .layout(forward_layout)
-                        .render_pass(render_pass)
-                        .subpass(0)],
+                        .subpasses(&[vk::SubpassDescription::default()
+                            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                            .color_attachments(&color_refs)
+                            .depth_stencil_attachment(&depth_ref)])
+                        .dependencies(&[
+                            vk::SubpassDependency::default()
+                                .src_subpass(vk::SUBPASS_EXTERNAL)
+                                .dst_subpass(0)
+                                .src_stage_mask(fragment_stages)
+                                .src_access_mask(attachment_writes)
+                                .dst_stage_mask(fragment_stages)
+                                .dst_access_mask(attachment_rw),
+                            vk::SubpassDependency::default()
+                                .src_subpass(0)
+                                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                                .src_stage_mask(fragment_stages)
+                                .src_access_mask(attachment_writes)
+                                .dst_stage_mask(vk::PipelineStageFlags::COMPUTE_SHADER)
+                                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                        ]),
                     None,
                 )
-                .map(|mut v| v.remove(0))
-                .map_err(|(_, e)| RenderError::new(format!("graphics pipeline: {e}")))?
+                .map_err(|e| RenderError::new(format!("glass render pass: {e}")))?
         };
+
+        // ---- graphics pipelines --------------------------------------------------
+        let graphics = c.graphics_pipeline(
+            (m_vs, c"vs_main"),
+            (m_fs, c"fs_main"),
+            forward_layout,
+            render_pass,
+            2,
+        )?;
+        let graphics_glass = c.graphics_pipeline(
+            (m_gvs, c"vs_glass"),
+            (m_gfs, c"fs_glass"),
+            forward_layout,
+            render_pass_glass,
+            1,
+        )?;
 
         let gi_pipeline = c.compute_pipeline(m_gi, gi_layout, "gi pipeline")?;
         let tone_pipeline = c.compute_pipeline(m_tone, tone_layout, "tone pipeline")?;
         let rq_pipeline = c.compute_pipeline(m_rq, rq_layout, "rq pipeline")?;
+        let post_pipeline = c.compute_pipeline(m_post, post_layout, "post pipeline")?;
 
         let sampler = unsafe {
             device
@@ -470,11 +634,16 @@ impl Pipelines {
             tone_set_layout,
             rq_layout,
             rq_set_layout,
+            post_layout,
+            post_set_layout,
             render_pass,
+            render_pass_glass,
             graphics,
+            graphics_glass,
             gi_pipeline,
             tone_pipeline,
             rq_pipeline,
+            post_pipeline,
             sampler,
         })
     }
@@ -732,12 +901,17 @@ impl Pipelines {
         device.destroy_pipeline_layout(self.gi_layout, None);
         device.destroy_pipeline_layout(self.tone_layout, None);
         device.destroy_pipeline_layout(self.rq_layout, None);
+        device.destroy_pipeline_layout(self.post_layout, None);
+        device.destroy_descriptor_set_layout(self.post_set_layout, None);
         device.destroy_descriptor_set_layout(self.forward_set_layout, None);
         device.destroy_descriptor_set_layout(self.gi_set_layout, None);
         device.destroy_descriptor_set_layout(self.tone_set_layout, None);
         device.destroy_descriptor_set_layout(self.rq_set_layout, None);
         device.destroy_render_pass(self.render_pass, None);
+        device.destroy_render_pass(self.render_pass_glass, None);
         device.destroy_pipeline(self.graphics, None);
+        device.destroy_pipeline(self.graphics_glass, None);
+        device.destroy_pipeline(self.post_pipeline, None);
         device.destroy_pipeline(self.gi_pipeline, None);
         device.destroy_pipeline(self.tone_pipeline, None);
         device.destroy_pipeline(self.rq_pipeline, None);
