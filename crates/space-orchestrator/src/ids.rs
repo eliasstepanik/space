@@ -340,8 +340,8 @@ mod tests {
         // The file stores the *next* id: 57 was the last one handed out.
         std::fs::write(&tmp, b"58\n").unwrap();
         let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("open");
-        assert_eq!(alloc.allocate(), ShardId::new(58));
-        assert_eq!(alloc.allocate(), ShardId::new(59));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(58)));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(59)));
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&tmp).ok();
     }
