@@ -409,7 +409,14 @@ fn window_handles(window: &Window) -> Result<WindowHandles, RenderError> {
 fn run_window(config: &Config) -> Result<(), RenderError> {
     let event_loop = EventLoop::new().map_err(|e| RenderError::new(format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(config)?;
+    // The instance must be created with the surface extensions this display
+    // needs, so take the display handle from the event loop before building
+    // the render context.
+    let display = event_loop
+        .display_handle()
+        .map_err(|e| RenderError::new(format!("display_handle: {e}")))?
+        .as_raw();
+    let mut app = App::new(config, display)?;
     event_loop
         .run_app(&mut app)
         .map_err(|e| RenderError::new(format!("event loop: {e}")))?;
