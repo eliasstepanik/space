@@ -93,8 +93,8 @@ jobs:
           else
             echo "vulkaninfo produced no JSON; no Vulkan device on this runner"
           fi
-      - name: cargo xtask ci
-        run: cargo xtask ci
+      - name: cargo run -p xtask -- ci
+        run: cargo run -p xtask -- ci
       # GPU tests on the runner's software Vulkan device (lavapipe), with the
       # Khronos validation layer enabled. `SPACE_RENDER_VALIDATION=1` makes
       # `RenderContext::new` request the layer, and every render test asserts
