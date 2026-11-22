@@ -216,7 +216,6 @@ fn galaxy_scene_at(camera: &CameraPose) -> Scene {
     });
     selected.truncate(MAX_SELECTED);
     let sc = Scene::from_selection(&galaxy, camera, &selected);
-    eprintln!("DBG selected {} inst {}", selected.len(), sc.instances.len());
     sc
 }
 
