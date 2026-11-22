@@ -112,10 +112,12 @@ fn drive_split_to_commit(orch: &mut Orchestrator<RecordingLauncher>, hot: ShardI
         if !outbox.is_empty() {
             prepared = true;
             // Collect the recipients of the EpochPrepare and ack them all.
-            let recipients: Vec<ShardId> = outbox
+            let recipients: Vec<(ShardId, u64)> = outbox
                 .iter()
-                .filter(|(_, m)| matches!(m, Message::EpochPrepare(_)))
-                .map(|(to, _)| *to)
+                .filter_map(|(to, m)| match m {
+                    Message::EpochPrepare(p) => Some((*to, p.epoch)),
+                    _ => None,
+                })
                 .collect();
             assert!(
                 outbox
@@ -123,8 +125,8 @@ fn drive_split_to_commit(orch: &mut Orchestrator<RecordingLauncher>, hot: ShardI
                     .any(|(_, m)| matches!(m, Message::EpochPrepare(_))),
                 "the outbox carried a prepare"
             );
-            for r in recipients {
-                orch.handle_epoch_ack(r);
+            for (r, epoch) in recipients {
+                orch.handle_epoch_ack(r, epoch);
             }
             break;
         }
