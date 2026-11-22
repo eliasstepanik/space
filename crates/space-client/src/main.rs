@@ -163,9 +163,10 @@ fn print_usage() {
         \x20 --stream ADDR  serve frames as JPEG over ws://ADDR (plain ws://, no TLS)\n\
         \x20              to the space-viewer wasm page; viewer input drives the camera\n\
         \x20              (scene: demo, or --galaxy)\n\
-        \x20 --server ADDR  with --stream, join the authoritative shard at ADDR as a\n\
-        \x20              normal player (viewer input drives the ship; replication\n\
-        \x20              drives the camera); default: offline, no server\n\
+        \x20 --server ADDR  join the authoritative shard at ADDR as a normal player,\n\
+        \x20              with --stream (viewer input drives the ship) or in the\n\
+        \x20              window (WASD/Space/Shift thrust); replication drives the\n\
+        \x20              camera; default: offline, no server\n\
         \x20 --frames N   with --stream, exit after N frames\n\
         \n\
         With neither --demo nor --galaxy a winit window is opened."
