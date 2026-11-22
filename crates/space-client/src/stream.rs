@@ -473,7 +473,10 @@ mod tests {
             magenta.len()
         );
         let cx = magenta.iter().map(|i| *i as u32 % w).sum::<u32>() / magenta.len() as u32;
-        assert!(cx.abs_diff(w / 2) < w / 8, "spawn cube is not ahead of the player (x={cx})");
+        assert!(
+            cx.abs_diff(w / 2) < w / 8,
+            "spawn cube is not ahead of the player (x={cx})"
+        );
     }
 
     #[test]
