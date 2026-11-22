@@ -31,7 +31,7 @@ use space_world::{Galaxy, LodSelector, WorldPos};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::window::{Window, WindowId};
 
 /// Offline demo scenes the client can render without a window.
