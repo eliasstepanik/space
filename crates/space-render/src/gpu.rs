@@ -424,11 +424,11 @@ impl RenderContext {
             .acceleration_structure(true);
         let mut bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
-        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_features);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut bda_features)
+            .push_next(&mut as_features);
         if ray_query_support.complete() {
-            features2 = features2
-                .push_next(&mut rq_features)
-                .push_next(&mut as_features);
+            features2 = features2.push_next(&mut rq_features);
         }
 
         let queue_props =
