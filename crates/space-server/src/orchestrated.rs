@@ -144,6 +144,7 @@ pub async fn start_orchestrated(
         let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
         tokio::spawn(async move { net.serve(shard).await })
     };
+    let state = Arc::clone(&shard);
     let ticking = tokio::spawn(async move {
         let mut clock = tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
