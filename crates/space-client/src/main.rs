@@ -404,9 +404,13 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let winit::keyboard::Key::Character(c) = &event.logical_key {
-                    if c.as_str() == "Escape" || c.as_str() == "q" {
+                    if c.as_str() == "q" {
                         event_loop.exit();
                     }
+                }
+                if event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                {
+                    event_loop.exit();
                 }
             }
             WindowEvent::RedrawRequested => {
