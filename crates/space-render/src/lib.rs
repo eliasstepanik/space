@@ -39,6 +39,7 @@ pub mod alloc;
 pub mod gpu;
 pub mod params;
 pub mod passes;
+pub mod quality;
 pub mod scene;
 pub mod swapchain;
 
