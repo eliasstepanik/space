@@ -747,7 +747,7 @@ fn mirror_scene(roughness: f32) -> Scene {
     };
     Scene::from_instances(
         post_camera(),
-        vec![floor, emissive_sphere([0.0, -0.4, -6.0], 0.5, [6.0, 0.3, 0.3])],
+        vec![floor, emissive_sphere([0.0, -0.4, -6.0], 0.5, [6.0, 0.0, 0.0])],
     )
 }
 
@@ -829,7 +829,7 @@ fn ssr_reflects_a_bright_object_where_mirror_geometry_predicts() {
 /// marker; with refraction the marker shows through, displaced from where it
 /// appears with no lens at all.
 fn refraction_scene(with_glass: bool) -> Scene {
-    let mut instances = vec![emissive_sphere([1.0, 0.0, -9.0], 0.6, [0.2, 6.0, 0.2])];
+    let mut instances = vec![emissive_sphere([1.0, 0.0, -9.0], 0.6, [0.0, 6.0, 0.0])];
     if with_glass {
         instances.push(GpuInstance {
             center: [0.0, 0.0, -4.0, 2.0],
