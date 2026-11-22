@@ -900,3 +900,26 @@ fn refraction_displaces_the_background_seen_through_glass() {
         );
     }
 }
+
+/// A context built without `window_display` enabled no surface extension, so
+/// `Swapchain::new` must return a clean error instead of letting ash abort on a
+/// null `vkCreate*SurfaceKHR` entry point (the Windows
+/// "Unable to load create_win32_surface_khr" crash).
+/// Mutation: remove the `window_surface` guard in `Swapchain::new` and this
+/// aborts/panics on platforms where the surface extension is absent.
+#[test]
+fn swapchain_without_surface_extension_is_a_clean_error() {
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, XlibDisplayHandle, XlibWindowHandle,
+    };
+    use space_render::{Swapchain, WindowHandles};
+    let Some(ctx) = context() else { return };
+    let handles = WindowHandles {
+        display: RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0)),
+        window: RawWindowHandle::Xlib(XlibWindowHandle::new(1)),
+    };
+    match Swapchain::new(&ctx, handles, 64, 64) {
+        Err(e) => assert!(e.to_string().contains("window_display"), "{e}"),
+        Ok(_) => panic!("swapchain must not be created without surface extensions"),
+    }
+}
