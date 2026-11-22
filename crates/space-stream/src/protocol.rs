@@ -308,7 +308,10 @@ mod tests {
         assert_eq!(ViewerInput::decode(&[]), Err(ProtocolError::Truncated));
         assert_eq!(ViewerInput::decode(&[9]), Err(ProtocolError::BadTag(9)));
         assert_eq!(ViewerInput::decode(&[2, 1]), Err(ProtocolError::Truncated));
-        assert_eq!(ViewerInput::decode(&[2, 99, 1]), Err(ProtocolError::BadTag(99)));
+        assert_eq!(
+            ViewerInput::decode(&[2, 99, 1]),
+            Err(ProtocolError::BadTag(99))
+        );
         assert_eq!(
             ViewerInput::decode(&[2, 1, 1, 0]),
             Err(ProtocolError::TrailingBytes)

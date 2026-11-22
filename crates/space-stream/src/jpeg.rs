@@ -76,7 +76,9 @@ impl JpegEncoder {
 
     /// Encode a tightly packed RGBA8 image (alpha is ignored).
     pub fn encode(&self, rgba: &[u8], width: u32, height: u32) -> Result<EncodedJpeg, JpegError> {
-        if width == 0 || height == 0 || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4
+        if width == 0
+            || height == 0
+            || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4
         {
             return Err(JpegError::BadBuffer);
         }
@@ -208,7 +210,13 @@ mod tests {
     #[test]
     fn quality_band_orders_output_size() {
         let img = gradient(128, 96);
-        let size = |q| JpegEncoder::new(q, 1).encode(&img, 128, 96).unwrap().bytes.len();
+        let size = |q| {
+            JpegEncoder::new(q, 1)
+                .encode(&img, 128, 96)
+                .unwrap()
+                .bytes
+                .len()
+        };
         let (low, mid, high) = (size(10), size(60), size(95));
         assert!(low < mid && mid < high, "{low} < {mid} < {high}");
         assert_eq!(JpegEncoder::default().quality(), 80);

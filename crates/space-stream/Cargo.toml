@@ -11,13 +11,14 @@ description = "Pixel streaming: JPEG frame encoder, ws:// stream server and the 
 # only the dependency-free wire protocol (`protocol`) is built, which is what the
 # wasm viewer uses (tokio's networking does not build for wasm32).
 default = ["net"]
-net = ["dep:jpeg-encoder", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+net = ["dep:log", "dep:jpeg-encoder", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 jpeg-encoder = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
 
 [lints]
 workspace = true
