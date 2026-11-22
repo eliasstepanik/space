@@ -56,6 +56,7 @@ pub mod config;
 pub mod epoch;
 pub mod handoff;
 pub mod net;
+pub mod orchestrated;
 pub mod replicate;
 pub mod shard;
 
