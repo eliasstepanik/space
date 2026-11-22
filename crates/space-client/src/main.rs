@@ -318,6 +318,73 @@ fn run_offscreen(config: &Config) -> Result<(), RenderError> {
     Ok(())
 }
 
+/// How long the windowed client waits for the shard's handshake before giving
+/// up (startup only, before any window exists).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The windowed client's server session. The tokio runtime owns the link's
+/// network tasks on its own worker threads, so the winit thread only ever
+/// reads the shared replica (a short mutex lock) and never waits on the network.
+struct Live {
+    link: space_client::link::ServerLink,
+    input: stream::InputState,
+    /// Keeps the link's tasks running.
+    _rt: tokio::runtime::Runtime,
+}
+
+impl Live {
+    /// Connect to the shard (bounded by [`CONNECT_TIMEOUT`]).
+    fn connect(server: SocketAddr) -> Result<Self, RenderError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| RenderError::new(format!("tokio runtime: {e}")))?;
+        let link = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    space_client::link::ServerLink::connect(server),
+                )
+                .await
+            })
+            .map_err(|_| RenderError::new(format!("server {server}: connect timed out")))?
+            .map_err(|e| RenderError::new(format!("server {server}: {e}")))?;
+        eprintln!(
+            "space-client: connected to {server} as session {}",
+            link.replica().session
+        );
+        Ok(Self {
+            link,
+            input: stream::InputState::default(),
+            _rt: rt,
+        })
+    }
+
+    /// Track a movement key and forward the resulting thrust to the shard.
+    fn key(&mut self, code: winit::keyboard::KeyCode, down: bool) {
+        use space_stream::{Key, ViewerInput};
+        use winit::keyboard::KeyCode;
+        let key = match code {
+            KeyCode::KeyW => Key::Forward,
+            KeyCode::KeyS => Key::Back,
+            KeyCode::KeyA => Key::Left,
+            KeyCode::KeyD => Key::Right,
+            KeyCode::Space => Key::Up,
+            KeyCode::ShiftLeft => Key::Down,
+            _ => return,
+        };
+        self.input.apply(ViewerInput::Key { key, down });
+        self.link.set_thrust(self.input.thrust());
+    }
+
+    /// The scene for this frame, built from the current replicated state
+    /// (non-blocking: one short lock).
+    fn scene(&self, width: u32, height: u32) -> Scene {
+        stream::live_scene(&self.link.replica(), &self.input, width, height)
+    }
+}
+
 /// The windowed app: owns the render context, window and swapchain and drives
 /// them from winit's `ApplicationHandler` callbacks.
 struct App {
@@ -330,10 +397,16 @@ struct App {
     failed: bool,
     /// Frames presented so far (logged so a hang is visible).
     frames: u64,
+    /// The server session, when `--server` was given; `None` = offline demo.
+    live: Option<Live>,
 }
 
 impl App {
-    fn new(config: &Config, display: RawDisplayHandle) -> Result<Self, RenderError> {
+    fn new(
+        config: &Config,
+        display: RawDisplayHandle,
+        live: Option<Live>,
+    ) -> Result<Self, RenderError> {
         let options = ContextOptions {
             window_display: Some(display),
             ..ContextOptions::default()
