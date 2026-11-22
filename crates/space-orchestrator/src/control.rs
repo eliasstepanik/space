@@ -99,6 +99,13 @@ impl ControlPlane {
     /// a free node. The one exception is the pre-allocated root owner
     /// ([`Self::set_unclaimed_root_owner`]): the first anonymous (or by-id) hello
     /// for the root adopts that id, since no shard was ever launched for it.
+    ///
+    /// A `NONE` hello for an owned node is idempotent when it advertises the
+    /// owner's own endpoint (the same process restarting): it gets the same id
+    /// back. A different endpoint is refused. A non-`NONE` claimed id is only
+    /// honoured when it already owns a region or the allocator has already
+    /// issued it, so a hello cannot push the persistent counter to an
+    /// implausible value.
     pub fn handle_shard_hello(&mut self, hello: &ShardHello) -> Result<ShardWelcome, String> {
         if hello.cluster != self.config.cluster {
             return Err(format!(
