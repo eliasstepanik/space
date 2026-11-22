@@ -208,8 +208,11 @@ async fn serve_viewer(
                     FrameHeader { seq: frame.seq, flags: frame.flags },
                     &frame.jpeg,
                 );
-                let sent: Result<_, tokio::time::error::Elapsed> =
-                    Ok(write.send(Message::Binary(wire.into())).await);
+                let sent = tokio::time::timeout(
+                    VIEWER_WRITE_TIMEOUT,
+                    write.send(Message::Binary(wire.into())),
+                )
+                .await;
                 match sent {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => break,
