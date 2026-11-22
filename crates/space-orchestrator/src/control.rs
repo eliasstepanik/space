@@ -151,7 +151,8 @@ impl ControlPlane {
             endpoints.insert(owner, hello.endpoint);
             self.publisher.set_endpoints(&endpoints);
             owner
-        } else { claim on a node wins; a conflicting claim (including a
+        } else {
+            // The first claim on a node wins; a conflicting claim (including a
             // second region-less hello for the root) is refused, and refused
             // before any id is allocated or reserved.
             if self
