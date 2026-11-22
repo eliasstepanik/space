@@ -440,6 +440,22 @@ impl Scene {
         }
     }
 
+    /// Append a solid, lit box (`half_extent` metres from its centre to each
+    /// face) at the camera-relative `center`, in `color` (linear rgb). The
+    /// box is albedo-lit plus a mild emissive term so it stands out from stars.
+    pub fn push_box(&mut self, center: [f32; 3], half_extent: f32, color: [f32; 3]) {
+        self.instances.push(GpuInstance {
+            center: [center[0], center[1], center[2], half_extent],
+            albedo: [color[0], color[1], color[2], 0.0],
+            emissive: [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6, 1.0],
+            roughness: 0.5,
+            shape: SHAPE_BOX,
+            transmission: 0.0,
+            _pad1: 0.0,
+        });
+        self.meshes.push(cube_mesh());
+    }
+
     /// Attach analytic lights (world-space positions).
     #[must_use]
     pub fn with_lights(mut self, lights: Vec<SceneLight>) -> Self {
