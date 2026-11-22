@@ -17,7 +17,7 @@
 //! | [`disconnect_is_observed`] | after the peer closes, receives return `Ok(None)` and `is_closed()` is true |
 //! | [`oversized_frame_rejected_before_alloc`] | a stream frame declaring a length over `MAX_FRAME_SIZE` errors without a huge allocation |
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_net::{
     accept_connection, client_endpoint_on, connect, server_endpoint, MessageClass, NetError,
