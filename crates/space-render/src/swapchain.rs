@@ -367,7 +367,7 @@ impl Swapchain {
         }
         unsafe {
             ctx.device
-                .wait_for_fences(&[self.present_ready], true, u64::MAX)
+                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
                 .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
             ctx.device
                 .reset_fences(&[self.present_ready])
