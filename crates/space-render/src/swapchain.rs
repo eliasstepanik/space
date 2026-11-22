@@ -476,7 +476,7 @@ impl Swapchain {
                 .image_indices(std::slice::from_ref(&index));
             let result = self.swapchain_ext.queue_present(ctx.queue, &present);
             ctx.device
-                .wait_for_fences(&[self.present_ready], true, u64::MAX)
+                .wait_for_fences(&[self.present_ready], true, PRESENT_TIMEOUT_NS)
                 .map_err(|e| RenderError::new(format!("wait present fence: {e}")))?;
             match result {
                 Ok(false) | Ok(true) => Ok(()),
