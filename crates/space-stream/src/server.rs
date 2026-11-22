@@ -389,7 +389,7 @@ mod tests {
         wait_for(|| client.viewer_count() == 1).await;
 
         // Frames far larger than the socket buffers, so the send really blocks.
-        let big = vec![0u8; 16 * 1024 * 1024];
+        let big = vec![0u8; 8 * 1024 * 1024];
         let start = tokio::time::Instant::now();
         let mut freed = false;
         while start.elapsed() < VIEWER_WRITE_TIMEOUT + Duration::from_secs(10) {
