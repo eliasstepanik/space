@@ -52,15 +52,12 @@ struct Config {
     height: u32,
     out: Option<PathBuf>,
     quality: QualityPreset,
-<<<<<<< HEAD
     /// `--stream ADDR`: serve rendered frames to viewers on this `ws://` address.
     stream: Option<String>,
     /// `--server ADDR`: with `--stream`, play on this authoritative shard.
     server: Option<SocketAddr>,
     /// `--frames N`: stop streaming after N frames (default: run until killed).
     frames: Option<u64>,
-=======
->>>>>>> refs/remotes/origin/main
 }
 
 fn parse_args() -> Config {
@@ -70,12 +67,9 @@ fn parse_args() -> Config {
         height: 480,
         out: None,
         quality: QualityPreset::default(),
-<<<<<<< HEAD
         stream: None,
         server: None,
         frames: None,
-=======
->>>>>>> refs/remotes/origin/main
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -110,7 +104,6 @@ fn parse_args() -> Config {
                     }
                 }
             }
-<<<<<<< HEAD
             "--stream" => match args.next() {
                 Some(addr) => config.stream = Some(addr),
                 None => {
@@ -135,8 +128,6 @@ fn parse_args() -> Config {
                     std::process::exit(2);
                 }
             },
-=======
->>>>>>> refs/remotes/origin/main
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -158,11 +149,7 @@ fn parse_args() -> Config {
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
-<<<<<<< HEAD
                [--quality high|medium|low|ci] [--stream ADDR [--server ADDR] [--frames N]]\n\
-=======
-               [--quality high|medium|low|ci]\n\
->>>>>>> refs/remotes/origin/main
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
@@ -170,7 +157,6 @@ fn print_usage() {
         \x20 --out FILE write the frame to FILE (PPM); default demo.ppm / galaxy.ppm\n\
         \x20 --quality P quality preset: high (default), medium, low or ci\n\
         \x20              (fog, screen-space reflections, refraction)\n\
-<<<<<<< HEAD
         \x20 --stream ADDR  serve frames as JPEG over ws://ADDR (plain ws://, no TLS)\n\
         \x20              to the space-viewer wasm page; viewer input drives the camera\n\
         \x20              (scene: demo, or --galaxy)\n\
@@ -178,8 +164,6 @@ fn print_usage() {
         \x20              normal player (viewer input drives the ship; replication\n\
         \x20              drives the camera); default: offline, no server\n\
         \x20 --frames N   with --stream, exit after N frames\n\
-=======
->>>>>>> refs/remotes/origin/main
         \n\
         With neither --demo nor --galaxy a winit window is opened."
     );
@@ -298,12 +282,9 @@ impl App {
                 height: config.height,
                 out: None,
                 quality: config.quality,
-<<<<<<< HEAD
                 stream: None,
                 server: None,
                 frames: None,
-=======
->>>>>>> refs/remotes/origin/main
             },
             window: None,
             swapchain: None,
