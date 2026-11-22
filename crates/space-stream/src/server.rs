@@ -28,6 +28,9 @@ pub const MAX_VIEWERS: usize = 8;
 const INPUT_QUEUE: usize = 1024;
 /// A peer that does not finish the WebSocket handshake in this long is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A viewer whose frame send does not complete in this long (it is not reading)
+/// is dropped, freeing its slot.
+const VIEWER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Frame {
     seq: u64,
