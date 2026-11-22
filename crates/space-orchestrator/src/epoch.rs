@@ -363,7 +363,7 @@ mod tests {
         let Outbound { to, .. } = &prepare;
         let mut last = None;
         for s in to.clone() {
-            last = pub_.ack(s, 110);
+            last = pub_.ack(s, 2, 110);
         }
         let commit = last.expect("the final ack commits");
         assert!(matches!(commit.message, Message::EpochCommit(_)));
