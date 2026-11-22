@@ -149,7 +149,8 @@ jobs:
   # pushed or run. (The container *runtime* behaviour is not exercised here.)
   docker:
     name: Docker build (${{ matrix.file }})
-    runs-on: ubuntu-latest
+    # Directly on the runner (no container): it needs the host's docker/buildx.
+    runs-on: [self-hosted, linux, x64, space-ci]
     strategy:
       fail-fast: false
       matrix:
