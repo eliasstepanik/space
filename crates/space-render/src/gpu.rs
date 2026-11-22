@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use raw_window_handle::RawDisplayHandle;
 
 use crate::alloc::SharedAllocator;
 use crate::params;
