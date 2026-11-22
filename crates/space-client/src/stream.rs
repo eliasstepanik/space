@@ -140,6 +140,9 @@ impl InputState {
 
 /// Drain viewer input into `input` and, when connected, hand the resulting
 /// thrust to the server link. Returns how many viewer events were applied.
+///
+/// With no viewer connected the held keys are released: nobody is left to send
+/// the key-ups, so a ship would otherwise keep thrusting after the viewer left.
 pub fn pump_input(
     client: &StreamClient,
     input: &mut InputState,
@@ -148,6 +151,9 @@ pub fn pump_input(
     let events = client.poll_input();
     for event in &events {
         input.apply(*event);
+    }
+    if client.viewer_count() == 0 {
+        input.release_keys();
     }
     if let Some(link) = link {
         link.set_thrust(input.thrust());
