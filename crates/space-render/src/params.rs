@@ -42,7 +42,8 @@ pub struct GiParams {
 }
 
 /// `Instance` in `shaders/common.wgsl` (64 bytes).
-/// Offsets: 0 center, 16 albedo, 32 emissive, 48 roughness, 52 shape -> 64.
+/// Offsets: 0 center, 16 albedo, 32 emissive, 48 roughness, 52 shape,
+/// 56 transmission -> 64.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuInstance {
@@ -55,7 +56,10 @@ pub struct GpuInstance {
     pub roughness: f32,
     /// 0 = sphere, 1 = box.
     pub shape: u32,
-    pub _pad0: f32,
+    /// 0 = opaque; > 0 = transmissive ("glass"): with refraction enabled the
+    /// surface shows the refracted scene behind it (`1` = fully transmissive,
+    /// only Fresnel reflection of the lit colour on top).
+    pub transmission: f32,
     pub _pad1: f32,
 }
 
@@ -106,6 +110,26 @@ pub struct ForwardParams {
     /// `FEATURE_*` bitmask from [`crate::quality`].
     pub features: u32,
     pub _pad2: [u32; 3],
+}
+
+/// `PostParams` in `shaders/post.wgsl` (192 bytes).
+/// Offsets: 0 camera(160), 160 features, 164 ssr_steps, 168 image_size(8),
+/// 176 ssr_max_roughness, 180 refract_distance, 184 refract_eta, 188 pad -> 192.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PostParams {
+    pub camera: Camera,
+    /// `FEATURE_*` bitmask from [`crate::quality`].
+    pub features: u32,
+    pub ssr_steps: u32,
+    pub image_size: [u32; 2],
+    pub ssr_max_roughness: f32,
+    /// Virtual thickness (metres) the refracted ray travels behind the surface
+    /// before its screen position is looked up.
+    pub refract_distance: f32,
+    /// Index-of-refraction ratio entering the medium (air -> glass = 1/1.5).
+    pub refract_eta: f32,
+    pub _pad: f32,
 }
 
 /// `ToneParams` in `shaders/tonemap.wgsl` (32 bytes).
@@ -201,6 +225,7 @@ mod tests {
             emissive => GPUINSTANCE_EMISSIVE,
             roughness => GPUINSTANCE_ROUGHNESS,
             shape => GPUINSTANCE_SHAPE,
+            transmission => GPUINSTANCE_TRANSMISSION,
         } size = GPUINSTANCE_SIZE);
     }
 
@@ -231,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn post_params_matches_wgsl() {
+        assert_layout!(PostParams {
+            camera => POSTPARAMS_CAMERA,
+            features => POSTPARAMS_FEATURES,
+            ssr_steps => POSTPARAMS_SSR_STEPS,
+            image_size => POSTPARAMS_IMAGE_SIZE,
+            ssr_max_roughness => POSTPARAMS_SSR_MAX_ROUGHNESS,
+            refract_distance => POSTPARAMS_REFRACT_DISTANCE,
+            refract_eta => POSTPARAMS_REFRACT_ETA,
+        } size = POSTPARAMS_SIZE);
+    }
+
+    #[test]
     fn tone_params_matches_wgsl() {
         assert_layout!(ToneParams {
             exposure => TONEPARAMS_EXPOSURE,
@@ -247,6 +285,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<GiParams>(), GIPARAMS_SIZE);
         assert_eq!(std::mem::size_of::<GpuInstance>(), GPUINSTANCE_SIZE);
         assert_eq!(std::mem::size_of::<ForwardParams>(), FORWARDPARAMS_SIZE);
+        assert_eq!(std::mem::size_of::<PostParams>(), POSTPARAMS_SIZE);
         assert_eq!(std::mem::size_of::<ToneParams>(), TONEPARAMS_SIZE);
     }
 

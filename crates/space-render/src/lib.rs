@@ -9,6 +9,8 @@
 //!   point lights) into an HDR `rgba16f` target,
 //! * **ray-query probe GI** (`VK_KHR_ray_query`, DDGI-style, 1-bounce diffuse)
 //!   feeding that pass as indirect diffuse,
+//! * an optional **post pass** (screen-space reflections + refraction, see
+//!   [`quality`]) skipped entirely on the `Ci`/`Low` presets,
 //! * an **ACES tone map** into an 8-bit image,
 //! * LOD integration: the scene is built from `space-world`'s deterministic
 //!   galaxy through its LOD selector (≤ [`space_world::MAX_SELECTED`] nodes).
@@ -47,7 +49,9 @@ pub use gpu::{
     validation_message_count, ContextOptions, FrameOutput, Quality, RayQuerySupport, RenderContext,
     RenderError, RenderOptions,
 };
-pub use params::{Camera, ForwardParams, GiParams, GpuInstance, Light, RqParams, ToneParams};
+pub use params::{
+    Camera, ForwardParams, GiParams, GpuInstance, Light, PostParams, RqParams, ToneParams,
+};
 pub use quality::{ParsePresetError, QualityPreset, RenderFeatures};
 pub use scene::{
     cube_mesh, icosphere_mesh, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH, SHAPE_BOX,
