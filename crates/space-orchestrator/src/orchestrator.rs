@@ -242,7 +242,13 @@ impl<L: Launcher> Orchestrator<L> {
         {
             return;
         }
-        let new_id = self.control.ids.allocate();
+        let Ok(new_id) = self.control.ids.allocate() else {
+            // The id space is exhausted: nothing can be spawned. Cool down so we
+            // do not retry every tick.
+            eprintln!("space-orchestrator: split refused: shard id space exhausted");
+            self.control.autoscaler.note_action(shard, self.tick);
+            return;
+        };
         let plan = match topology::split_plan(self.control.map(), shard, octant, new_id) {
             Ok(plan) => plan,
             Err(_) => {
