@@ -329,10 +329,17 @@ impl ShardNet {
         for out in outbox {
             match out.dest {
                 Destination::Shard(shard_id) => {
+<<<<<<< HEAD
                     // The peer is dialled at the address the shard's own map
                     // names for it, so a shard that appears or migrates through
                     // an epoch change is reachable without any extra wiring; an
                     // endpoint registered by hand is only the fallback.
+=======
+                    // An endpoint registered by hand wins; otherwise the peer is
+                    // dialled at the address the shard's own map names for it, so
+                    // a shard that appears through an epoch change is reachable
+                    // without any extra wiring.
+>>>>>>> refs/remotes/origin/main
                     let from_map = shard.lock().await.peer_endpoint(shard_id);
                     self.send_to_peer(local, shard_id, from_map, out.message)
                         .await;
@@ -364,11 +371,16 @@ impl ShardNet {
         from_map: Option<SocketAddr>,
         message: Message,
     ) {
+<<<<<<< HEAD
         // The shard map is current; a hand-registered endpoint is only a fallback
         // for a peer the map does not (yet) name, so it can never shadow a
         // migrated shard's new address.
         let registered = self.shard_endpoints.lock().await.get(&shard_id).copied();
         let Some(addr) = from_map.or(registered) else {
+=======
+        let registered = self.shard_endpoints.lock().await.get(&shard_id).copied();
+        let Some(addr) = registered.or(from_map) else {
+>>>>>>> refs/remotes/origin/main
             self.peer_send_failures.fetch_add(1, Ordering::SeqCst);
             eprintln!("space-server: no endpoint known for peer shard {shard_id}; message dropped");
             return;
@@ -625,6 +637,7 @@ mod tests {
             assert_eq!(peer_shard_id(&hello.player_token), Some(ShardId::new(id)));
         }
     }
+<<<<<<< HEAD
 
     fn probe() -> Message {
         Message::Reject(Reject {
@@ -660,4 +673,6 @@ mod tests {
         );
         net.close();
     }
+=======
+>>>>>>> refs/remotes/origin/main
 }

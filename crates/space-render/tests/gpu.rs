@@ -6,8 +6,13 @@
 //! lavapipe) — the exact-pixel tests must pass on lavapipe.
 
 use space_render::{
+<<<<<<< HEAD
     validation_message_count, ContextOptions, GpuInstance, Quality, QualityPreset, RenderContext,
     RenderError, RenderOptions, Renderer, Scene,
+=======
+    validation_message_count, ContextOptions, GpuInstance, Quality, RenderContext, RenderError,
+    RenderOptions, Renderer, Scene,
+>>>>>>> refs/remotes/origin/main
 };
 use space_world::WorldPos;
 
@@ -16,8 +21,11 @@ fn ci_options() -> RenderOptions {
     RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+<<<<<<< HEAD
         // Fog off: the golden/pixel tests must not depend on fog.
         preset: QualityPreset::Ci,
+=======
+>>>>>>> refs/remotes/origin/main
         ..Default::default()
     }
 }
@@ -231,7 +239,11 @@ fn gi_scene(width: u32, height: u32) -> Scene {
                 emissive: [0.0, 0.0, 0.0, 1.0],
                 roughness: 0.9,
                 shape: space_render::SHAPE_BOX,
+<<<<<<< HEAD
                 transmission: 0.0,
+=======
+                _pad0: 0.0,
+>>>>>>> refs/remotes/origin/main
                 _pad1: 0.0,
             },
             // Emitter: well behind the camera and large enough to fill the
@@ -243,7 +255,11 @@ fn gi_scene(width: u32, height: u32) -> Scene {
                 emissive: [10.0, 10.0, 10.0, 1.0],
                 roughness: 0.5,
                 shape: space_render::SHAPE_SPHERE,
+<<<<<<< HEAD
                 transmission: 0.0,
+=======
+                _pad0: 0.0,
+>>>>>>> refs/remotes/origin/main
                 _pad1: 0.0,
             },
         ],
@@ -390,8 +406,11 @@ fn lod_galaxy_renders() {
     let opts = RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+<<<<<<< HEAD
         // Fog off: the golden/pixel tests must not depend on fog.
         preset: QualityPreset::Ci,
+=======
+>>>>>>> refs/remotes/origin/main
         ..Default::default()
     };
     let out = ctx
@@ -496,7 +515,11 @@ fn brdf_analytic_light_lights_the_sphere() {
             emissive: [0.0, 0.0, 0.0, 1.0],
             roughness: 0.3,
             shape: space_render::SHAPE_SPHERE,
+<<<<<<< HEAD
             transmission: 0.0,
+=======
+            _pad0: 0.0,
+>>>>>>> refs/remotes/origin/main
             _pad1: 0.0,
         }],
     )
@@ -508,8 +531,11 @@ fn brdf_analytic_light_lights_the_sphere() {
     let opts = RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
+<<<<<<< HEAD
         // Fog off: the golden/pixel tests must not depend on fog.
         preset: QualityPreset::Ci,
+=======
+>>>>>>> refs/remotes/origin/main
         ..Default::default()
     };
     let out = ctx
@@ -548,6 +574,7 @@ fn brdf_analytic_light_lights_the_sphere() {
         "zeroing the light count must leave a non-emissive scene black"
     );
 }
+<<<<<<< HEAD
 
 /// One emissive sphere of `radius` at `distance` metres straight ahead.
 fn fog_scene(distance: f32, radius: f32) -> Scene {
@@ -899,3 +926,5 @@ fn refraction_displaces_the_background_seen_through_glass() {
         );
     }
 }
+=======
+>>>>>>> refs/remotes/origin/main

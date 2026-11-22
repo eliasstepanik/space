@@ -49,6 +49,7 @@ const SHADERS: &[(&str, &str, naga::ShaderStage, &str)] = &[
         naga::ShaderStage::Fragment,
         "fs_main",
     ),
+<<<<<<< HEAD
     (
         "forward.wgsl",
         "forward_glass_vs",
@@ -62,6 +63,8 @@ const SHADERS: &[(&str, &str, naga::ShaderStage, &str)] = &[
         "fs_glass",
     ),
     ("post.wgsl", "post", naga::ShaderStage::Compute, "main"),
+=======
+>>>>>>> refs/remotes/origin/main
 ];
 
 /// `(shader output name, WGSL struct name, Rust mirror name)`.
@@ -73,7 +76,10 @@ const LAYOUT_MAP: &[(&str, &str, &str)] = &[
     ("rq_triangle", "Params", "RqParams"),
     ("gi_probe", "GiParams", "GiParams"),
     ("tonemap", "ToneParams", "ToneParams"),
+<<<<<<< HEAD
     ("post", "PostParams", "PostParams"),
+=======
+>>>>>>> refs/remotes/origin/main
     ("forward_fs", "Params", "ForwardParams"),
     ("forward_fs", "Camera", "Camera"),
     ("forward_fs", "Light", "Light"),

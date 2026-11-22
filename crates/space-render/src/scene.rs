@@ -309,7 +309,11 @@ impl Scene {
                 ],
                 roughness: 0.6,
                 shape,
+<<<<<<< HEAD
                 transmission: 0.0,
+=======
+                _pad0: 0.0,
+>>>>>>> refs/remotes/origin/main
                 _pad1: 0.0,
             });
             meshes.push(match shape {

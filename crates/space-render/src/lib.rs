@@ -9,8 +9,11 @@
 //!   point lights) into an HDR `rgba16f` target,
 //! * **ray-query probe GI** (`VK_KHR_ray_query`, DDGI-style, 1-bounce diffuse)
 //!   feeding that pass as indirect diffuse,
+<<<<<<< HEAD
 //! * an optional **post pass** (screen-space reflections + refraction, see
 //!   [`quality`]) skipped entirely on the `Ci`/`Low` presets,
+=======
+>>>>>>> refs/remotes/origin/main
 //! * an **ACES tone map** into an 8-bit image,
 //! * LOD integration: the scene is built from `space-world`'s deterministic
 //!   galaxy through its LOD selector (≤ [`space_world::MAX_SELECTED`] nodes).
@@ -41,7 +44,10 @@ pub mod alloc;
 pub mod gpu;
 pub mod params;
 pub mod passes;
+<<<<<<< HEAD
 pub mod quality;
+=======
+>>>>>>> refs/remotes/origin/main
 pub mod scene;
 pub mod swapchain;
 
@@ -49,10 +55,14 @@ pub use gpu::{
     validation_message_count, ContextOptions, FrameOutput, Quality, RayQuerySupport, RenderContext,
     RenderError, RenderOptions,
 };
+<<<<<<< HEAD
 pub use params::{
     Camera, ForwardParams, GiParams, GpuInstance, Light, PostParams, RqParams, ToneParams,
 };
 pub use quality::{ParsePresetError, QualityPreset, RenderFeatures};
+=======
+pub use params::{Camera, ForwardParams, GiParams, GpuInstance, Light, RqParams, ToneParams};
+>>>>>>> refs/remotes/origin/main
 pub use scene::{
     cube_mesh, icosphere_mesh, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH, SHAPE_BOX,
     SHAPE_SPHERE, STAR_RADIUS_M,
@@ -126,7 +136,11 @@ pub fn demo_scene(width: u32, height: u32) -> Scene {
             emissive: [4.0, 4.0, 4.0, 1.0],
             roughness: 0.5,
             shape: crate::scene::SHAPE_SPHERE,
+<<<<<<< HEAD
             transmission: 0.0,
+=======
+            _pad0: 0.0,
+>>>>>>> refs/remotes/origin/main
             _pad1: 0.0,
         }],
     )

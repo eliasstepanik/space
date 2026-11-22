@@ -15,8 +15,13 @@
 use std::path::PathBuf;
 
 use space_render::{
+<<<<<<< HEAD
     demo_scene, CameraPose, ContextOptions, Quality, QualityPreset, RenderContext, RenderError,
     RenderOptions, Scene, Swapchain, WindowHandles,
+=======
+    demo_scene, CameraPose, ContextOptions, Quality, RenderContext, RenderError, RenderOptions,
+    Scene, Swapchain, WindowHandles,
+>>>>>>> refs/remotes/origin/main
 };
 use space_world::{Galaxy, LodSelector, WorldPos};
 use winit::application::ApplicationHandler;
@@ -41,7 +46,10 @@ struct Config {
     width: u32,
     height: u32,
     out: Option<PathBuf>,
+<<<<<<< HEAD
     quality: QualityPreset,
+=======
+>>>>>>> refs/remotes/origin/main
 }
 
 fn parse_args() -> Config {
@@ -50,7 +58,10 @@ fn parse_args() -> Config {
         width: 640,
         height: 480,
         out: None,
+<<<<<<< HEAD
         quality: QualityPreset::default(),
+=======
+>>>>>>> refs/remotes/origin/main
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -75,6 +86,7 @@ fn parse_args() -> Config {
             "--out" => {
                 config.out = args.next().map(PathBuf::from);
             }
+<<<<<<< HEAD
             "--quality" => {
                 let value = args.next().unwrap_or_default();
                 match value.parse() {
@@ -85,6 +97,8 @@ fn parse_args() -> Config {
                     }
                 }
             }
+=======
+>>>>>>> refs/remotes/origin/main
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -102,14 +116,20 @@ fn parse_args() -> Config {
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
+<<<<<<< HEAD
                [--quality high|medium|low|ci]\n\
+=======
+>>>>>>> refs/remotes/origin/main
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
         \x20 --size WxH frame size in pixels (default 640x480)\n\
         \x20 --out FILE write the frame to FILE (PPM); default demo.ppm / galaxy.ppm\n\
+<<<<<<< HEAD
         \x20 --quality P quality preset: high (default), medium, low or ci\n\
         \x20              (fog, screen-space reflections, refraction)\n\
+=======
+>>>>>>> refs/remotes/origin/main
         \n\
         With neither --demo nor --galaxy a winit window is opened."
     );
@@ -151,6 +171,7 @@ fn write_ppm(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> st
     std::fs::write(path, out)
 }
 
+<<<<<<< HEAD
 /// The CI-cheap, deterministic render options used by both the offline demo and
 /// the windowed/swapchain path (`App` renders with these through
 /// `render_frame_gpu`, so the same preset gates the same features, including the
@@ -161,6 +182,13 @@ fn demo_options(preset: QualityPreset) -> RenderOptions {
         gi_enabled: false,
         quality: Quality::CI,
         preset,
+=======
+/// The CI-cheap, deterministic render options used by the offline demo.
+fn demo_options() -> RenderOptions {
+    RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+>>>>>>> refs/remotes/origin/main
         ..Default::default()
     }
 }
@@ -173,12 +201,16 @@ fn run_offscreen(config: &Config) -> Result<(), RenderError> {
         ctx.ray_query_support().complete()
     );
     let scene = scene_for(config.mode, config.width, config.height);
+<<<<<<< HEAD
     let out = ctx.render_offscreen(
         &scene,
         config.width,
         config.height,
         &demo_options(config.quality),
     )?;
+=======
+    let out = ctx.render_offscreen(&scene, config.width, config.height, &demo_options())?;
+>>>>>>> refs/remotes/origin/main
     let default = match config.mode {
         Mode::Galaxy => PathBuf::from("galaxy.ppm"),
         _ => PathBuf::from("demo.ppm"),
@@ -218,12 +250,19 @@ impl App {
                 width: config.width,
                 height: config.height,
                 out: None,
+<<<<<<< HEAD
                 quality: config.quality,
+=======
+>>>>>>> refs/remotes/origin/main
             },
             window: None,
             swapchain: None,
             scene: None,
+<<<<<<< HEAD
             options: demo_options(config.quality),
+=======
+            options: demo_options(),
+>>>>>>> refs/remotes/origin/main
             failed: false,
         })
     }
@@ -386,7 +425,11 @@ mod tests {
         let size = 64;
         let scene = demo_scene(size, size);
         let out = ctx
+<<<<<<< HEAD
             .render_offscreen(&scene, size, size, &demo_options(QualityPreset::Ci))
+=======
+            .render_offscreen(&scene, size, size, &demo_options())
+>>>>>>> refs/remotes/origin/main
             .expect("demo render");
         assert_eq!(out.validation_messages, 0);
         let lit = out
@@ -399,6 +442,7 @@ mod tests {
         assert!(lit > 0, "the demo scene rendered nothing");
     }
 
+<<<<<<< HEAD
     /// The windowed path renders through `render_frame_gpu` with the same
     /// options as the offline demo: every preset (including the SSR/refraction
     /// presets) must render cleanly through it, carry the preset into the frame
@@ -498,6 +542,8 @@ mod tests {
         }
     }
 
+=======
+>>>>>>> refs/remotes/origin/main
     /// The galaxy scene builds through the LOD selector and stays within the
     /// `MAX_SELECTED` bound.
     #[test]
