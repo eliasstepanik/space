@@ -697,4 +697,88 @@ mod tests {
         net.close();
         drop(stream_server);
     }
+
+    /// The windowed+server path: joins a real loopback shard through
+    /// `ServerLink`, and the scene it builds each frame (`live_scene`) comes
+    /// from the *replicated* ship state — it is the demo scene while the ship
+    /// sits still and is re-based onto the camera once the server moves it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windowed_join_builds_its_scene_from_live_replica_state() {
+        use space_protocol::ShardId;
+        use space_server::net::ShardNet;
+        use space_server::{Shard, ShardConfig};
+        use space_world::NodeRef;
+        use std::net::SocketAddr;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let any = SocketAddr::from(([127, 0, 0, 1], 0));
+        let net = Arc::new(ShardNet::bind(any).expect("bind"));
+        let shard = Arc::new(AsyncMutex::new(Shard::new(ShardConfig::new(
+            ShardId::new(1),
+            net.local_addr().expect("addr"),
+            NodeRef::new(64, [0, 0, 0]),
+        ))));
+        let serve = tokio::spawn({
+            let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
+            async move { net.serve(shard).await }
+        });
+        let ticker = tokio::spawn({
+            let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
+            async move {
+                let mut clock =
+                    tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
+                clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    clock.tick().await;
+                    shard.lock().await.tick();
+                    net.flush(&shard).await;
+                }
+            }
+        });
+
+        let link = ServerLink::connect(net.local_addr().expect("addr"))
+            .await
+            .expect("join the shard");
+        let demo = space_render::demo_scene(32, 32);
+        let input = InputState::default();
+
+        // Wait for live state: our ship replicated.
+        let mut joined = false;
+        for _ in 0..200 {
+            if link.replica().state.is_some() {
+                joined = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(joined, "no replicated ship state after joining");
+        let at_rest = live_scene(&link.replica(), &input, 32, 32);
+        assert_eq!(at_rest.instances.len(), demo.instances.len());
+
+        // Thrust forward (-Z); the scene must follow the replicated ship.
+        let mut moved_scene = None;
+        for _ in 0..200 {
+            link.set_thrust([0.0, 0.0, -1.0]);
+            let replica = link.replica();
+            if replica.offset()[2] < -0.05 {
+                moved_scene = Some((replica.offset(), live_scene(&replica, &input, 32, 32)));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let (offset, scene) = moved_scene.expect("replicated ship never moved");
+        // Camera moved by `offset` toward -Z: instances shift by -offset.
+        let expected = demo.instances[0].center[2] - offset[2] as f32;
+        assert!(
+            (scene.instances[0].center[2] - expected).abs() < 1e-4,
+            "scene is not built from the replica: {} vs {expected}",
+            scene.instances[0].center[2]
+        );
+        assert!(scene.instances[0].center[2] > demo.instances[0].center[2]);
+
+        link.close();
+        ticker.abort();
+        serve.abort();
+        net.close();
+    }
 }
