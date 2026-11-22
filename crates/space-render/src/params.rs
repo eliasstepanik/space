@@ -101,6 +101,11 @@ pub struct ForwardParams {
     pub gi_grid_size_x: u32,
     pub gi_grid_size_y: u32,
     pub _pad1: f32,
+    /// Fog colour (linear rgb) with the exp-squared density in `.w`.
+    pub fog: [f32; 4],
+    /// `FEATURE_*` bitmask from [`crate::quality`].
+    pub features: u32,
+    pub _pad2: [u32; 3],
 }
 
 /// `ToneParams` in `shaders/tonemap.wgsl` (32 bytes).
