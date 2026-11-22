@@ -1,0 +1,61 @@
+name: Deploy
+
+# Manual / API-triggered redeploy of the proxy host. The PRIMARY auto-redeploy is
+# a poll-based systemd timer on the host itself (see deploy/proxy/README.md);
+# this is the push-button path for when you do not want to wait for the poll.
+#
+# Required repository secrets (they do NOT exist yet; add them under
+# Settings > Secrets and variables > Actions):
+#   DEPLOY_SSH_HOST   hostname or IP of the proxy host
+#   DEPLOY_SSH_USER   login user (must be able to run docker)
+#   DEPLOY_SSH_KEY    private key (PEM/OpenSSH) authorised for that user
+#
+# Trigger by hand: Actions > Deploy > Run workflow, or
+#   gh workflow run deploy.yml
+#   gh api repos/eliasstepanik/space/dispatches -f event_type=redeploy
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [redeploy]
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  redeploy:
+    name: Redeploy on proxy
+    # Self-hosted space-ci runner (proxy host); it only needs ssh to reach the host.
+    runs-on: [self-hosted, linux, x64, space-ci]
+    steps:
+      - name: Check secrets are configured
+        env:
+          HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          USER_NAME: ${{ secrets.DEPLOY_SSH_USER }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$HOST" ] || missing="$missing DEPLOY_SSH_HOST"
+          [ -n "$USER_NAME" ] || missing="$missing DEPLOY_SSH_USER"
+          [ -n "$KEY" ] || missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing"
+            exit 1
+          fi
+      - name: Run /opt/space/redeploy.sh over SSH
+        env:
+          HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          USER_NAME: ${{ secrets.DEPLOY_SSH_USER }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Trust-on-first-use host key; pin it in known_hosts instead if desired.
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$USER_NAME@$HOST" /opt/space/redeploy.sh

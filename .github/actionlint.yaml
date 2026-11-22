@@ -1,0 +1,6 @@
+# actionlint config: declare the custom label of the self-hosted runner(s) on
+# the maintainer's proxy host so `runs-on: [self-hosted, linux, x64, space-ci]`
+# is not reported as an unknown label.
+self-hosted-runner:
+  labels:
+    - space-ci

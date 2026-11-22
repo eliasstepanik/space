@@ -1,0 +1,23 @@
+name: Runner smoke (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  bare:
+    runs-on: [self-hosted, linux, x64, space-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "workdir: $(pwd)"; ls -la | head -5
+          docker version --format '{{.ServerVersion}}' || echo "NO DOCKER"
+          docker buildx version || echo "NO BUILDX"
+  container:
+    runs-on: [self-hosted, linux, x64, space-ci]
+    container:
+      image: rust:1.100-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "inside container, workdir: $(pwd)"
+          ls -la | head -5
+          test -f Cargo.toml && echo "CHECKOUT VISIBLE" || echo "CHECKOUT EMPTY — dind workdir mount problem"
+          git --version
