@@ -45,11 +45,19 @@ pub const JPEG_QUALITY: u8 = 85;
 pub type SharedRender = Arc<StdMutex<Option<RenderContext>>>;
 
 /// Everything the tools share.
-#[derive(Debug)]
 pub struct ClientState {
     link: Mutex<Option<ServerLink>>,
     render: SharedRender,
     out_dir: PathBuf,
+}
+
+impl std::fmt::Debug for ClientState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientState")
+            .field("link", &self.link)
+            .field("out_dir", &self.out_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientState {
