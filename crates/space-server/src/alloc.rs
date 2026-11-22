@@ -59,6 +59,16 @@ impl ShardIdAllocator {
     pub fn peek(&self) -> u64 {
         self.next.load(Ordering::SeqCst)
     }
+
+    /// Record that `id` is in use by a shard this allocator did not hand out
+    /// (a relaunch or a shard claiming a known id), so [`allocate`](Self::allocate)
+    /// never returns it later. The counter only ever moves up
+    /// (`fetch_max(id + 1)`); [`ShardId::NONE`] is not an id and is ignored.
+    pub fn reserve(&self, id: ShardId) {
+        if id != ShardId::NONE {
+            self.next.fetch_max(u64::from(id.0) + 1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
