@@ -118,7 +118,7 @@ jobs:
       # (`assert_naga_at_least_30`), which runs on every build of the renderer
       # and fails the build if naga resolves below 30 — naga 24 cannot compile
       # the WGSL ray-query shaders (see spikes/rq-triangle/README.md). The guard
-      # therefore fires locally and in `cargo xtask ci`, not only in a log line.
+      # therefore fires locally and in `cargo run -p xtask -- ci`, not only in a log line.
 
   windows:
     name: Windows
