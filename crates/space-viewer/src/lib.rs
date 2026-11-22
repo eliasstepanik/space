@@ -197,7 +197,7 @@ pub mod web {
         {
             let (ws, held) = (ws.clone(), Rc::clone(&held));
             let on_blur = Closure::<dyn FnMut()>::new(move || {
-                for msg in release_messages(&held.borrow()) {
+                for msg in release_messages(held.borrow().iter()) {
                     send(&ws, &msg);
                 }
                 held.borrow_mut().clear();
