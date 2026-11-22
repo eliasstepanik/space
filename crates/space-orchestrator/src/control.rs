@@ -699,7 +699,10 @@ mod tests {
         // 3 on a free node is the legitimate case and must still work.
         let config = OrchestratorConfig::default();
         let root = config.root_node();
-        let map = ShardMap::new(1, vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))]);
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+        );
         let ids = PersistentShardIdAllocator::with_sink(5, Box::new(MemoryCounterSink::default()));
         let mut plane = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
         let child = space_world::octree::children(root).expect("splits")[0];
@@ -709,15 +712,25 @@ mod tests {
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
         };
-        assert_eq!(plane.handle_shard_hello(&claim).expect("ok").shard, ShardId::new(3));
-        assert_eq!(plane.ids.peek(), 5, "an issued id does not move the counter");
+        assert_eq!(
+            plane.handle_shard_hello(&claim).expect("ok").shard,
+            ShardId::new(3)
+        );
+        assert_eq!(
+            plane.ids.peek(),
+            5,
+            "an issued id does not move the counter"
+        );
     }
 
     #[test]
     fn a_hello_is_refused_not_panicked_when_the_id_space_is_exhausted() {
         let config = OrchestratorConfig::default();
         let root = config.root_node();
-        let map = ShardMap::new(1, vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))]);
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+        );
         let ids = PersistentShardIdAllocator::with_sink(
             u64::from(u32::MAX),
             Box::new(MemoryCounterSink::default()),
