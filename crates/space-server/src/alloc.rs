@@ -66,18 +66,23 @@ impl ShardIdAllocator {
     /// so the allocator refuses instead; the counter is left unchanged. (It used
     /// to panic, which let one poisoned counter crash the orchestrator.)
     pub fn allocate(&self) -> Result<ShardId, IdSpaceExhausted> {
-        let id = self
-            .next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
-                u32::try_from(id)
-                    .ok()
-                    .filter(|v| *v != u32::MAX)
-                    .map(|_| id + 1)
-            })
-            .map_err(|next| IdSpaceExhausted { next })?;
-        u32::try_from(id)
-            .map(ShardId::new)
-            .map_err(|_| IdSpaceExhausted { next: id })
+        let mut current = self.next.load(Ordering::SeqCst);
+        loop {
+            // Exhausted: past u32::MAX, or on it (that is `ShardId::NONE`).
+            match u32::try_from(current) {
+                Ok(v) if v != u32::MAX => {}
+                _ => return Err(IdSpaceExhausted { next: current }),
+            }
+            match self.next.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(ShardId::new(u32::try_from(current).unwrap_or(u32::MAX - 1))),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// The id the next [`allocate`](Self::allocate) call returns.
