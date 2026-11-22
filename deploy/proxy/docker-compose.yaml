@@ -5,6 +5,8 @@
 # NOT EXECUTED: no Docker daemon in the authoring sandbox; correct by inspection
 # and YAML-parse only. Topology and addressing match deploy/docker-compose.yaml
 # (fixed IPv4s on the bridge: addresses are parsed as socket addresses).
+# Subnet is 172.29.0.0/24 (NOT 172.31.0.0/24 as in deploy/docker-compose.yaml):
+# 172.31.0.0/24 collides with an existing docker network on the proxy host.
 #
 #   docker compose up -d                          # orchestrator + shard-a
 #   docker compose --profile stream up -d         # + ws:// pixel-stream client
