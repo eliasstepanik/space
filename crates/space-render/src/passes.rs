@@ -1790,6 +1790,62 @@ impl FrameGpu {
         Self::end(self.cmd_build_tlas, device)
     }
 
+    /// Bind `pipeline`, set the full-frame viewport/scissor and draw every
+    /// instance (inside an active render pass).
+    fn draw_scene(
+        &self,
+        device: &ash::Device,
+        pipelines: &Pipelines,
+        pipeline: vk::Pipeline,
+        scene: &SceneGpu,
+    ) {
+        unsafe {
+            device.cmd_bind_pipeline(self.cmd_frame, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_set_viewport(
+                self.cmd_frame,
+                0,
+                // Positive height: the projection already flips Y
+                // (`mat4_perspective` negates its y row), so no negative
+                // viewport is needed — and a negative viewport height is
+                // not portable without VK_KHR_maintenance5.
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.width as f32,
+                    height: self.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(
+                self.cmd_frame,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: self.width,
+                        height: self.height,
+                    },
+                }],
+            );
+            device.cmd_bind_descriptor_sets(
+                self.cmd_frame,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipelines.forward_layout,
+                0,
+                std::slice::from_ref(&self.forward_set),
+                &[],
+            );
+            device.cmd_draw(
+                self.cmd_frame,
+                scene.mesh_vertex_count,
+                scene.instance_count,
+                0,
+                0,
+            );
+        }
+    }
+
     /// Submission C: GI probe compute (optional), the forward render pass,
     /// the tone map and the readback copy.
     #[allow(clippy::too_many_arguments)]
@@ -1805,14 +1861,20 @@ impl FrameGpu {
         unsafe {
             // 0. The `out` image is written as a storage image (by the tone map
             //    or by the ray-query probe), so move it out of UNDEFINED first.
-            device.cmd_pipeline_barrier(
-                self.cmd_frame,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::default(),
-                &[],
-                &[],
-                &[
+            let mut initial_barriers = Vec::new();
+            if let Some(post) = &self.post {
+                // The post pass writes this as a storage image.
+                initial_barriers.push(
+                    vk::ImageMemoryBarrier::default()
+                        .image(post.out.handle)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .subresource_range(color_range()),
+                );
+            }
+            initial_barriers.extend([
                     vk::ImageMemoryBarrier::default()
                         .image(self.out.handle)
                         .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1829,7 +1891,15 @@ impl FrameGpu {
                         .src_access_mask(vk::AccessFlags::empty())
                         .dst_access_mask(vk::AccessFlags::SHADER_READ)
                         .subresource_range(color_range()),
-                ],
+            ]);
+            device.cmd_pipeline_barrier(
+                self.cmd_frame,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::default(),
+                &[],
+                &[],
+                &initial_barriers,
             );
 
             // 1. GI probe pass: probe texture TRANSFER_DST -> GENERAL, dispatch.
@@ -1987,6 +2057,12 @@ impl FrameGpu {
                                 float32: [0.0, 0.0, 0.0, 1.0],
                             },
                         },
+                        // Material channel: zero = "no surface / not metallic".
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 0.0],
+                            },
+                        },
                         vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
                                 depth: 1.0,
@@ -1997,55 +2073,49 @@ impl FrameGpu {
                 vk::SubpassContents::INLINE,
             );
             if !options.mutate_skip_forward_draw {
-                device.cmd_bind_pipeline(
-                    self.cmd_frame,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.graphics,
-                );
-                device.cmd_set_viewport(
-                    self.cmd_frame,
-                    0,
-                    // Positive height: the projection already flips Y
-                    // (`mat4_perspective` negates its y row), so no negative
-                    // viewport is needed — and a negative viewport height is
-                    // not portable without VK_KHR_maintenance5.
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: self.width as f32,
-                        height: self.height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
-                );
-                device.cmd_set_scissor(
-                    self.cmd_frame,
-                    0,
-                    &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D {
-                            width: self.width,
-                            height: self.height,
-                        },
-                    }],
-                );
-                device.cmd_bind_descriptor_sets(
-                    self.cmd_frame,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.forward_layout,
-                    0,
-                    std::slice::from_ref(&self.forward_set),
-                    &[],
-                );
-                device.cmd_draw(
-                    self.cmd_frame,
-                    scene.mesh_vertex_count,
-                    scene.instance_count,
-                    0,
-                    0,
-                );
+                self.draw_scene(device, pipelines, pipelines.graphics, scene);
             }
             device.cmd_end_render_pass(self.cmd_frame);
+
+            // 2c. Glass pass (refraction only): transmissive instances into
+            //     their own colour target, depth-tested against the opaque
+            //     depth, so the opaque scene behind them stays in the HDR
+            //     target for the post pass to refract.
+            if let Some(post) = &self.post {
+                if let Some(glass_fb) = post.glass_framebuffer {
+                    device.cmd_begin_render_pass(
+                        self.cmd_frame,
+                        &vk::RenderPassBeginInfo::default()
+                            .render_pass(pipelines.render_pass_glass)
+                            .framebuffer(glass_fb)
+                            .render_area(vk::Rect2D {
+                                offset: vk::Offset2D { x: 0, y: 0 },
+                                extent: vk::Extent2D {
+                                    width: self.width,
+                                    height: self.height,
+                                },
+                            })
+                            .clear_values(&[
+                                vk::ClearValue {
+                                    color: vk::ClearColorValue {
+                                        float32: [0.0, 0.0, 0.0, 0.0],
+                                    },
+                                },
+                                vk::ClearValue {
+                                    depth_stencil: vk::ClearDepthStencilValue {
+                                        depth: 1.0,
+                                        stencil: 0,
+                                    },
+                                },
+                            ]),
+                        vk::SubpassContents::INLINE,
+                    );
+                    if !options.mutate_skip_forward_draw {
+                        self.draw_scene(device, pipelines, pipelines.graphics_glass, scene);
+                    }
+                    device.cmd_end_render_pass(self.cmd_frame);
+                }
+            }
 
             // 3. Tone map. The render pass already transitioned the HDR
             //    attachment to SHADER_READ_ONLY_OPTIMAL as its final layout,
@@ -2062,6 +2132,45 @@ impl FrameGpu {
                 &[],
                 &[],
             );
+            // 3a. Post pass (SSR + refraction): skipped entirely — nothing is
+            //     recorded — unless the preset enabled a post feature.
+            if let Some(post) = &self.post {
+                device.cmd_bind_pipeline(
+                    self.cmd_frame,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipelines.post_pipeline,
+                );
+                device.cmd_bind_descriptor_sets(
+                    self.cmd_frame,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipelines.post_layout,
+                    0,
+                    std::slice::from_ref(&post.set),
+                    &[],
+                );
+                device.cmd_dispatch(
+                    self.cmd_frame,
+                    self.width.div_ceil(8),
+                    self.height.div_ceil(8),
+                    1,
+                );
+                // Post output GENERAL -> SHADER_READ_ONLY for the tone map.
+                device.cmd_pipeline_barrier(
+                    self.cmd_frame,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::default(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::default()
+                        .image(post.out.handle)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .subresource_range(color_range())],
+                );
+            }
             device.cmd_bind_pipeline(
                 self.cmd_frame,
                 vk::PipelineBindPoint::COMPUTE,
@@ -2150,6 +2259,16 @@ unsafe fn device_destroy_views(device: &ash::Device, frame: &mut FrameGpu) {
     device.destroy_image_view(frame.hdr_view, None);
     device.destroy_image_view(frame.depth_view, None);
     device.destroy_image_view(frame.out_view, None);
+    device.destroy_image_view(frame.material_view, None);
+    if let Some(post) = &frame.post {
+        device.destroy_image_view(post.out_view, None);
+        if let Some(view) = post.glass_view {
+            device.destroy_image_view(view, None);
+        }
+        if let Some(fb) = post.glass_framebuffer {
+            device.destroy_framebuffer(fb, None);
+        }
+    }
     if let Some((_, view)) = &frame.gi_tex {
         device.destroy_image_view(*view, None);
     }
