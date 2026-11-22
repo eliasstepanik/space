@@ -8,12 +8,14 @@
 //!
 //! * **persist before hand-out**, never hand-out before persist. A crash between
 //!   "allocated" and "persisted" is the one window in which an id could be
-//!   reused; writing first makes the worst case a *skipped* id, which is
-//!   harmless — the rule is *never reused*, not *contiguous*.
-//! * **atomic write**: write-to-temp then rename. On Windows `rename` over an
-//!   existing file needs a replace-existing equivalent, so the writer
-//!   deletes-then-renames and the reader tolerates a missing file by falling
-//!   back to `first`.
+//!   reused; writing first closes it.
+//! * **atomic write**: write a sibling `.tmp` file, then `rename` it directly
+//!   over the counter file. Rename replaces the destination atomically on
+//!   POSIX, so a crash at any point leaves the old file, the new file, or (only
+//!   before the first rename ever completes) the `.tmp` file holding the last
+//!   written value — never *no* counter. The old file is never deleted first.
+//!   The reader falls back to the `.tmp` file when the main file is missing, and
+//!   to `first` only when neither exists (a genuinely fresh state dir).
 //! * **resume on restart**: `open` reads the file if present, so the first id
 //!   after a restart is strictly greater than the last one before it.
 //!
