@@ -70,6 +70,15 @@ impl Swapchain {
         width: u32,
         height: u32,
     ) -> Result<Self, RenderError> {
+        // `ash_window::create_surface` panics (and, in a non-unwinding fn,
+        // aborts) when the platform surface extension was not enabled on the
+        // instance, so refuse cleanly here instead.
+        if !ctx.window_surface {
+            return Err(RenderError::new(
+                "create_surface: the context was created without a window display \
+                 (set ContextOptions::window_display), so no surface extension is enabled",
+            ));
+        }
         let surface_ext = ash::khr::surface::Instance::new(&ctx.entry, &ctx.instance);
         let surface = unsafe {
             ash_window::create_surface(
