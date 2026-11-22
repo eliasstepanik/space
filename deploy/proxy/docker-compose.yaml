@@ -1,0 +1,77 @@
+# PRODUCTION compose for the proxy host: pulls the prebuilt ghcr.io images pushed
+# by .github/workflows/release-images.yml (no build section). Installed as
+# /opt/space/docker-compose.yaml next to .env and redeploy.sh.
+#
+# NOT EXECUTED: no Docker daemon in the authoring sandbox; correct by inspection
+# and YAML-parse only. Topology and addressing match deploy/docker-compose.yaml
+# (fixed IPv4s on the bridge: addresses are parsed as socket addresses).
+#
+#   docker compose up -d                          # orchestrator + shard-a
+#   docker compose --profile stream up -d         # + ws:// pixel-stream client
+#   (or set COMPOSE_PROFILES=stream in .env)
+
+x-cluster: &cluster
+  SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
+
+services:
+  orchestrator:
+    image: ghcr.io/eliasstepanik/space-orchestrator:${SPACE_TAG:-latest}
+    container_name: space-orchestrator
+    environment:
+      <<: *cluster
+      ORCHESTRATOR_BIND: 0.0.0.0:7900
+      ORCHESTRATOR_CONTROL_ADDR: 172.31.0.10:7900
+    volumes:
+      - orchestrator-state:/var/lib/space
+    ports:
+      - "${ORCHESTRATOR_PORT:-7900}:7900/udp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.10
+    restart: unless-stopped
+
+  shard-a:
+    image: ghcr.io/eliasstepanik/space-shard:${SPACE_TAG:-latest}
+    container_name: space-shard-a
+    depends_on:
+      - orchestrator
+    environment:
+      <<: *cluster
+      ORCHESTRATOR_ADDR: 172.31.0.10:7900
+      SHARD_BIND: 0.0.0.0:7870
+      SHARD_ADVERTISE: 172.31.0.11:7870
+    ports:
+      - "${SHARD_PORT:-7871}:7870/udp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.11
+    restart: unless-stopped
+
+  client:
+    profiles: ["stream"]
+    image: ghcr.io/eliasstepanik/space-client:${SPACE_TAG:-latest}
+    container_name: space-client
+    depends_on:
+      - shard-a
+    environment:
+      STREAM_BIND: 0.0.0.0:8099
+      SPACE_SERVER: 172.31.0.11:7870
+      CLIENT_ARGS: "--galaxy"
+    ports:
+      - "${STREAM_PORT:-8099}:8099/tcp"
+    networks:
+      space:
+        ipv4_address: 172.31.0.12
+    restart: unless-stopped
+
+volumes:
+  orchestrator-state:
+
+networks:
+  space:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
