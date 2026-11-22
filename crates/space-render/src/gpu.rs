@@ -108,6 +108,11 @@ pub struct RenderOptions {
     /// Run the ray-query probe GI pass and feed it into the forward pass.
     pub gi_enabled: bool,
     pub quality: Quality,
+    /// Quality tier driving the optional render features (fog, ...); see
+    /// [`crate::quality`]. `RenderOptions::default()` uses
+    /// [`QualityPreset::Ci`] (all optional features off) so headless/golden
+    /// callers stay deterministic; the client opts in to its own preset.
+    pub preset: QualityPreset,
     pub exposure: f32,
     /// MUTATION SWITCH: skip the forward draw entirely (the render pass is
     /// still begun and ended, so only the draw is removed). Any pixel test
