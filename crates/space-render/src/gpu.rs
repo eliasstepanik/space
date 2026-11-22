@@ -15,6 +15,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use crate::alloc::SharedAllocator;
 use crate::params;
+use crate::quality::{self, QualityPreset};
 use crate::scene::Scene;
 
 /// Validation layer name (NUL-terminated for the Vulkan API).
