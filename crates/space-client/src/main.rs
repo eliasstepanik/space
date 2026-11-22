@@ -204,6 +204,9 @@ fn galaxy_scene_at(camera: &CameraPose) -> Scene {
         let candidates = lod.candidates_from(root, camera.position, camera.forward, camera.fov_y);
         selected.extend(lod.select(&candidates, camera.position, camera.fov_y));
     }
+    // Drop nodes without a star first so the budget goes to visible stars, not to
+    // the many coarse, empty nodes the extra roots contribute.
+    selected.retain(|&n| galaxy.star_at(n).is_some());
     selected.sort_unstable_by_key(|n| (n.depth, n.index));
     selected.truncate(MAX_SELECTED);
     let sc = Scene::from_selection(&galaxy, camera, &selected);
