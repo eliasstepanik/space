@@ -19,15 +19,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use space_orchestrator::boot::boot;
 use space_orchestrator::config::{LauncherKind, OrchestratorConfig};
-use space_orchestrator::control::ControlPlane;
-use space_orchestrator::epoch::EpochPublisher;
-use space_orchestrator::ids::PersistentShardIdAllocator;
 use space_orchestrator::launcher::docker::DockerLauncher;
 use space_orchestrator::launcher::local::LocalLauncher;
 use space_orchestrator::launcher::Launcher;
 use space_orchestrator::orchestrator::Orchestrator;
-use space_protocol::shard::{ShardMap, ShardRegion};
 
 /// What the command line said.
 #[derive(Debug)]
