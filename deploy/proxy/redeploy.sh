@@ -22,9 +22,7 @@ if ! flock -n 9; then
 fi
 
 log "pulling images"
-# --profile '*' also pulls the stream client image when its profile is off, so
-# the digest checks in check-updates.sh do not flap.
-docker compose -f "$COMPOSE_FILE" --profile '*' pull --quiet
+docker compose -f "$COMPOSE_FILE" pull --quiet
 log "up -d"
 docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 log "pruning dangling images"
