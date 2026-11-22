@@ -137,7 +137,7 @@ impl Default for RenderOptions {
         Self {
             gi_enabled: true,
             quality: Quality::DEFAULT,
-            exposure: 1.0,
+            preset: QualityPreset::Ci,: 1.0,
             mutate_skip_forward_draw: false,
             mutate_skip_gi_dispatch: false,
             mutate_zero_light_count: false,
