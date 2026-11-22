@@ -2265,42 +2265,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "space-mcp"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "space-mcp-client"
-version = "0.0.0"
-dependencies = [
- "serde_json",
- "space-client",
- "space-mcp",
- "space-mcp-server",
- "space-render",
- "space-stream",
- "space-world",
- "tokio",
-]
-
-[[package]]
-name = "space-mcp-server"
-version = "0.0.0"
-dependencies = [
- "serde_json",
- "space-mcp",
- "space-protocol",
- "space-server",
- "space-sim",
- "space-world",
- "tokio",
-]
-
-[[package]]
 name = "space-net"
 version = "0.1.0"
 dependencies = [

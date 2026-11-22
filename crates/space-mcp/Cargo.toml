@@ -1,10 +1,6 @@
 [package]
 name = "space-mcp"
-<<<<<<< HEAD
 version = "0.1.0"
-=======
-version = "0.0.0"
->>>>>>> refs/remotes/origin/main
 edition.workspace = true
 rust-version.workspace = true
 publish = false
