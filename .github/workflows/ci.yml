@@ -22,7 +22,8 @@ jobs:
   # missing run, not a red one). Parse every workflow and deploy compose file.
   lint:
     name: Workflow YAML
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, space-ci]
+    container: python:3.12-slim
     steps:
       - uses: actions/checkout@v4
       - name: Install PyYAML
