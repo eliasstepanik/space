@@ -263,8 +263,10 @@ mod tests {
     #[test]
     fn demo_scene_is_rebased_onto_the_moved_camera() {
         let base = scene_for_input(Mode::Demo, &InputState::default(), 32, 32);
-        let mut s = InputState::default();
-        s.offset = [0.0, 0.0, -1.0];
+        let s = InputState {
+            offset: [0.0, 0.0, -1.0],
+            ..Default::default()
+        };
         let moved = scene_for_input(Mode::Demo, &s, 32, 32);
         // Camera moved 1 m toward the sphere, so it is 1 m closer.
         assert!((moved.instances[0].center[2] - (base.instances[0].center[2] + 1.0)).abs() < 1e-6);
