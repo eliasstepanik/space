@@ -474,7 +474,9 @@ mod tests {
 
         // Far past the cap: the connection is cut, nothing is delivered.
         let _ = ws
-            .send(Message::Binary(vec![2u8; MAX_INPUT_MESSAGE_LEN * 64].into()))
+            .send(Message::Binary(
+                vec![2u8; MAX_INPUT_MESSAGE_LEN * 64].into(),
+            ))
             .await;
         let ended = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
