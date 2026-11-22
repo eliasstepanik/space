@@ -27,7 +27,7 @@ use space_render::{
     demo_scene, CameraPose, ContextOptions, Quality, QualityPreset, RenderContext, RenderError,
     RenderOptions, Scene, Swapchain, WindowHandles,
 };
-use space_world::{Galaxy, LodSelector, WorldPos};
+use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -193,7 +193,18 @@ fn galaxy_camera(width: u32, height: u32) -> CameraPose {
 fn galaxy_scene_at(camera: &CameraPose) -> Scene {
     let galaxy = Galaxy::new(0x5eed);
     let lod = LodSelector::new(30, 63, 8.0);
-    Scene::build(&galaxy, &lod, camera)
+    // Traverse from the octree root, not `Scene::build`'s depth-30 node around the
+    // camera: the camera sits exactly on the x=0/y=0 cell boundary, so that node
+    // covers only one octant and the galaxy would fill a single frame quadrant.
+    let candidates = lod.candidates_from(
+        NodeRef::ROOT,
+        camera.position,
+        camera.forward,
+        camera.fov_y,
+    );
+    let mut selected = lod.select(&candidates, camera.position, camera.fov_y);
+    selected.truncate(MAX_SELECTED);
+    Scene::from_selection(&galaxy, camera, &selected)
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {

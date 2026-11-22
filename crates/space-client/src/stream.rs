@@ -433,19 +433,6 @@ mod tests {
             .render_offscreen(&scene, w, h, &demo_options(space_render::QualityPreset::Ci))
             .expect("galaxy render");
         assert_eq!((out.width, out.height), (w, h));
-        {
-            let vp = scene.view_proj();
-            let mut q = [0usize; 5];
-            for i in &scene.instances {
-                let c = i.center;
-                let x = vp[0][0]*c[0]+vp[1][0]*c[1]+vp[2][0]*c[2]+vp[3][0];
-                let y = vp[0][1]*c[0]+vp[1][1]*c[1]+vp[2][1]*c[2]+vp[3][1];
-                let wv = vp[0][3]*c[0]+vp[1][3]*c[1]+vp[2][3]*c[2]+vp[3][3];
-                if wv <= 0.0 { q[4]+=1; continue; }
-                q[usize::from(x/wv>0.0)+2*usize::from(y/wv>0.0)]+=1;
-            }
-            eprintln!("DBG instances {} proj quads {:?} cam {:?} vp {:?}", scene.instances.len(), q, scene.camera.forward, vp);
-        }
         // Lit pixel counts per quadrant: [top-left, top-right, bottom-left, bottom-right].
         let mut quads = [0usize; 4];
         for (i, px) in out.pixels.as_chunks::<4>().0.iter().enumerate() {
