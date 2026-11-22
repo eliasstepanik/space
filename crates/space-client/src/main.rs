@@ -483,15 +483,18 @@ mod tests {
             let offscreen = ctx
                 .render_offscreen(scene, size, size, &options)
                 .expect("offscreen render");
-            assert_eq!(out.pixels, offscreen.pixels, "{preset}: frame path != offscreen");
+            assert!(
+                out.pixels == offscreen.pixels,
+                "{preset}: frame path != offscreen"
+            );
             out.pixels
         };
         for scene in [&mirror, &far] {
             let [high, medium, low, ci] = QualityPreset::ALL.map(|p| render(scene, p));
-            assert_eq!(low, ci, "Low and Ci have every optional feature off");
-            assert_ne!(high, ci, "High must differ from Ci");
-            assert_ne!(medium, ci, "Medium must differ from Ci");
-            assert_ne!(high, medium, "High and Medium must differ");
+            assert!(low == ci, "Low and Ci have every optional feature off");
+            assert!(high != ci, "High must differ from Ci");
+            assert!(medium != ci, "Medium must differ from Ci");
+            assert!(high != medium, "High and Medium must differ");
         }
     }
 
