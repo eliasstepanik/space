@@ -33,6 +33,14 @@ pub fn key_message(dom_code: &str, down: bool) -> Option<Vec<u8>> {
     Some(ViewerInput::Key { key, down }.encode())
 }
 
+/// Key-up wire messages for every held DOM key code (sent on window blur, when
+/// the browser will not deliver the real key-ups).
+pub fn release_messages<'a>(held: impl IntoIterator<Item = &'a String>) -> Vec<Vec<u8>> {
+    held.into_iter()
+        .filter_map(|code| key_message(code, false))
+        .collect()
+}
+
 /// Wire message for a pointer at CSS-pixel `(x, y)` inside a `width`×`height`
 /// canvas rectangle, normalised to `0..=1` (clamped). `None` for an empty rect.
 pub fn pointer_message(x: f64, y: f64, width: f64, height: f64, buttons: u8) -> Option<Vec<u8>> {
