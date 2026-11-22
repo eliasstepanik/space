@@ -448,7 +448,10 @@ mod tests {
         ])
         .expect("parses");
         let bound: SocketAddr = "0.0.0.0:7870".parse().unwrap();
-        assert_eq!(options.advertised(bound), "10.0.0.5:7870".parse().unwrap());
+        assert_eq!(
+            options.orchestrated().advertised(bound),
+            "10.0.0.5:7870".parse().unwrap()
+        );
     }
 
     #[test]
