@@ -48,6 +48,7 @@ pub use gpu::{
     RenderError, RenderOptions,
 };
 pub use params::{Camera, ForwardParams, GiParams, GpuInstance, Light, RqParams, ToneParams};
+pub use quality::{ParsePresetError, QualityPreset, RenderFeatures};
 pub use scene::{
     cube_mesh, icosphere_mesh, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH, SHAPE_BOX,
     SHAPE_SPHERE, STAR_RADIUS_M,
