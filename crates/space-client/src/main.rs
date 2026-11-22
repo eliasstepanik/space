@@ -202,13 +202,13 @@ fn galaxy_scene_at(camera: &CameraPose) -> Scene {
         let index = [-(octant & 1), -((octant >> 1) & 1), -((octant >> 2) & 1)];
         let root = NodeRef::new(lod.min_depth, index);
         let candidates = lod.candidates_from(root, camera.position, camera.forward, camera.fov_y);
-        selected.extend(lod.select(&candidates, camera.position, camera.fov_y));
+        let mut part = lod.select(&candidates, camera.position, camera.fov_y);
+        // Drop nodes without a star so the budget goes to visible stars, and share
+        // it evenly between the roots so no side of the galaxy starves the others.
+        part.retain(|&n| galaxy.star_at(n).is_some());
+        part.truncate(MAX_SELECTED / 8);
+        selected.extend(part);
     }
-    // Drop nodes without a star first so the budget goes to visible stars, not to
-    // the many coarse, empty nodes the extra roots contribute.
-    selected.retain(|&n| galaxy.star_at(n).is_some());
-    selected.sort_unstable_by_key(|n| (n.depth, n.index));
-    selected.truncate(MAX_SELECTED);
     let sc = Scene::from_selection(&galaxy, camera, &selected);
     eprintln!("DBG selected {} inst {}", selected.len(), sc.instances.len());
     sc
