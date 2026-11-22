@@ -397,10 +397,7 @@ mod tests {
         let straggler = *prepare.to.iter().max().expect("at least one recipient");
         let acker = *prepare.to.iter().min().expect("at least two recipients");
         assert_ne!(straggler, acker, "test needs two recipients");
-        assert!(
-            pub_.ack(acker, 2, 510).is_none(),
-            "one ack must not commit"
-        );
+        assert!(pub_.ack(acker, 2, 510).is_none(), "one ack must not commit");
         // Before the deadline: nothing.
         assert!(pub_.timeout(500 + EPOCH_ACK_TIMEOUT_TICKS - 1).is_none());
         // At the deadline: abort, and the published map is untouched.
