@@ -95,8 +95,8 @@ jobs:
       # `validation_messages == 0`, so a layout or barrier regression fails here
       # rather than shipping. The exact-pixel tests must pass on lavapipe.
       #
-      # `continue-on-error: true` on purpose: this has never been run on a stock
-      # ubuntu-latest runner (the authoring sandbox is not one), and both the
+      # `continue-on-error: true` on purpose: this has never been run on the
+      # self-hosted runner (no GPU) (the authoring sandbox is not one), and both the
       # lavapipe ICD file name below and the layer path depend on the runner's
       # Mesa packaging. With SPACE_RENDER_VALIDATION=1 a missing layer is a hard
       # failure, so until a green run on a hosted runner proves the environment,
