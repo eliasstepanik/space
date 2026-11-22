@@ -9,9 +9,19 @@
 //! * **windowed** (default): open a winit window and present the demo scene
 //!   through the swapchain path.
 //!
-//! Networking is deliberately *not* a dependency: this binary only ever talks to
-//! `space-render` and `space-world`.
+//! * **streaming** (`--stream ADDR`, opt-in): render headlessly in a loop, JPEG
+//!   each frame and serve it to browser viewers over `ws://` (see [`stream`]).
+//!   Without the flag nothing below changes.
+//!
+//! * **multiplayer streaming** (`--stream ADDR --server ADDR`): the same, but the
+//!   process is also a normal `space-net` player on the authoritative shard;
+//!   viewer input becomes the player's input and the replicated state drives the
+//!   camera (see [`link`] and [`stream`]).
 
+mod link;
+mod stream;
+
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use space_render::{
@@ -42,6 +52,12 @@ struct Config {
     height: u32,
     out: Option<PathBuf>,
     quality: QualityPreset,
+    /// `--stream ADDR`: serve rendered frames to viewers on this `ws://` address.
+    stream: Option<String>,
+    /// `--server ADDR`: with `--stream`, play on this authoritative shard.
+    server: Option<SocketAddr>,
+    /// `--frames N`: stop streaming after N frames (default: run until killed).
+    frames: Option<u64>,
 }
 
 fn parse_args() -> Config {
@@ -51,6 +67,9 @@ fn parse_args() -> Config {
         height: 480,
         out: None,
         quality: QualityPreset::default(),
+        stream: None,
+        server: None,
+        frames: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -85,6 +104,30 @@ fn parse_args() -> Config {
                     }
                 }
             }
+            "--stream" => match args.next() {
+                Some(addr) => config.stream = Some(addr),
+                None => {
+                    eprintln!("space-client: --stream needs an address, e.g. 127.0.0.1:8099");
+                    std::process::exit(2);
+                }
+            },
+            "--server" => {
+                let addr = args.next().and_then(|a| a.to_socket_addrs().ok()?.next());
+                match addr {
+                    Some(addr) => config.server = Some(addr),
+                    None => {
+                        eprintln!("space-client: --server needs a host:port, e.g. 127.0.0.1:7000");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--frames" => match args.next().and_then(|n| n.parse().ok()) {
+                Some(n) => config.frames = Some(n),
+                None => {
+                    eprintln!("space-client: --frames needs a number");
+                    std::process::exit(2);
+                }
+            },
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -96,13 +139,17 @@ fn parse_args() -> Config {
             }
         }
     }
+    if config.server.is_some() && config.stream.is_none() {
+        eprintln!("space-client: --server is only supported together with --stream");
+        std::process::exit(2);
+    }
     config
 }
 
 fn print_usage() {
     eprintln!(
         "usage: space-client [--demo | --galaxy] [--size WxH] [--out FILE.ppm]\n\
-               [--quality high|medium|low|ci]\n\
+               [--quality high|medium|low|ci] [--stream ADDR [--server ADDR] [--frames N]]\n\
         \n\
         \x20 --demo     render the deterministic demo scene headlessly and exit\n\
         \x20 --galaxy   render the deterministic galaxy (LOD selector) headlessly and exit\n\
@@ -110,6 +157,13 @@ fn print_usage() {
         \x20 --out FILE write the frame to FILE (PPM); default demo.ppm / galaxy.ppm\n\
         \x20 --quality P quality preset: high (default), medium, low or ci\n\
         \x20              (fog, screen-space reflections, refraction)\n\
+        \x20 --stream ADDR  serve frames as JPEG over ws://ADDR (plain ws://, no TLS)\n\
+        \x20              to the space-viewer wasm page; viewer input drives the camera\n\
+        \x20              (scene: demo, or --galaxy)\n\
+        \x20 --server ADDR  with --stream, join the authoritative shard at ADDR as a\n\
+        \x20              normal player (viewer input drives the ship; replication\n\
+        \x20              drives the camera); default: offline, no server\n\
+        \x20 --frames N   with --stream, exit after N frames\n\
         \n\
         With neither --demo nor --galaxy a winit window is opened."
     );
@@ -117,9 +171,14 @@ fn print_usage() {
 
 /// The deterministic galaxy scene, built through `space-world`'s LOD selector.
 fn galaxy_scene(width: u32, height: u32) -> Scene {
+    galaxy_scene_at(&galaxy_camera(width, height))
+}
+
+/// The galaxy scene's base camera.
+fn galaxy_camera(width: u32, height: u32) -> CameraPose {
     // Same camera as the `lod_galaxy_renders` GPU test: pulled back along -Z so
     // the LOD selector refines a dense band of the octree around the camera.
-    let camera = CameraPose {
+    CameraPose {
         position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [0.0, 0.0, -5.0e4]),
         forward: [0.0, 0.0, -1.0],
         up: [0.0, 1.0, 0.0],
@@ -127,10 +186,14 @@ fn galaxy_scene(width: u32, height: u32) -> Scene {
         aspect: width as f32 / height as f32,
         near: 1.0,
         far: 5.0e6,
-    };
+    }
+}
+
+/// The galaxy through the LOD selector, seen from `camera`.
+fn galaxy_scene_at(camera: &CameraPose) -> Scene {
     let galaxy = Galaxy::new(0x5eed);
     let lod = LodSelector::new(30, 63, 8.0);
-    Scene::build(&galaxy, &lod, &camera)
+    Scene::build(&galaxy, &lod, camera)
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
@@ -219,6 +282,9 @@ impl App {
                 height: config.height,
                 out: None,
                 quality: config.quality,
+                stream: None,
+                server: None,
+                frames: None,
             },
             window: None,
             swapchain: None,
@@ -353,9 +419,10 @@ fn run_window(config: &Config) -> Result<(), RenderError> {
 fn main() {
     env_logger::init();
     let config = parse_args();
-    let result = match config.mode {
-        Mode::Demo | Mode::Galaxy => run_offscreen(&config),
-        Mode::Window => run_window(&config),
+    let result = match (&config.stream, config.mode) {
+        (Some(addr), _) => stream::run_stream(&config, addr),
+        (None, Mode::Demo | Mode::Galaxy) => run_offscreen(&config),
+        (None, Mode::Window) => run_window(&config),
     };
     if let Err(e) = result {
         eprintln!("space-client: {e}");
