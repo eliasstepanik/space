@@ -434,7 +434,7 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         } else {
                             self.frames += 1;
-                            if self.frames <= 3 || self.frames % 300 == 0 {
+                            if self.frames <= 3 || self.frames.is_multiple_of(300) {
                                 eprintln!("space-client: presented frame {}", self.frames);
                             }
                             let _ = window;
