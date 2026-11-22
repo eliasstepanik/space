@@ -533,9 +533,12 @@ impl OrchestratorLink {
         let welcome = match next.map_err(|e| space_net::NetError::Io(e.to_string()))? {
             Some(Message::ShardWelcome(w)) => w,
             Some(Message::Reject(reject)) => {
+                let why = match reject.reason {
+                    space_protocol::RejectReason::Other(text) => text,
+                    other => format!("{other:?}"),
+                };
                 return Err(space_net::NetError::Protocol(format!(
-                    "the orchestrator rejected this shard's hello: {:?}",
-                    reject.reason
+                    "the orchestrator rejected this shard's hello: {why}"
                 )));
             }
             Some(other) => {
