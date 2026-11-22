@@ -82,10 +82,12 @@ pub struct Light {
     pub color: [f32; 4],
 }
 
-/// `Params` in `shaders/forward.wgsl` (464 bytes).
+/// `Params` in `shaders/forward.wgsl` (496 bytes).
 /// Offsets: 0 camera(160), 160 lights(8x32=256) -> 416, 416 light_count,
 /// 420 gi_enabled, 424 _pad0(8) -> 432, 432 gi_grid_origin(16) -> 448,
-/// 448 gi_spacing, 452 gi_grid_size_x, 456 gi_grid_size_y, 460 _pad1 -> 464.
+/// 448 gi_spacing, 452 gi_grid_size_x, 456 gi_grid_size_y, 460 _pad1 -> 464,
+/// 464 fog (rgb colour, w = density), 480 features (bitmask, see
+/// [`crate::quality`]), 484..496 padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardParams {
