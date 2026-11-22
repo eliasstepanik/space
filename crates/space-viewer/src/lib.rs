@@ -77,6 +77,7 @@ pub mod web {
     //! Browser glue (WebSocket, canvas, DOM events). Only meaningful in a browser.
 
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     use space_stream::protocol::decode_frame;
