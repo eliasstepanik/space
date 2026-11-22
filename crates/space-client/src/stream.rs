@@ -427,25 +427,34 @@ mod tests {
                 return;
             }
         };
-        let size = 64;
-        let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), size, size);
+        let (w, h) = (128u32, 96u32);
+        let scene = scene_for_input(Mode::Galaxy, &initial_input(Mode::Galaxy), w, h);
         let out = ctx
-            .render_offscreen(
-                &scene,
-                size,
-                size,
-                &demo_options(space_render::QualityPreset::Ci),
-            )
+            .render_offscreen(&scene, w, h, &demo_options(space_render::QualityPreset::Ci))
             .expect("galaxy render");
-        let lit = out
-            .pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
-            .count();
-        eprintln!("galaxy stream view: {lit} lit pixels of {}", size * size);
+        assert_eq!((out.width, out.height), (w, h));
+        // Lit pixel counts per quadrant: [top-left, top-right, bottom-left, bottom-right].
+        let mut quads = [0usize; 4];
+        for (i, px) in out.pixels.as_chunks::<4>().0.iter().enumerate() {
+            if px[0] > 8 || px[1] > 8 || px[2] > 8 {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                quads[usize::from(x >= w / 2) + 2 * usize::from(y >= h / 2)] += 1;
+            }
+        }
+        let lit: usize = quads.iter().sum();
+        eprintln!(
+            "galaxy stream view: {lit} lit pixels of {} (quadrants TL/TR/BL/BR: {quads:?})",
+            w * h
+        );
         assert!(lit > 0, "the default galaxy stream view is black");
+        assert!(
+            quads.iter().all(|&q| q > 0),
+            "galaxy content must reach all four quadrants, got {quads:?}"
+        );
+        assert!(
+            lit * 100 > (w * h) as usize * 2,
+            "too few lit pixels ({lit}) for a frame-filling galaxy"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use space_render::{
     demo_scene, CameraPose, ContextOptions, Quality, QualityPreset, RenderContext, RenderError,
     RenderOptions, Scene, Swapchain, WindowHandles,
 };
-use space_world::{Galaxy, LodSelector, WorldPos};
+use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -193,7 +193,29 @@ fn galaxy_camera(width: u32, height: u32) -> CameraPose {
 fn galaxy_scene_at(camera: &CameraPose) -> Scene {
     let galaxy = Galaxy::new(0x5eed);
     let lod = LodSelector::new(30, 63, 8.0);
-    Scene::build(&galaxy, &lod, camera)
+    // `Scene::build` traverses only the one depth-30 node containing the camera.
+    // The galaxy is centred on the cell origin and the camera sits on its x=0/y=0
+    // boundary, so that node covers a single octant and the galaxy would fill one
+    // frame quadrant. Traverse the 8 nodes of that depth meeting at the origin.
+    let mut selected = Vec::new();
+    for octant in 0..8i64 {
+        let index = [-(octant & 1), -((octant >> 1) & 1), -((octant >> 2) & 1)];
+        let root = NodeRef::new(lod.min_depth, index);
+        let candidates = lod.candidates_from(root, camera.position, camera.forward, camera.fov_y);
+        selected.extend(lod.select(&candidates, camera.position, camera.fov_y));
+    }
+    // Keep only nodes that hold a star, nearest to the camera first, so the
+    // budget goes to the stars around the viewer rather than to one side.
+    selected.retain(|&n| galaxy.star_at(n).is_some());
+    selected.sort_by(|&a, &b| {
+        let (da, db) = (
+            lod.distance_to(a, camera.position),
+            lod.distance_to(b, camera.position),
+        );
+        da.total_cmp(&db)
+    });
+    selected.truncate(MAX_SELECTED);
+    Scene::from_selection(&galaxy, camera, &selected)
 }
 
 fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
