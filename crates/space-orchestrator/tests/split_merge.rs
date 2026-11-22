@@ -338,8 +338,8 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
         .expect("handshake over loopback");
     assert_eq!(
         welcome.shard,
-        shard(100),
-        "the orchestrator allocated the first id"
+        shard(1),
+        "the first anonymous shard adopts the reserved root owner"
     );
     assert_eq!(welcome.region.shard, welcome.shard);
     assert_eq!(
