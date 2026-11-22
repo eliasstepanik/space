@@ -22,13 +22,17 @@ COPY . .
 RUN cargo build --release --locked -p space-client --bin space-client
 
 # ---- runtime stage --------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 # The renderer loads libvulkan.so.1 at run time (ash `loaded`), so the image needs
 # the loader plus an ICD. `mesa-vulkan-drivers` ships lavapipe (CPU Vulkan), which
-# is what a GPU-less container uses. bookworm's Mesa 22.3 lavapipe has no
-# VK_KHR_ray_query, so the renderer logs "GI will be disabled" and runs without
-# ray-query GI; use Mesa >= 25 (bookworm-backports) or pass a real GPU
-# (/dev/dri) through for the full path.
+# is what a GPU-less container uses.
+# WHY trixie: the renderer always builds a BLAS, so RenderContext::new fails
+# without VK_KHR_acceleration_structure. lavapipe only exposes it (plus
+# deferred_host_operations, ray_query, ray_tracing_pipeline) from Mesa >= 24.1.
+# bookworm's Mesa 22.3 lacks it ("llvmpipe ... lacks VK_KHR_acceleration_structure"
+# and the proxy exits); trixie ships Mesa 25.0.x, verified to list all of them.
+# The build stage stays on bookworm: the binary only needs an older glibc than
+# trixie's, and the builder never runs Vulkan.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers \
  && rm -rf /var/lib/apt/lists/* \

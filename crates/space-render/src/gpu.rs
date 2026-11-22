@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use raw_window_handle::RawDisplayHandle;
 
 use crate::alloc::SharedAllocator;
 use crate::params;
@@ -185,6 +186,14 @@ pub struct ContextOptions {
     pub validation: Option<bool>,
     /// Prefer a discrete/ray-query-capable device (default true).
     pub prefer_ray_query: bool,
+    /// The display the context will present to, for the windowed path. When
+    /// set, the instance enables the surface extensions that display needs
+    /// (`VK_KHR_surface` plus `VK_KHR_win32_surface` / `VK_KHR_xlib_surface` /
+    /// `VK_KHR_xcb_surface` / `VK_KHR_wayland_surface`, as
+    /// `ash_window::enumerate_required_extensions` reports). Without them
+    /// `ash_window::create_surface` aborts on a null entry point. `None` (the
+    /// default) is the headless path and enables no surface extension.
+    pub window_display: Option<RawDisplayHandle>,
 }
 
 impl Default for ContextOptions {
@@ -192,6 +201,7 @@ impl Default for ContextOptions {
         Self {
             validation: None,
             prefer_ray_query: true,
+            window_display: None,
         }
     }
 }
@@ -274,6 +284,9 @@ pub struct RenderContext {
     /// instance (requested *and* installed). Lets a test tell "validated and
     /// clean" apart from "no layer, so nothing to report".
     validation_active: bool,
+    /// True when the instance was created with the window-surface extensions
+    /// (`ContextOptions::window_display`); `Swapchain::new` refuses otherwise.
+    pub(crate) window_surface: bool,
 }
 
 impl RenderContext {
@@ -291,6 +304,16 @@ impl RenderContext {
         };
         let mut instance_exts: Vec<*const c_char> =
             vec![vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME.as_ptr()];
+        if let Some(display) = options.window_display {
+            // Windowed path: enable the platform surface extensions *at instance
+            // creation* (they cannot be added later).
+            for &ext in crate::swapchain::WindowHandles::required_instance_extensions(display)? {
+                if !instance_exts.contains(&ext) {
+                    instance_exts.push(ext);
+                }
+            }
+        }
+        let window_surface = options.window_display.is_some();
         let mut layers: Vec<*const c_char> = Vec::new();
         let mut with_debug_utils = false;
         let mut messenger_info = if validation {
@@ -495,6 +518,7 @@ impl RenderContext {
             device_name,
             ray_query: ray_query_support,
             validation_active: with_debug_utils,
+            window_surface,
         })
     }
 

@@ -31,7 +31,7 @@ use space_world::{Galaxy, LodSelector, WorldPos};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::window::{Window, WindowId};
 
 /// Offline demo scenes the client can render without a window.
@@ -272,9 +272,13 @@ struct App {
 }
 
 impl App {
-    fn new(config: &Config) -> Result<Self, RenderError> {
+    fn new(config: &Config, display: RawDisplayHandle) -> Result<Self, RenderError> {
+        let options = ContextOptions {
+            window_display: Some(display),
+            ..ContextOptions::default()
+        };
         Ok(Self {
-            ctx: RenderContext::new(&ContextOptions::default())?,
+            ctx: RenderContext::new(&options)?,
             config: Config {
                 mode: Mode::Window,
                 width: config.width,
@@ -405,7 +409,14 @@ fn window_handles(window: &Window) -> Result<WindowHandles, RenderError> {
 fn run_window(config: &Config) -> Result<(), RenderError> {
     let event_loop = EventLoop::new().map_err(|e| RenderError::new(format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(config)?;
+    // The instance must be created with the surface extensions this display
+    // needs, so take the display handle from the event loop before building
+    // the render context.
+    let display = event_loop
+        .display_handle()
+        .map_err(|e| RenderError::new(format!("display_handle: {e}")))?
+        .as_raw();
+    let mut app = App::new(config, display)?;
     event_loop
         .run_app(&mut app)
         .map_err(|e| RenderError::new(format!("event loop: {e}")))?;
