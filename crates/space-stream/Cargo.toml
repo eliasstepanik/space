@@ -1,0 +1,23 @@
+[package]
+name = "space-stream"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Pixel streaming: JPEG frame encoder, ws:// stream server and the shared viewer wire protocol"
+
+[features]
+# `net` (default) = JPEG encoder + tokio/tungstenite stream server. Without it
+# only the dependency-free wire protocol (`protocol`) is built, which is what the
+# wasm viewer uses (tokio's networking does not build for wasm32).
+default = ["net"]
+net = ["dep:jpeg-encoder", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+jpeg-encoder = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[lints]
+workspace = true

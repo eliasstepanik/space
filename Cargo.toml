@@ -11,6 +11,8 @@ members = [
     "crates/space-render",
     "crates/space-client",
     "crates/space-orchestrator",
+    "crates/space-stream",
+    "crates/space-viewer",
 ]
 
 [workspace.package]
@@ -28,6 +30,7 @@ space-ecs = { path = "crates/space-ecs" }
 space-protocol = { path = "crates/space-protocol" }
 space-sim = { path = "crates/space-sim" }
 space-render = { path = "crates/space-render" }
+space-stream = { path = "crates/space-stream", default-features = false }
 # Wire format: `serde` (derive) + `bincode` 2.x, both pure Rust.
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", default-features = false, features = ["std", "serde"] }
@@ -62,6 +65,16 @@ winit = "0.30"
 ash-window = "0.13"
 raw-window-handle = "0.6"
 
+# Phase 6 pixel streaming (both pure Rust, NO C code, NO TLS).
+# `jpeg-encoder` is a pure-Rust baseline JPEG encoder. `tokio-tungstenite` is
+# built with default features OFF and only `handshake`: the default `connect`
+# feature and every `*-tls` feature are left out, so no rustls/ring/native-tls is
+# pulled in for the stream path (ws:// only; wss:// would need `ring`, the
+# sanctioned exception above, and is deferred). `futures-util` (already in the
+# lock via tokio-tungstenite) provides the Sink/Stream extension traits.
+jpeg-encoder = { version = "0.7", default-features = false, features = ["std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [workspace.lints.cargo]
 # `space-world` in [workspace.dependencies] is reserved for the later Phase-1
