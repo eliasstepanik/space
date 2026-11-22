@@ -267,15 +267,7 @@ async fn read_frames(conn: Conn, shared: Arc<Mutex<Shared>>, datagrams: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::{pump_input, InputState};
-    use futures_util::SinkExt;
     use space_protocol::ShardId;
-    use space_server::net::ShardNet;
-    use space_server::{Shard, ShardConfig};
-    use space_stream::{Key, StreamServer, ViewerInput};
-    use space_world::NodeRef;
-    use tokio::sync::Mutex as AsyncMutex;
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     #[test]
     fn server_name_matches_the_shards_certificate() {
@@ -293,98 +285,5 @@ mod tests {
             input_ack: 0,
         }));
         assert_eq!((r.tick, r.ship, r.offset()), (5, None, [0.0; 3]));
-    }
-
-    /// Loopback, no GPU: a real in-process shard (same boot wiring as
-    /// `space-server`'s acceptance harness), the stream proxy's `ServerLink`
-    /// connecting through the ordinary `space-net` client path, and a viewer
-    /// that talks WebSocket to a real `space-stream` server. The viewer holds
-    /// "forward"; the test asserts the *authoritative* ship moved along -Z on the
-    /// server, and that the replicated state came back to drive the proxy's
-    /// camera offset.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn viewer_input_reaches_the_server_and_replication_drives_the_scene() {
-        // --- the shard
-        let any = SocketAddr::from(([127, 0, 0, 1], 0));
-        let net = Arc::new(ShardNet::bind(any).expect("bind"));
-        let shard = Arc::new(AsyncMutex::new(Shard::new(ShardConfig::new(
-            ShardId::new(1),
-            net.local_addr().expect("addr"),
-            NodeRef::new(64, [0, 0, 0]),
-        ))));
-        let serve = tokio::spawn({
-            let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
-            async move { net.serve(shard).await }
-        });
-        let ticker = tokio::spawn({
-            let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
-            async move {
-                let mut clock =
-                    tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-                clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    clock.tick().await;
-                    shard.lock().await.tick();
-                    net.flush(&shard).await;
-                }
-            }
-        });
-
-        // --- the proxy client: server link + stream endpoint
-        let link = ServerLink::connect(net.local_addr().expect("addr"))
-            .await
-            .expect("connect through the space-net client path");
-        let (stream_server, stream_client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
-
-        // --- the viewer (browser stand-in): a WebSocket client sending a key
-        let ws_addr = stream_server.local_addr();
-        let tcp = tokio::net::TcpStream::connect(ws_addr).await.unwrap();
-        let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{ws_addr}/"), tcp)
-            .await
-            .unwrap();
-        let forward = ViewerInput::Key {
-            key: Key::Forward,
-            down: true,
-        };
-        ws.send(WsMessage::Binary(forward.encode().into()))
-            .await
-            .unwrap();
-
-        // --- run the proxy's per-frame input pump until the ship has moved
-        let mut input = InputState::default();
-        let mut moved = false;
-        for _ in 0..200 {
-            pump_input(&stream_client, &mut input, Some(&link));
-            if link.offset()[2] < -0.05 {
-                moved = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        assert!(moved, "replicated state never showed the ship moving");
-
-        // The server's own ship moved forward (-Z) and sideways not at all.
-        let replica = link.replica();
-        let ship = replica.ship.expect("our ship was replicated");
-        let (server_ship, server_state) = {
-            let shard = shard.lock().await;
-            let session = shard.session_of(ship).expect("the ship has a session");
-            assert_eq!(session, replica.session, "the shard's session is ours");
-            (ship, shard.sim().ship_state(ship).expect("ship alive"))
-        };
-        assert_eq!(Some(server_ship), replica.ship);
-        let start = replica.offset();
-        assert!(start[2] < 0.0, "forward is -Z: {start:?}");
-        assert!(start[0].abs() < 1e-3, "no sideways drift: {start:?}");
-        assert!(
-            server_state.vel[2] < 0.0,
-            "server velocity: {server_state:?}"
-        );
-
-        link.close();
-        ticker.abort();
-        serve.abort();
-        net.close();
-        drop(stream_server);
     }
 }

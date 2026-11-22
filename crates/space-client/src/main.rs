@@ -18,8 +18,9 @@
 //!   viewer input becomes the player's input and the replicated state drives the
 //!   camera (see [`link`] and [`stream`]).
 
-mod link;
 mod stream;
+
+use space_client::link;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
