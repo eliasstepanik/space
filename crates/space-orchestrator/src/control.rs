@@ -66,7 +66,22 @@ impl ControlPlane {
             publisher,
             autoscaler: Autoscaler::new(),
             peer_token,
+            unclaimed_root_owner: None,
         }
+    }
+
+    /// Record `shard` as the pre-allocated root owner no live shard has claimed
+    /// yet. It must own a region in the initial map. The first hello for that
+    /// region that names no id (or names this id) adopts it, and the marker is
+    /// cleared.
+    pub fn set_unclaimed_root_owner(&mut self, shard: ShardId) {
+        self.unclaimed_root_owner = Some(shard);
+    }
+
+    /// The reserved root owner still waiting for a live shard, if any.
+    #[must_use]
+    pub fn unclaimed_root_owner(&self) -> Option<ShardId> {
+        self.unclaimed_root_owner
     }
 
     /// The published map (every reply carries this, never a stale copy).
