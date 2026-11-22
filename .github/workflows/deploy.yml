@@ -1,8 +1,10 @@
 name: Deploy
 
 # Manual / API-triggered redeploy of the proxy host. The PRIMARY auto-redeploy is
-# a poll-based systemd timer on the host itself (see deploy/proxy/README.md);
+# Watchtower on the host (label-based, 60s poll; see deploy/proxy/README.md);
 # this is the push-button path for when you do not want to wait for the poll.
+# NOTE: the host's stack is now in /home/proxy/stacks/space; copy redeploy.sh
+# there (or to /opt/space) for the SSH step below to find it.
 #
 # Required repository secrets (they do NOT exist yet; add them under
 # Settings > Secrets and variables > Actions):
