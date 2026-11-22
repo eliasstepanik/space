@@ -350,6 +350,7 @@ impl App {
             scene: None,
             options: demo_options(config.quality),
             failed: false,
+            frames: 0,
         })
     }
 }
