@@ -55,6 +55,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 pub mod autoscale;
+pub mod boot;
 pub mod config;
 pub mod control;
 pub mod epoch;
