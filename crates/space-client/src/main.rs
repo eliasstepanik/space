@@ -584,7 +584,10 @@ fn run_window(config: &Config) -> Result<(), RenderError> {
         .display_handle()
         .map_err(|e| RenderError::new(format!("display_handle: {e}")))?
         .as_raw();
-    let mut app = App::new(config, display)?;
+    // Join the shard first (bounded) when asked; afterwards the event loop only
+    // ever does non-blocking reads of the replica, so the window stays responsive.
+    let live = config.server.map(Live::connect).transpose()?;
+    let mut app = App::new(config, display, live)?;
     event_loop
         .run_app(&mut app)
         .map_err(|e| RenderError::new(format!("event loop: {e}")))?;
