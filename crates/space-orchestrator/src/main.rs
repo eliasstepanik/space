@@ -131,19 +131,12 @@ async fn serve<L: Launcher + 'static>(
     launcher: L,
 ) -> Result<(), String> {
     // The initial map: one region at the configured root, owned by the first id.
-    // The orchestrator allocates that id so a restart resumes above it (H9).
-    let mut ids = PersistentShardIdAllocator::open(&config.state_path, config.first_shard_id)
-        .map_err(|e| e.to_string())?;
-    let root_owner = ids.allocate();
-    let map = ShardMap::new(
-        1,
-        vec![ShardRegion::new(
-            config.root_node(),
-            root_owner,
-            config.bind,
-        )],
-    );
-    let control = ControlPlane::new(config.clone(), ids, EpochPublisher::new(map), peer_token);
+    // The orchestrator allocates that id so a restart resumes above it (H9); the
+    // first live shard that asks for the root adopts it (`boot` marks it unclaimed).
+    let control = boot(config.clone(), peer_token)?;
+    let root_owner = control
+        .unclaimed_root_owner()
+        .ok_or("boot left no root owner")?;
     let mut orchestrator = Orchestrator::new(control, Arc::new(launcher));
     println!(
         "space-orchestrator: cluster {:?} on {}, root owned by {root_owner}",
