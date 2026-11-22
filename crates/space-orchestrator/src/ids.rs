@@ -313,13 +313,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("open");
-            assert_eq!(alloc.allocate(), ShardId::new(1));
-            assert_eq!(alloc.allocate(), ShardId::new(2));
+            assert_eq!(alloc.allocate(), Ok(ShardId::new(1)));
+            assert_eq!(alloc.allocate(), Ok(ShardId::new(2)));
         }
         // Fresh process, same file: the first id is strictly greater than the
         // last one before the restart.
         let mut alloc = PersistentShardIdAllocator::open(&path, 1).expect("reopen");
-        assert_eq!(alloc.allocate(), ShardId::new(3));
+        assert_eq!(alloc.allocate(), Ok(ShardId::new(3)));
         std::fs::remove_file(&path).ok();
     }
 
