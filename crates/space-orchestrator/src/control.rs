@@ -195,6 +195,19 @@ impl ControlPlane {
         })
     }
 
+    /// The owner of `node` when `hello` is that owner restarting: a `NONE`
+    /// hello advertising the very endpoint the owner already holds.
+    fn incumbent_for_restart(&self, hello: &ShardHello, node: NodeRef) -> Option<ShardId> {
+        if hello.shard != ShardId::NONE {
+            return None;
+        }
+        self.map()
+            .regions
+            .iter()
+            .find(|r| r.node == node && r.endpoint == hello.endpoint)
+            .map(|r| r.shard)
+    }
+
     /// Handle a `LoadReport`: feed the autoscaler and return its decision.
     ///
     /// The returned action is *advisory*: the orchestrator turns it into a
