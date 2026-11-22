@@ -490,6 +490,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
+                if let (Some(live), winit::keyboard::PhysicalKey::Code(code)) =
+                    (self.live.as_mut(), event.physical_key)
+                {
+                    live.key(code, event.state.is_pressed());
+                }
                 if let winit::keyboard::Key::Character(c) = &event.logical_key {
                     if c.as_str() == "q" {
                         event_loop.exit();
