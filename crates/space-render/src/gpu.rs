@@ -301,6 +301,16 @@ impl RenderContext {
         };
         let mut instance_exts: Vec<*const c_char> =
             vec![vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME.as_ptr()];
+        if let Some(display) = options.window_display {
+            // Windowed path: enable the platform surface extensions *at instance
+            // creation* (they cannot be added later).
+            for &ext in crate::swapchain::WindowHandles::required_instance_extensions(display)? {
+                if !instance_exts.contains(&ext) {
+                    instance_exts.push(ext);
+                }
+            }
+        }
+        let window_surface = options.window_display.is_some();
         let mut layers: Vec<*const c_char> = Vec::new();
         let mut with_debug_utils = false;
         let mut messenger_info = if validation {
