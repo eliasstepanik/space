@@ -240,7 +240,7 @@ impl Swapchain {
                         .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
                         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .pre_transform(capabilities.current_transform)
-                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .composite_alpha(composite_alpha)
                         .present_mode(present_mode)
                         .clipped(true),
                     None,
