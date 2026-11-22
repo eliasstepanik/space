@@ -642,6 +642,19 @@ mod tests {
         assert!(scene.instances.len() <= space_world::MAX_SELECTED);
     }
 
+    /// The spawn cube is the last instance: a box straight ahead (+Z) of the
+    /// spawn camera at `SPAWN_CUBE_DISTANCE_M`.
+    #[test]
+    fn galaxy_scene_has_a_cube_in_front_of_the_spawn_camera() {
+        let scene = galaxy_scene(64, 64);
+        let cube = scene.instances.last().expect("cube instance");
+        assert_eq!(cube.shape, space_render::SHAPE_BOX);
+        assert_eq!(scene.instances.len(), scene.meshes.len());
+        assert!(cube.center[0].abs() < 1e-3 && cube.center[1].abs() < 1e-3);
+        assert!((f64::from(cube.center[2]) - SPAWN_CUBE_DISTANCE_M).abs() < 1e-3);
+        assert_eq!(cube.center[3], SPAWN_CUBE_HALF_M);
+    }
+
     /// `write_ppm` emits a valid P6 header and one RGB triple per pixel.
     #[test]
     fn write_ppm_writes_a_valid_p6_file() {
