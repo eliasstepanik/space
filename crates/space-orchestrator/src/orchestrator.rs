@@ -142,8 +142,8 @@ impl<L: Launcher> Orchestrator<L> {
     /// Record an `EpochAck` from `shard`. When the last required ack lands the
     /// publisher commits; the commit message is queued for every shard and the
     /// autoscaler is told an action completed (cooldown).
-    pub fn handle_epoch_ack(&mut self, shard: ShardId) {
-        if let Some(commit) = self.control.publisher.ack(shard, self.tick) {
+    pub fn handle_epoch_ack(&mut self, shard: ShardId, epoch: u64) {
+        if let Some(commit) = self.control.publisher.ack(shard, epoch, self.tick) {
             self.queue_outbound(&commit);
             // Then push the committed map with every known shard's real endpoint
             // (plan §3.3, F9). The commit names ownership only; this is what lets
