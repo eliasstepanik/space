@@ -86,6 +86,8 @@ struct Pair {
     /// The sending shard is part of the key because session ids are per-shard
     /// counters that both shards start at 1 — a bare session id is ambiguous.
     client_frames: Vec<(ShardId, u64, Message)>,
+    /// How many handoff offers each shard has sent the other.
+    offers_sent: Vec<ShardId>,
 }
 
 impl Pair {
@@ -108,6 +110,7 @@ impl Pair {
             a,
             b,
             client_frames: Vec::new(),
+            offers_sent: Vec::new(),
         }
     }
 
@@ -149,6 +152,9 @@ impl Pair {
             drain(id_b, &mut self.b, &mut self.client_frames);
         }
         for (from, message) in pending {
+            if matches!(message, Message::HandoffOffer(_)) {
+                self.offers_sent.push(from);
+            }
             let target = if self.other(from) == id_a {
                 &mut self.a
             } else {
@@ -1042,11 +1048,9 @@ fn a_stale_epoch_offer_is_refused_and_the_transfer_aborts() {
     for _ in 0..600 {
         pair.thrust(id_a, session_a, 0, 1.0);
         pair.tick();
-        for (_, _, message) in std::mem::take(&mut pair.client_frames) {
-            if matches!(message, Message::Redirect(_)) {
-                saw_offer = true;
-            }
-        }
+        // A redirect waits for an accept that never comes here, so the
+        // offer itself is what shows A tried.
+        saw_offer = saw_offer || pair.offers_sent.contains(&id_a);
         // The StaleEpoch answer is consumed by `peer_message` on A; observe its
         // effect through A's counters instead of the message itself.
         if pair.a.stats().aborted > 0 {
@@ -2752,6 +2756,87 @@ fn offer_and_accept(pair: &mut Pair, token: &str) -> (u64, EntityGuid) {
     (session_a, guid)
 }
 
+/// A client is redirected only once the accepting shard has staged the ship.
+///
+/// The redirect used to go out with the offer. Over real connections the
+/// client's hello could then reach B before the offer did: B, holding no
+/// staged transfer for the client's token, spawned it a placeholder ship at
+/// its spawn point — on top of the ship on its way in, the two shoving each
+/// other apart through their ghosts — and dropped its `NeighbourStatus` as a
+/// claim for nothing. Waiting for the accept makes that order impossible.
+///
+/// Mutation this catches: sending the `Redirect` from the offer instead of
+/// from the accept (the outbox of the offer tick then holds one).
+#[test]
+fn a_client_is_redirected_only_after_the_peer_accepted() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (session_a, guid) = join(&mut pair.a, "player");
+
+    // Fly out of A, holding everything A sends until it offers the ship.
+    let mut offer = None;
+    for _ in 0..600 {
+        pair.thrust(id_a, session_a, 0, 1.0);
+        pair.a.tick();
+        let mut redirected = false;
+        for out in pair.a.take_outbox() {
+            match out.message {
+                Message::HandoffOffer(o) => offer = Some(o),
+                Message::Redirect(_) => redirected = true,
+                _ => {}
+            }
+        }
+        assert!(!redirected, "a redirect went out before B accepted");
+        if offer.is_some() {
+            break;
+        }
+    }
+    let offer = offer.expect("A offered the ship");
+
+    // B stages it and accepts; only the accept makes A redirect the client.
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    let accept = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .find_map(|out| match out.message {
+            Message::HandoffAccept(a) => Some(a),
+            _ => None,
+        })
+        .expect("B accepted");
+    pair.a
+        .peer_message(id_b, Message::HandoffAccept(accept.clone()));
+    let redirects: Vec<(Destination, Redirect)> = pair
+        .a
+        .take_outbox()
+        .into_iter()
+        .filter_map(|out| match out.message {
+            Message::Redirect(r) => Some((out.dest, r)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redirects.len(), 1, "one redirect, to the one client");
+    let (dest, redirect) = &redirects[0];
+    assert!(matches!(dest, Destination::Client(s) if *s == session_a));
+    assert_eq!(redirect.entity, guid);
+    assert_eq!(redirect.new_shard, id_b);
+    assert_eq!(redirect.activation_tick, accept.activation_tick);
+
+    // A repeated accept redirects nobody again.
+    pair.a.peer_message(id_b, Message::HandoffAccept(accept));
+    assert!(!pair
+        .a
+        .take_outbox()
+        .iter()
+        .any(|out| matches!(out.message, Message::Redirect(_))));
+
+    // So the client arriving at B is the staged ship's owner: no placeholder.
+    let welcome = pair.b.join(&space_net::hello("player")).expect("join B");
+    assert_eq!(pair.b.ship_of(welcome.session), None, "no placeholder ship");
+    assert_eq!(pair.b.stats().ships, 0);
+}
+
 /// A peer that refuses an offer is not asked again on the very next tick.
 ///
 /// B is full, so every offer is answered with `TargetFull`. The ship is still
@@ -2817,8 +2902,8 @@ fn a_refused_offer_is_not_repeated_every_tick() {
          not once per tick: {offers} offers"
     );
     assert_eq!(
-        redirects, offers,
-        "one redirect per offer, to the one client"
+        redirects, 0,
+        "a client is redirected only once the peer has accepted: a refused offer          sends it nowhere"
     );
     assert!(pair.a.sim().ship_state(guid).is_some(), "A keeps the ship");
 

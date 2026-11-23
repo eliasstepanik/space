@@ -44,8 +44,9 @@ pub const ADOPT_TIMEOUT_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 /// (`TargetFull`, "entity is not available here", …) or its
 /// [`StaleEpoch`](space_protocol::StaleEpoch). The ship is still across the
 /// boundary on the next tick, so without a pause the shard re-offered at once —
-/// about fifteen offer/refusal round trips a second, each with a `Redirect`
-/// (carrying the whole shard map) to every client watching the ship — for as
+/// about fifteen offer/refusal round trips a second (each used to come with a
+/// `Redirect` to every client watching the ship; now a redirect waits for the
+/// accept, so a refused offer redirects nobody) — for as
 /// long as the peer kept refusing. Two seconds matches the handoff timeout: it
 /// is the rate a peer that does not answer at all is retried at. A shard-map
 /// change clears the pause, because the refusal was about the old map.

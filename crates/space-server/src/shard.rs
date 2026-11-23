@@ -1060,7 +1060,14 @@ impl Shard {
             self.abort_outgoing(accept.entity, HandoffReason::EpochChanged);
             return;
         }
-        self.ledger.mark_accepted(&accept);
+        // The first accept of a ship's transfer is what redirects its
+        // watchers (see [`Shard::redirect_watchers`]); a repeated one is not.
+        let first_ship_accept = self.ledger.outgoing().get(&accept.entity).is_some_and(|e| {
+            !e.accepted && e.kind == TransferKind::Ship && self.session_of(accept.entity).is_some()
+        });
+        if self.ledger.mark_accepted(&accept) && first_ship_accept {
+            self.redirect_watchers(accept.entity, accept.to, accept.activation_tick);
+        }
     }
 
     fn on_commit(&mut self, commit: space_protocol::HandoffCommit) {
@@ -1469,8 +1476,8 @@ impl Shard {
         self.timeout_pass(tick);
     }
 
-    /// Offer the ship `guid` a client drives to `to`, and redirect everyone
-    /// watching it there (see the module docs of [`crate::handoff`]).
+    /// Offer the ship `guid` a client drives to `to`. Everyone watching it is
+    /// redirected there once `to` has accepted ([`Shard::redirect_watchers`]).
     fn offer_ship(
         &mut self,
         guid: EntityGuid,
@@ -1479,78 +1486,81 @@ impl Shard {
         lead: SimTick,
         group: u64,
     ) {
-        {
-            let Some(entity) = self.sim.entity_of(guid) else {
-                return;
-            };
-            let Some(ship_pos) = self.sim.ship_state(guid).map(|s| s.pos) else {
-                return;
-            };
-            let Some(state) = replicate::snapshot_of(&self.sim, &self.guids, entity) else {
-                return;
-            };
-            // Stamp the owner's token into the offer's state so the accepting
-            // shard can require a claiming client's hello token to match it
-            // (see [`OWNER_TOKEN_COMPONENT`]).
-            let mut state = with_owner_token(state, &self.owner_token_of(guid));
-            state.components.push(TransferKind::Ship.component(lead));
-            state
-                .components
-                .push(crate::handoff::scene_time_component(self.sim.scene_time()));
-            let offer = Ledger::offer_with_lead(
-                guid,
-                self.config.shard,
-                to,
-                self.epoch(),
-                tick,
-                state,
-                lead,
-            );
-            let activation = offer.activation_tick;
-            self.ledger
-                .offer_sent_as(&offer, tick, TransferKind::Ship, group);
-            self.send_to(Destination::Shard(to), Message::HandoffOffer(offer));
-            // Tell the client *now*, with the activation tick, so it can open the
-            // new connection while the old path is still live (guarantee 3).
-            let redirect = Redirect {
-                entity: guid,
-                new_shard: to,
-                shard_map: self.shard_map.clone(),
-                activation_tick: activation,
-            };
-            // Everyone whose interest set holds the entity is redirected, not just
-            // the player driving it: `Redirect::entity` is "the entity the client
-            // is now interested in", so an observer that has been watching the ship
-            // must be told to follow it to `to` rather than simply lose it.
-            //
-            // "Holds the entity" is a distance test against the one ship being
-            // offered — the same `distance² <= radius²` rule the interest grid
-            // applies — not a full sphere query per client, which walked ~9 000
-            // grid cells for every client for every offer.
-            let radius_sq =
-                f64::from(self.config.interest_radius) * f64::from(self.config.interest_radius);
-            let watchers: Vec<u64> = self
-                .clients
-                .values()
-                .filter(|client| {
-                    let anchor = client
-                        .ship
-                        .and_then(|g| self.sim.ship_state(g))
-                        .map_or(WorldPos::ZERO, |s| s.pos);
-                    WorldPos::distance_squared(anchor, ship_pos) <= radius_sq
-                })
-                .map(|client| client.session)
-                .collect();
-            for session in watchers {
-                if let Some(client) = self.clients.get_mut(&session) {
-                    client.redirect_pending = Some(to);
-                    client.redirect_deadline = Some(tick.saturating_add(REDIRECT_TIMEOUT_TICKS));
-                }
-                self.send_to(
-                    Destination::Client(session),
-                    Message::Redirect(redirect.clone()),
-                );
+        let Some(entity) = self.sim.entity_of(guid) else {
+            return;
+        };
+        let Some(state) = replicate::snapshot_of(&self.sim, &self.guids, entity) else {
+            return;
+        };
+        // Stamp the owner's token into the offer's state so the accepting
+        // shard can require a claiming client's hello token to match it
+        // (see [`OWNER_TOKEN_COMPONENT`]).
+        let mut state = with_owner_token(state, &self.owner_token_of(guid));
+        state.components.push(TransferKind::Ship.component(lead));
+        state
+            .components
+            .push(crate::handoff::scene_time_component(self.sim.scene_time()));
+        let offer =
+            Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
+        self.ledger
+            .offer_sent_as(&offer, tick, TransferKind::Ship, group);
+        self.send_to(Destination::Shard(to), Message::HandoffOffer(offer));
+    }
+
+    /// `to` accepted the ship `guid`: tell everyone watching it, with the
+    /// activation tick, so they open the new connection while the old path is
+    /// still live (guarantee 3).
+    ///
+    /// Not before the accept: until then the accepting shard has not staged
+    /// the transfer, so the owner's hello there would not match a staged
+    /// owner token and would be spawned a placeholder ship at that shard's
+    /// spawn point — on top of the ship on its way in, the two pushing each
+    /// other apart through their ghosts — and its `NeighbourStatus` would be
+    /// dropped as a claim for nothing. The accept is sent after the staging,
+    /// so a client redirected here can only arrive after it.
+    fn redirect_watchers(&mut self, guid: EntityGuid, to: ShardId, activation: SimTick) {
+        let Some(ship_pos) = self.sim.ship_state(guid).map(|s| s.pos) else {
+            return;
+        };
+        let tick = self.sim.tick();
+        let redirect = Redirect {
+            entity: guid,
+            new_shard: to,
+            shard_map: self.shard_map.clone(),
+            activation_tick: activation,
+        };
+        // Everyone whose interest set holds the entity is redirected, not just
+        // the player driving it: `Redirect::entity` is "the entity the client
+        // is now interested in", so an observer that has been watching the ship
+        // must be told to follow it to `to` rather than simply lose it.
+        //
+        // "Holds the entity" is a distance test against the one ship being
+        // offered — the same `distance² <= radius²` rule the interest grid
+        // applies — not a full sphere query per client, which walked ~9 000
+        // grid cells for every client for every offer.
+        let radius_sq =
+            f64::from(self.config.interest_radius) * f64::from(self.config.interest_radius);
+        let watchers: Vec<u64> = self
+            .clients
+            .values()
+            .filter(|client| {
+                let anchor = client
+                    .ship
+                    .and_then(|g| self.sim.ship_state(g))
+                    .map_or(WorldPos::ZERO, |s| s.pos);
+                WorldPos::distance_squared(anchor, ship_pos) <= radius_sq
+            })
+            .map(|client| client.session)
+            .collect();
+        for session in watchers {
+            if let Some(client) = self.clients.get_mut(&session) {
+                client.redirect_pending = Some(to);
+                client.redirect_deadline = Some(tick.saturating_add(REDIRECT_TIMEOUT_TICKS));
             }
+            self.send_to(
+                Destination::Client(session),
+                Message::Redirect(redirect.clone()),
+            );
         }
     }
 
