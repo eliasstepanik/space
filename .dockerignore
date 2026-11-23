@@ -4,3 +4,8 @@ target
 spikes/*/target
 .warren
 .local
+
+# Asset sources and review renders are not needed to build or test. The GLBs and
+# manifest.json stay: xtask/tests/assets.rs reads them during the CI image build.
+assets/ships/*/source/
+assets/ships/*/previews/

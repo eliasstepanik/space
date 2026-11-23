@@ -1,0 +1,3464 @@
+{
+ "asset": "IC-4 Kestrel",
+ "blender": "5.2.4 LTS",
+ "frame": "source Blender Z-up, nose +Y, metres; GLB Y-up, nose -Z (export_yup=True)",
+ "scripts": {
+  "git_commit": "a6f6c3f902ba91d7db55ef3d39c839a2f2c5de75",
+  "uncommitted_changes": [],
+  "sha256": {
+   "00_common.py": "b1127437b514d75f8105110256c45b98c972b0ed8a13d9af5c8582aa934c581c",
+   "10_blockout.py": "38e3879231d6d36ead9a2d78aaef574db409e92e6b145a14a851aae76cc2936b",
+   "11_blockout_previews.py": "a5c97941557254ee1aa115bd7a810cead7e6e532e80c7a062468457938b332f1",
+   "20_exterior.py": "3c7092d1e30f9d21e38591b4804d3b1ca10ca30605a60dc1e8fa31a42448a2fc",
+   "21_exterior_previews.py": "604186d167ffc8f439eb9a1e97ff4ca7a1c50da6b5ee140631f36adf6d627cd8",
+   "30_interior.py": "dc861c9dbb96d959ec4a278b8093f1c30e735db59b2b344d4639b8b8315b8992",
+   "31_bays.py": "95c94b30449914b6e94f24e94039b0cd6444ec6d4aece0d3ae1ed46af8b821e1",
+   "31_interior_previews.py": "d40f276dc43943a4b3c022b7c4929f72219d616b928e0fe7803939da379b58cd",
+   "32_bay_previews.py": "ddd4af901fcfdb0733d9c705e7222301f74943ee46760acf1f9f39d35cf1dee9",
+   "40_materials.py": "416a393c239adf51d9a3cc932d662912bee03d77f4187f7528f9c4eea1b0fcce",
+   "50_export.py": "8ec88a0771ebeea3a13f2e723cd39d1d588533955cd6acf4beb0d4b2fd270b17",
+   "51_validate_glb.py": "f95af1f73548fbdf875e669ab01a7f81a9919e1e2b9c43e52b0764879d044af3",
+   "52_reimport_check.py": "c594ae0b59e60b21bb6ea4f76094be884c2fb161fd8a94b1d80f1af28b409e2f",
+   "53_enclosure.py": "c431ed0d7fd825e2bf367c604c1a068e69a713006611dc60a5d624408cc1e07b",
+   "54_hero_previews.py": "e0b7dfed20da8f7ef1e9528dcc220dfe8852ae6bf3cd160e8908cbc171c26fa0",
+   "55_build_report.py": "ef7fdee0957a4ee108ed53f43cdb4f96dd349335ebb7985f5bbc214148ef795b"
+  },
+  "chain": [
+   "10_blockout.py",
+   "20_exterior.py",
+   "30_interior.py",
+   "31_bays.py",
+   "40_materials.py"
+  ],
+  "post": [
+   "50_export.py --what full",
+   "50_export.py --what lod1",
+   "51_validate_glb.py",
+   "52_reimport_check.py",
+   "53_enclosure.py",
+   "54_hero_previews.py",
+   "55_build_report.py"
+  ]
+ },
+ "stages": {
+  "10_blockout": {
+   "tris_total": 784,
+   "tris_exterior": 592,
+   "tris_interior": 192
+  },
+  "20_exterior": {
+   "tris_exterior": 169210,
+   "tris_total": 169402
+  },
+  "30_interior": {
+   "tris_interior_rooms": 168944,
+   "tris_total": 338250,
+   "objects": 992
+  },
+  "31_bays": {
+   "tris_bays": 79392,
+   "tris_total": 417546,
+   "objects": 1072
+  },
+  "40_materials": {
+   "tris_total": 417546,
+   "objects": 1072,
+   "mesh_objects": 1010,
+   "meshes": 251
+  }
+ },
+ "final_totals": {
+  "objects": 1072,
+  "mesh_objects": 1010,
+  "meshes": 251,
+  "triangles": 417546,
+  "triangles_exterior": 169210,
+  "triangles_interior_incl_bays": 248336,
+  "previous_release": {
+   "objects": 1071,
+   "triangles": 417512,
+   "note": "before the task-7 dock-trunk fix"
+  },
+  "delta_vs_previous": {
+   "objects": 1,
+   "triangles": 34
+  }
+ },
+ "dock_trunk_fix": {
+  "file": "20_exterior.py build_hull()",
+  "change": "split_dock + drop_openings hooks on panel_loft; new EXT_HULL_DockOpeningRim",
+  "opening": "flat dorsal panel column X -0.9..0 (existing longitudinal seams), Y 1.05..2.05 (two bisect cuts across the two straddling panels); corners 0.67 m from the collar axis, inside the 0.72 m EXT_DOCK_Collar skirt",
+  "tri_delta": {
+   "EXT_HULL_Fuselage": [
+    12000,
+    12002
+   ],
+   "EXT_HULL_DockOpeningRim": [
+    0,
+    32
+   ],
+   "exterior_total": [
+    169176,
+    169210
+   ],
+   "scene_total": [
+    417512,
+    417546
+   ],
+   "objects": [
+    1071,
+    1072
+   ]
+  },
+  "verification": {
+   "R03a_centre_rays": "500/500 hit, 500/500 front-facing (was 494)",
+   "trunk_grid_up_rays": "396 rays up/oblique from a 11x12 grid at Z 1.2 under the trunk: 0 hits on skin back-faces; EXT_DOCK_Hatch 155 (front), INT_R03a_DockTrunk 84, ceiling 120, hatch leaf 17 front + 20 back - the 20 are probe origins at Y 1.27-1.37 that start INSIDE the open hanging INT_R03a_CeilingHatch leaf (leaf bbox Y 1.096-1.392, Z 0.84-1.51), a probe artefact, not skin",
+   "render": "tmp_t7/trunk_before.jpg (flat skin underside) vs trunk_after.jpg (closed dock hatch disc inside collar)",
+   "exterior_rays": "2084/4000 hits, 100 % front-facing - unchanged, opening not visible from outside"
+  }
+ },
+ "chain_reproducibility": {
+  "chain_run_1": {
+   "blend": "tmp_t7/chain.blend -> source/kestrel.blend",
+   "sha256": "a86c8b75548608dbbbd5557f21c75aea97a135bb554cad0f601a61b6ea5bc059"
+  },
+  "chain_run_2": {
+   "blend": "tmp_t7/chain2.blend (deleted after check)",
+   "sha256": "d67bec4aa7fbc49b500f6c28e9f9d39065acb0e6d0244fed0d28580cf1a3b06e"
+  },
+  "content_hash_method": "sha256 over sorted object names + world matrices (5 dp) + per-mesh tri counts (tmp_t7/stat2.py)",
+  "content_hash_run_1": "bee23479772276e699130f2278e88dc08858aa0693aaaec9ea109dd7474725a0",
+  "content_hash_run_2": "bee23479772276e699130f2278e88dc08858aa0693aaaec9ea109dd7474725a0",
+  "packed_images_identical": true,
+  "objects": 1072,
+  "tris": 417546,
+  "reproduces": true,
+  "note": "file bytes differ between runs (blend header/timestamps/zstd framing); scene content identical"
+ },
+ "materials": {
+  "count": 16,
+  "list": [
+   "M_Decals",
+   "M_Glass_Canopy",
+   "M_HullBare_Metal",
+   "M_HullPaint_Grey",
+   "M_HullPaint_White",
+   "M_Int_Equipment",
+   "M_Int_Fabric",
+   "M_Int_Floor",
+   "M_Int_Panel",
+   "M_Lights_Emissive",
+   "M_MLI_Foil",
+   "M_Paint_SafetyYellow",
+   "M_Radiator",
+   "M_Rubber_Dark",
+   "M_Screens_Emissive",
+   "M_Thermal_Dark"
+  ],
+  "object_count": {
+   "M_Decals": 18,
+   "M_Glass_Canopy": 28,
+   "M_HullBare_Metal": 795,
+   "M_HullPaint_Grey": 19,
+   "M_HullPaint_White": 10,
+   "M_Int_Equipment": 122,
+   "M_Int_Fabric": 14,
+   "M_Int_Floor": 8,
+   "M_Int_Panel": 64,
+   "M_Lights_Emissive": 23,
+   "M_MLI_Foil": 14,
+   "M_Paint_SafetyYellow": 146,
+   "M_Radiator": 12,
+   "M_Rubber_Dark": 189,
+   "M_Screens_Emissive": 55,
+   "M_Thermal_Dark": 78
+  },
+  "mesh_count": {
+   "M_Decals": 14,
+   "M_Glass_Canopy": 18,
+   "M_HullBare_Metal": 172,
+   "M_HullPaint_Grey": 7,
+   "M_HullPaint_White": 5,
+   "M_Int_Equipment": 75,
+   "M_Int_Fabric": 10,
+   "M_Int_Floor": 8,
+   "M_Int_Panel": 51,
+   "M_Lights_Emissive": 12,
+   "M_MLI_Foil": 8,
+   "M_Paint_SafetyYellow": 59,
+   "M_Radiator": 6,
+   "M_Rubber_Dark": 87,
+   "M_Screens_Emissive": 21,
+   "M_Thermal_Dark": 17
+  }
+ },
+ "textures": {
+  "list": [
+   {
+    "name": "T_Decal_Atlas",
+    "size": [
+     2048,
+     2048
+    ],
+    "format": "PNG",
+    "packed_bytes": 186229,
+    "colorspace": "sRGB"
+   },
+   {
+    "name": "T_Hull_Normal",
+    "size": [
+     1024,
+     1024
+    ],
+    "format": "JPEG",
+    "packed_bytes": 77430,
+    "colorspace": "Non-Color"
+   },
+   {
+    "name": "T_Hull_ORM",
+    "size": [
+     1024,
+     1024
+    ],
+    "format": "JPEG",
+    "packed_bytes": 109481,
+    "colorspace": "Non-Color"
+   },
+   {
+    "name": "T_Int_Normal",
+    "size": [
+     1024,
+     1024
+    ],
+    "format": "JPEG",
+    "packed_bytes": 133963,
+    "colorspace": "Non-Color"
+   },
+   {
+    "name": "T_Int_ORM",
+    "size": [
+     1024,
+     1024
+    ],
+    "format": "JPEG",
+    "packed_bytes": 136756,
+    "colorspace": "Non-Color"
+   },
+   {
+    "name": "T_Screen_Atlas",
+    "size": [
+     1024,
+     1024
+    ],
+    "format": "JPEG",
+    "packed_bytes": 210719,
+    "colorspace": "sRGB"
+   }
+  ],
+  "total_packed_bytes": 854578,
+  "total_MB": 0.815
+ },
+ "glb_full": {
+  "checks": {
+   "magic_glTF": true,
+   "version_2": true,
+   "length_matches_file": true,
+   "chunk0_JSON": true,
+   "chunk1_BIN": true,
+   "one_embedded_buffer": true,
+   "no_uri_anywhere": true,
+   "images_via_bufferView": true,
+   "extensionsRequired_absent_or_empty": true,
+   "extensionsUsed_only_emissive_strength": true,
+   "no_draco_or_meshopt": true,
+   "no_skins": true,
+   "no_animations": true,
+   "all_primitives_TRIANGLES": true,
+   "all_primitives_NORMAL": true,
+   "all_primitives_TEXCOORD_0": true,
+   "bufferViews_in_range": true,
+   "no_cameras_lights": true,
+   "longest_axis_Z": true,
+   "size_lt_45MB": true
+  },
+  "all_pass": true,
+  "counts": {
+   "nodes": 1069,
+   "mesh_nodes": 1010,
+   "meshes": 251,
+   "primitives": 578,
+   "materials": 16,
+   "images": 6,
+   "textures": 24,
+   "accessors": 2171,
+   "bufferViews": 2177,
+   "triangles_instanced": 417546
+  },
+  "extensionsUsed": [
+   "KHR_materials_emissive_strength"
+  ],
+  "extensionsRequired": [],
+  "materials": [
+   "M_HullPaint_White",
+   "M_HullBare_Metal",
+   "M_Glass_Canopy",
+   "M_Thermal_Dark",
+   "M_HullPaint_Grey",
+   "M_Decals",
+   "M_Rubber_Dark",
+   "M_MLI_Foil",
+   "M_Paint_SafetyYellow",
+   "M_Radiator",
+   "M_Int_Equipment",
+   "M_Int_Panel",
+   "M_Screens_Emissive",
+   "M_Lights_Emissive",
+   "M_Int_Floor",
+   "M_Int_Fabric"
+  ],
+  "images": [
+   {
+    "name": "T_Hull_Normal",
+    "mimeType": "image/jpeg",
+    "bytes": 77430
+   },
+   {
+    "name": "T_Hull_ORM",
+    "mimeType": "image/jpeg",
+    "bytes": 109481
+   },
+   {
+    "name": "T_Decal_Atlas",
+    "mimeType": "image/png",
+    "bytes": 186229
+   },
+   {
+    "name": "T_Int_Normal",
+    "mimeType": "image/jpeg",
+    "bytes": 133963
+   },
+   {
+    "name": "T_Int_ORM",
+    "mimeType": "image/jpeg",
+    "bytes": 136756
+   },
+   {
+    "name": "T_Screen_Atlas",
+    "mimeType": "image/jpeg",
+    "bytes": 210719
+   }
+  ],
+  "bbox_gltf": {
+   "min": [
+    -6.32,
+    -3.3,
+    -11.84
+   ],
+   "max": [
+    6.32,
+    2.3436,
+    11.955
+   ],
+   "dims_xyz": [
+    12.64,
+    5.6436,
+    23.795
+   ]
+  },
+  "envelope_check": {
+   "longest_axis": "Z",
+   "nose_direction": "-Z (SOCKET_Camera_PilotEye z<0, nose tip at min z)",
+   "x_span_m": {
+    "measured": 12.64,
+    "envelope": 12.5,
+    "dev_pct": 1.12
+   },
+   "y_height_on_gear_m": {
+    "measured": 5.6436,
+    "envelope": 5.6,
+    "dev_pct": 0.78
+   },
+   "z_length_m": {
+    "measured": 23.795,
+    "envelope": 23.0,
+    "dev_pct": 3.46
+   },
+   "within_10pct": true
+  },
+  "export": {
+   "exported_objects": 1069,
+   "excluded": [
+    "CAM_Preview_34",
+    "CAM_Preview_Top",
+    "LGT_Preview_Sun"
+   ],
+   "source_tris": 417546,
+   "out": "/workspace/assets/ships/kestrel/kestrel.glb",
+   "bytes": 14862392
+  }
+ },
+ "glb_lod1": {
+  "checks": {
+   "magic_glTF": true,
+   "version_2": true,
+   "length_matches_file": true,
+   "chunk0_JSON": true,
+   "chunk1_BIN": true,
+   "one_embedded_buffer": true,
+   "no_uri_anywhere": true,
+   "images_via_bufferView": true,
+   "extensionsRequired_absent_or_empty": true,
+   "extensionsUsed_only_emissive_strength": true,
+   "no_draco_or_meshopt": true,
+   "no_skins": true,
+   "no_animations": true,
+   "all_primitives_TRIANGLES": true,
+   "all_primitives_NORMAL": true,
+   "all_primitives_TEXCOORD_0": true,
+   "bufferViews_in_range": true,
+   "no_cameras_lights": true,
+   "longest_axis_Z": true,
+   "single_mesh_node": true,
+   "single_mesh": true,
+   "single_primitive": true,
+   "lod1_tris_8k_15k": true,
+   "size_lt_45MB": true
+  },
+  "all_pass": true,
+  "counts": {
+   "nodes": 1,
+   "mesh_nodes": 1,
+   "meshes": 1,
+   "primitives": 1,
+   "materials": 1,
+   "images": 2,
+   "textures": 2,
+   "accessors": 5,
+   "bufferViews": 7,
+   "triangles_instanced": 11585
+  },
+  "materials": [
+   "M_Kestrel_LOD1"
+  ],
+  "images": [
+   {
+    "name": "T_Hull_Normal",
+    "mimeType": "image/jpeg",
+    "bytes": 77430
+   },
+   {
+    "name": "T_Hull_ORM",
+    "mimeType": "image/jpeg",
+    "bytes": 109481
+   }
+  ],
+  "bbox_gltf": {
+   "min": [
+    -6.3161,
+    -3.3057,
+    -11.8409
+   ],
+   "max": [
+    6.3197,
+    2.3418,
+    11.956
+   ],
+   "dims_xyz": [
+    12.6358,
+    5.6475,
+    23.7969
+   ]
+  },
+  "build": {
+   "source_exterior_objects": 683,
+   "source_exterior_tris": 169210,
+   "joined_tris": 169210,
+   "welded_tris": 168068,
+   "decimate_tries": [
+    {
+     "ratio": 0.0714,
+     "decimated_tris": 12000,
+     "clean_tris": 9063
+    },
+    {
+     "ratio": 0.09454,
+     "decimated_tris": 15887,
+     "clean_tris": 13367
+    },
+    {
+     "ratio": 0.08487,
+     "decimated_tris": 14263,
+     "clean_tris": 11585
+    }
+   ],
+   "final_tris": 11585,
+   "material": "M_Kestrel_LOD1",
+   "material_note": "16 source materials merged: base colour per face -> COLOR_0, T_Hull_ORM (rough x0.45, metal x0.2, occlusion) + T_Hull_Normal",
+   "out": "/workspace/assets/ships/kestrel/kestrel_lod1.glb",
+   "bytes": 1712052
+  }
+ },
+ "socket_orientation": {
+  "summary": {
+   "SOCKET_Camera_PilotEye_z_lt_0": {
+    "z": -6.85,
+    "pass": true
+   },
+   "SOCKET_Engine_Main_z_gt_0": {
+    "SOCKET_Engine_Main_L": {
+     "z": 11.5,
+     "pass": true
+    },
+    "SOCKET_Engine_Main_R": {
+     "z": 11.5,
+     "pass": true
+    }
+   },
+   "PilotEye_looks_nose_minus_Z": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "Engine_exhaust_axis_plus_Z": {
+    "SOCKET_Engine_Main_L": [
+     0.0,
+     0.0,
+     1.0
+    ],
+    "SOCKET_Engine_Main_R": [
+     0.0,
+     0.0,
+     1.0
+    ]
+   },
+   "all_pass": true
+  },
+  "per_socket_all_ok": true,
+  "sockets": {
+   "SOCKET_Camera_PilotEye": {
+    "pos_gltf": [
+     0.0,
+     1.85,
+     -6.85
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     0.0,
+     -1.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.7071068286895752,
+     0,
+     0,
+     0.7071068286895752
+    ],
+    "extras": {
+     "socket_kind": "Camera"
+    },
+    "ok": true
+   },
+   "SOCKET_Camera_EngEye": {
+    "pos_gltf": [
+     0.0,
+     1.85,
+     -5.05
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     0.0,
+     -1.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.7071068286895752,
+     0,
+     0,
+     0.7071068286895752
+    ],
+    "extras": {
+     "socket_kind": "Camera"
+    },
+    "ok": true
+   },
+   "SOCKET_Seat_Pilot": {
+    "pos_gltf": [
+     0.0,
+     0.55,
+     -6.75
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Seat"
+    },
+    "ok": true
+   },
+   "SOCKET_Seat_Engineer": {
+    "pos_gltf": [
+     0.0,
+     0.55,
+     -4.95
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Seat"
+    },
+    "ok": true
+   },
+   "SOCKET_Engine_Main_L": {
+    "pos_gltf": [
+     -1.2,
+     -0.5,
+     11.5
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     0.0,
+     1.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -0.7071068286895752,
+     0,
+     0,
+     0.7071068286895752
+    ],
+    "extras": {
+     "socket_kind": "Engine",
+     "thrust_axis": "+Y"
+    },
+    "ok": true
+   },
+   "SOCKET_Engine_Main_R": {
+    "pos_gltf": [
+     1.2,
+     -0.5,
+     11.5
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     0.0,
+     1.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -0.7071068286895752,
+     0,
+     0,
+     0.7071068286895752
+    ],
+    "extras": {
+     "socket_kind": "Engine",
+     "thrust_axis": "+Y"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_FwdUp_L": {
+    "pos_gltf": [
+     -1.1137,
+     1.0388,
+     -9.0
+    ],
+    "pos_err_m": 5e-05,
+    "axis_neg_local_z_gltf": [
+     0.7071,
+     -0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.27059808373451233,
+     -0.6532815098762512,
+     0.27059805393218994,
+     0.6532815098762512
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_FwdUp_R": {
+    "pos_gltf": [
+     1.1137,
+     1.0388,
+     -9.0
+    ],
+    "pos_err_m": 5e-05,
+    "axis_neg_local_z_gltf": [
+     -0.7071,
+     -0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.27059808373451233,
+     0.6532815098762512,
+     -0.27059805393218994,
+     0.6532815098762512
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_FwdDn_L": {
+    "pos_gltf": [
+     -1.1137,
+     -1.3188,
+     -9.0
+    ],
+    "pos_err_m": 5e-05,
+    "axis_neg_local_z_gltf": [
+     0.7071,
+     0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.6532815098762512,
+     -0.27059805393218994,
+     0.6532815098762512,
+     0.27059808373451233
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_FwdDn_R": {
+    "pos_gltf": [
+     1.1137,
+     -1.3188,
+     -9.0
+    ],
+    "pos_err_m": 5e-05,
+    "axis_neg_local_z_gltf": [
+     -0.7071,
+     0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.6532815098762512,
+     0.27059805393218994,
+     -0.6532815098762512,
+     0.27059808373451233
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_AftUp_L": {
+    "pos_gltf": [
+     -1.35,
+     1.45,
+     9.4
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.7071,
+     -0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.27059808373451233,
+     -0.6532815098762512,
+     0.27059805393218994,
+     0.6532815098762512
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_AftUp_R": {
+    "pos_gltf": [
+     1.35,
+     1.45,
+     9.4
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     -0.7071,
+     -0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.27059808373451233,
+     0.6532815098762512,
+     -0.27059805393218994,
+     0.6532815098762512
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_AftDn_L": {
+    "pos_gltf": [
+     -1.35,
+     -1.45,
+     9.4
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.7071,
+     0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.6532815098762512,
+     -0.27059805393218994,
+     0.6532815098762512,
+     0.27059808373451233
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_RCS_Quad_AftDn_R": {
+    "pos_gltf": [
+     1.35,
+     -1.45,
+     9.4
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     -0.7071,
+     0.7071,
+     -0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0.6532815098762512,
+     0.27059805393218994,
+     -0.6532815098762512,
+     0.27059808373451233
+    ],
+    "extras": {
+     "socket_kind": "RCS"
+    },
+    "ok": true
+   },
+   "SOCKET_Hardpoint_1_BayL": {
+    "pos_gltf": [
+     -0.4,
+     -0.65,
+     -0.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -1,
+     0,
+     0,
+     4.371138828673793e-08
+    ],
+    "extras": {
+     "socket_kind": "Hardpoint",
+     "internal": true
+    },
+    "ok": true
+   },
+   "SOCKET_Hardpoint_2_BayR": {
+    "pos_gltf": [
+     0.4,
+     -0.65,
+     -0.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -1,
+     0,
+     0,
+     4.371138828673793e-08
+    ],
+    "extras": {
+     "socket_kind": "Hardpoint",
+     "internal": true
+    },
+    "ok": true
+   },
+   "SOCKET_Hardpoint_3_SponsonL": {
+    "pos_gltf": [
+     -1.925,
+     -1.7,
+     5.8
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -1,
+     0,
+     0,
+     4.371138828673793e-08
+    ],
+    "extras": {
+     "socket_kind": "Hardpoint",
+     "internal": false
+    },
+    "ok": true
+   },
+   "SOCKET_Hardpoint_4_SponsonR": {
+    "pos_gltf": [
+     1.925,
+     -1.7,
+     5.8
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -1,
+     0,
+     0,
+     4.371138828673793e-08
+    ],
+    "extras": {
+     "socket_kind": "Hardpoint",
+     "internal": false
+    },
+    "ok": true
+   },
+   "SOCKET_Turret_Chin": {
+    "pos_gltf": [
+     0.0,
+     -1.925,
+     -8.7
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     -1,
+     0,
+     0,
+     4.371138828673793e-08
+    ],
+    "extras": {
+     "socket_kind": "Turret"
+    },
+    "ok": true
+   },
+   "SOCKET_Dock_Dorsal": {
+    "pos_gltf": [
+     -0.45,
+     2.15,
+     -1.55
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Dock"
+    },
+    "ok": true
+   },
+   "SOCKET_Hatch_Crew": {
+    "pos_gltf": [
+     -1.84,
+     0.25,
+     -1.5
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     1.0,
+     0.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0.7071068286895752,
+     0.7071068286895752
+    ],
+    "extras": {
+     "socket_kind": "Hatch"
+    },
+    "ok": true
+   },
+   "SOCKET_Gear_Contact_Nose": {
+    "pos_gltf": [
+     0.0,
+     -3.3,
+     -7.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Gear"
+    },
+    "ok": true
+   },
+   "SOCKET_Gear_Contact_Main_L": {
+    "pos_gltf": [
+     -1.925,
+     -3.3,
+     3.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Gear"
+    },
+    "ok": true
+   },
+   "SOCKET_Gear_Contact_Main_R": {
+    "pos_gltf": [
+     1.925,
+     -3.3,
+     3.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Gear"
+    },
+    "ok": true
+   },
+   "SOCKET_Nav_Light_L": {
+    "pos_gltf": [
+     -6.25,
+     0.0,
+     5.0
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Nav",
+     "color": "red"
+    },
+    "ok": true
+   },
+   "SOCKET_Nav_Light_R": {
+    "pos_gltf": [
+     6.25,
+     0.0,
+     5.0
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Nav",
+     "color": "green"
+    },
+    "ok": true
+   },
+   "SOCKET_Nav_Light_Tail": {
+    "pos_gltf": [
+     0.0,
+     1.55,
+     11.0
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Nav",
+     "color": "white"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B01": {
+    "pos_gltf": [
+     0.0,
+     0.3,
+     -9.8
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B01_NoseSensorBay"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B02": {
+    "pos_gltf": [
+     0.0,
+     -0.5,
+     -7.25
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B02_NoseGearWell"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R01": {
+    "pos_gltf": [
+     0.0,
+     2.1,
+     -6.15
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R01_Cockpit"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R02": {
+    "pos_gltf": [
+     0.0,
+     1.45,
+     -3.45
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R02_AvionicsLifeSupport"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R03": {
+    "pos_gltf": [
+     0.525,
+     1.45,
+     -1.55
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R03_AirlockVestibule"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R04": {
+    "pos_gltf": [
+     0.0,
+     1.45,
+     0.55
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R04_CrewQuarters"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R05": {
+    "pos_gltf": [
+     0.0,
+     1.45,
+     2.1
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R05_StoresLocker"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_R06": {
+    "pos_gltf": [
+     0.0,
+     1.45,
+     3.65
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "R06_EngineeringBay"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_C01": {
+    "pos_gltf": [
+     0.0,
+     1.5,
+     7.2
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "C01_DorsalCrawlway"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B03": {
+    "pos_gltf": [
+     0.0,
+     -0.65,
+     -0.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B03_OrdnanceBay"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B04": {
+    "pos_gltf": [
+     -1.925,
+     -0.3,
+     3.3
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B04_MainGearWell_L"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B05": {
+    "pos_gltf": [
+     0.0,
+     0.45,
+     5.95
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B05_PropellantTankBay"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B06": {
+    "pos_gltf": [
+     0.0,
+     0.45,
+     8.05
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B06_ReactorCompartment"
+    },
+    "ok": true
+   },
+   "SOCKET_Light_B07": {
+    "pos_gltf": [
+     0.0,
+     0.45,
+     9.85
+    ],
+    "pos_err_m": 0.0,
+    "axis_neg_local_z_gltf": [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    "axis_angle_err_deg": 0.0,
+    "rotation_xyzw": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "extras": {
+     "socket_kind": "Light",
+     "room": "B07_EngineBay"
+    },
+    "ok": true
+   }
+  }
+ },
+ "reimport_comparison": {
+  "source": {
+   "objects": 1069,
+   "mesh_objects": 1010,
+   "meshes": 251,
+   "tris": 417546,
+   "bbox_min": [
+    -6.32,
+    -11.955,
+    -3.3
+   ],
+   "bbox_max": [
+    6.32,
+    11.84,
+    2.3436
+   ]
+  },
+  "reimport": {
+   "objects": 1069,
+   "mesh_objects": 1010,
+   "meshes": 251,
+   "tris": 417546,
+   "bbox_min": [
+    -6.32,
+    -11.955,
+    -3.3
+   ],
+   "bbox_max": [
+    6.32,
+    11.84,
+    2.3436
+   ]
+  },
+  "tris_match": true,
+  "object_count_match": true,
+  "bbox_max_abs_err_m": 0.0,
+  "names_only_in_source": [],
+  "names_only_in_reimport": [],
+  "renames": [],
+  "mismatches": [],
+  "materials_match": true,
+  "images_match": true,
+  "pass": true
+ },
+ "enclosure": {
+  "method": "pressurised rooms: strict from centre (all hit, >=99% front-facing); unpressurised bays: from best free point (max clearance), all hit and (>=99% front-facing or all back-face hits on hull skin); gear wells: closed (all hit from centre and free point); exterior: rays from enclosing sphere aimed at random points in ship bbox, pass >=99.5% front-facing",
+  "seed": 7,
+  "rooms": {
+   "B01": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 346,
+    "front_fraction": 0.692,
+    "all_hit": true,
+    "backface_then_open_space": 152,
+    "backface_then_more_ship": 2,
+    "backface_objects": {
+     "EXT_HULL_Fuselage": 154
+    },
+    "miss_dir_examples": [],
+    "id": "B01",
+    "name": "NoseSensorBay",
+    "centre": [
+     0.0,
+     9.8,
+     -0.25
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 269,
+     "front_fraction": 0.538,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 227,
+     "backface_then_more_ship": 4,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 231
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      -0.1,
+      10.2,
+      -0.13
+     ],
+     "clearance_m": 0.412,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 231,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         -0.481,
+         0.864,
+         -0.15
+        ],
+        "dir_buckets": {
+         "-X": 74,
+         "-Y": 19,
+         "+X": 63,
+         "+Y": 51,
+         "-Z": 20,
+         "+Z": 4
+        },
+        "hit_bounds": [
+         [
+          -1.82,
+          3.623,
+          -1.71
+         ],
+         [
+          1.82,
+          11.366,
+          1.347
+         ]
+        ],
+        "open_space_behind": 227
+       }
+      },
+      "by_direction": {
+       "+X": 63,
+       "-X": 74,
+       "+Y": 51,
+       "-Y": 19,
+       "+Z": 4,
+       "-Z": 20
+      },
+      "skin_hits": 231,
+      "nonskin_hits": 0,
+      "then_open_space": 227,
+      "then_more_ship": 4,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only"
+   },
+   "B02": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 14,
+    "front_fraction": 0.028,
+    "all_hit": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 486,
+    "backface_objects": {
+     "INT_B02_Strut": 486
+    },
+    "miss_dir_examples": [],
+    "id": "B02",
+    "name": "NoseGearWell",
+    "centre": [
+     0.0,
+     7.25,
+     -1.075
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 394,
+     "front_fraction": 0.788,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 102,
+     "backface_then_more_ship": 4,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 106
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      0.0,
+      6.775,
+      -1.388
+     ],
+     "clearance_m": 0.366,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 106,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         -0.012,
+         0.075,
+         -0.997
+        ],
+        "dir_buckets": {
+         "-Y": 10,
+         "-Z": 63,
+         "-X": 12,
+         "+X": 7,
+         "+Y": 14
+        },
+        "hit_bounds": [
+         [
+          -0.662,
+          6.091,
+          -1.906
+         ],
+         [
+          0.636,
+          8.328,
+          -1.799
+         ]
+        ],
+        "open_space_behind": 102
+       }
+      },
+      "by_direction": {
+       "+X": 7,
+       "-X": 12,
+       "+Y": 14,
+       "-Y": 10,
+       "+Z": 0,
+       "-Z": 63
+      },
+      "skin_hits": 106,
+      "nonskin_hits": 0,
+      "then_open_space": 102,
+      "then_more_ship": 4,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)"
+   },
+   "R01": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 499,
+    "front_fraction": 0.998,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 1,
+    "backface_objects": {
+     "EXT_HULL_Fuselage": 1
+    },
+    "miss_dir_examples": [],
+    "id": "R01",
+    "name": "Cockpit",
+    "centre": [
+     0.0,
+     6.15,
+     1.35
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "backface_account": {
+     "by_object": {
+      "EXT_HULL_Fuselage": {
+       "hits": 1,
+       "hull_skin": true,
+       "role": "hull-skin interior (bay wall = inside of the hull skin)",
+       "mean_dir": [
+        0.855,
+        0.212,
+        0.474
+       ],
+       "dir_buckets": {
+        "+X": 1
+       },
+       "hit_bounds": [
+        [
+         0.945,
+         6.384,
+         1.874
+        ],
+        [
+         0.945,
+         6.384,
+         1.874
+        ]
+       ],
+       "open_space_behind": 0
+      }
+     },
+     "by_direction": {
+      "+X": 1,
+      "-X": 0,
+      "+Y": 0,
+      "-Y": 0,
+      "+Z": 0,
+      "-Z": 0
+     },
+     "skin_hits": 1,
+     "nonskin_hits": 0,
+     "then_open_space": 0,
+     "then_more_ship": 1,
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "R02": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "R02",
+    "name": "AvionicsLifeSupport",
+    "centre": [
+     0.0,
+     3.45,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "R03": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "R03",
+    "name": "AirlockVestibule",
+    "centre": [
+     0.525,
+     1.55,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "R03a": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "R03a",
+    "name": "AirlockChamber",
+    "centre": [
+     -0.625,
+     1.55,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "R04": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "R04",
+    "name": "CrewQuarters",
+    "centre": [
+     0.0,
+     -0.55,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "R05": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "R05",
+    "name": "StoresLocker",
+    "centre": [
+     0.0,
+     -2.1,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "R06": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 499,
+    "front_fraction": 0.998,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 1,
+    "backface_objects": {
+     "INT_R06_ShieldPlate": 1
+    },
+    "miss_dir_examples": [],
+    "id": "R06",
+    "name": "EngineeringBay",
+    "centre": [
+     0.0,
+     -3.65,
+     0.5
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "backface_account": {
+     "by_object": {
+      "INT_R06_ShieldPlate": {
+       "hits": 1,
+       "hull_skin": false,
+       "role": "fitting / structure",
+       "mean_dir": [
+        0.032,
+        -0.945,
+        -0.326
+       ],
+       "dir_buckets": {
+        "-Y": 1
+       },
+       "hit_bounds": [
+        [
+         0.032,
+         -4.615,
+         0.167
+        ],
+        [
+         0.032,
+         -4.615,
+         0.167
+        ]
+       ],
+       "open_space_behind": 0
+      }
+     },
+     "by_direction": {
+      "+X": 0,
+      "-X": 0,
+      "+Y": 0,
+      "-Y": 1,
+      "+Z": 0,
+      "-Z": 0
+     },
+     "skin_hits": 0,
+     "nonskin_hits": 1,
+     "then_open_space": 0,
+     "then_more_ship": 1,
+     "all_backfaces_on_hull_skin": false
+    }
+   },
+   "C01": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "pass": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "C01",
+    "name": "DorsalCrawlway",
+    "centre": [
+     0.0,
+     -7.2,
+     1.1
+    ],
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing"
+   },
+   "B03": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 500,
+    "front_fraction": 1.0,
+    "all_hit": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 0,
+    "backface_objects": {},
+    "miss_dir_examples": [],
+    "id": "B03",
+    "name": "OrdnanceBay",
+    "centre": [
+     0.0,
+     0.3,
+     -1.175
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 499,
+     "front_fraction": 0.998,
+     "all_hit": true,
+     "pass": true,
+     "backface_then_open_space": 1,
+     "backface_then_more_ship": 0,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 1
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      -0.17,
+      1.45,
+      -1.29
+     ],
+     "clearance_m": 0.538,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 1,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         0.196,
+         0.893,
+         -0.404
+        ],
+        "dir_buckets": {
+         "+Y": 1
+        },
+        "hit_bounds": [
+         [
+          0.126,
+          2.802,
+          -1.902
+         ],
+         [
+          0.126,
+          2.802,
+          -1.902
+         ]
+        ],
+        "open_space_behind": 1
+       }
+      },
+      "by_direction": {
+       "+X": 0,
+       "-X": 0,
+       "+Y": 1,
+       "-Y": 0,
+       "+Z": 0,
+       "-Z": 0
+      },
+      "skin_hits": 1,
+      "nonskin_hits": 0,
+      "then_open_space": 1,
+      "then_more_ship": 0,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": true,
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "front-facing >= 99%"
+   },
+   "B04_L": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 19,
+    "front_fraction": 0.038,
+    "all_hit": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 481,
+    "backface_objects": {
+     "INT_B04_Strut_L": 481
+    },
+    "miss_dir_examples": [],
+    "id": "B04",
+    "name": "MainGearWell_L",
+    "centre": [
+     -1.925,
+     -3.3,
+     -0.85
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 353,
+     "front_fraction": 0.706,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 131,
+     "backface_then_more_ship": 16,
+     "backface_objects": {
+      "EXT_HULL_Sponson_L": 147
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      -1.925,
+      -3.85,
+      -1.33
+     ],
+     "clearance_m": 0.276,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Sponson_L": {
+        "hits": 147,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         0.051,
+         -0.077,
+         -0.996
+        ],
+        "dir_buckets": {
+         "-Z": 76,
+         "+X": 22,
+         "-Y": 21,
+         "+Y": 15,
+         "-X": 13
+        },
+        "hit_bounds": [
+         [
+          -2.355,
+          -4.733,
+          -1.702
+         ],
+         [
+          -1.5,
+          -2.438,
+          -1.534
+         ]
+        ],
+        "open_space_behind": 131
+       }
+      },
+      "by_direction": {
+       "+X": 22,
+       "-X": 13,
+       "+Y": 15,
+       "-Y": 21,
+       "+Z": 0,
+       "-Z": 76
+      },
+      "skin_hits": 147,
+      "nonskin_hits": 0,
+      "then_open_space": 131,
+      "then_more_ship": 16,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)"
+   },
+   "B04_R": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 25,
+    "front_fraction": 0.05,
+    "all_hit": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 475,
+    "backface_objects": {
+     "INT_B04_Strut_R": 475
+    },
+    "miss_dir_examples": [],
+    "id": "B04",
+    "name": "MainGearWell_R",
+    "centre": [
+     1.925,
+     -3.3,
+     -0.85
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 339,
+     "front_fraction": 0.678,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 146,
+     "backface_then_more_ship": 15,
+     "backface_objects": {
+      "EXT_HULL_Sponson_R": 161
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      1.925,
+      -3.85,
+      -1.33
+     ],
+     "clearance_m": 0.276,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Sponson_R": {
+        "hits": 161,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         -0.035,
+         0.027,
+         -0.999
+        ],
+        "dir_buckets": {
+         "-X": 18,
+         "-Z": 87,
+         "-Y": 15,
+         "+Y": 20,
+         "+X": 21
+        },
+        "hit_bounds": [
+         [
+          1.484,
+          -4.675,
+          -1.702
+         ],
+         [
+          2.359,
+          -1.841,
+          -1.523
+         ]
+        ],
+        "open_space_behind": 146
+       }
+      },
+      "by_direction": {
+       "+X": 21,
+       "-X": 18,
+       "+Y": 20,
+       "-Y": 15,
+       "+Z": 0,
+       "-Z": 87
+      },
+      "skin_hits": 161,
+      "nonskin_hits": 0,
+      "then_open_space": 146,
+      "then_more_ship": 15,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)"
+   },
+   "B05": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 417,
+    "front_fraction": 0.834,
+    "all_hit": true,
+    "backface_then_open_space": 68,
+    "backface_then_more_ship": 15,
+    "backface_objects": {
+     "EXT_HULL_Fuselage": 83
+    },
+    "miss_dir_examples": [],
+    "id": "B05",
+    "name": "PropellantTankBay",
+    "centre": [
+     0.0,
+     -5.95,
+     -0.55
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 413,
+     "front_fraction": 0.826,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 74,
+     "backface_then_more_ship": 13,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 87
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      0.5,
+      -5.95,
+      -0.025
+     ],
+     "clearance_m": 0.427,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 87,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         0.974,
+         -0.216,
+         -0.072
+        ],
+        "dir_buckets": {
+         "-Z": 28,
+         "-X": 19,
+         "+X": 21,
+         "+Z": 12,
+         "-Y": 3,
+         "+Y": 4
+        },
+        "hit_bounds": [
+         [
+          -1.802,
+          -8.737,
+          -1.902
+         ],
+         [
+          1.802,
+          -4.336,
+          1.92
+         ]
+        ],
+        "open_space_behind": 74
+       }
+      },
+      "by_direction": {
+       "+X": 21,
+       "-X": 19,
+       "+Y": 4,
+       "-Y": 3,
+       "+Z": 12,
+       "-Z": 28
+      },
+      "skin_hits": 87,
+      "nonskin_hits": 0,
+      "then_open_space": 74,
+      "then_more_ship": 13,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only"
+   },
+   "B06": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 56,
+    "front_fraction": 0.112,
+    "all_hit": true,
+    "backface_then_open_space": 0,
+    "backface_then_more_ship": 444,
+    "backface_objects": {
+     "INT_B06_ReactorVessel": 444
+    },
+    "miss_dir_examples": [],
+    "id": "B06",
+    "name": "ReactorCompartment",
+    "centre": [
+     0.0,
+     -8.05,
+     -0.55
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 376,
+     "front_fraction": 0.752,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 118,
+     "backface_then_more_ship": 6,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 124
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      -0.2,
+      -8.73,
+      -0.025
+     ],
+     "clearance_m": 0.405,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 124,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         -0.138,
+         -0.987,
+         -0.083
+        ],
+        "dir_buckets": {
+         "-X": 26,
+         "-Z": 34,
+         "-Y": 19,
+         "+X": 31,
+         "+Z": 13,
+         "+Y": 1
+        },
+        "hit_bounds": [
+         [
+          -1.802,
+          -11.002,
+          -1.902
+         ],
+         [
+          1.802,
+          -6.772,
+          1.75
+         ]
+        ],
+        "open_space_behind": 118
+       }
+      },
+      "by_direction": {
+       "+X": 31,
+       "-X": 26,
+       "+Y": 1,
+       "-Y": 19,
+       "+Z": 13,
+       "-Z": 34
+      },
+      "skin_hits": 124,
+      "nonskin_hits": 0,
+      "then_open_space": 118,
+      "then_more_ship": 6,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only"
+   },
+   "B07": {
+    "rays": 500,
+    "hits": 500,
+    "misses": 0,
+    "front_hits": 394,
+    "front_fraction": 0.788,
+    "all_hit": true,
+    "backface_then_open_space": 103,
+    "backface_then_more_ship": 3,
+    "backface_objects": {
+     "EXT_HULL_Fuselage": 106
+    },
+    "miss_dir_examples": [],
+    "id": "B07",
+    "name": "EngineBay",
+    "centre": [
+     0.0,
+     -9.85,
+     -0.4
+    ],
+    "free_point": {
+     "rays": 500,
+     "hits": 500,
+     "misses": 0,
+     "front_hits": 379,
+     "front_fraction": 0.758,
+     "all_hit": true,
+     "pass": false,
+     "backface_then_open_space": 118,
+     "backface_then_more_ship": 3,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": 121
+     },
+     "miss_dir_examples": [],
+     "origin": [
+      0.0,
+      -9.85,
+      -0.22
+     ],
+     "clearance_m": 0.548,
+     "backface_account": {
+      "by_object": {
+       "EXT_HULL_Fuselage": {
+        "hits": 121,
+        "hull_skin": true,
+        "role": "hull-skin interior (bay wall = inside of the hull skin)",
+        "mean_dir": [
+         0.206,
+         -0.489,
+         0.848
+        ],
+        "dir_buckets": {
+         "+Z": 56,
+         "+Y": 6,
+         "-Y": 12,
+         "-Z": 28,
+         "+X": 10,
+         "-X": 9
+        },
+        "hit_bounds": [
+         [
+          -1.802,
+          -11.008,
+          -1.902
+         ],
+         [
+          1.802,
+          -6.92,
+          1.914
+         ]
+        ],
+        "open_space_behind": 118
+       }
+      },
+      "by_direction": {
+       "+X": 10,
+       "-X": 9,
+       "+Y": 6,
+       "-Y": 12,
+       "+Z": 56,
+       "-Z": 28
+      },
+      "skin_hits": 121,
+      "nonskin_hits": 0,
+      "then_open_space": 118,
+      "then_more_ship": 3,
+      "all_backfaces_on_hull_skin": true
+     }
+    },
+    "centre_pass_strict": false,
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only"
+   }
+  },
+  "exterior": {
+   "rays": 4000,
+   "hits": 2084,
+   "misses": 1916,
+   "front_hits": 2084,
+   "front_fraction": 1.0,
+   "pass": true,
+   "backface_then_open_space": 0,
+   "backface_then_more_ship": 0,
+   "sphere_centre": [
+    0.0,
+    -0.057,
+    -0.478
+   ],
+   "sphere_radius": 14.452,
+   "backface_objects": {}
+  },
+  "notes": {
+   "R03a": "PASS (strict) 500/500 front-facing after the dock-trunk fix in 20_exterior.py: the flat dorsal skin under EXT_DOCK_Collar is opened along its seams (X -0.9..0, Y 1.05..2.05) with a rim (EXT_HULL_DockOpeningRim); rays up the open ceiling hatch now end on the closed EXT_DOCK_Hatch (front faces). Before the fix: 494/500 (6 hits on the skin underside).",
+   "B01": "Unpressurised sensor bay, nose. All back-face hits are EXT_HULL_Fuselage (hull skin); rays come from every side (+/-X sides, +Y nose cone, -Z belly) with open space behind = single-layer outer skin, not a hole. The bay has no aft lining, so some rays travel aft inside the hull and end on the skin interior around the cockpit shell (hit Y down to 3.6) - still inside the skin.",
+   "B02": "Nose gear well: closed in the model (500/500 hits from centre and free point). Centre lies inside the strut; free-point back faces are the belly skin (-Z) around the well = hull-skin interior.",
+   "B03": "Free point 99.8 % front-facing (1 back-face hit on the belly skin).",
+   "B04_L": "Main gear well L: closed (500/500). Back faces = EXT_HULL_Sponson_L interior, mostly -Z (sponson belly).",
+   "B04_R": "Main gear well R: closed (500/500). Back faces = EXT_HULL_Sponson_R interior, mostly -Z.",
+   "B05": "Tank bay: back faces all EXT_HULL_Fuselage interior, +/-X sides and -Z belly, open space behind.",
+   "B06": "Reactor bay: centre inside INT_B06_ReactorVessel; from the free point all back faces are the fuselage skin interior (+/-X, -Z, -Y aft bulkhead skin).",
+   "B07": "Engine bay: back faces all EXT_HULL_Fuselage interior, mostly +Z (dorsal skin over the engine bay) and -Z belly; open space behind.",
+   "exterior": "PASS: 2,084 of 4,000 inbound rays hit the ship, 100 % front-facing (unchanged by the dock fix; the opening lies entirely under the collar skirt)."
+  },
+  "summary": {
+   "B01": {
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.692
+    },
+    "free_point": {
+     "origin": [
+      -0.1,
+      10.2,
+      -0.13
+     ],
+     "clearance_m": 0.412,
+     "hits": 500,
+     "front_fraction": 0.538,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 231,
+       "hull_skin": true,
+       "mean_dir": [
+        -0.481,
+        0.864,
+        -0.15
+       ],
+       "dir_buckets": {
+        "-X": 74,
+        "-Y": 19,
+        "+X": 63,
+        "+Y": 51,
+        "-Z": 20,
+        "+Z": 4
+       },
+       "open_space_behind": 227
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B02": {
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.028
+    },
+    "free_point": {
+     "origin": [
+      0.0,
+      6.775,
+      -1.388
+     ],
+     "clearance_m": 0.366,
+     "hits": 500,
+     "front_fraction": 0.788,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 106,
+       "hull_skin": true,
+       "mean_dir": [
+        -0.012,
+        0.075,
+        -0.997
+       ],
+       "dir_buckets": {
+        "-Y": 10,
+        "-Z": 63,
+        "-X": 12,
+        "+X": 7,
+        "+Y": 14
+       },
+       "open_space_behind": 102
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "R01": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.998
+    },
+    "free_point": null
+   },
+   "R02": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "R03": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "R03a": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "R04": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "R05": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "R06": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.998
+    },
+    "free_point": null
+   },
+   "C01": {
+    "class": "pressurised",
+    "criterion": "strict: centre, 100% hits and >=99% front-facing",
+    "pass": true,
+    "pass_basis": "strict",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": null
+   },
+   "B03": {
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "front-facing >= 99%",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 1.0
+    },
+    "free_point": {
+     "origin": [
+      -0.17,
+      1.45,
+      -1.29
+     ],
+     "clearance_m": 0.538,
+     "hits": 500,
+     "front_fraction": 0.998,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 1,
+       "hull_skin": true,
+       "mean_dir": [
+        0.196,
+        0.893,
+        -0.404
+       ],
+       "dir_buckets": {
+        "+Y": 1
+       },
+       "open_space_behind": 1
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B04_L": {
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.038
+    },
+    "free_point": {
+     "origin": [
+      -1.925,
+      -3.85,
+      -1.33
+     ],
+     "clearance_m": 0.276,
+     "hits": 500,
+     "front_fraction": 0.706,
+     "backface_objects": {
+      "EXT_HULL_Sponson_L": {
+       "hits": 147,
+       "hull_skin": true,
+       "mean_dir": [
+        0.051,
+        -0.077,
+        -0.996
+       ],
+       "dir_buckets": {
+        "-Z": 76,
+        "+X": 22,
+        "-Y": 21,
+        "+Y": 15,
+        "-X": 13
+       },
+       "open_space_behind": 131
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B04_R": {
+    "class": "gear well (closed)",
+    "criterion": "closed well: 100% hits from centre and from free point (no ray escapes)",
+    "pass": true,
+    "pass_basis": "closed (0 escapes)",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.05
+    },
+    "free_point": {
+     "origin": [
+      1.925,
+      -3.85,
+      -1.33
+     ],
+     "clearance_m": 0.276,
+     "hits": 500,
+     "front_fraction": 0.678,
+     "backface_objects": {
+      "EXT_HULL_Sponson_R": {
+       "hits": 161,
+       "hull_skin": true,
+       "mean_dir": [
+        -0.035,
+        0.027,
+        -0.999
+       ],
+       "dir_buckets": {
+        "-X": 18,
+        "-Z": 87,
+        "-Y": 15,
+        "+Y": 20,
+        "+X": 21
+       },
+       "open_space_behind": 146
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B05": {
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.834
+    },
+    "free_point": {
+     "origin": [
+      0.5,
+      -5.95,
+      -0.025
+     ],
+     "clearance_m": 0.427,
+     "hits": 500,
+     "front_fraction": 0.826,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 87,
+       "hull_skin": true,
+       "mean_dir": [
+        0.974,
+        -0.216,
+        -0.072
+       ],
+       "dir_buckets": {
+        "-Z": 28,
+        "-X": 19,
+        "+X": 21,
+        "+Z": 12,
+        "-Y": 3,
+        "+Y": 4
+       },
+       "open_space_behind": 74
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B06": {
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.112
+    },
+    "free_point": {
+     "origin": [
+      -0.2,
+      -8.73,
+      -0.025
+     ],
+     "clearance_m": 0.405,
+     "hits": 500,
+     "front_fraction": 0.752,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 124,
+       "hull_skin": true,
+       "mean_dir": [
+        -0.138,
+        -0.987,
+        -0.083
+       ],
+       "dir_buckets": {
+        "-X": 26,
+        "-Z": 34,
+        "-Y": 19,
+        "+X": 31,
+        "+Z": 13,
+        "+Y": 1
+       },
+       "open_space_behind": 118
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   },
+   "B07": {
+    "class": "unpressurised bay",
+    "criterion": "free point: 100% hits and (>=99% front-facing or all back-face hits on hull skin)",
+    "pass": true,
+    "pass_basis": "back faces are hull-skin interiors only",
+    "centre": {
+     "hits": 500,
+     "rays": 500,
+     "front_fraction": 0.788
+    },
+    "free_point": {
+     "origin": [
+      0.0,
+      -9.85,
+      -0.22
+     ],
+     "clearance_m": 0.548,
+     "hits": 500,
+     "front_fraction": 0.758,
+     "backface_objects": {
+      "EXT_HULL_Fuselage": {
+       "hits": 121,
+       "hull_skin": true,
+       "mean_dir": [
+        0.206,
+        -0.489,
+        0.848
+       ],
+       "dir_buckets": {
+        "+Z": 56,
+        "+Y": 6,
+        "-Y": 12,
+        "-Z": 28,
+        "+X": 10,
+        "-X": 9
+       },
+       "open_space_behind": 118
+      }
+     },
+     "all_backfaces_on_hull_skin": true
+    }
+   }
+  },
+  "all_pass": true
+ },
+ "previews": {
+  "count": 25,
+  "required_min": 21,
+  "list": [
+   {
+    "file": "01_blockout_exterior.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 42074,
+    "non_background_fraction": 0.7488,
+    "method": "diff>0.04 vs backdrop estimated from the 4 corner patches"
+   },
+   {
+    "file": "02_blockout_top_cutaway.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 55948,
+    "non_background_fraction": 0.3313,
+    "method": "diff>0.04 vs backdrop estimated from the 4 corner patches"
+   },
+   {
+    "file": "03_exterior_starboard_fg.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 80710,
+    "non_background_fraction": 0.3434,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "04_exterior_port_aft.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 88295,
+    "non_background_fraction": 0.4297,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "05_exterior_top.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 92225,
+    "non_background_fraction": 0.3228,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "06_exterior_bottom.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 70554,
+    "non_background_fraction": 0.322,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "07_exterior_nose_close.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 91743,
+    "non_background_fraction": 0.5411,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "08_exterior_engine_close.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 99509,
+    "non_background_fraction": 0.4446,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "09_room_R01.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 117336,
+    "non_background_fraction": 0.6805,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "10_room_R02.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 155230,
+    "non_background_fraction": 0.9996,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "11_room_R03.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 80106,
+    "non_background_fraction": 1.0,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "12_room_R03a.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 72546,
+    "non_background_fraction": 1.0,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "13_room_R04.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 142727,
+    "non_background_fraction": 0.9988,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "14_room_R05.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 159537,
+    "non_background_fraction": 1.0,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "15_room_R06.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 171610,
+    "non_background_fraction": 0.9997,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "16_room_C01.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 114230,
+    "non_background_fraction": 1.0,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "17_bay_B01.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 81725,
+    "non_background_fraction": 0.1827,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "18_bay_B02.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 63602,
+    "non_background_fraction": 0.2381,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "19_bay_B03.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 92258,
+    "non_background_fraction": 0.9999,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "20_bay_B04.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 71565,
+    "non_background_fraction": 0.2906,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "21_bay_B05.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 107726,
+    "non_background_fraction": 0.3533,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "22_bay_B06.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 108001,
+    "non_background_fraction": 0.3959,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "23_bay_B07.jpg",
+    "size": [
+     1280,
+     720
+    ],
+    "bytes": 115355,
+    "non_background_fraction": 0.3448,
+    "method": "diff>0.03 vs known studio backdrop gradient"
+   },
+   {
+    "file": "24_hero_port_bow.jpg",
+    "size": [
+     1920,
+     1080
+    ],
+    "bytes": 156330,
+    "non_background_fraction": 0.3402,
+    "method": "diff>0.03 vs known hero backdrop (vignetted, conservative)"
+   },
+   {
+    "file": "25_hero_full_deployed.jpg",
+    "size": [
+     1920,
+     1080
+    ],
+    "bytes": 223995,
+    "non_background_fraction": 0.429,
+    "method": "diff>0.03 vs known hero backdrop (vignetted, conservative)"
+   }
+  ],
+  "hero_renders": [
+   {
+    "file": "/workspace/assets/ships/kestrel/previews/24_hero_port_bow.jpg",
+    "size": [
+     1920,
+     1080
+    ],
+    "samples": 192,
+    "render_s": 339.1,
+    "ship_coverage_alpha_gt_0.5": 0.2132,
+    "jpeg_non_background_fraction": 0.3402,
+    "mean_rgb": [
+     0.207,
+     0.21,
+     0.222
+    ],
+    "std_luma": 0.211
+   },
+   {
+    "file": "/workspace/assets/ships/kestrel/previews/25_hero_full_deployed.jpg",
+    "size": [
+     1920,
+     1080
+    ],
+    "samples": 192,
+    "render_s": 500.6,
+    "ship_coverage_alpha_gt_0.5": 0.2648,
+    "jpeg_non_background_fraction": 0.429,
+    "mean_rgb": [
+     0.236,
+     0.245,
+     0.262
+    ],
+    "std_luma": 0.251
+   }
+  ],
+  "dock_fix_impact": {
+   "method": "primary-ray first-hit map (object + hit point at 1 mm) from each preview camera at 1/4 render resolution, old blend (pre-fix, sha e255f924...) vs new blend; identical map = no visible change of the frame",
+   "shots": {
+    "03_exterior_starboard_fg.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "04_exterior_port_aft.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "05_exterior_top.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "06_exterior_bottom.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "07_exterior_nose_close.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "08_exterior_engine_close.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "11_room_R03.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "12_room_R03a.jpg": {
+     "rays": 57600,
+     "differing_first_hits": 0,
+     "examples": [],
+     "dock_area_changed": false
+    },
+    "24_hero_port_bow.jpg": {
+     "rays": 129600,
+     "differing_first_hits": 1,
+     "examples": [
+      [
+       "EXT_HULL_Fuselage:-1.316,0.806,1.503",
+       "EXT_HULL_Fuselage:-1.317,0.806,1.503"
+      ]
+     ],
+     "dock_area_changed": false
+    },
+    "25_hero_full_deployed.jpg": {
+     "rays": 129600,
+     "differing_first_hits": 2,
+     "examples": [
+      [
+       "EXT_HULL_Fuselage:0.212,0.753,1.914",
+       "EXT_HULL_Fuselage:0.212,0.752,1.914"
+      ],
+      [
+       "EXT_GREEBLES_BoltRow104:0.451,1.869,1.920",
+       "EXT_HULL_Fuselage:0.451,1.869,1.920"
+      ]
+     ],
+     "dock_area_changed": false
+    }
+   },
+   "rerendered": [],
+   "conclusion": "no preview shows the dock opening (it lies entirely under the 0.72 m collar skirt); differences in 24/25 are 3 sub-millimetre float ties on coincident surfaces at Y 0.75-1.87 dorsal skin/bolt row, not the opening. No preview re-rendered."
+  }
+ },
+ "files": {
+  "kestrel.glb": {
+   "path": "/workspace/assets/ships/kestrel/kestrel.glb",
+   "bytes": 14862392,
+   "MB": 14.174,
+   "sha256": "4a063aa5910acac428614299bcb0feafa6e2ab7bc0e91a42e85faa19fa18bdf5"
+  },
+  "kestrel_lod1.glb": {
+   "path": "/workspace/assets/ships/kestrel/kestrel_lod1.glb",
+   "bytes": 1712052,
+   "MB": 1.633,
+   "sha256": "bc6c7f157cd39ae9dc52c8f84ec79c0b44ba2c0946990df42e64de118f887fb6"
+  },
+  "kestrel.blend": {
+   "path": "/workspace/assets/ships/kestrel/source/kestrel.blend",
+   "bytes": 3714591,
+   "MB": 3.543,
+   "sha256": "a86c8b75548608dbbbd5557f21c75aea97a135bb554cad0f601a61b6ea5bc059",
+   "compressed_zstd": true
+  },
+  "all_lt_45MB": true
+ }
+}

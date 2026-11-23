@@ -5,3 +5,9 @@
 # Deliberately NOT a blanket `* text=auto` rule: that would renormalise every
 # file in the tree.
 *.sh text eol=lf
+
+# Binary assets: never diff, merge or normalise line endings (plain git, no LFS;
+# see assets/README.md).
+*.glb binary
+*.blend binary
+*.jpg binary

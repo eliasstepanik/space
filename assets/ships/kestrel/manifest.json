@@ -1,0 +1,70 @@
+{
+  "id": "kestrel",
+  "name": "IC-4 Kestrel",
+  "type": "fighter_interceptor",
+  "description": "Hard-sci-fi 23 m two-seat patrol interceptor with full interior.",
+  "units": "meters",
+  "axes": {
+    "up": "+Y",
+    "forward": "-Z",
+    "starboard": "+X",
+    "handedness": "right"
+  },
+  "bbox_m": [12.64, 5.6436, 23.795],
+  "files": {
+    "kestrel.glb": {
+      "bytes": 14862392,
+      "sha256": "4a063aa5910acac428614299bcb0feafa6e2ab7bc0e91a42e85faa19fa18bdf5"
+    },
+    "kestrel_lod1.glb": {
+      "bytes": 1712052,
+      "sha256": "bc6c7f157cd39ae9dc52c8f84ec79c0b44ba2c0946990df42e64de118f887fb6"
+    },
+    "source/kestrel.blend": {
+      "bytes": 3714591,
+      "sha256": "a86c8b75548608dbbbd5557f21c75aea97a135bb554cad0f601a61b6ea5bc059",
+      "optional_in_build_context": true
+    }
+  },
+  "triangles": {
+    "full": 417546,
+    "lod1": 11585
+  },
+  "objects": 1072,
+  "gltf": {
+    "full": {
+      "nodes": 1069,
+      "meshes": 251,
+      "primitives": 578
+    },
+    "lod1": {
+      "nodes": 1,
+      "meshes": 1,
+      "primitives": 1,
+      "materials": 1
+    }
+  },
+  "materials": 16,
+  "images": 6,
+  "sockets": 41,
+  "rooms": [
+    {"id": "B01", "name": "NoseSensorBay"},
+    {"id": "B02", "name": "NoseGearWell"},
+    {"id": "R01", "name": "Cockpit"},
+    {"id": "R02", "name": "AvionicsLifeSupport"},
+    {"id": "R03", "name": "AirlockVestibule", "parts": ["R03a AirlockChamber"]},
+    {"id": "R04", "name": "CrewQuarters"},
+    {"id": "R05", "name": "StoresLocker"},
+    {"id": "R06", "name": "EngineeringBay"},
+    {"id": "C01", "name": "DorsalCrawlway"},
+    {"id": "B03", "name": "OrdnanceBay"},
+    {"id": "B04", "name": "MainGearWell", "parts": ["MainGearWell_L", "MainGearWell_R"]},
+    {"id": "B05", "name": "PropellantTankBay"},
+    {"id": "B06", "name": "ReactorCompartment"},
+    {"id": "B07", "name": "EngineBay"}
+  ],
+  "lod1": {
+    "meshes": 1,
+    "primitives": 1
+  }
+}
