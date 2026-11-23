@@ -1157,11 +1157,14 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
     let far_centre = NodeRef::new(64, [1, 1, 1]).center();
 
     let mut alice = Dry::online(&rt, a.addr());
-    let mut bob = Dry::online(&rt, b.addr());
     // Alice is handed to B at once (A's spawn point lies in B's octant).
+    // Bob joins only after that: had he joined first, B would have put him on
+    // the free spawn point and Alice would arrive inside his ship (seen on a
+    // slow CI runner: the two ships pushed each other 10 m apart).
     alice.until("was handed over", |app| {
         app.replica().is_some_and(|r| r.handoffs == 1)
     });
+    let mut bob = Dry::online(&rt, b.addr());
     for client in [&mut alice, &mut bob] {
         client.until("saw the other player", |app| {
             app.replica().is_some_and(|r| r.others().count() == 1)
