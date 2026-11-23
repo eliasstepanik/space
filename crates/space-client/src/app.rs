@@ -25,9 +25,9 @@
 //!
 //! The server knows ships at world positions; the client draws a scene
 //! ([`World`]) around a spawn point. The two are tied together by the map:
-//! the scene's spawn point lies on the map's **anchor** — the centre of its
-//! root region ([`crate::link::map_anchor`]), which is where the root shard
-//! spawns its players — so a ship `d` metres from the anchor is drawn `d`
+//! the scene's spawn point lies on the map's **anchor** — a point of its
+//! root region ([`crate::link::map_anchor`]), which is where the shard that
+//! owns it spawns its players — so a ship `d` metres from the anchor is drawn `d`
 //! metres from the spawn point. Every client derives the same anchor from the
 //! map its shard sent, so everybody sees the scene in the same place: one
 //! world, whichever shard a player joined through. A ship's position is its

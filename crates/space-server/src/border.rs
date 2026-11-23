@@ -60,9 +60,15 @@
 //!   names, as before physics), so a ship's island follows the ship.
 //! * **Settling.** A body that has been inside another shard's territory
 //!   for [`SETTLE_TICKS`] in a row is taken over too, however close to the
-//!   border it is. (A carved octant at the spawn point has a border plane at
-//!   spawn height, and the demo area's zero-g corner floats a few decimetres
-//!   above it: on distance alone those bodies would never move.)
+//!   border it is: on distance alone a body resting within the hysteresis of
+//!   a border would never move. (Found when a scene's spawn point still lay
+//!   on the corner where cells meet: a carved octant then had a border plane
+//!   at spawn height, and the demo area's zero-g corner floats a few
+//!   decimetres above that. The anchor now lies half a cell above the corner
+//!   and a few metres beside it — `space_scene::ANCHOR_OFFSET` — so the only
+//!   border planes through a scene are the vertical ones at scene `x = −6`
+//!   and `z = −4`; the demo area has a crate floating exactly on the
+//!   latter.)
 //! * **Holding.** Moving an island that touches another shard's ghosts is a
 //!   necessity (its contacts must be solved by one solver) and happens at
 //!   once. Moving one that touches none is a body going home after an
@@ -105,13 +111,15 @@
 //!
 //! A scene's bodies are spawned **once per cluster**, by the scene's
 //! **spawner** ([`scene_spawner`]): the shard of the map's shallowest region,
-//! the region whose centre is the scene's anchor. Splits only add deeper
-//! regions and merges only remove them, so the spawner of a running cluster
-//! never changes — a shard born from a split, told the scene when it
-//! registers, spawns nothing (it would duplicate what its parent already
-//! simulates and is about to hand it). Every body the spawner holds outside
-//! its own territory goes to the shard that owns it by the ordinary handoff,
-//! a few ticks after the spawn. On a scene change every shard despawns the
+//! the root the scene's anchor is placed in (`space_scene::scene_anchor`).
+//! Carves only add deeper regions and merges only remove them, so the spawner
+//! of a running cluster never changes — a shard born from a split or a carve,
+//! told the scene when it registers, spawns nothing (it would duplicate what
+//! the root's shard already simulates and is about to hand it). The spawner
+//! need not own the spawn point, or any of the scene: every body it holds
+//! outside its own territory — all of them, when the cells the scene lies in
+//! were carved out for other shards — goes to the shard that owns it by the
+//! ordinary handoff, a few ticks after the spawn. On a scene change every shard despawns the
 //! bodies of the old scene it simulates (their ghosts go with the next ghost
 //! frame) and the spawner spawns the new scene's.
 //!
@@ -136,7 +144,8 @@ pub const GHOST_LEAD: f64 = 3.0;
 /// it; see [`space_sim::IslandQuery`]). Small: the velocity lead is what
 /// gives a moving body its reach; at rest two bodies a metre apart do not
 /// touch, and a larger margin chained whole resting groups across a border
-/// into one island (the demo area's zero-g corner, a hinged door below the
+/// into one island (the demo area's zero-g corner, back when a horizontal
+/// border ran through a scene at spawn height: a hinged door below an
 /// octant's floor and a spring pair just above it).
 pub const ISLAND_MARGIN: f64 = 0.5;
 /// Velocity lead of an island, seconds: long enough for a player's handoff

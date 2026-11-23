@@ -221,19 +221,22 @@ pub struct RegionView {
     pub endpoint: Option<SocketAddr>,
     /// How many regions of the map contain this one (0 for a top-level region).
     pub nesting: u8,
-    /// The enclosing region this one was carved out of, when its octree parent
-    /// is itself a region of the map.
+    /// The enclosing region this one was carved out of, and the one a merge
+    /// gives it back to: the nearest ancestor node that is a region of the
+    /// map — the octree parent after an octant split, any number of levels up
+    /// for a carved cell (`None` for a top-level region).
     pub parent: Option<NodeRef>,
-    /// Which octant of `parent` this region is (`None` when it has no such
-    /// parent). Bit 0 = +x, bit 1 = +y, bit 2 = +z.
+    /// Which octant of `parent` this region is, when `parent` is its direct
+    /// octree parent (`None` for a top-level region and for a region carved
+    /// more than one level down). Bit 0 = +x, bit 1 = +y, bit 2 = +z.
     pub octant: Option<u8>,
     /// The octants of this region that can still be carved out for a new shard.
     pub free_octants: Vec<u8>,
     /// Why a split of this region would be refused right now (`None`: it
     /// would be accepted).
     pub split_refusal: Option<String>,
-    /// Why a merge of this region into its parent would be refused right now
-    /// (`None`: it would be accepted).
+    /// Why a merge of this region into the one around it (`parent`) would be
+    /// refused right now (`None`: it would be accepted).
     pub merge_refusal: Option<String>,
 }
 

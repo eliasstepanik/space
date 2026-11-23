@@ -3,9 +3,14 @@
 //! client link that starts on one and is handed off to the other.
 //!
 //! The topology is what a split leaves behind: shard A owns a region, and
-//! shard B owns one octant carved out of it. A's spawn point — the centre of
-//! its region — lies in the carved-out octant, so the player's ship belongs to
-//! B from its first tick and A starts a handoff straight away. The test asserts
+//! shard B owns one octant carved out of it — the cell the scene's spawn
+//! point lies in. A does not own that point, so it puts a joining player on
+//! its own spawn point, the centre of its region: the corner where its cells
+//! meet, which is the lowest corner of B's cell. The player's ship therefore
+//! belongs to B from its first tick and A starts a handoff straight away.
+//! (The scene itself is 6 m, half a cell up and 4 m from that corner,
+//! `space_scene::ANCHOR_OFFSET`; this test is about the link, not about where
+//! the scene is.) The test asserts
 //! the client's half of the make-before-break exchange:
 //!
 //! * the link follows the `Redirect` to B and reports in, and the handoff
@@ -103,10 +108,31 @@ fn scene(scene: Scene, revision: u64) -> SceneState {
 
 /// Two neighbouring shards as a split leaves them: A owns a two-cell-wide
 /// node; B owns the far octant carved out of it, which is where A's region
-/// centre (the spawn point) lies — so a player joining A is handed to B.
+/// centre (A's spawn point, for want of the scene's) lies — so a player
+/// joining A is handed to B.
 async fn neighbours() -> (Running, Running) {
     let region_a = NodeRef::new(63, [0, 0, 0]);
     let region_b = NodeRef::new(64, [1, 1, 1]);
+    // The fixture's premise, under the anchor rule: B owns the scene's spawn
+    // point, and the point A falls back to — the centre of its region — too.
+    let both = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(
+                region_a,
+                ShardId::new(1),
+                SocketAddr::from(([127, 0, 0, 1], 1)),
+            ),
+            ShardRegion::new(
+                region_b,
+                ShardId::new(2),
+                SocketAddr::from(([127, 0, 0, 1], 2)),
+            ),
+        ],
+    );
+    let scene_at = space_scene::scene_anchor(&both).expect("an anchor");
+    assert_eq!(both.lookup(&scene_at), Some(ShardId::new(2)));
+    assert_eq!(both.lookup(&region_a.center()), Some(ShardId::new(2)));
     let a = start(1, region_a);
     let b = start(2, region_b);
     let map = ShardMap::new(

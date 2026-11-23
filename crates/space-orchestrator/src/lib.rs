@@ -17,8 +17,8 @@
 //! | # | guarantee | mechanism |
 //! |---|-----------|-----------|
 //! | **H9** | Shard ids are allocated by the orchestrator, are strictly monotonic, and are never reused across a split, a merge, a crash or an orchestrator restart. | [`ids::PersistentShardIdAllocator`]: persist-before-handout over [`space_server::alloc::ShardIdAllocator`]. |
-//! | **H10** | A map change is published through the epoch protocol only: prepare → ack → commit. No shard observes a map that is not some committed epoch. | [`epoch::EpochPublisher`]: one outstanding prepare, activation from the max observer tick, abort on deadline leaves the published map byte-identical. |
-//! | **H11** | A split or merge never leaves a position owned by two shards or by none. | [`topology`]: additive one-octant splits, exact-inverse merges, [`topology::validate`] on every produced map. |
+//! | **H10** | A map change is published through the epoch protocol only: prepare → ack → commit. No shard observes a map that is not some committed epoch. | [`epoch::EpochPublisher`]: one outstanding prepare, sent to and acked by every shard of the map and every new owner, activation from the max observer tick, abort on deadline leaves the published map byte-identical. |
+//! | **H11** | A carve (a split is the carve of one child octant) or a merge never leaves a position owned by two shards or by none. | [`topology`]: additive carves of one node inside an existing region — a child octant or a single cell many levels down — merges that remove exactly that region so ownership falls back to the region around it, [`topology::validate`] on every produced map. |
 //! | **H12** | An epoch change cannot strand a handoff. | One epoch change at a time ([`epoch`]), never two bumps inside the handoff timeout for the same region pair. |
 //! | **H13** | A split or merge is invisible to a connected client. | Phase 2's make-before-break, unchanged: the new map reaches the client through `Redirect`. A merge only ever removes a shard whose own load report says it has no players, and kills it only once the merge has committed ([`orchestrator`]). |
 //! | **H14** | The autoscaler is deterministic and never flaps. | [`autoscale`]: pure function of `(reports, tick, prior state)`, dwell in ticks, hysteresis band, per-shard cooldown, one action in flight. |
@@ -36,7 +36,7 @@
 //! * [`config`] — [`config::OrchestratorConfig`] and the tuning constants
 //! * [`ids`] — the persistent, monotonic, never-reused
 //!   [`ShardId`](space_protocol::ShardId) allocator
-//! * [`topology`] — split/merge geometry over `space_world::octree`
+//! * [`topology`] — carve/split/merge geometry over `space_world::octree`
 //! * [`epoch`] — the two-phase epoch publication state machine
 //! * [`autoscale`] — the load metric and the split/merge decision
 //! * [`launcher`] — the [`launcher::Launcher`] seam and [`launcher::local::LocalLauncher`]

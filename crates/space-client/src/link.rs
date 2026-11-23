@@ -47,8 +47,10 @@
 //! # The anchor
 //!
 //! Every client must agree on *where* the scene is, so it is tied to the map
-//! and not to the client: the scene's spawn point lies on the **anchor**, the
-//! centre of the map's root region ([`map_anchor`]). Every shard hands its
+//! and not to the client: the scene's spawn point lies on the **anchor**, a
+//! point of the map's root region ([`map_anchor`]: the centre of a one-cell
+//! root, else a few metres beside and half a cell above the corner where the
+//! root's cells meet, clear of every shard border). Every shard hands its
 //! clients the same map in the `Welcome`, so every client derives the same
 //! point, whichever shard it joined through. The link takes it from the first
 //! `Welcome` and keeps it ([`Replica::anchor`]): a handoff, a split or a merge
@@ -163,17 +165,24 @@ pub fn unique_player_token() -> String {
     format!("{PLAYER_TOKEN_PREFIX}{:016x}", hasher.finish())
 }
 
-/// Where a scene's spawn point lies in the world of `map`: the centre of the
-/// map's **root region**.
+/// Where a scene's spawn point lies in the world of `map`: the **anchor** of
+/// the map's **root region**.
 ///
 /// The root region is the shallowest region of the map — the one every split
-/// carved its octants out of. Splits only *add* a deeper region and merges
-/// only remove one (`space-orchestrator`'s topology), so the root, and with it
-/// this point, stays where it is for as long as the cluster lives, and it is
-/// where the root's shard spawns the ships of the players who join it. A map
-/// without a single root (standalone shards side by side, all of one depth)
-/// takes the region of the lowest shard id; the node index breaks what ties
-/// are left. `None` for a map with no region at all.
+/// and carve took its node out of. Carves only *add* a deeper region and
+/// merges only remove one (`space-orchestrator`'s topology), so the root, and
+/// with it this point, stays where it is for as long as the cluster lives,
+/// and it is where the shard that owns it spawns the ships of the players who
+/// join it. A map without a single root (standalone shards side by side, all
+/// of one depth) takes the region of the lowest shard id; the node index
+/// breaks what ties are left. `None` for a map with no region at all.
+///
+/// Within the root the anchor is the centre of a root of one cell, and for a
+/// larger one the corner where its cells meet moved by
+/// [`space_scene::ANCHOR_OFFSET`] — 6 m, half a cell up, 4 m — so that no
+/// horizontal shard border comes within 512 m of the scene and the vertical
+/// ones pass beside the spawn point (at `pos` x = −6 and z = −4 on the HUD),
+/// not through it ([`space_scene::anchor_in`]).
 ///
 /// A pure function of the map: two clients handed the same map — by whichever
 /// shards — get the same point. It is [`space_scene::scene_anchor`], the rule
@@ -1491,14 +1500,19 @@ mod tests {
         )
     }
 
-    /// The anchor is the centre of the root region: the spawn point of the
-    /// first shard in each of the topologies the dev scripts start, the same
-    /// for every client whatever the order of the map's entries, and the
-    /// same before and after a split or a merge.
+    /// The anchor is a point of the root region — the centre of a one-cell
+    /// root, and for a larger one 6 m, 512 m up and 4 m from the corner where
+    /// its cells meet: the spawn point of the shard that owns it in each of
+    /// the topologies the dev scripts start, the same for every client
+    /// whatever the order of the map's entries, and the same before and after
+    /// a split or a merge.
     #[test]
-    fn the_anchor_is_the_centre_of_the_maps_root_region() {
+    fn the_anchor_is_a_point_of_the_maps_root_region() {
         use space_world::NodeRef;
-        let centre = |depth, index| NodeRef::new(depth, index).center();
+        // Beside and above the centre corner of a root of several cells.
+        let off_the_corner = |depth, index| {
+            WorldPos::from_f64_metres_around(NodeRef::new(depth, index).center(), [6.0, 512.0, 4.0])
+        };
         // One standalone shard: its cell's centre, the world origin.
         let single = ShardMap::new(1, vec![region(64, [0, 0, 0], 1)]);
         assert_eq!(map_anchor(&single), Some(WorldPos::ZERO));
@@ -1515,7 +1529,7 @@ mod tests {
         let root = region(40, [3, -2, 5], 7);
         let before = ShardMap::new(4, vec![root.clone()]);
         let anchor = map_anchor(&before);
-        assert_eq!(anchor, Some(centre(40, [3, -2, 5])));
+        assert_eq!(anchor, Some(off_the_corner(40, [3, -2, 5])));
         let child = NodeRef::new(41, [7, -4, 11]);
         assert!(space_world::octree::children(root.node)
             .expect("children")
@@ -1532,13 +1546,39 @@ mod tests {
                 region(42, [14, -8, 22], 9),
                 region(41, [6, -4, 10], 10),
             ],
+            // Single cells carved out of the root, the one the anchor lies in
+            // among them: the anchor is the root's, whoever owns its cell.
+            vec![
+                region(64, [7 << 23, -3 << 23, 11 << 23], 3),
+                root.clone(),
+                region(64, [(7 << 23) - 1, -3 << 23, 11 << 23], 4),
+            ],
         ] {
             assert_eq!(map_anchor(&ShardMap::new(5, split)), anchor);
         }
-        assert_eq!(map_anchor(&ShardMap::new(6, vec![root])), anchor);
+        assert_eq!(map_anchor(&ShardMap::new(6, vec![root.clone()])), anchor);
+        // The anchor lies strictly inside one cell: the lowest cell of the
+        // root's +x+y+z octant, 6 m and 4 m from its faces towards -x and -z
+        // and in the middle of its height.
+        let at = anchor.expect("an anchor");
+        assert_eq!(at.cell, [7 << 23, -3 << 23, 11 << 23]);
+        assert_eq!(at.cell, root.node.center().cell, "the centre corner's cell");
+        assert_eq!(at.local, [-506.0, 0.0, -508.0]);
+        assert!(space_world::octree::contains(
+            NodeRef::new(41, [7, -3, 11]),
+            at
+        ));
         // The handoff test's topology: A owns the node, B an octant of it.
         let carved = ShardMap::new(1, vec![region(63, [0, 0, 0], 1), region(64, [1, 1, 1], 2)]);
-        assert_eq!(map_anchor(&carved), Some(centre(63, [0, 0, 0])));
+        assert_eq!(map_anchor(&carved), Some(off_the_corner(63, [0, 0, 0])));
+        assert_eq!(
+            map_anchor(&carved),
+            Some(WorldPos {
+                cell: [1, 1, 1],
+                local: [-506.0, 0.0, -508.0]
+            }),
+            "inside B's cell"
+        );
         // No region, no anchor.
         assert_eq!(map_anchor(&ShardMap::new(1, Vec::new())), None);
     }

@@ -10,6 +10,12 @@
 //! reference. The last tests run real shards over loopback QUIC, paced at the
 //! real tick rate, with a raw client watching.
 //!
+//! Where a test cuts the demo area, the borders are where a scene has them:
+//! a root of more than one cell puts the scene 6 m, 512 m up and 4 m from the
+//! corner where its cells meet (`space_scene::ANCHOR_OFFSET`), so the planes
+//! through the scene are `x = −6` and `z = −4` ([`BORDER_X`], [`BORDER_Z`])
+//! and none is horizontal.
+//!
 //! | test | what |
 //! |---|---|
 //! | [`a_body_flying_across_a_border_is_seen_without_a_gap_or_a_jump`] | handoff of an unowned body tracked by clients on both sides; ghosts appear and disappear at the margin |
@@ -24,6 +30,7 @@
 //! | [`a_crate_falls_through_the_gravity_room_across_a_border`] | gravity, a falling crate crossing a border, a player standing there |
 //! | [`a_split_hands_the_carved_octants_bodies_to_the_child`] | the orchestrator's split falls out of the handoff rule |
 //! | [`joining_players_get_distinct_free_spawn_points_and_ships_are_solid`] | spawn search, ship-ship contact |
+//! | [`a_busy_spawn_point_never_puts_a_ship_across_a_border`] | the spawn grid stays on its shard's ground when the scene is cut into four shard areas |
 //! | [`replication_bandwidth_of_the_moving_showcase`] | bytes per tick for a client in the demo area, and for the chain |
 //! | [`over_quic_a_body_crosses_between_two_real_shards`] | the same handoff through the real front end, paced at 30 Hz |
 //! | [`an_old_peer_is_refused_with_both_versions`] | protocol 5 |
@@ -909,14 +916,25 @@ fn a_spring_across_a_border_keeps_its_period() {
 
 // --------------------------------------------------------- the scene
 
-/// The demo area split by a border: shard 1 owns a two-cell node, shard 2
-/// the octant carved out of it at the scene's spawn point (+x+y+z of it).
+/// The demo area split by borders: shard 1 owns a two-cell-wide node, shard 2
+/// the one cell carved out of it that the scene's spawn point lies in (the
+/// node's +x+y+z cell). The scene's anchor is 6 m and 4 m inside that cell
+/// and in the middle of its height (`space_scene::ANCHOR_OFFSET`), so shard 2
+/// has the part of the scene with `x > −6` and `z > −4` — the spawn point,
+/// the gravity room down to its bowl — and shard 1 the rest: the bowl
+/// (`z < −4`), the zero-g corner (`x < −6`), the Kestrel, the planetoid. No
+/// border is horizontal: the nearest one is 512 m above or below.
 fn split_demo() -> Cluster {
     Cluster::new(&[
         (1, NodeRef::new(63, [0, 0, 0])),
         (2, NodeRef::new(64, [1, 1, 1])),
     ])
 }
+
+/// The scene's border planes of [`split_demo`] and of every cluster whose
+/// root is more than one cell: `x = −6` and `z = −4` in scene coordinates.
+const BORDER_X: f64 = -6.0;
+const BORDER_Z: f64 = -4.0;
 
 fn scene_bodies(c: &Cluster) -> Vec<(EntityGuid, ShardId)> {
     let mut out: Vec<(EntityGuid, ShardId)> = c
@@ -998,13 +1016,19 @@ fn a_scene_change_replaces_the_bodies_cluster_wide() {
         .all(|(g, _)| border::scene_revision_of(*g) == Some(3)));
 }
 
-/// The gravity room with a border through it (the border planes y = 0 and
-/// z = 0 of the spawn point, shard 2 owning x, y, z > 0): a crate thrown
-/// from shard 2's part of the room falls, crosses into shard 1's region,
-/// lands on the floor and slides to rest, simulated by exactly one shard at
-/// every tick and handed to shard 1 on the way; its path matches the same
-/// throw on one shard. A player standing in the room half a metre from the
-/// border stands still, on one shard.
+/// The gravity room with a border through it ([`split_demo`]: the plane
+/// z = −4 of the scene, shard 2 owning the side the spawn point is on): a
+/// crate thrown from shard 2's part of the room falls, crosses into shard 1's
+/// region, lands on the floor and slides to rest, simulated by exactly one
+/// shard at every tick and handed to shard 1 on the way; its path matches the
+/// same throw on one shard. A player standing in the room half a metre from
+/// the border stands still, on one shard.
+///
+/// (Until the anchor moved off the corner where cells meet, the border
+/// planes through the room were z = 0 and y = 0, and the crate fell through
+/// the horizontal one as well. No horizontal border comes near a scene any
+/// more; the throw is the old one moved to the lane between the room's west
+/// curb and the crate stack, where the floor is clear across z = −4.)
 #[test]
 fn a_crate_falls_through_the_gravity_room_across_a_border() {
     let throw = |c: &mut Cluster, shard: u32| {
@@ -1014,7 +1038,12 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
         crate_body.friction = 0.6;
         let start = ShipState {
             vel: [0.0, 0.0, -6.0],
-            ..ShipState::at_rest(WorldPos::from_f64_metres_around(anchor, [13.0, 2.0, 3.0]))
+            // 3 m before the border, as the throw was when the border was
+            // the plane z = 0.
+            ..ShipState::at_rest(WorldPos::from_f64_metres_around(
+                anchor,
+                [10.9, 2.0, BORDER_Z + 3.0],
+            ))
         };
         c.shard_mut(shard)
             .spawn_body(BodySpawn::new(start, crate_body))
@@ -1028,7 +1057,13 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
     let floor = space_scene::demo::FLOOR;
     let crate_guid = throw(&mut c, 2);
     let mut player = Player::join(&mut c, 1, "stander");
-    let stand = WorldPos::from_f64_metres_around(anchor, [16.5, floor + 1.69, -0.6]);
+    // Half a metre from the border, on shard 1's side of it.
+    let stand = WorldPos::from_f64_metres_around(anchor, [16.5, floor + 1.69, BORDER_Z - 0.6]);
+    assert_eq!(
+        c.shards[0].shard_map().lookup(&stand),
+        Some(ShardId::new(1)),
+        "the player stands in shard 1's part of the room"
+    );
     assert!(c
         .shard_mut(1)
         .set_state(player.ship, ShipState::at_rest(stand)));
@@ -1051,8 +1086,10 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
     let rel = WorldPos::delta(anchor, crate_state.pos);
     assert!(on_1, "handed to shard 1 on the way");
     assert_eq!(c.simulators(crate_guid), vec![ShardId::new(1)]);
+    // Further into shard 1's region than the body hysteresis: there by
+    // distance, not only because it has rested there for a while.
     assert!(
-        rel[2] < -2.0,
+        rel[2] < BORDER_Z - border::BODY_HYSTERESIS,
         "it ended in shard 1's region: z = {:.2}",
         rel[2]
     );
@@ -1082,39 +1119,81 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
     );
 }
 
-/// What a live run showed: the demo area split so that the floor of the
-/// gravity room's +z half is shard 2's (x > 0, y < 0, z > 0 of the spawn
-/// point), and a player who runs through the room. The player's ship pulls
-/// the room's islands over to shard 2 as it passes; once it has gone, the
-/// bodies settle — the pendulums swinging in and out of reach of the crates
-/// and the seesaw must not send them back and forth at every swing (the
-/// island hysteresis). Bounded: each body goes back at most a couple of
-/// times, and after a while nothing moves between the shards at all.
+/// What a live run showed, on the borders a scene has now: the demo area
+/// split so that most of the gravity room is shard 2's ([`split_demo`]), and
+/// a player who starts on shard 1, three metres behind the border between
+/// the zero-g corner and the spawn point, and runs through the room. The
+/// ship is handed to shard 2 on the way and pulls the islands it passes over
+/// with it — bodies of the zero-g corner and the bowl, which lie on shard 1's
+/// side; once it has gone, the bodies settle and must not be sent back and
+/// forth (the island hysteresis). Bounded: each body goes back at most a
+/// couple of times, and after a while nothing moves between the shards at
+/// all.
+///
+/// (The run was first seen with a *horizontal* border at eye height, the
+/// floor of the room's +z half on shard 2: the ship crossed it by landing,
+/// and the pendulums above it swung in and out of reach of the crates and
+/// the seesaw below it. That flicker cannot be staged on the showcase any
+/// more — no horizontal border comes within 512 m of a scene, and the
+/// vertical ones at x = −6 and z = −4 leave the gantry and the seesaw on one
+/// side — and is covered where it is built by hand:
+/// [`a_crate_in_reach_of_a_swinging_pendulum_does_not_change_shard_every_swing`].
+/// The run through the room is the same one, lane and all.)
 #[test]
 fn a_player_running_through_a_split_showcase_leaves_it_settled() {
-    let mut c = Cluster::new(&[
-        (1, NodeRef::new(63, [0, 0, 0])),
-        (2, NodeRef::new(64, [1, 0, 1])),
-    ]);
+    let mut c = split_demo();
     for s in &mut c.shards {
         assert!(s.set_scene(SceneState::new(Scene::DemoArea.id(), 1)));
     }
     let anchor = c.shards[0].installed_scene().expect("scene").1;
     let mut player = Player::join(&mut c, 1, "runner");
-    let start = WorldPos::from_f64_metres_around(anchor, [0.0, 0.0, 2.8]);
+    let start = WorldPos::from_f64_metres_around(anchor, [BORDER_X - 3.0, 0.0, 2.8]);
+    assert_eq!(
+        c.shards[0].shard_map().lookup(&start),
+        Some(ShardId::new(1)),
+        "the run starts in shard 1's part of the scene"
+    );
     assert!(c
         .shard_mut(1)
         .set_state(player.ship, ShipState::at_rest(start)));
+    let handoffs = |c: &Cluster| -> usize { c.shards.iter().map(|s| s.stats().handed_off).sum() };
+    // Scene bodies shard 2 simulates although shard 1 owns their position:
+    // what the ship's island took along.
+    let pulled_over = |c: &Cluster| -> usize {
+        let map = c.shards[0].shard_map();
+        c.shard(2)
+            .body_list()
+            .iter()
+            .filter(|b| !b.ghost && !b.ship)
+            .filter(|b| map.lookup(&b.state.pos) == Some(ShardId::new(1)))
+            .count()
+    };
+    let mut most_pulled_over = 0;
     // Run +x through the room for three seconds, then let go.
     for _ in 0..90 {
         player.drive(&mut c, [1.0, 0.0, 0.0]);
         c.tick();
+        most_pulled_over = most_pulled_over.max(pulled_over(&c));
     }
     for _ in 0..60 {
         player.drive(&mut c, [0.0, 0.0, 0.0]);
         c.tick();
+        most_pulled_over = most_pulled_over.max(pulled_over(&c));
     }
-    let handoffs = |c: &Cluster| -> usize { c.shards.iter().map(|s| s.stats().handed_off).sum() };
+    // The run is what it is meant to be: across the border, and not alone.
+    assert_eq!(player.shard, 2, "the ship was handed to shard 2 on the way");
+    let ship_x = WorldPos::delta(anchor, c.state(player.ship).expect("ship").pos)[0];
+    assert!(
+        ship_x > 19.0,
+        "it ran through the room and out: x = {ship_x:.1}"
+    );
+    // (More than the bowl's three balls, which roll into reach of the
+    // pyramid across the border by themselves: the spring pair and the door
+    // of the zero-g corner, which the ship started beside.)
+    assert!(
+        most_pulled_over > 3,
+        "the ship's island took bodies of shard 1's side along: {most_pulled_over}"
+    );
     let after_run = handoffs(&c);
     c.tick_n(600);
     let settling = handoffs(&c) - after_run;
@@ -1139,15 +1218,25 @@ fn a_player_running_through_a_split_showcase_leaves_it_settled() {
     }
 }
 
-/// Phase 3's live run: the demo area with shard 2 on the octant carved out at
-/// the spawn point towards -x, +y, +z (the zero-g corner's side). The
-/// demo's spring pair spawns in it (0.3 m above the octant's floor, the
-/// y = 0 plane through the spawn point), and a floating crate pushed 9 m
-/// into it (0.6 m above that plane) stayed on shard 1 for good. A settled
-/// body must end up on the shard that owns its position — unless it is in
-/// an island with a body of another territory: a crate parked against the
-/// hinged door (which hangs just below the octant's floor) is simulated
-/// together with the door, on the home of the island's lowest guid.
+/// Phase 3's live run, on the borders a scene has now: the demo area with
+/// shard 2 on the octant carved out beside the spawn point's cell towards -x
+/// (the zero-g corner's side: x < −6, z > −4). The corner's spring pair,
+/// its door and two of its floating crates spawn in it and must end up
+/// there. A third floating crate spawns on shard 1's side of the z = −4
+/// plane; pushed 0.6 m past that plane — inside the 2 m body hysteresis, where
+/// a body once stayed on shard 1 for good — it must go over too. A settled
+/// body ends up on the shard that owns its position — unless it is in an
+/// island with a body of another territory: the fourth floating crate spawns
+/// exactly on the border, and with a crate parked against it from shard 1's
+/// side it is simulated together with that one, on the home of the island's
+/// lowest guid.
+///
+/// (When the border planes through the scene were those of the spawn point —
+/// x, y, z = 0 — the octant was x < 0, y > 0, z > 0: the spring pair spawned
+/// 0.3 m above its floor, the pushed crate ended 0.6 m above it, and the
+/// island across a border was a crate parked against the door, which hung
+/// just below that floor. The horizontal border is gone; each of the three
+/// cases is the same case at a border the scene still has.)
 #[test]
 fn the_zero_g_corner_settles_on_a_carved_octant() {
     let mut c = Cluster::new(&[
@@ -1158,6 +1247,7 @@ fn the_zero_g_corner_settles_on_a_carved_octant() {
         assert!(s.set_scene(SceneState::new(Scene::DemoArea.id(), 1)));
     }
     let anchor = c.shards[0].installed_scene().expect("scene").1;
+    let owner_of = |c: &Cluster, p: WorldPos| c.shards[0].shard_map().lookup(&p).expect("owned");
     let corner: Vec<EntityGuid> = c.shards[0]
         .body_list()
         .into_iter()
@@ -1169,36 +1259,58 @@ fn the_zero_g_corner_settles_on_a_carved_octant() {
         corner.len() >= 6,
         "the floating crates and the spring pair: {corner:?}"
     );
-    // Push the crate at (-13.2, 0.6, -4.0) 9 m along +z, into the octant.
-    let pushed = *corner
+    let crate_at = |c: &Cluster, x: f64, z: f64| -> EntityGuid {
+        *corner
+            .iter()
+            .find(|g| {
+                let d = WorldPos::delta(anchor, c.state(**g).expect("alive").pos);
+                (d[0] - x).abs() < 0.1 && (d[2] - z).abs() < 0.1
+            })
+            .unwrap_or_else(|| panic!("the floating crate at ({x}, {z})"))
+    };
+    // Most of the corner spawns in shard 2's octant (by the spawner, shard 1).
+    let spawned_in_2 = corner
         .iter()
-        .find(|g| {
-            let s = c.state(**g).expect("alive");
-            (WorldPos::delta(anchor, s.pos)[2] + 4.0).abs() < 0.1
-        })
-        .expect("the crate at z = -4");
-    let to = WorldPos::from_f64_metres_around(anchor, [-13.2, 0.6, 9.0]);
+        .filter(|g| owner_of(&c, c.state(**g).expect("alive").pos) == ShardId::new(2))
+        .count();
+    assert!(spawned_in_2 >= 5, "{spawned_in_2} of the corner's crates");
+    // Push the crate at (-15.5, 0.0, -5.5), on shard 1's side, to 0.6 m
+    // inside the octant.
+    let pushed = crate_at(&c, -15.5, -5.5);
+    assert_eq!(
+        owner_of(&c, c.state(pushed).expect("alive").pos),
+        ShardId::new(1)
+    );
+    let to = WorldPos::from_f64_metres_around(anchor, [-15.5, 0.0, BORDER_Z + 0.6]);
+    assert_eq!(owner_of(&c, to), ShardId::new(2));
     assert!(c.shard_mut(1).set_state(pushed, ShipState::at_rest(to)));
-    // Another crate parked against the door, 2 cm from it, in the octant.
-    let door = c.shards[0]
-        .body_list()
-        .into_iter()
-        .find(|b| b.visual == Some(space_scene::visual::DOOR))
-        .expect("the door")
-        .guid;
+    // The crate at (-13.2, 0.6, -4.0) floats exactly on the border, which
+    // makes it the octant's; another crate parked against it, 2 cm from it,
+    // on shard 1's side.
+    let on_border = crate_at(&c, -13.2, BORDER_Z);
+    let on_border_at = WorldPos::delta(anchor, c.state(on_border).expect("alive").pos);
+    assert_eq!(
+        owner_of(&c, c.state(on_border).expect("alive").pos),
+        ShardId::new(2),
+        "a border belongs to the cell above it"
+    );
     let mut crate_body = Body::dynamic(ShapeRef::cuboid([0.4; 3]));
     crate_body.mass = MassSpec::Mass(20.0);
-    let door_at = WorldPos::delta(anchor, c.state(door).expect("door").pos);
+    let parked_at = WorldPos::from_f64_metres_around(
+        anchor,
+        [
+            on_border_at[0],
+            on_border_at[1],
+            // Half the floating crate (0.7 m), the gap, half this one.
+            on_border_at[2] - 0.35 - 0.02 - 0.2,
+        ],
+    );
+    assert_eq!(owner_of(&c, parked_at), ShardId::new(1));
     let parked = c
         .shard_mut(1)
-        .spawn_body(BodySpawn::new(
-            ShipState::at_rest(WorldPos::from_f64_metres_around(
-                anchor,
-                [door_at[0], 0.25, door_at[2] + 0.25],
-            )),
-            crate_body,
-        ))
+        .spawn_body(BodySpawn::new(ShipState::at_rest(parked_at), crate_body))
         .expect("parked");
+    assert!(parked < on_border, "the parked crate has the lower guid");
     c.tick_n(600);
     if std::env::var_os("PHYS_DEBUG").is_some() {
         for b in c
@@ -1223,20 +1335,39 @@ fn the_zero_g_corner_settles_on_a_carved_octant() {
     }
     assert_eq!(
         c.simulators(parked),
-        c.simulators(door),
-        "a crate against the door is in the door's island and on its shard"
+        c.simulators(on_border),
+        "a crate against the one on the border is in its island and on its shard"
     );
-    assert_eq!(c.simulators(door).len(), 1);
-    for guid in &corner {
+    assert_eq!(
+        c.simulators(on_border),
+        vec![ShardId::new(1)],
+        "on the home of the island's lowest guid: the parked crate's"
+    );
+    let mut settled_on_2 = 0;
+    for guid in corner.iter().filter(|g| **g != on_border) {
         let s = c.state(*guid).expect("alive");
-        let owner = c.shards[0].shard_map().lookup(&s.pos).expect("owned");
+        let owner = owner_of(&c, s.pos);
         assert_eq!(
             c.simulators(*guid),
             vec![owner],
             "{guid} at {:.2?} is settled and must be on the shard that owns it",
             WorldPos::delta(anchor, s.pos)
         );
+        settled_on_2 += usize::from(owner == ShardId::new(2));
     }
+    assert!(
+        settled_on_2 >= 5,
+        "the corner went to the octant's shard: {settled_on_2}"
+    );
+    // The door too, which is not a crate.
+    let door = c
+        .shards
+        .iter()
+        .flat_map(Shard::body_list)
+        .find(|b| !b.ghost && b.visual == Some(space_scene::visual::DOOR))
+        .expect("the door");
+    assert_eq!(door.simulator, owner_of(&c, door.state.pos));
+    assert_eq!(door.simulator, ShardId::new(2));
     assert!(
         c.simulators(pushed) == vec![ShardId::new(2)],
         "the pushed crate went over"
@@ -1558,6 +1689,108 @@ fn joining_players_get_distinct_free_spawn_points_and_ships_are_solid() {
     assert!(
         gap > 0.55,
         "the ships do not overlap: {gap:.3} m between centres"
+    );
+}
+
+/// A busy spawn point never puts a new ship across a border. The scene is cut
+/// into its four shard areas — the root keeps the cell the spawn point lies
+/// in, 6 m and 4 m from its borders — and a hundred players (all a shard
+/// admits) join the root's shard: every one of them starts on that shard's
+/// own ground, the first on the spawn point itself, no two closer than a
+/// ship's width. On a shard that has no neighbours the same hundred spread
+/// over both border planes, which is what the spawn grid (15 m out) does when
+/// nothing holds it back.
+///
+/// Mutation this catches: handing out the nearest free grid point whoever
+/// owns it — the 26th player already lands 0.5 m inside a neighbour and
+/// spends its first second being handed over.
+#[test]
+fn a_busy_spawn_point_never_puts_a_ship_across_a_border() {
+    let root = NodeRef::new(63, [0, 0, 0]);
+    let crowd = space_server::shard::MAX_PLAYERS_PER_SHARD;
+    let fill = |c: &mut Cluster| -> Vec<WorldPos> {
+        (0..crowd)
+            .map(|i| {
+                let (_, ship) = join(&mut c.shards[0], &format!("p{i}"));
+                c.shards[0].sim().ship_state(ship).expect("a ship").pos
+            })
+            .collect()
+    };
+    // The four cells that meet at the root's centre corner (cell 1 on each
+    // axis): the root's own, and one each towards -z, -x and both.
+    let mut four = Cluster::new(&[
+        (1, root),
+        (2, NodeRef::new(64, [1, 1, 0])),
+        (3, NodeRef::new(64, [0, 1, 1])),
+        (4, NodeRef::new(64, [0, 1, 0])),
+    ]);
+    let map = four.shards[0].shard_map().clone();
+    let anchor = space_scene::scene_anchor(&map).expect("an anchor");
+    assert_eq!(map.lookup(&anchor), Some(ShardId::new(1)));
+    let at = |p: WorldPos| WorldPos::delta(anchor, p);
+    // The borders are where the anchor rule puts them.
+    for (d, owner) in [
+        ([0.0, 0.0, 0.0], 1),
+        ([BORDER_X, 0.0, BORDER_Z], 1),
+        ([0.0, 0.0, BORDER_Z - 0.01], 2),
+        ([BORDER_X - 0.01, 0.0, 0.0], 3),
+        ([BORDER_X - 0.01, 0.0, BORDER_Z - 0.01], 4),
+        ([0.0, 511.0, 0.0], 1),
+        ([0.0, -511.0, 0.0], 1),
+    ] {
+        let p = WorldPos::from_f64_metres_around(anchor, d);
+        assert_eq!(map.lookup(&p), Some(ShardId::new(owner)), "{d:?}");
+    }
+
+    let positions = fill(&mut four);
+    assert_eq!(positions.len(), crowd);
+    assert_eq!(
+        positions[0], anchor,
+        "the first player gets the spawn point"
+    );
+    for (i, p) in positions.iter().enumerate() {
+        let d = at(*p);
+        assert_eq!(
+            map.lookup(p),
+            Some(ShardId::new(1)),
+            "player {i} starts at {d:.1?}, on another shard's ground"
+        );
+        assert!(d[0] >= BORDER_X && d[2] >= BORDER_Z && d[1] == 0.0, "{d:?}");
+        for q in &positions[i + 1..] {
+            assert!(WorldPos::distance(*p, *q) >= 1.4, "{p:?} and {q:?} overlap");
+        }
+    }
+    // Nobody was dropped on the spawn point for want of a free one.
+    assert_eq!(positions.iter().filter(|p| **p == anchor).count(), 1);
+
+    // The same crowd on a shard that owns everything: the grid is not held
+    // back, and reaches over both planes.
+    let mut alone = Cluster::new(&[(1, root)]);
+    let spread = fill(&mut alone);
+    assert_eq!(
+        space_scene::scene_anchor(alone.shards[0].shard_map()),
+        Some(anchor)
+    );
+    assert!(spread.iter().any(|p| at(*p)[2] < BORDER_Z), "over z = -4");
+    assert!(spread.iter().any(|p| at(*p)[0] < BORDER_X), "over x = -6");
+    // And the players that fit on the root's ground are placed alike.
+    let shared = spread
+        .iter()
+        .zip(&positions)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert_eq!(
+        shared, 25,
+        "the first 25 points are the same; the 26th is the first across a border"
+    );
+    assert!(at(spread[25])[2] < BORDER_Z, "{:?}", at(spread[25]));
+
+    // A shard that does not own the spawn point still puts a joiner on the
+    // centre of its own region (until it can send it to the one that does).
+    let (_, elsewhere) = join(four.shard_mut(2), "elsewhere");
+    assert_eq!(
+        four.state(elsewhere).expect("ship").pos,
+        NodeRef::new(64, [1, 1, 0]).center()
     );
 }
 

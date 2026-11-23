@@ -32,6 +32,13 @@
 //! killing at the abort. The async [`Orchestrator::run`] wires those pieces
 //! together over real QUIC; the tests drive the synchronous half directly.
 //!
+//! A split is one case of a **carve**: [`Orchestrator::begin_carve`] gives any
+//! node inside an existing region — a child octant, or a single cell under
+//! the depth-40 root — to a newly launched shard, through exactly these
+//! steps. The split only adds the choice of the octant. Whichever it is, the
+//! prepare goes to **every shard of the map** and the new one, and all of
+//! them must ack before the map changes ([`crate::epoch`]).
+//!
 //! # What the orchestrator believes about load
 //!
 //! Only a [`LoadReport`] from a shard that owns a region in the published map is
@@ -132,7 +139,7 @@ pub const PEER_PRINTS_PER_WINDOW: u32 = 3;
 
 /// Which octant of a region a split carves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Carve {
+enum Octant {
     /// The first free octant counting round from the one holding the region's
     /// centre (the autoscaler's choice).
     FromCentre,
@@ -140,6 +147,36 @@ enum Carve {
     From(usize),
     /// Exactly this octant, or nothing (an operator named it).
     Exactly(usize),
+}
+
+/// A carve that was started ([`Orchestrator::begin_carve`]): its epoch has
+/// been proposed and the new shard's launch is staged. Nothing is committed
+/// yet — the map changes when every recipient has acked, or not at all.
+///
+/// Displayed, it is the sentence the event log and an operator's answer use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarveStarted {
+    /// The node being carved out.
+    pub node: space_world::NodeRef,
+    /// The id allocated for its new owner.
+    pub shard: ShardId,
+    /// The owner of the enclosing region: who loses the node, and who gets it
+    /// back if the carve is merged away.
+    pub from: ShardId,
+    /// The epoch the carve was proposed as.
+    pub epoch: u64,
+}
+
+impl core::fmt::Display for CarveStarted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "epoch {} proposed, region {} goes to new {}",
+            self.epoch,
+            node_path(self.node),
+            self.shard
+        )
+    }
 }
 
 /// The orchestrator: control plane + the launcher seam.
@@ -168,8 +205,9 @@ pub struct Orchestrator<L: Launcher> {
     /// commits and left alone when it aborts: until the commit it still owns its
     /// region, so killing it any earlier leaves the map naming a dead owner.
     pending_merge: Option<ShardId>,
-    /// The child the split **in flight** launched. If that epoch aborts the
-    /// child owns nothing and is killed, instead of running on unowned.
+    /// The child the split or carve **in flight** launched. If that epoch
+    /// aborts the child owns nothing and is killed, instead of running on
+    /// unowned.
     pending_split: Option<ShardId>,
     /// Messages the async layer must deliver, keyed by destination shard.
     outbox: Vec<(ShardId, Message)>,
@@ -766,7 +804,7 @@ impl<L: Launcher> Orchestrator<L> {
     /// instead, because that is where joining ships spawn).
     pub fn handle_admin(&mut self, command: &AdminCommand) -> AdminReply {
         let outcome = match command {
-            AdminCommand::ForceSplit(shard) => self.begin_split(*shard, Carve::From(0)),
+            AdminCommand::ForceSplit(shard) => self.begin_split(*shard, Octant::From(0)),
             AdminCommand::ForceMerge(shard) => self.begin_merge(*shard),
             AdminCommand::KillShard(shard) => {
                 self.pending_kill.push(*shard);
@@ -855,7 +893,7 @@ impl<L: Launcher> Orchestrator<L> {
                 // positions); the split starts at the region's centre octant.
                 ScaleAction::Split { shard, .. } => (
                     format!("split {shard}"),
-                    self.begin_split(shard, Carve::FromCentre),
+                    self.begin_split(shard, Octant::FromCentre),
                 ),
                 ScaleAction::Merge { shard } => (format!("merge {shard}"), self.begin_merge(shard)),
             };
@@ -896,17 +934,18 @@ impl<L: Launcher> Orchestrator<L> {
     // ------------------------------------------------- autoscale -> topology
 
     /// Turn a split decision into a topology plan + epoch proposal + a staged
-    /// child spawn.
+    /// child spawn: the carve ([`Self::begin_carve`]) of one child octant of
+    /// `shard`'s region.
     ///
-    /// `carve` says where the search for an octant to carve starts:
-    /// [`Carve::FromCentre`] means the region's centre octant (where a shard
+    /// `which` says where the search for an octant to carve starts:
+    /// [`Octant::FromCentre`] means the region's centre octant (where a shard
     /// spawns joining ships, so the first split of a fresh region moves the
-    /// players it was meant to relieve), [`Carve::From`] an explicit
+    /// players it was meant to relieve), [`Octant::From`] an explicit
     /// preference. Either way the octant carved is the first one, counting
     /// round from there, whose plan validates — an octant already carved out
     /// for another shard is skipped, so a region can be split again and again
     /// until none is left ([`topology::pick_split_octant`]).
-    /// [`Carve::Exactly`] is an operator naming one octant: that one is carved
+    /// [`Octant::Exactly`] is an operator naming one octant: that one is carved
     /// or the split is refused, never a different octant than the one asked for.
     ///
     /// The child's id is allocated only once a valid plan exists: a split that
@@ -920,7 +959,7 @@ impl<L: Launcher> Orchestrator<L> {
     /// Why the split was not started. Apart from "an epoch is in flight" the
     /// shard is put on cooldown first (a shard that cannot be split is not
     /// helped by retrying every tick); the caller logs or reports the reason.
-    fn begin_split(&mut self, shard: ShardId, carve: Carve) -> Result<String, String> {
+    fn begin_split(&mut self, shard: ShardId, which: Octant) -> Result<String, String> {
         if !self
             .control
             .publisher
@@ -928,92 +967,157 @@ impl<L: Launcher> Orchestrator<L> {
         {
             return Err("an epoch change is in flight or was committed too recently".into());
         }
+        let outcome = self.split_octant(shard, which);
+        // Started or not, the shard is on cooldown from here: a split that was
+        // proposed must settle first, and one that cannot happen (the map is
+        // full, the region too small, nothing left to carve, no id to give) is
+        // not helped by retrying every tick.
+        self.control.autoscaler.note_action(shard, self.tick);
+        outcome
+    }
+
+    /// The part of [`Self::begin_split`] behind its first check: pick the
+    /// octant, then carve its node like any other ([`Self::carve`]).
+    fn split_octant(&mut self, shard: ShardId, which: Octant) -> Result<String, String> {
         // The map is full: no split, whoever asks (the autoscaler included).
+        // Said before an octant is looked for, so that is the reason given.
         if let Some(full) = self.region_limit_refusal() {
-            self.control.autoscaler.note_action(shard, self.tick);
             return Err(full);
         }
-        let picked = match carve {
-            Carve::FromCentre => {
-                let first = topology::region_of(self.control.map(), shard)
+        let map = self.control.map();
+        let octant = match which {
+            Octant::FromCentre => {
+                let first = topology::region_of(map, shard)
                     .map_or(0, |region| topology::centre_octant(region.node));
-                topology::pick_split_octant(self.control.map(), shard, first)
+                topology::pick_split_octant(map, shard, first)
             }
-            Carve::From(first) => topology::pick_split_octant(self.control.map(), shard, first),
-            // The placeholder owner stands in for the id allocated below: the
-            // owner is irrelevant to whether a plan validates.
-            Carve::Exactly(octant) => {
-                topology::split_plan(self.control.map(), shard, octant, ShardId::NONE)
-                    .map(|_| octant)
-            }
-        };
-        let octant = match picked {
-            Ok(octant) => octant,
-            Err(err) => {
-                self.control.autoscaler.note_action(shard, self.tick);
-                return Err(err.to_string());
-            }
-        };
-        let new_id = match self.control.ids.allocate() {
-            Ok(id) => id,
-            Err(err) => {
-                // The id space is exhausted or the counter cannot be written:
-                // nothing can be spawned. Cool down so we do not retry every tick.
-                self.control.autoscaler.note_action(shard, self.tick);
-                return Err(err.to_string());
-            }
-        };
-        let plan = match topology::split_plan(self.control.map(), shard, octant, new_id) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.control.autoscaler.note_action(shard, self.tick);
-                return Err(err.to_string());
-            }
-        };
+            Octant::From(first) => topology::pick_split_octant(map, shard, first),
+            // Not picked: named. Whether it is still free is the carve's call.
+            Octant::Exactly(octant) => Ok(octant),
+        }
+        .map_err(|err| err.to_string())?;
+        let child = topology::octant_node(map, shard, octant).map_err(|err| err.to_string())?;
+        let signs = octant_signs(u8::try_from(octant % 8).unwrap_or(0));
+        let started = self.carve(child, |new_id| {
+            format!(
+                "split of {shard}, region {} (octant {octant}, {signs}) goes to new {new_id}",
+                node_path(child)
+            )
+        })?;
+        Ok(started.to_string())
+    }
+
+    /// Carve `node` out of the region that encloses it, for a **new shard**:
+    /// the general form of a split, and the one entry point through which a
+    /// region comes into being.
+    ///
+    /// `node` may be any octree node inside an existing region of the
+    /// published map that is not a region itself — a child octant, or a single
+    /// cell (depth 64) under the depth-40 root; see [`topology::carve_plan`].
+    /// What happens is what happens for a split, step for step: the plan is
+    /// made and validated, a fresh id is allocated for the node's new owner,
+    /// the change is proposed as **one epoch** to every shard of the map plus
+    /// the new one, and the new shard's launch is staged
+    /// ([`Self::take_pending_spawn`]) — it registers with the id and the node,
+    /// is handed the prepare it owes an ack for, and the carve commits when
+    /// everybody has acked, or aborts at the deadline (and the launched shard
+    /// is stopped). The shard losing the node is put on the autoscaler's
+    /// cooldown, like the parent of a split.
+    ///
+    /// The id is allocated only once a valid plan exists: a carve that cannot
+    /// happen burns no id and writes nothing to the counter file. A refusal
+    /// changes nothing at all.
+    ///
+    /// Returns what was started ([`CarveStarted`]; it reads as a sentence).
+    ///
+    /// # Errors
+    ///
+    /// Why the carve was not started: an epoch change is in flight or was
+    /// committed less than [`MIN_EPOCH_INTERVAL_TICKS`] ago, the map already
+    /// holds [`OrchestratorConfig::max_regions`], the node cannot be carved
+    /// ([`topology::TopologyError`]), or no id could be allocated.
+    pub fn begin_carve(&mut self, node: space_world::NodeRef) -> Result<CarveStarted, String> {
+        if let Some(busy) = self.proposal_refusal() {
+            return Err(busy);
+        }
+        if let Some(full) = self.region_limit_refusal() {
+            return Err(full);
+        }
+        let started = self.carve(node, |new_id| {
+            format!("carve of region {} for new {new_id}", node_path(node))
+        })?;
+        self.control.autoscaler.note_action(started.from, self.tick);
+        Ok(started)
+    }
+
+    /// Plan the carve of `node`, allocate its owner's id, propose the epoch
+    /// and stage the launch. `describe` words the change for the operator
+    /// view once the new id is known. The callers have checked that an epoch
+    /// may be proposed and that the map has room.
+    fn carve(
+        &mut self,
+        node: space_world::NodeRef,
+        describe: impl FnOnce(ShardId) -> String,
+    ) -> Result<CarveStarted, String> {
+        // Planned once with a placeholder owner (the owner is irrelevant to
+        // whether a plan validates), so a carve that cannot happen burns no id.
+        topology::carve_plan(self.control.map(), node, ShardId::NONE)
+            .map_err(|err| err.to_string())?;
+        // The id space may be exhausted, or the counter cannot be written:
+        // then nothing can be launched.
+        let new_id = self.control.ids.allocate().map_err(|err| err.to_string())?;
+        let plan = topology::carve_plan(self.control.map(), node, new_id)
+            .map_err(|err| err.to_string())?;
         let observer_ticks: Vec<(ShardId, u64)> =
             self.shard_ticks.iter().map(|(s, t)| (*s, *t)).collect();
-        let Some(prepare) = self.control.publisher.propose(
-            plan.map.clone(),
-            vec![plan.change],
-            &observer_ticks,
-            self.tick,
-        ) else {
-            // Lost the race to an in-flight epoch (can_propose said Idle but the
-            // publisher disagreed); cool down so we do not spin.
-            self.control.autoscaler.note_action(shard, self.tick);
-            return Err("the publisher refused the proposal".into());
-        };
+        // (`None`: lost the race to an in-flight epoch — the callers' check
+        // said Idle but the publisher disagreed.)
+        let prepare = self
+            .control
+            .publisher
+            .propose(
+                plan.map.clone(),
+                vec![plan.change],
+                &observer_ticks,
+                self.tick,
+            )
+            .ok_or_else(|| String::from("the publisher refused the proposal"))?;
         self.queue_outbound(&prepare);
-        self.control.autoscaler.note_action(shard, self.tick);
-        // Stage the child spawn: the async layer runs the launcher and the child
-        // then registers with its own ShardHello (and is handed the prepare it
-        // still owes an ack for).
-        let parent_endpoint = self
+        // Stage the new shard's launch: the async layer runs the launcher and
+        // the shard then registers with its own ShardHello (and is handed the
+        // prepare it still owes an ack for). The endpoint in the spec is only
+        // a placeholder, as it was for a split: a launcher binds its own
+        // address, and the map names the new region with the un-dialable
+        // sentinel until its shard has said hello.
+        let placeholder = self
             .endpoints
-            .get(&shard)
+            .get(&plan.from)
             .copied()
             .unwrap_or(plan.map.regions[0].endpoint);
         self.pending_spawn.push(SpawnSpec {
             shard: new_id,
-            region: space_protocol::shard::ShardRegion::new(plan.child, new_id, parent_endpoint),
+            region: space_protocol::shard::ShardRegion::new(plan.node, new_id, placeholder),
             cluster: self.control.config.cluster.clone(),
             control_addr: self.control.config.control_addr(),
             host_port: 0,
         });
         self.pending_split = Some(new_id);
-        let child = node_path(plan.child);
-        self.in_flight = Some(format!(
-            "split of {shard}, region {child} (octant {octant}, {}) goes to new {new_id}",
-            octant_signs(u8::try_from(octant % 8).unwrap_or(0)),
-        ));
-        Ok(format!(
-            "epoch {} proposed, region {child} goes to new {new_id}",
-            plan.map.epoch
-        ))
+        self.in_flight = Some(describe(new_id));
+        Ok(CarveStarted {
+            node: plan.node,
+            shard: new_id,
+            from: plan.from,
+            epoch: plan.map.epoch,
+        })
     }
 
     /// Turn a merge decision into a topology plan + epoch proposal. The merged
     /// shard is killed when (and only if) that epoch commits.
+    ///
+    /// The shard's region goes back to the owner of the region around it
+    /// ([`topology::merge_target`]): its parent node's after an octant split,
+    /// the nearest enclosing region's — however many levels up — for a carved
+    /// cell.
     ///
     /// **Only a shard with no players is merged away.** A merge removes the
     /// shard's region from the map and then the shard itself; there is no step
@@ -1071,7 +1175,7 @@ impl<L: Launcher> Orchestrator<L> {
         };
         self.queue_outbound(&prepare);
         self.control.autoscaler.note_action(shard, self.tick);
-        // The merged child's region folds back into the parent — when the epoch
+        // The merged region folds back into the region around it — when the epoch
         // commits. Until then the shard owns its region and keeps running; it
         // is staged for killing by the commit (`handle_epoch_ack`), and left
         // alone if the epoch aborts (`tick`).
@@ -1191,10 +1295,11 @@ impl<L: Launcher> Orchestrator<L> {
     /// `None` when it would be accepted. Changes nothing (see
     /// [`Self::split_refusal`]).
     ///
-    /// The rules are `begin_merge`'s: the region must have a parent region
-    /// owned by another shard, and the shard's own fresh load report must say
-    /// it has no players — a shard that has not reported is not known to be
-    /// empty (H13).
+    /// The rules are `begin_merge`'s: the region must have an enclosing region
+    /// owned by another shard (its parent node, or — for a carved cell — the
+    /// nearest region around it, however many levels up), and the shard's own
+    /// fresh load report must say it has no players — a shard that has not
+    /// reported is not known to be empty (H13).
     #[must_use]
     pub fn merge_refusal(&self, shard: ShardId) -> Option<String> {
         // Looked up, not planned (see `split_refusal`).
@@ -1315,8 +1420,8 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(why) = self.split_refusal(shard, octant) {
             return Err(why);
         }
-        let carve = octant.map_or(Carve::FromCentre, |o| Carve::Exactly(usize::from(o)));
-        self.begin_split(shard, carve)
+        let which = octant.map_or(Octant::FromCentre, |o| Octant::Exactly(usize::from(o)));
+        self.begin_split(shard, which)
     }
 
     /// An operator's merge: checked without side effects first, then started
@@ -1488,15 +1593,19 @@ impl<L: Launcher> Orchestrator<L> {
         // control port `boot` puts on the root until a shard claims it.
         let placeholder = region.endpoint == ShardRegion::UNRESOLVED_ENDPOINT
             || self.control.unclaimed_root_owner() == Some(shard);
-        let parent = space_world::octree::parent(region.node)
-            .filter(|parent| map.regions.iter().any(|r| r.node == *parent));
+        // The region around this one: its direct parent after an octant
+        // split, any number of levels up for a carved cell. A lookup.
+        let parent = topology::enclosing_region(map, region.node).map(|around| around.node);
+        let octant = parent
+            .filter(|parent| space_world::octree::parent(region.node) == Some(*parent))
+            .and_then(|_| octant_of(region.node));
         RegionView {
             node: region.node,
             shard,
             endpoint: (!placeholder).then_some(region.endpoint),
             nesting,
             parent,
-            octant: parent.and_then(|_| octant_of(region.node)),
+            octant,
             free_octants,
             split_refusal,
             merge_refusal,
@@ -2759,7 +2868,7 @@ mod tests {
             (split(42, Some(0)), "no region owned by shard 42"),
             (split(100, Some(0)), "shard 100 is not connected"),
             (stale, "the map changed"),
-            (merge(1), "no parent to merge into"),
+            (merge(1), "no enclosing region to merge into"),
             (merge(42), "no region owned by shard 42"),
             (merge(100), "not known to be empty"),
         ] {
@@ -2870,6 +2979,346 @@ mod tests {
         assert_eq!(orch.map().regions.len(), 1);
         assert_eq!(orch.take_pending_kill(), vec![child]);
         assert!(event_texts(&orch)[0].starts_with("epoch 2 committed: merge of shard 2"));
+    }
+
+    // ------------------------------------------------------------- carving
+
+    /// The cell `d` cells from the root's centre corner on each axis: `[0,0,0]`
+    /// is the one the scene's spawn point lies in (`docs/plan-sharding.md` §1).
+    fn cell_at_the_centre(orch: &Orchestrator<MockLauncher>, d: [i64; 3]) -> space_world::NodeRef {
+        let k = orch.config().root_node().center().cell;
+        space_world::NodeRef::new(64, [k[0] + d[0], k[1] + d[1], k[2] + d[2]])
+    }
+
+    fn hello_of_a_launched_shard(shard: u32, node: space_world::NodeRef) -> ShardHello {
+        let endpoint = addr(9_000 + shard as u16);
+        ShardHello {
+            cluster: OrchestratorConfig::default().cluster,
+            shard: ShardId::new(shard),
+            endpoint,
+            region: Some(ShardRegion::new(node, ShardId::new(shard), endpoint)),
+        }
+    }
+
+    /// `begin_carve` is a split whose node is named: one cell, twenty-four
+    /// levels below the root, goes to a newly launched shard through the same
+    /// steps — plan, id, one epoch to **every** shard of the map and the new
+    /// one, launch, hello, acks, commit — and the merge that undoes it gives
+    /// the cell back to the root's owner.
+    ///
+    /// Mutations this catches: a carve path that writes the map itself; a
+    /// recipient rule that misses the shards of a deep carve; a merge that
+    /// needs the direct parent node to be a region; a `validate` that refuses
+    /// depth 64.
+    #[test]
+    fn a_cell_is_carved_for_a_new_shard_through_the_epoch_protocol_and_merged_back() {
+        let mut orch = connected_orchestrator();
+        let (one, first, second) = (ShardId::new(1), ShardId::new(100), ShardId::new(101));
+        let cell = cell_at_the_centre(&orch, [0, 0, -1]);
+        let inside = cell.center();
+        assert_eq!(orch.map().lookup(&inside), Some(one));
+
+        let started = orch
+            .begin_carve(cell)
+            .expect("the cell lies inside the root");
+        assert_eq!(
+            started,
+            CarveStarted {
+                node: cell,
+                shard: first,
+                from: one,
+                epoch: 2
+            }
+        );
+        assert_eq!(
+            started.to_string(),
+            format!(
+                "epoch 2 proposed, region {} goes to new shard 100",
+                node_path(cell)
+            )
+        );
+        // Proposed is not published (H10), and the new shard's launch is staged
+        // with the id and the node it must say hello with.
+        assert_eq!(orch.map().epoch, 1);
+        assert_eq!(orch.map().lookup(&inside), Some(one));
+        let spec = orch.take_pending_spawn().pop().expect("a launch is staged");
+        assert_eq!((spec.shard, spec.region.node), (first, cell));
+        let snapshot = orch.snapshot();
+        let in_flight = snapshot.in_flight.expect("the carve is in flight");
+        assert_eq!(in_flight.changes, vec![(cell, first)]);
+        assert_eq!(
+            in_flight.what,
+            format!("carve of region {} for new shard 100", node_path(cell))
+        );
+        assert_eq!(in_flight.recipients, vec![(one, false), (first, false)]);
+        let role = |orch: &Orchestrator<MockLauncher>, shard| {
+            orch.snapshot()
+                .shards
+                .iter()
+                .find(|s| s.shard == shard)
+                .map(|s| s.role)
+        };
+        assert_eq!(role(&orch, first), Some(ShardRole::SplitChild));
+        // The shard losing the cell is on the autoscaler's cooldown.
+        assert!(orch.control.autoscaler.busy_until() > orch.current_tick());
+
+        // The prepare went to the root's owner and to the shard that does not
+        // exist yet; the launched shard is handed it when it registers.
+        assert_eq!(prepares(&orch.drain_outbox()), vec![(one, 2), (first, 2)]);
+        orch.handle_epoch_ack(one, 2);
+        assert_eq!(orch.map().epoch, 1, "the new shard has not acked");
+        let welcome = orch
+            .handle_shard_hello(&hello_of_a_launched_shard(100, cell))
+            .expect("the id was allocated for this node");
+        assert_eq!((welcome.shard, welcome.region.node), (first, cell));
+        assert!(orch
+            .control
+            .publisher
+            .outstanding_prepare_for(first)
+            .is_some());
+        orch.note_connected([one, first]);
+        orch.handle_epoch_ack(first, 2);
+
+        // Committed: the cell is the new shard's, at its real address, and
+        // everything around it is still the root owner's.
+        assert_eq!(orch.map().epoch, 2);
+        crate::topology::validate(orch.map()).expect("a depth-64 region is valid (H11)");
+        assert_eq!(orch.map().lookup(&inside), Some(first));
+        for d in [[0, 0, 0], [0, 0, -2], [-1, 0, -1], [0, 1, -1], [0, -1, -1]] {
+            let neighbour = cell_at_the_centre(&orch, d).center();
+            assert_eq!(orch.map().lookup(&neighbour), Some(one), "{d:?}");
+        }
+        let published = orch
+            .map()
+            .regions
+            .iter()
+            .find(|r| r.shard == first)
+            .expect("published");
+        assert_eq!((published.node, published.endpoint), (cell, addr(9_100)));
+        let sent = orch.drain_outbox();
+        for to in [one, first] {
+            assert!(sent
+                .iter()
+                .any(|(s, m)| *s == to && matches!(m, Message::EpochCommit(c) if c.epoch == 2)));
+            assert!(sent.iter().any(|(s, m)| *s == to
+                && matches!(m, Message::DirectoryReply(r) if r.shard_map == *orch.map())));
+        }
+        assert!(orch.take_pending_kill().is_empty(), "a carve kills nobody");
+        assert_eq!(role(&orch, first), Some(ShardRole::Owner));
+        assert!(event_texts(&orch)[0].starts_with("epoch 2 committed: carve of region 64:"));
+
+        // The operator view: the cell is listed under the root, as carved out
+        // of it (it is nobody's octant), too small to split, and mergeable
+        // once it is known to be empty.
+        let snapshot = orch.snapshot();
+        let paths: Vec<String> = snapshot.regions.iter().map(|r| node_path(r.node)).collect();
+        assert_eq!(paths, vec!["40:0:0:0".to_string(), node_path(cell)]);
+        let view = &snapshot.regions[1];
+        assert_eq!(
+            (view.nesting, view.parent, view.octant),
+            (1, Some(orch.config().root_node()), None)
+        );
+        assert!(view.free_octants.is_empty());
+        assert!(view
+            .split_refusal
+            .as_deref()
+            .is_some_and(|why| why.contains("below the split floor")));
+        assert!(view
+            .merge_refusal
+            .as_deref()
+            .is_some_and(|why| why.contains("not known to be empty")));
+
+        // A second cell, for a third shard: now everybody in the map hears
+        // about it — the first cell's owner too, though the cells only share
+        // an edge and no parent.
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        let other = cell_at_the_centre(&orch, [-1, 0, 0]);
+        let started = orch.begin_carve(other).expect("the second cell");
+        assert_eq!(
+            (started.shard, started.from, started.epoch),
+            (second, one, 3)
+        );
+        let _ = orch.take_pending_spawn();
+        assert_eq!(
+            prepares(&orch.drain_outbox()),
+            vec![(one, 3), (first, 3), (second, 3)]
+        );
+        orch.handle_shard_hello(&hello_of_a_launched_shard(101, other))
+            .expect("registers");
+        orch.note_connected([one, first, second]);
+        for shard in [one, first, second] {
+            assert_eq!(orch.map().epoch, 2);
+            orch.handle_epoch_ack(shard, 3);
+        }
+        assert_eq!(orch.map().epoch, 3);
+        assert_eq!(orch.map().regions.len(), 3);
+        let _ = orch.drain_outbox();
+
+        // Merge the first cell back. It is refused until its shard is known
+        // to be empty; then it is one epoch to everyone, the shard itself
+        // included, and the shard is stopped only by the commit.
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        let reply = orch.handle_operator(&merge(100));
+        assert!(
+            !reply.accepted && reply.message.contains("not known to be empty"),
+            "{reply:?}"
+        );
+        orch.handle_load_report(&report(100, 0));
+        assert_eq!(orch.merge_refusal(first), None);
+        let reply = orch.handle_operator(&merge(100));
+        assert!(reply.accepted, "{reply:?}");
+        assert!(
+            reply.message.contains(&format!(
+                "epoch 4 proposed, region {} goes back to shard 1",
+                node_path(cell)
+            )),
+            "{reply:?}"
+        );
+        assert_eq!(orch.pending_merge(), Some(first));
+        assert_eq!(
+            orch.map().lookup(&inside),
+            Some(first),
+            "not before the commit"
+        );
+        assert_eq!(
+            prepares(&orch.drain_outbox()),
+            vec![(one, 4), (first, 4), (second, 4)]
+        );
+        for shard in [one, first, second] {
+            assert!(orch.take_pending_kill().is_empty());
+            orch.handle_epoch_ack(shard, 4);
+        }
+        assert_eq!(orch.map().epoch, 4);
+        crate::topology::validate(orch.map()).expect("valid");
+        assert_eq!(orch.map().regions.len(), 2);
+        assert_eq!(
+            orch.map().lookup(&inside),
+            Some(one),
+            "the cell fell back to the root's owner"
+        );
+        assert_eq!(orch.map().lookup(&other.center()), Some(second));
+        assert_eq!(orch.take_pending_kill(), vec![first]);
+        // The merged shard is told the outcome before it is stopped.
+        let sent = orch.drain_outbox();
+        assert!(sent
+            .iter()
+            .any(|(s, m)| *s == first && matches!(m, Message::EpochCommit(c) if c.epoch == 4)));
+        assert!(event_texts(&orch)[0].starts_with("epoch 4 committed: merge of shard 100"));
+    }
+
+    /// What `begin_carve` refuses, and that a refusal has no side effect: no
+    /// id is allocated, nothing is published or staged, nobody is put on
+    /// cooldown.
+    #[test]
+    fn a_carve_that_cannot_happen_changes_nothing_and_says_why() {
+        let config = OrchestratorConfig {
+            max_regions: 2,
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        let mut orch = orchestrator_over(
+            config,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ids,
+        );
+        let state = |orch: &Orchestrator<MockLauncher>| {
+            (
+                orch.map().clone(),
+                orch.control.ids.peek(),
+                orch.control.autoscaler.busy_until(),
+                orch.snapshot().in_flight,
+            )
+        };
+        let before = state(&orch);
+        let cell = cell_at_the_centre(&orch, [0, 0, -1]);
+        let k = root.center().cell[0];
+        for (node, why) in [
+            (root, "already a region"),
+            (
+                space_world::NodeRef::new(64, [-k, k, k]),
+                "inside no region",
+            ),
+            (space_world::NodeRef::new(39, [0, 0, 0]), "inside no region"),
+            (
+                space_world::NodeRef::new(65, [k, k, k]),
+                "exceeds MAX_DEPTH",
+            ),
+        ] {
+            let err = orch.begin_carve(node).expect_err("refused");
+            assert!(err.contains(why), "{node:?}: {err}");
+            assert_eq!(
+                state(&orch),
+                before,
+                "{node:?}: a refusal has no side effect"
+            );
+            assert!(orch.take_pending_spawn().is_empty());
+            assert!(orch.drain_outbox().is_empty());
+        }
+
+        // One at a time (H12): while the first carve is in flight a second is
+        // refused, and so is one right after its commit.
+        orch.begin_carve(cell).expect("the first carve starts");
+        let in_flight = state(&orch);
+        let other = cell_at_the_centre(&orch, [-1, 0, 0]);
+        let err = orch.begin_carve(other).expect_err("one change at a time");
+        assert!(err.contains("epoch 2 is still in flight"), "{err}");
+        assert_eq!(state(&orch), in_flight);
+        assert_eq!(orch.take_pending_spawn().len(), 1, "only the first one's");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().epoch, 2);
+        let err = orch
+            .begin_carve(other)
+            .expect_err("too soon after a commit");
+        assert!(err.contains("committed too recently"), "{err}");
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        // The map is full (two regions, the limit of this cluster).
+        let err = orch.begin_carve(other).expect_err("the map is full");
+        assert!(err.contains("--max-regions"), "{err}");
+        assert_eq!(orch.control.ids.peek(), 101, "one id for the one carve");
+        assert!(orch.take_pending_spawn().is_empty());
+    }
+
+    /// A carve whose new shard never registers aborts at the deadline like a
+    /// split: the map is untouched and the launched shard is stopped.
+    #[test]
+    fn a_carve_nobody_acks_aborts_and_its_shard_is_stopped() {
+        let mut orch = connected_orchestrator();
+        let cell = cell_at_the_centre(&orch, [-1, 0, -1]);
+        let before = orch.map().clone();
+        let started = orch.begin_carve(cell).expect("starts");
+        let _ = orch.take_pending_spawn();
+        let _ = orch.drain_outbox();
+        orch.handle_epoch_ack(ShardId::new(1), started.epoch);
+        for _ in 0..=crate::config::EPOCH_ACK_TIMEOUT_TICKS {
+            orch.tick();
+        }
+        assert_eq!(orch.map(), &before, "byte-identical after the abort (H10)");
+        assert_eq!(orch.take_pending_kill(), vec![started.shard]);
+        let texts = event_texts(&orch);
+        let aborted = texts
+            .iter()
+            .find(|t| t.starts_with("epoch 2 aborted"))
+            .unwrap_or_else(|| panic!("the abort is logged: {texts:?}"));
+        assert!(
+            aborted.contains("carve of region 64:") && aborted.contains("no ack from shard 100"),
+            "{aborted}"
+        );
+        // The abort went to both recipients of the prepare.
+        let aborts: Vec<ShardId> = orch
+            .drain_outbox()
+            .into_iter()
+            .filter(|(_, m)| matches!(m, Message::EpochAbort(_)))
+            .map(|(to, _)| to)
+            .collect();
+        assert_eq!(aborts, vec![ShardId::new(1), started.shard]);
     }
 
     /// Mutation this catches: a pause that only hides the autoscaler's
@@ -3013,7 +3462,7 @@ mod tests {
         assert!(outer
             .merge_refusal
             .as_deref()
-            .is_some_and(|why| why.contains("no parent")));
+            .is_some_and(|why| why.contains("no enclosing region")));
         assert_eq!(
             (inner.nesting, inner.parent, inner.octant),
             (1, Some(root), Some(0))

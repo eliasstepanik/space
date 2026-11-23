@@ -994,8 +994,10 @@ fn regions(h: &mut Html, input: &PageInput<'_>) {
          each level halves the edge. A split carves one octant (bit 0 = +x, bit 1 = +y, \
          bit 2 = +z) out of a region for a newly launched shard; the rest stays with its owner. \
          <q>auto</q> takes the first free octant counting from the one that holds the region's \
-         centre, where joining ships spawn. A merge gives a carved region back to the owner of \
-         the region around it. Both go through the epoch protocol: prepare, ack, commit, one \
+         centre, where joining ships spawn. A region can also be carved more than one level \
+         down (a single 1 km cell under the root); it is listed under the region around it. A \
+         merge gives a carved region back to the owner of the region around it. Both go \
+         through the epoch protocol: prepare, ack by every shard of the map, commit, one \
          change at a time.</p></section>\n",
     );
 }
@@ -1024,12 +1026,19 @@ fn region_row(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
         ),
         "",
     );
-    if let (Some(octant), Some(parent)) = (region.octant, region.parent) {
-        h.text(format_args!(
+    match (region.octant, region.parent) {
+        (Some(octant), Some(parent)) => h.text(format_args!(
             ": octant {octant} ({}) of {}",
             octant_signs(octant),
             node_path(parent)
-        ));
+        )),
+        // Carved more than one level down (a single cell under the root).
+        (None, Some(parent)) => h.text(format_args!(
+            ": carved out of {}, {} levels up",
+            node_path(parent),
+            region.node.depth.saturating_sub(parent.depth)
+        )),
+        (_, None) => {}
     }
     h.raw("</div></td>");
     h.wrapped(
@@ -1115,7 +1124,7 @@ fn merge_cell(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
     );
     match into {
         Some(shard) => h.text(shard),
-        None => h.raw("its parent"),
+        None => h.raw("the region around it"),
     }
     h.raw("</button></form>");
     if let Some(why) = &region.merge_refusal {

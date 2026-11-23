@@ -56,7 +56,8 @@ pub enum ScaleAction {
         /// ([`crate::topology::pick_split_octant`]).
         octant: usize,
     },
-    /// Merge `shard`'s region back into its parent's owner.
+    /// Merge `shard`'s region back into the owner of the region around it
+    /// ([`crate::topology::merge_target`]).
     Merge {
         /// The cold shard.
         shard: ShardId,

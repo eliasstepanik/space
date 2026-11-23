@@ -263,6 +263,79 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
     );
 }
 
+/// The autoscaler's merge of a **carved cell**: the cold shard owns one cell
+/// (depth 64) of the depth-40 root, whose node is twenty-four levels above it
+/// and the only region around it. The merge is proposed, goes to both shards,
+/// commits, gives the cell back to the root's owner and stages the kill.
+///
+/// Mutation this catches: a merge target that has to be the parent *node* —
+/// the autoscaler's decision would be refused on every dwell, for ever.
+#[test]
+fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
+    let config = OrchestratorConfig::default();
+    let root = config.root_node();
+    let k = root.center().cell;
+    let cell = NodeRef::new(64, [k[0] - 1, k[1], k[2] - 1]);
+    let inside = cell.center();
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(root, shard(1), addr(7_001)),
+            ShardRegion::new(cell, shard(2), addr(7_002)),
+        ],
+    );
+    assert_eq!(map.lookup(&inside), Some(shard(2)));
+    space_orchestrator::topology::validate(&map).expect("a cell under the root is a valid map");
+    let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+    let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+    let mut orch = Orchestrator::new(control, Arc::new(RecordingLauncher::default()));
+
+    let mut merged = false;
+    for _ in 0..(space_orchestrator::autoscale::MERGE_DWELL_TICKS + 5) {
+        orch.handle_load_report(&cold_report(shard(2)));
+        orch.tick();
+        assert!(
+            orch.take_pending_kill().is_empty(),
+            "nothing is killed before the merge has committed"
+        );
+        let recipients: Vec<(ShardId, u64)> = orch
+            .drain_outbox()
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                Message::EpochPrepare(p) => {
+                    assert_eq!(
+                        p.changes,
+                        vec![(cell, shard(1))],
+                        "the cell reverts to shard 1"
+                    );
+                    Some((to, p.epoch))
+                }
+                _ => None,
+            })
+            .collect();
+        if recipients.is_empty() {
+            continue;
+        }
+        assert_eq!(recipients, vec![(shard(1), 2), (shard(2), 2)]);
+        assert_eq!(orch.pending_merge(), Some(shard(2)));
+        assert_eq!(orch.map().lookup(&inside), Some(shard(2)), "not yet");
+        for (r, epoch) in recipients {
+            orch.handle_epoch_ack(r, epoch);
+        }
+        assert_eq!(orch.take_pending_kill(), vec![shard(2)]);
+        merged = true;
+        break;
+    }
+    assert!(merged, "the cold cell was merged");
+    assert_eq!(orch.map().epoch, 2);
+    assert_eq!(orch.map().regions.len(), 1, "the cell's region was removed");
+    assert_eq!(
+        orch.map().lookup(&inside),
+        Some(shard(1)),
+        "the cell fell back to the root's owner"
+    );
+}
+
 #[test]
 fn an_unacked_prepare_aborts_and_the_map_is_unchanged() {
     let mut orch = Orchestrator::new(
@@ -360,6 +433,262 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
         "the welcome carries the current map"
     );
     assert_eq!(welcome.peer_token, "secret");
+    server.close();
+}
+
+/// Run the orchestrator's real loop until `done` resolves (20 s at most), then
+/// a few beats more, so the loop is not stopped in the middle of delivering
+/// what the last beat produced.
+async fn run_the_loop_until<T>(
+    orchestrator: &mut Orchestrator<LocalLauncher>,
+    server: &Arc<space_orchestrator::control::ControlServer>,
+    what: &str,
+    done: impl std::future::Future<Output = T>,
+) -> T {
+    use std::time::Duration;
+    let settled = async {
+        let value = done.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        value
+    };
+    tokio::select! {
+        ended = orchestrator.run_with(Arc::clone(server)) => panic!("the loop ended: {ended:?}"),
+        value = tokio::time::timeout(Duration::from_secs(20), settled) => {
+            value.unwrap_or_else(|_| panic!("timed out waiting until {what}"))
+        }
+    }
+}
+
+/// `docs/plan-sharding.md` §1, end to end: one **cell** (depth 64) is carved
+/// out of the depth-40 root for a shard the local launcher starts, the epoch
+/// commits, and the merge that undoes it gives the cell back to the root's
+/// owner and stops the shard.
+///
+/// Everything in between is production code: `Orchestrator::run_with` over the
+/// QUIC control endpoint, a root shard booted by `start_orchestrated` (what
+/// `space-server --orchestrator` runs) and the carved cell's shard booted by
+/// [`LocalLauncher`], which registers with the id and the node the orchestrator
+/// allocated. The test only asks for the carve and the merge, and — because no
+/// shard sends load reports yet — says on the shard's behalf that it is empty;
+/// the loop is stopped for those calls and resumed.
+///
+/// Mutations this catches, each on its own: a `validate` that refuses a region
+/// below depth 60 (the carve is never proposed); a merge that needs the parent
+/// *node* to be a region (the merge is refused). Who is sent the prepare is
+/// pinned where it can be seen exactly: `epoch::tests` and
+/// `orchestrator::tests` (here a shard that missed the prepare would still
+/// catch up from the map push behind the commit).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
+    use space_orchestrator::ops::OperatorCommand;
+    use space_server::orchestrated::{start_orchestrated, OrchestratedOptions};
+    use std::time::Duration;
+
+    // Port 0 everywhere: the loop resolves the port the launched shard dials.
+    let config = OrchestratorConfig {
+        bind: addr(0),
+        ..OrchestratorConfig::default()
+    };
+    let cluster = config.cluster.clone();
+    let root_node = config.root_node();
+    assert_eq!(root_node.depth, 40);
+    let map = ShardMap::new(1, vec![ShardRegion::new(root_node, shard(1), addr(0))]);
+    let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+    let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+    // As `boot` does: the root's id is reserved, the first shard adopts it.
+    control.set_unclaimed_root_owner(shard(1));
+    let launcher = Arc::new(LocalLauncher::new());
+    let mut orchestrator = Orchestrator::new(control, Arc::clone(&launcher));
+    let server = orchestrator.bind().expect("bind control");
+    let control_addr = server.local_addr().expect("control port");
+
+    // --- the root shard registers.
+    let root = run_the_loop_until(
+        &mut orchestrator,
+        &server,
+        "the root shard has registered",
+        start_orchestrated(
+            OrchestratedOptions {
+                shard: ShardId::NONE,
+                bind: addr(0),
+                advertise: None,
+                claim_region: None,
+                cluster,
+            },
+            control_addr,
+        ),
+    )
+    .await
+    .expect("the root shard registers");
+    assert_eq!((root.shard, root.region), (shard(1), root_node));
+
+    // --- carve the cell next to the one the scene's spawn point lies in: of
+    // the four cells that meet at the root's centre, the one towards -z.
+    let k = root_node.center().cell;
+    let cell = NodeRef::new(64, [k[0], k[1], k[2] - 1]);
+    let inside = cell.center();
+    assert_eq!(orchestrator.map().lookup(&inside), Some(shard(1)));
+    let started = orchestrator
+        .begin_carve(cell)
+        .expect("the carve is started");
+    let child = started.shard;
+    assert_eq!(
+        (started.node, started.from, started.epoch),
+        (cell, shard(1), 2)
+    );
+    assert_eq!(child, shard(100), "a fresh id (H9)");
+    assert_eq!(orchestrator.map().epoch, 1, "proposed is not published");
+
+    // --- the loop carries it out: prepare to the root shard and the new one,
+    // launch, hello, the prepare again, both acks, commit, map push. Done when
+    // the root shard runs the new map with both regions at real addresses.
+    let root_map_when = |epoch: u64, regions: usize| {
+        let state = Arc::clone(&root.state);
+        async move {
+            loop {
+                {
+                    let shard = state.lock().await;
+                    let map = shard.shard_map();
+                    if map.epoch == epoch
+                        && map.regions.len() == regions
+                        && map.regions.iter().all(|r| r.endpoint.port() != 0)
+                    {
+                        return map.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let root_map = run_the_loop_until(
+        &mut orchestrator,
+        &server,
+        "the carve has committed (it aborts after 3 s if the new shard never acks)",
+        root_map_when(2, 2),
+    )
+    .await;
+    assert_eq!(orchestrator.map().epoch, 2, "the carve committed");
+    assert_eq!(
+        orchestrator.map(),
+        &root_map,
+        "the root shard runs the published map"
+    );
+    space_orchestrator::topology::validate(orchestrator.map()).expect("valid (H11)");
+    let carved = orchestrator
+        .map()
+        .regions
+        .iter()
+        .find(|r| r.shard == child)
+        .expect("the cell's region is published")
+        .clone();
+    assert_eq!(
+        carved.node, cell,
+        "one cell, twenty-four levels below the root"
+    );
+    assert_eq!(root_map.lookup(&inside), Some(child));
+    assert_eq!(
+        root_map.lookup(&root_node.center()),
+        Some(shard(1)),
+        "the cell the spawn point lies in is still the root shard's"
+    );
+    assert!(orchestrator.take_pending_kill().is_empty());
+
+    // The cell's shard is alive, serves at the published address and follows
+    // the committed map.
+    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Alive);
+    let client = space_net::client_endpoint().expect("client endpoint");
+    let mut child_map = None;
+    for _ in 0..100 {
+        let (conn, welcome) = space_net::connect(
+            &client,
+            carved.endpoint,
+            space_server::net::SERVER_NAME,
+            &space_net::hello("after-the-carve"),
+        )
+        .await
+        .expect("the cell's shard answers at the address the map names");
+        assert_eq!(welcome.shard, child);
+        conn.close(0, "probe");
+        if welcome.shard_map.epoch == 2 {
+            child_map = Some(welcome.shard_map);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let child_map = child_map.expect("the cell's shard installs the committed map");
+    assert_eq!(child_map.lookup(&inside), Some(child));
+    assert_eq!(child_map.lookup(&root_node.center()), Some(shard(1)));
+
+    // --- merge it back. Not before the minimum interval between two commits
+    // has passed, and not before the shard is known to be empty: no shard
+    // sends load reports yet, so the test says so on its behalf.
+    let empty = LoadReport {
+        shard: child,
+        players: 0,
+        tick_p95_ms: 1.0,
+        load: 0.0,
+    };
+    let mut refusal = Some(String::new());
+    for _ in 0..40 {
+        orchestrator.handle_load_report(&empty);
+        refusal = orchestrator.merge_refusal(child);
+        if refusal.is_none() {
+            break;
+        }
+        run_the_loop_until(
+            &mut orchestrator,
+            &server,
+            "some time has passed",
+            tokio::time::sleep(Duration::from_millis(300)),
+        )
+        .await;
+    }
+    assert_eq!(refusal, None, "an empty carved cell can be merged");
+    let reply = orchestrator.handle_operator(&OperatorCommand::Merge {
+        shard: child,
+        expected_epoch: Some(2),
+    });
+    assert!(reply.accepted, "{reply:?}");
+    assert_eq!(orchestrator.pending_merge(), Some(child));
+    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Alive);
+
+    // The loop carries it out: prepare to both shards, acks, commit, push, and
+    // only then the kill. Done when the root shard runs the map without the
+    // cell and the launcher has stopped the cell's shard.
+    let stopped = {
+        let launcher = Arc::clone(&launcher);
+        let merged = root_map_when(3, 1);
+        async move {
+            let map = merged.await;
+            while launcher.poll(child).await.expect("poll") != Poll::Dead {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            map
+        }
+    };
+    let root_map = run_the_loop_until(
+        &mut orchestrator,
+        &server,
+        "the merge has committed and the cell's shard is stopped",
+        stopped,
+    )
+    .await;
+    assert_eq!(orchestrator.map().epoch, 3, "the merge committed");
+    assert_eq!(orchestrator.map(), &root_map);
+    assert_eq!(
+        orchestrator.map().regions.len(),
+        1,
+        "the cell's region is gone"
+    );
+    assert_eq!(
+        root_map.lookup(&inside),
+        Some(shard(1)),
+        "the cell fell back to the root's owner"
+    );
+    assert_eq!(orchestrator.pending_merge(), None);
+    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Dead);
+
+    root.abort();
     server.close();
 }
 

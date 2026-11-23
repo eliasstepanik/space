@@ -14,7 +14,10 @@
 //!   binaries (the Kestrel's collider, read from its GLB by [`glb`], and the
 //!   showcase's bowl);
 //! * the **scene anchor** ([`scene_anchor`]) — where in the world a scene
-//!   is.
+//!   is: in the middle of a cell layer of the map's root region, a few metres
+//!   off the corner where its cells meet ([`ANCHOR_OFFSET`]), so that no
+//!   horizontal shard border comes near it and the vertical ones cut it into
+//!   four shard areas beside the spawn point, not through it.
 //!
 //! Everything is given **relative to the scene anchor** (scene space: the
 //! anchor is the spawn point, +Y up, a fresh player looks down -Z — the same
@@ -60,7 +63,7 @@ use space_sim::rigid::{PhysicsError, StaticCollider};
 use space_sim::shape::{AssetId, MeshGeometry, ShapeCatalog, ShapeRef};
 use space_sim::spring::{Spring, SpringTarget, Springs};
 use space_sim::{BodySpawn, ShipState, SimWorld};
-use space_world::WorldPos;
+use space_world::{NodeRef, WorldPos};
 
 /// Catalogue id of the Kestrel's collider (its LOD1 exterior mesh).
 pub const KESTREL: AssetId = AssetId(1);
@@ -231,19 +234,67 @@ pub enum GravityDef {
     },
 }
 
-/// Where a scene lies in the world of `map`: the centre of the map's
-/// **shallowest** region, ties broken by the lowest shard id, then the lowest
-/// node index. `None` for a map without regions.
+/// Where a scene's spawn point lies from the **centre corner** of a root
+/// region of more than one cell, metres: 6 m along +X, half a cell (512 m)
+/// up, 4 m along +Z ([`anchor_in`]).
 ///
-/// This is the rule `space-client`'s `link::map_anchor` implements (splits
+/// The centre of a node of two or more cells is the corner where its eight
+/// child octants — and eight cells — meet, and a cell is the smallest shard
+/// area there is. A scene placed *on* that corner (the rule until the demo
+/// area was cut into four shard areas) has a possible shard border on each
+/// of the three planes through its spawn point: `x = 0`, `z = 0`, and — worst
+/// — `y = 0`, eye height, a horizontal border under everything that floats
+/// and over everything that stands. The offset moves the scene to where
+/// borders do the least harm:
+///
+/// * **512 m up**: the scene's height 0 is the middle of a cell layer, so no
+///   horizontal border lies within 512 m of it. Nothing in a scene the size
+///   of the demo area ever crosses one;
+/// * **6 m and 4 m sideways**: the two vertical border planes pass through
+///   the scene at `x = −6` and `z = −4` instead of through the spawn point.
+///   The spawn point is strictly inside one cell (with `k` the corner's cell
+///   index: `[k, k, k]`), and the four cells that meet at the line
+///   `x = −6, z = −4` are that one, `[k, k, k−1]` (z < −4), `[k−1, k, k]`
+///   (x < −6) and `[k−1, k, k−1]`: the four shard areas of a scene, each with
+///   a piece of it.
+///
+/// All three are whole metres, so the anchor is exact in a position's `f32`
+/// cell offset.
+pub const ANCHOR_OFFSET: [f64; 3] = [6.0, 512.0, 4.0];
+
+/// Where a scene's spawn point lies in a root region `node`.
+///
+/// * A root of **one cell** (depth 64 — a standalone shard, the test
+///   convention): the cell's centre. Its borders are the cell's faces, 512 m
+///   away on every axis; there is nothing to stay clear of.
+/// * A root of **more than one cell**: its centre corner plus
+///   [`ANCHOR_OFFSET`] — see there for why not the corner itself.
+#[must_use]
+pub fn anchor_in(node: NodeRef) -> WorldPos {
+    let centre = node.center();
+    if node.depth >= space_world::MAX_DEPTH {
+        centre
+    } else {
+        WorldPos::from_f64_metres_around(centre, ANCHOR_OFFSET)
+    }
+}
+
+/// Where a scene lies in the world of `map` — its **anchor**, the scene's
+/// spawn point: [`anchor_in`] the map's **shallowest** region (the root),
+/// ties broken by the lowest shard id, then the lowest node index. `None` for
+/// a map without regions.
+///
+/// Shards place their scene's statics and bodies by this point and
+/// `space-client` draws by it (`link::map_anchor` is this function), so what
+/// a shard simulates and what a client draws are in the same place. Carves
 /// only add deeper regions and merges only remove them, so the root and with
-/// it this point never move); the client calls this function from phase 3 on.
+/// it this point never move while a cluster lives.
 #[must_use]
 pub fn scene_anchor(map: &ShardMap) -> Option<WorldPos> {
     map.regions
         .iter()
         .min_by_key(|region| (region.node.depth, region.shard.0, region.node.index))
-        .map(|region| region.node.center())
+        .map(|region| anchor_in(region.node))
 }
 
 /// The concave bowl of the showcase: the inside of a sphere cap of radius

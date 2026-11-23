@@ -2059,6 +2059,89 @@ mod tests {
         assert!(page.contains("one change at a time"));
     }
 
+    /// A region carved more than one level down — one cell under the
+    /// depth-40 root — is listed under the region around it, the page and the
+    /// JSON say what it would be merged into, and the page's merge button
+    /// carries the merge out.
+    ///
+    /// Mutation this catches: taking "the region around it" to be the parent
+    /// *node* (the cell would be listed as a top-level region with no merge
+    /// button, and its merge refused for want of a parent).
+    #[tokio::test]
+    async fn a_carved_cell_is_listed_under_its_region_and_merged_from_the_page() {
+        let mut orch = orchestrator("space-test");
+        let root = orch.config().root_node();
+        let k = root.center().cell;
+        let cell = space_world::NodeRef::new(64, [k[0] - 1, k[1], k[2]]);
+        let started = orch.begin_carve(cell).expect("the cell is inside the root");
+        assert_eq!(started.shard, ShardId::new(2));
+        for shard in [ShardId::new(1), started.shard] {
+            orch.handle_epoch_ack(shard, started.epoch);
+        }
+        assert_eq!(orch.map().epoch, 2, "the carve committed");
+        for _ in 0..crate::config::MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        // The cell's shard says it is empty.
+        orch.handle_load_report(&LoadReport {
+            shard: started.shard,
+            players: 0,
+            tick_p95_ms: 1.0,
+            load: 0.0,
+        });
+        let path = crate::snapshot::node_path(cell);
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        run_loop(orch, port, ShardAnswers::Promptly);
+        let service = service_with(handle, None, &[]);
+
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        let entry = json
+            .split("{\"node\":")
+            .find(|region| region.starts_with(&format!("{{\"path\":\"{path}\"")))
+            .unwrap_or_else(|| panic!("the cell is not among the regions of {json}"));
+        for needle in [
+            "\"depth\":64",
+            "\"shard\":2",
+            // Nested in the root, whose node is its enclosing region although
+            // it is 24 levels up; it is nobody's octant.
+            "\"nesting\":1,\"parent\":\"40:0:0:0\",\"octant\":null,\"free_octants\":[]",
+            "\"split_refused_because\":\"region at depth 64 (edge 1024 m) is below the split floor\"",
+            "\"merge_refused_because\":null",
+        ] {
+            assert!(entry.contains(needle), "missing {needle} in {entry}");
+        }
+
+        let page = text(&service.handle(&get("/")).await);
+        assert!(page.contains(&path), "the cell has a row");
+        assert!(
+            page.contains(": carved out of 40:0:0:0, 24 levels up"),
+            "the row says where the cell was carved from"
+        );
+        // One region can be merged — the cell — and its button is live.
+        assert_eq!(page.matches("action=\"action/merge\"").count(), 1);
+        assert!(
+            page.contains("<button title=\"Give this region back")
+                && page.contains(">merge into shard 1</button>"),
+            "an enabled merge button naming the root's owner"
+        );
+
+        let body = format!("csrf={}&epoch=2&shard=2", service.form_token);
+        let response = service.handle(&post("/action/merge", &body)).await;
+        assert_eq!(response.status, 303, "{}", text(&response));
+        assert_eq!(response.header("x-space-result"), Some("accepted"));
+        assert!(
+            text(&response).starts_with(&format!(
+                "accepted: epoch 3 proposed, region {path} goes back to shard 1"
+            )),
+            "{}",
+            text(&response)
+        );
+        let page = follow(&service, &response).await;
+        assert!(page.contains("Epoch change in flight"));
+        assert!(page.contains("merge of shard 2"));
+    }
+
     /// Mutation this catches: trusting the browser's credentials alone. A page
     /// on another site can make the operator's browser post here.
     #[tokio::test]

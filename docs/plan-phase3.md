@@ -204,6 +204,15 @@ impl PersistentShardIdAllocator {
 
 ### 3.2 Topology and split geometry (`topology.rs`, pure)
 
+> **Changed since (`docs/plan-sharding.md` §1).** A region may now be carved
+> out of any enclosing region at any depth down to one cell
+> (`topology::carve_plan`; the octant split below is the special case and
+> keeps its size floor), so `SPLIT_MAX_DEPTH` and the ceiling it stood for
+> are gone: `validate` accepts every node `validate_node` does, depth 64
+> included. A merge gives a region back to the **nearest enclosing** region's
+> owner, which need not be its parent node, and §3.3's recipient rule is now
+> "every shard of the published map, plus every owner the change names".
+
 Geometry arithmetic first, because it is easy to get wrong:
 `NodeRef::size_m(d) = CELL_SIZE × 2^(64−d)` with `CELL_SIZE = 1024 m`, so
 `size_m(64) = 1024 m` (one cell), `size_m(54) = 1 048 576 m = 1024 km`,

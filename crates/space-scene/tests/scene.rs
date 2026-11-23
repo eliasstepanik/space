@@ -26,19 +26,26 @@ fn region(depth: u8, index: [i64; 3], shard: u32) -> ShardRegion {
     ShardRegion::new(NodeRef::new(depth, index), ShardId(shard), addr)
 }
 
-/// The anchor is the centre of the shallowest region (ties: lowest shard,
-/// then node index) — `space-client`'s `link::map_anchor`, on the same maps
-/// its own test uses.
+/// The anchor is a point of the shallowest region (ties: lowest shard, then
+/// node index) — `space-client`'s `link::map_anchor`, on the same maps its
+/// own test uses.
 #[test]
 fn the_anchor_rule_is_the_clients() {
     let root = region(0, [0, 0, 0], 1);
-    let centre = root.node.center();
+    // The whole cell space: its centre corner is the lower corner of cell 0,
+    // and the anchor 6 m, 512 m and 4 m from it.
+    let off_the_corner = WorldPos {
+        cell: [0; 3],
+        local: [-506.0, 0.0, -508.0],
+    };
     let single = ShardMap::new(1, vec![root]);
-    assert_eq!(space_scene::scene_anchor(&single), Some(centre));
+    assert_eq!(space_scene::scene_anchor(&single), Some(off_the_corner));
     for map in [
         single,
         ShardMap::new(2, vec![region(1, [0, 0, 0], 2), region(1, [-1, 0, 0], 3)]),
         ShardMap::new(3, vec![region(63, [5, 0, 0], 7), region(63, [0, 0, 0], 4)]),
+        ShardMap::new(4, vec![region(64, [5, 0, 0], 7), region(64, [0, 0, 0], 4)]),
+        ShardMap::new(5, vec![region(64, [1, 1, 1], 2), region(63, [0, 0, 0], 4)]),
     ] {
         assert_eq!(
             space_scene::scene_anchor(&map),
@@ -50,6 +57,120 @@ fn the_anchor_rule_is_the_clients() {
         space_scene::scene_anchor(&ShardMap::new(1, Vec::new())),
         None
     );
+}
+
+/// Where the anchor lies in the root (`docs/plan-sharding.md` §1):
+///
+/// * a root of one cell (depth 64): the cell's centre;
+/// * any larger root: its centre corner plus (6 m, 512 m, 4 m). With `k` the
+///   corner's cell index the spawn point is strictly inside cell `[k,k,k]`,
+///   no horizontal border lies within 512 m of the scene, the vertical ones
+///   pass at scene x = −6 and z = −4, and the four cells that meet on that
+///   line are `[k,k,k]`, `[k,k,k−1]`, `[k−1,k,k]` and `[k−1,k,k−1]`.
+///
+/// Mutations this catches: the old rule (the corner itself: borders through
+/// the spawn point on all three planes, one of them at eye height); an
+/// offset applied to a one-cell root too (a standalone shard's scene would
+/// move off its cell centre and 6 m from nothing).
+#[test]
+fn the_anchor_lies_beside_and_above_the_corner_where_the_roots_cells_meet() {
+    assert_eq!(space_scene::ANCHOR_OFFSET, [6.0, 512.0, 4.0]);
+    // One cell: its centre, wherever the cell is.
+    for cell in [[0i64, 0, 0], [1, 1, 1], [-7, 3, 9_765_625_000]] {
+        let node = NodeRef::new(64, cell);
+        let anchor = space_scene::anchor_in(node);
+        assert_eq!((anchor.cell, anchor.local), (cell, [0.0; 3]));
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(1, vec![region(64, cell, 1)])),
+            Some(anchor)
+        );
+    }
+    // More than one cell: off the centre corner, at every size from two
+    // cells to the whole cell space, on both sides of the origin.
+    for node in [
+        NodeRef::new(63, [0, 0, 0]),
+        NodeRef::new(63, [-1, 4, -9]),
+        NodeRef::new(40, [0, 0, 0]),
+        NodeRef::new(40, [3, -2, 5]),
+        NodeRef::new(1, [-1, 0, -1]),
+        NodeRef::ROOT,
+    ] {
+        let corner = node.center();
+        assert_eq!(
+            corner.local, [-512.0; 3],
+            "{node:?}: the corner of eight cells"
+        );
+        let k = corner.cell;
+        let anchor = space_scene::anchor_in(node);
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(1, vec![region(node.depth, node.index, 1)])),
+            Some(anchor),
+            "{node:?}"
+        );
+        assert_eq!(
+            WorldPos::delta(corner, anchor),
+            [6.0, 512.0, 4.0],
+            "{node:?}"
+        );
+        // Exact: whole metres in the cell's own frame.
+        assert_eq!((anchor.cell, anchor.local), (k, [-506.0, 0.0, -508.0]));
+        assert!(space_world::octree::contains(node, anchor));
+        // The cell of a point `d` metres from the spawn point.
+        let cell_at = |d: [f64; 3]| WorldPos::from_f64_metres_around(anchor, d).cell;
+        // The four cells that meet on the line x = -6, z = -4, at every
+        // height of the scene's cell layer.
+        for y in [-511.9, -100.0, 0.0, 100.0, 511.9] {
+            assert_eq!(cell_at([0.0, y, 0.0]), k, "the spawn point's cell");
+            assert_eq!(cell_at([-5.99, y, -3.99]), k);
+            assert_eq!(cell_at([-5.99, y, -4.01]), [k[0], k[1], k[2] - 1]);
+            assert_eq!(cell_at([-6.01, y, -3.99]), [k[0] - 1, k[1], k[2]]);
+            assert_eq!(cell_at([-6.01, y, -4.01]), [k[0] - 1, k[1], k[2] - 1]);
+            // A border belongs to the cell above it.
+            assert_eq!(cell_at([-6.0, y, -4.0]), k);
+        }
+        // No other vertical border for a kilometre: the cell reaches 1018 m
+        // along +x and 1020 m along +z.
+        assert_eq!(cell_at([1017.9, 0.0, 1019.9]), k);
+        assert_eq!(cell_at([1018.0, 0.0, 0.0]), [k[0] + 1, k[1], k[2]]);
+        assert_eq!(cell_at([0.0, 0.0, 1020.0]), [k[0], k[1], k[2] + 1]);
+        // The horizontal borders are half a cell away, above and below.
+        assert_eq!(cell_at([0.0, -512.0, 0.0]), k);
+        assert_eq!(cell_at([0.0, -512.01, 0.0]), [k[0], k[1] - 1, k[2]]);
+        assert_eq!(cell_at([0.0, 512.0, 0.0]), [k[0], k[1] + 1, k[2]]);
+    }
+    // The root decides, whoever owns the cell the anchor lies in and
+    // whatever was carved out around it.
+    let root = NodeRef::new(40, [0, 0, 0]);
+    let k = root.center().cell[0];
+    let anchor = space_scene::anchor_in(root);
+    for regions in [
+        vec![region(40, [0, 0, 0], 1), region(64, [k, k, k], 2)],
+        vec![
+            region(64, [k, k, k - 1], 2),
+            region(64, [k - 1, k, k], 3),
+            region(40, [0, 0, 0], 9),
+            region(64, [k - 1, k, k - 1], 4),
+            region(41, [1, 1, 1], 5),
+        ],
+    ] {
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(7, regions)),
+            Some(anchor)
+        );
+    }
+    // Nothing of the demo area comes near a horizontal border: every static
+    // and body is placed well inside the 512 m to the cell layer's floor and
+    // ceiling.
+    let heights = space_scene::statics(Scene::DemoArea)
+        .iter()
+        .map(|s| s.offset[1])
+        .chain(
+            space_scene::body_defs(Scene::DemoArea)
+                .iter()
+                .map(|b| b.offset[1]),
+        )
+        .fold((f64::MAX, f64::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+    assert!(heights.0 > -400.0 && heights.1 < 400.0, "{heights:?}");
 }
 
 /// The Kestrel's collider is the LOD1 GLB: 11,585 triangles, its bounds those

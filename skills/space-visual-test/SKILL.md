@@ -172,6 +172,11 @@ orchestrator that was restarted: restart the shards after the orchestrator.
 
 The page also splits and merges regions, pauses the autoscaler and shows which
 shards have confirmed the scene. Actions are rate-limited (429 when hurried).
+A split carves one octant of a region for a newly launched shard; a region
+carved more than one level down (a single cell under the root) is listed under
+the region around it as "carved out of ...", and its merge button gives it
+back to that region's owner. Every shard of the map must acknowledge a map
+change within 3 s, or it is rolled back.
 
 ## 4. What to look at
 
@@ -209,15 +214,26 @@ Check what your change touches, and one step either side of it.
   was. Players and bodies within 64 m (plus 3 s of their motion) of a border
   are seen from both sides (the neighbour's *ghosts*); further apart a
   client sees its own shard's only.
-- **Physics across a border:** run the two shards so the border cuts the
+- **Where the borders are:** a shard area is at least one cell (1024 m). In
+  `two-shards` each shard is one cell and the scene sits in the middle of
+  shard 1's, 512 m from every border. Under a root of more than one cell —
+  the orchestrator's depth-40 root, or `--region 63:…` by hand — the scene
+  sits 6 m, half a cell up and 4 m from the corner where the root's cells
+  meet: the only border planes through it are the vertical ones at HUD `pos`
+  x = -6 and z = -4, the spawn point is inside one cell, and no border is
+  horizontal within 512 m (nothing ever falls or floats across one).
+- **Physics across a border:** run two shards so that a border cuts the
   showcase: `space-server --shard 1 --region 63:0:0:0 --peer
-  2:127.0.0.1:<p2>:64:1:0:1 --scene demo-area` and `space-server --shard 2
-  --region 64:1:0:1 --peer 1:127.0.0.1:<p1>:63:0:0:0 --scene demo-area`
-  (shard 2 owns the gravity room's floor at z > 0), connect to shard 1, walk
-  into the room and back out over z = 0. The bodies near the player move
-  with it as one group (each shard logs `... N bodies, M ghosts; handoffs
-  ...` every 5 s when it changes); nothing may jump, sink or stay on the
-  move once the player has gone.
+  2:127.0.0.1:<p2>:64:1:1:0 --scene demo-area` and `space-server --shard 2
+  --region 64:1:1:0 --peer 1:127.0.0.1:<p1>:63:0:0:0 --scene demo-area`
+  (shard 2 owns what lies at z < -4 with x > -6: the bowl end of the gravity
+  room; `64:0:1:1` instead is x < -6, the zero-g corner). Connect to shard 1
+  — you arrive on the spawn point, `pos 0.0 0.0 0.0` — walk into the room
+  and on past the crate stack towards the bowl, over z = -4 (the HUD goes
+  to `shard 2  handoffs 1`), and back. The bodies near the player move with
+  it as one group (each shard logs `... N bodies, M ghosts; handoffs ...`
+  every 5 s when it changes); nothing may jump, sink or stay on the move
+  once the player has gone.
 - **In every frame:** nothing black that should be lit, nothing inside-out,
   no z-fighting, sane exposure, the HUD values plausible (`fps`, `shard`,
   `scene`, `speed`).

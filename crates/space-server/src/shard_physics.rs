@@ -373,20 +373,34 @@ impl Shard {
 
     // ---------------------------------------------------------- spawn points
 
-    /// Where a joining player's ship starts: the scene's spawn point (its
-    /// anchor) if this shard owns it, else the centre of this shard's region
-    /// — or, where a ship, body or static is in the way, the nearest free
-    /// point of a grid around it ([`SPAWN_SPACING`] apart, [`SPAWN_RINGS`]
-    /// rings out, nearest first, then by bearing: deterministic). The base
-    /// point itself if none is free.
+    /// Where a joining player's ship starts: the scene's spawn point — the
+    /// map's anchor, [`space_scene::scene_anchor`] — if this shard owns it,
+    /// else the centre of this shard's region; or, where a ship, body or
+    /// static is in the way, the nearest free point of a grid around it
+    /// ([`SPAWN_SPACING`] apart, [`SPAWN_RINGS`] rings out, nearest first,
+    /// then by bearing: deterministic). The base point itself if none is
+    /// free.
+    ///
+    /// **Around the spawn point, only points of this shard's own territory
+    /// are handed out.** The grid reaches 15 m and the borders of the cell
+    /// the spawn point lies in pass 6 m and 4 m from it
+    /// ([`space_scene::ANCHOR_OFFSET`]): once the cells beside it belong to
+    /// other shards, a busy spawn would otherwise put a new ship on a
+    /// neighbour's ground — a player whose first second is a handoff. A point
+    /// across a border is skipped like an occupied one. (A shard that does not
+    /// own the spawn point and falls back to its region's centre is not held
+    /// to this: that centre may itself be another shard's, in which case the
+    /// ship is that shard's from its first tick and the ordinary handoff takes
+    /// it there.)
+    ///
+    /// The spawn point is a function of the map, not of the scene: a shard
+    /// nobody gave a scene puts its players on the same point its clients
+    /// measure from.
     #[must_use]
     pub fn free_spawn_point(&self) -> WorldPos {
-        let base = match self.installed {
-            Some((_, anchor)) if self.shard_map.lookup(&anchor) == Some(self.config.shard) => {
-                anchor
-            }
-            _ => self.config.region.center(),
-        };
+        let own = |pos: &WorldPos| self.shard_map.lookup(pos) == Some(self.config.shard);
+        let spawn = space_scene::scene_anchor(&self.shard_map).filter(|anchor| own(anchor));
+        let base = spawn.unwrap_or_else(|| self.config.region.center());
         let body = Body::ship(&self.sim.params());
         for (i, j) in spawn_grid() {
             let pos = WorldPos::from_f64_metres_around(
@@ -397,6 +411,9 @@ impl Shard {
                     f64::from(j) * SPAWN_SPACING,
                 ],
             );
+            if spawn.is_some() && !own(&pos) {
+                continue; // across a border: a neighbour's ground
+            }
             let blocked = self
                 .sim
                 .overlaps(&body, &ShipState::at_rest(pos), SPAWN_CLEARANCE)
