@@ -32,8 +32,22 @@
 //! map its shard sent, so everybody sees the scene in the same place: one
 //! world, whichever shard a player joined through. A ship's position is its
 //! pilot's eye point; the placeholder character stands [`EYE_HEIGHT`] below
-//! it. A ship a session owns is drawn as that character, a ship nobody owns
-//! as the ship model.
+//! it. A player's ship — one a session owns, or one the shard marks with the
+//! player visual (a player on a neighbouring shard, seen as its ghost) — is
+//! drawn as that character, a ship nobody flies as the ship model.
+//!
+//! # Moving things, smoothly
+//!
+//! The shard steps at 30 Hz; frames are drawn at whatever the display does.
+//! Everything that moves is drawn by one clock ([`crate::predict::Clock`]):
+//! the physics bodies ([`crate::bodies`]) and the other players a couple of
+//! ticks in the past, interpolated between the states the shard sent; the
+//! player's own ship a few ticks in the future, predicted through the scene's
+//! physics from the shard's last word and the inputs it has not seen yet
+//! ([`crate::predict::OwnShip`]). The camera follows the predicted ship, the
+//! brake assist brakes against its predicted velocity, and the HUD says what
+//! the prediction knows of the ship's surroundings: the gravity where it is
+//! and whether it stands on something.
 //!
 //! # Staying connected without a person
 //!
@@ -64,7 +78,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use space_harness::{ClientState, Command, Frame, Hub, Screen};
+use space_harness::{BodyState, ClientState, Command, Frame, Hub, Screen};
 use space_protocol::{EntityGuid, SceneState};
 use space_render::{
     rotation_y, CameraPose, MeshData, MeshError, ModelInstance, QualityPreset, RenderOptions, Scene,
@@ -75,11 +89,17 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::address::{dial, ServerAddress, DEFAULT_ADDRESS};
+use crate::bodies::{pose_at, BodyRenderer, Drawn, INTERPOLATION_DELAY};
 use crate::connect::Prompt;
 use crate::input::{CameraMode, Controls, Request, ScreenKind, KEY_HELP};
+use crate::kestrel::Detail;
 use crate::link::{OtherShip, Replica, ServerLink};
+use crate::predict::{Clock, OwnShip, Shown};
 use crate::scenes::{character_mesh, metres, relative, ship_mesh, Prop, World, EYE_HEIGHT};
 use crate::ui::{self, ConnectView, HudView, Status};
+
+/// The most bodies [`ClientState::bodies`] lists (the nearest ones).
+pub const MAX_LISTED_BODIES: usize = 64;
 
 /// The longest a connection attempt may take, name lookup included, before
 /// the connect screen is back with an error.
@@ -228,6 +248,50 @@ struct Session {
     label: String,
     /// The replicated view as of this frame.
     replica: Replica,
+    /// The estimate of the shard's tick everything is drawn by.
+    clock: Clock,
+    /// The own ship, predicted.
+    own: Option<OwnShip>,
+    /// The own ship as drawn this frame.
+    shown: Option<Shown>,
+}
+
+impl Session {
+    /// The frame's bookkeeping: the clock, and the own ship's prediction
+    /// (rebuilt for a new ship, shard, scene or anchor).
+    fn advance(&mut self, scene: space_protocol::Scene, now: Instant) {
+        self.clock.update(&self.replica, now);
+        let sent = self.link.take_sent();
+        let stale = self
+            .own
+            .as_ref()
+            .is_none_or(|own| !own.is_for(&self.replica, scene));
+        if stale {
+            match OwnShip::new(&self.replica, scene) {
+                Some(mut fresh) => {
+                    if let Some(old) = &self.own {
+                        fresh.inherit(old, self.shown.map(|s| s.state.pos), now);
+                    }
+                    self.own = Some(fresh);
+                }
+                None => self.own = None,
+            }
+        }
+        self.shown = match (self.own.as_mut(), self.clock.now()) {
+            (Some(own), Some(tick)) => {
+                let at = OwnShip::draw_tick(tick);
+                own.update(&self.replica, &sent, at, now);
+                Some(own.shown(at, now))
+            }
+            _ => None,
+        };
+    }
+
+    /// The own ship's state as drawn: predicted, or the shard's word until
+    /// there is a prediction.
+    fn ship(&self) -> Option<space_sim::ShipState> {
+        self.shown.map(|s| s.state).or(self.replica.state)
+    }
 }
 
 enum Net {
@@ -315,12 +379,19 @@ pub struct App {
     retry_at: Option<Instant>,
     /// Esc on the connect screen ends the client ([`AppConfig::escape_quits`]).
     escape_quits: bool,
+    /// What draws the frames ([`App::set_render_device`]): every world is
+    /// built for it.
+    detail: Detail,
     quit: bool,
     /// Frames finished so far: the number of the last one.
     frame: u64,
     fps: FpsMeter,
     scene: Scene,
     base: Option<Base>,
+    /// Draws the physics bodies (and keeps their meshes).
+    bodies: BodyRenderer,
+    /// The bodies the last frame drew.
+    drawn_bodies: Vec<Drawn>,
 }
 
 impl std::fmt::Debug for App {
@@ -356,11 +427,14 @@ impl App {
             failures: 0,
             retry_at: None,
             escape_quits: config.escape_quits,
+            detail: Detail::default(),
             quit: false,
             frame: 0,
             fps: FpsMeter::new(),
             scene: Scene::from_instances(CameraPose::default(), Vec::new()),
             base: None,
+            bodies: BodyRenderer::new(),
+            drawn_bodies: Vec::new(),
         };
         if config.server.is_some() {
             app.connect();
@@ -385,6 +459,22 @@ impl App {
     #[must_use]
     pub fn world(&self) -> &World {
         &self.world
+    }
+
+    /// Tell the app what draws its frames, by the device's name
+    /// (`RenderContext::device_name`): a front end calls this once it has
+    /// its render context. On a software rasteriser the worlds are built
+    /// with less detail in the distance ([`Detail`]).
+    pub fn set_render_device(&mut self, name: &str) {
+        let detail = Detail::for_device(name);
+        if detail != self.detail {
+            log::info!(
+                "space-client: {name} is a software rasteriser: less detail in the distance"
+            );
+        }
+        self.detail = detail;
+        self.world = self.world.with_detail(detail);
+        self.base = None;
     }
 
     /// The replicated view of the shard being played on, as of the last
@@ -551,6 +641,8 @@ impl App {
         self.controls.view.release_keys();
         self.headings.clear();
         self.base = None;
+        self.bodies.forget();
+        self.drawn_bodies.clear();
         match error {
             Some(error) => {
                 log::warn!("space-client: {error}");
@@ -581,16 +673,21 @@ impl App {
             link,
             label,
             replica,
+            clock: Clock::new(),
+            own: None,
+            shown: None,
         }));
     }
 
     /// Draw `scene` from now on, looking the way a newcomer to it looks.
     fn set_world(&mut self, scene: space_protocol::Scene) {
-        self.world = World::new(scene);
+        self.world = World::new(scene).with_detail(self.detail);
         let (yaw, pitch) = self.world.initial_view();
         self.controls.view.yaw = yaw;
         self.controls.view.pitch = pitch;
         self.base = None;
+        // The old scene's bodies are not held over into the new one.
+        self.bodies.forget();
     }
 
     /// Once per frame, before the scene is built: apply the harness's
@@ -642,10 +739,12 @@ impl App {
                 Event::Failed(format!("lost the connection to {}", session.label))
             }
             Net::Online(session) => {
-                // The server is authoritative: show its answer, send intent
-                // (the held keys, or the brake assist's answer to the speed).
+                // The server is authoritative: take its answer, run the own
+                // ship ahead of it, send intent (the held keys, or the brake
+                // assist's answer to the predicted speed).
                 session.replica = session.link.replica();
-                let velocity = session.replica.state.map(|ship| ship.vel);
+                session.advance(self.world.scene(), Instant::now());
+                let velocity = session.ship().map(|ship| ship.vel);
                 session.link.set_thrust(self.controls.thrust(velocity));
                 Event::Scene(session.replica.scene)
             }
@@ -762,19 +861,20 @@ impl App {
         Some(WorldPos::delta(anchor, ship.pos))
     }
 
-    /// Where the player's eye point is in the scene: the ship's place, or the
-    /// spawn point until the shard has shown the ship.
-    fn eye(&self, replica: &Replica) -> WorldPos {
+    /// Where the player's eye point is in the scene: the ship's place as
+    /// drawn (predicted), or the spawn point until the shard has shown the
+    /// ship.
+    fn eye(&self, session: &Session) -> WorldPos {
         let spawn = self.world.spawn();
-        replica
-            .state
-            .map_or(spawn, |ship| scene_place(spawn, replica.anchor(), ship.pos))
+        session.ship().map_or(spawn, |ship| {
+            scene_place(spawn, session.replica.anchor(), ship.pos)
+        })
     }
 
     /// The camera for this frame, and whether the player's own character is
     /// in the picture.
-    fn camera(&self, replica: &Replica, aspect: f32) -> (CameraPose, WorldPos, bool) {
-        let eye = self.eye(replica);
+    fn camera(&self, session: &Session, aspect: f32) -> (CameraPose, WorldPos, bool) {
+        let eye = self.eye(session);
         let forward = self.controls.view.forward();
         let position = match self.controls.camera {
             CameraMode::FirstPerson => eye,
@@ -804,7 +904,7 @@ impl App {
             return;
         };
         let replica = &session.replica;
-        let (camera, eye, show_self) = self.camera(replica, aspect);
+        let (camera, eye, show_self) = self.camera(session, aspect);
         let key = BaseKey {
             scene: self.world.scene(),
             position: camera.position,
@@ -845,14 +945,22 @@ impl App {
             });
         }
         // Everybody else: where they are relative to the map's anchor is
-        // where they are relative to the scene's spawn point.
+        // where they are relative to the scene's spawn point, a moment ago
+        // (interpolated between the shard's ticks).
         let (spawn, anchor) = (self.world.spawn(), replica.anchor());
+        let behind = session.clock.now().map(|t| t - INTERPOLATION_DELAY);
         let mut headings = std::mem::take(&mut self.headings);
         let mut seen: Vec<EntityGuid> = Vec::new();
-        for other in replica.others() {
-            let place = scene_place(spawn, anchor, other.state.pos);
+        for tracked in replica.other_ships() {
+            let other = &tracked.ship;
+            let pos = behind
+                .and_then(|t| pose_at(&tracked.history, t))
+                .map_or(other.state.pos, |poses| poses[0].pos);
+            let place = scene_place(spawn, anchor, pos);
             seen.push(other.guid);
-            if other.owner == 0 {
+            // A player (here or, as a ghost, on a neighbouring shard) is a
+            // character; a ship nobody flies is the ship model.
+            if !tracked.is_player() {
                 self.scene.models.push(ModelInstance {
                     mesh: ship_mesh(),
                     position: relative(&camera, place),
@@ -870,6 +978,11 @@ impl App {
         }
         headings.retain(|(guid, _)| seen.contains(guid));
         self.headings = headings;
+        // The physics bodies, at the same moment.
+        let t = behind.unwrap_or(replica.tick as f64);
+        self.drawn_bodies = self
+            .bodies
+            .draw(replica, t, spawn, Instant::now(), &mut self.scene);
     }
 
     fn hud_lines(&self) -> Vec<String> {
@@ -882,7 +995,7 @@ impl App {
         let shard = replica
             .shard
             .map_or_else(|| "?".to_owned(), |shard| shard.0.to_string());
-        let players = 1 + replica.others().filter(|ship| ship.owner != 0).count();
+        let players = 1 + replica.other_ships().filter(|t| t.is_player()).count();
         let mut lines = vec![
             format!("{fps:.0} fps  {ms:.1} ms"),
             format!(
@@ -907,11 +1020,57 @@ impl App {
             }
             _ => lines.push("waiting for the ship...".to_owned()),
         }
-        let eye = self.eye(replica);
+        if let Some(own) = &session.own {
+            lines.push(hud_gravity(own.gravity(), own.landed()));
+        }
+        if let Some(near) = self.nearest_body(session) {
+            lines.push(format!(
+                "bodies {}  nearest {} {:.1} m  {:.1} m/s",
+                self.drawn_bodies.len(),
+                space_scene::visual::name(near.0.visual),
+                near.1,
+                near.0.speed
+            ));
+        }
+        let eye = self.eye(session);
         if let Some(place) = self.world.whereabouts(eye) {
             lines.push(place);
         }
         lines
+    }
+
+    /// The body drawn nearest to the player's eye, and how far its root is,
+    /// metres.
+    fn nearest_body(&self, session: &Session) -> Option<(&Drawn, f64)> {
+        let eye = self.eye(session);
+        self.drawn_bodies
+            .iter()
+            .map(|b| (b, WorldPos::distance(eye, b.place)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// The bodies of the last frame as the harness lists them: nearest
+    /// first, at most [`MAX_LISTED_BODIES`].
+    fn body_states(&self, session: &Session) -> Vec<BodyState> {
+        let eye = self.eye(session);
+        let spawn = self.world.spawn();
+        let mut out: Vec<BodyState> = self
+            .drawn_bodies
+            .iter()
+            .map(|b| BodyState {
+                guid: format!("{}", b.guid),
+                visual: space_scene::visual::name(b.visual).to_owned(),
+                visual_id: b.visual,
+                position: WorldPos::delta(spawn, b.place),
+                distance: WorldPos::distance(eye, b.place),
+                speed: f64::from(b.speed),
+                parts: u32::try_from(b.parts).unwrap_or(u32::MAX),
+                in_view: b.in_view,
+            })
+            .collect();
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        out.truncate(MAX_LISTED_BODIES);
+        out
     }
 
     /// The snapshot the harness publishes for a `width` x `height` frame.
@@ -947,6 +1106,17 @@ impl App {
                 if let Some(ship) = replica.state {
                     state.set_ship(metres(ship.pos), ship.vel.map(f64::from));
                 }
+                if let Some(own) = &session.own {
+                    let g = own.gravity();
+                    state.gravity = g.iter().map(|c| c * c).sum::<f64>().sqrt();
+                    state.landed = own.landed();
+                    state.correction_m = f64::from(own.correction());
+                    state.correction_max_m = f64::from(own.corrections().0);
+                }
+                state.bodies = self.body_states(session);
+                state.bodies_in_view =
+                    u32::try_from(self.drawn_bodies.iter().filter(|b| b.in_view).count())
+                        .unwrap_or(u32::MAX);
             }
         }
         state
@@ -994,7 +1164,7 @@ impl App {
                 };
                 let place = self
                     .world
-                    .whereabouts(self.eye(replica))
+                    .whereabouts(self.eye(session))
                     .map_or_else(String::new, |place| format!(" - {place}"));
                 format!(
                     "{} on {}, shard {shard}{handoffs}{place}",
@@ -1059,6 +1229,20 @@ fn hud_motion(speed: f32, from_anchor: [f64; 3]) -> String {
     // (A value that rounds to zero is shown as 0.0, not -0.0.)
     let [x, y, z] = from_anchor.map(|v| if v.abs() < 0.05 { 0.0 } else { v });
     format!("speed {speed:.1} m/s  pos {x:.1} {y:.1} {z:.1}")
+}
+
+/// The HUD's line on the gravity at the ship and whether it stands on
+/// something.
+fn hud_gravity(gravity: [f64; 3], landed: bool) -> String {
+    let g = gravity.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if g < 0.005 {
+        "weightless".to_owned()
+    } else {
+        format!(
+            "gravity {g:.2} m/s2{}",
+            if landed { "  landed" } else { "" }
+        )
+    }
 }
 
 /// Where `position` — a place in the server's world — is in a scene whose
@@ -1631,6 +1815,19 @@ mod tests {
         );
         // No anchor yet: at the spawn point.
         assert_eq!(scene_place(spawn, None, ship), spawn);
+    }
+
+    /// The HUD says what pulls on the ship and whether it stands.
+    #[test]
+    fn the_hud_tells_gravity_and_landing() {
+        assert_eq!(hud_gravity([0.0; 3], false), "weightless");
+        assert_eq!(hud_gravity([0.0, -9.81, 0.0], false), "gravity 9.81 m/s2");
+        assert_eq!(
+            hud_gravity([0.0, -9.81, 0.0], true),
+            "gravity 9.81 m/s2  landed"
+        );
+        // A touch without a pull is not landing.
+        assert_eq!(hud_gravity([0.0, 0.0, 0.001], true), "weightless");
     }
 
     #[test]

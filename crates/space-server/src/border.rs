@@ -1,0 +1,381 @@
+//! Physics across shard borders: the rules, as pure functions of the map.
+//!
+//! A shard simulates the bodies of its region exactly ([`space_sim`]'s rigid
+//! bodies, springs, joints and gravity). What happens at a border is decided
+//! here, and every rule is a deterministic function of what *both* shards on
+//! either side can see — the shard map, the positions and the guids — so the
+//! two sides agree without asking each other.
+//!
+//! # Ghosts
+//!
+//! Every body (ships included) a shard simulates within [`GHOST_MARGIN`] plus
+//! [`GHOST_LEAD`] seconds of its own motion of a neighbour's territory is sent
+//! to that neighbour every tick it changes ([`space_protocol::GhostUpdate`]),
+//! and in full every [`GHOST_REFRESH_TICKS`]. The neighbour keeps it as a
+//! **ghost** ([`space_sim::SimWorld::insert_ghost`]): a kinematic copy its own
+//! bodies collide with, its springs pull on, and its clients see. An update
+//! is the owner's state at the end of its tick — the start of the
+//! receiver's next step, which collides against it there; after the step the
+//! ghost is moved on one tick along its velocity, so it shows the owner's
+//! state *now*, and it keeps being dead-reckoned that way for up to
+//! [`GHOST_DEAD_RECKON_TICKS`] without an update. A shard that sends nothing
+//! for [`GHOST_SILENCE_TICKS`] loses its ghosts. So a body near a border is seen
+//! from both sides, and when it crosses, the side it enters already shows it.
+//!
+//! The two ends of a spring are ghosted to each other's shard whatever the
+//! distance, so each side applies the spring's force to its own end from the
+//! other end's ghost (a delay of one or two ticks; see the spring rule below).
+//!
+//! # Islands and consolidation
+//!
+//! Two bodies simulated by two shards would collide only approximately (each
+//! sees the other as an immovable ghost). So bodies that may touch soon —
+//! an **island**: [`space_sim::SimWorld::islands`] with [`ISLAND_MARGIN`] and
+//! [`ISLAND_LEAD`] — are consolidated onto **one** shard before they meet:
+//!
+//! * Every island is given a **key**: its member with the lowest guid and that
+//!   member's [`home`]. A shard computes it over its own bodies in the island
+//!   and the ghosts touching them (the one-hop key, which it announces with
+//!   each ghost in [`space_protocol::IslandKey`]), then folds in the keys the
+//!   owners of those ghosts announced (two hops). Both shards on either side
+//!   of a border therefore arrive at the same key within a tick.
+//! * The island belongs on the key's home. A shard holding members of an
+//!   island whose home is another shard hands them to it, all in one group
+//!   (the handoff commits a group together or not at all). So contacts and
+//!   joints across a border are always solved by one solver.
+//! * While a body is in such an island it may be simulated by a shard whose
+//!   region does not contain it — the one exception to "the shard a body is
+//!   on is the one the map names". When the island dissolves, each body's own
+//!   home applies again and it returns to its region's owner.
+//!
+//! # Hysteresis
+//!
+//! Three rules keep bodies from changing shard back and forth, and none of
+//! them can keep a settled body away from its region for good:
+//!
+//! * **Distance.** A body is taken over by the region it is in once it is
+//!   [`BODY_HYSTERESIS`] inside it ([`home`]): a pendulum swinging over a
+//!   border, a crate pushed a little across one and back, do not change shard
+//!   at every swing. Ships have none (a player's ship is on the shard the map
+//!   names, as before physics), so a ship's island follows the ship.
+//! * **Settling.** A body that has been inside another shard's territory
+//!   for [`SETTLE_TICKS`] in a row is taken over too, however close to the
+//!   border it is. (A carved octant at the spawn point has a border plane at
+//!   spawn height, and the demo area's zero-g corner floats a few decimetres
+//!   above it: on distance alone those bodies would never move.)
+//! * **Holding.** Moving an island that touches another shard's ghosts is a
+//!   necessity (its contacts must be solved by one solver) and happens at
+//!   once. Moving one that touches none is a body going home after an
+//!   interaction: if any of its members was in a group within the last
+//!   [`HOLD_TICKS`], it waits until the island has wanted to go to the same
+//!   shard for that long, continuously. (Not an island with a ship in it: it
+//!   follows the ship, which has no hysteresis.) A swinging pendulum whose reach
+//!   flickers in and out of a group of crates therefore does not send the
+//!   crates to and fro at every swing (seen in a live run of the demo area
+//!   split by a border) — and a body that simply rests near others of its
+//!   shard goes home once the wish has held for [`HOLD_TICKS`]. (An earlier
+//!   rule waited until no other body of the shard was loosely near; a body
+//!   resting a few metres from one that never moves then never went home.)
+//!   The hold backs off: a body a shard sent home and gets back within
+//!   [`RETURN_WINDOW_TICKS`] — something of that shard keeps reaching it,
+//!   slower than the hold (a spring pair drifting in and out of a parked
+//!   player's reach, seen live) — waits twice as long the next time, up to
+//!   [`MAX_HOLD_DOUBLINGS`] doublings.
+//!
+//! Exactness has a speed limit: an island is only noticed once both sides see
+//! each other's bodies as ghosts, i.e. within [`GHOST_MARGIN`] (plus the
+//! velocity lead), and the handoff then needs its lead time (a second for a
+//! player, whose client must connect first; [`BODY_HANDOFF_LEAD`] for an
+//! unowned body). Bodies closing faster than about 50 m/s across a border can
+//! meet before they are consolidated; they then collide as body against ghost
+//! until the handoff lands.
+//!
+//! # Springs across a border
+//!
+//! A spring does **not** make its two ends an island on its own (the
+//! `springs: false` island query): only contact proximity does. A spring or
+//! rope can be long, and pulling its ends onto one shard would drag bodies
+//! arbitrarily far from their regions. Its force is explicit — evaluated from
+//! the two end states — so each shard applies it to the end it simulates,
+//! reading the other end's ghost; the only difference to one shard is the one
+//! or two ticks the ghost lags. Ends close enough to touch are an island like
+//! any other bodies and are solved together.
+//!
+//! # Scene bodies
+//!
+//! A scene's bodies are spawned **once per cluster**, by the scene's
+//! **spawner** ([`scene_spawner`]): the shard of the map's shallowest region,
+//! the region whose centre is the scene's anchor. Splits only add deeper
+//! regions and merges only remove them, so the spawner of a running cluster
+//! never changes — a shard born from a split, told the scene when it
+//! registers, spawns nothing (it would duplicate what its parent already
+//! simulates and is about to hand it). Every body the spawner holds outside
+//! its own territory goes to the shard that owns it by the ordinary handoff,
+//! a few ticks after the spawn. On a scene change every shard despawns the
+//! bodies of the old scene it simulates (their ghosts go with the next ghost
+//! frame) and the spawner spawns the new scene's.
+//!
+//! The guids are a function of the scene revision and the body's index,
+//! under the spawner's id ([`scene_guid`]), so every shard can name every
+//! body — a spring from one shard's body to another's resolves — and none can
+//! collide with a guid a shard's own counter mints. (A spawner that restarts
+//! spawns the scene again; bodies another shard still holds then exist twice
+//! until the next scene change. The world is not persisted.)
+
+use space_protocol::{EntityGuid, ShardId, ShardMap};
+use space_sim::SimTick;
+use space_world::{octree, NodeRef, WorldPos};
+
+/// How close (metres) a body must come to a neighbour's territory to be
+/// ghosted to it, before the velocity lead.
+pub const GHOST_MARGIN: f64 = 64.0;
+/// Velocity lead of the ghost margin, seconds: a body's margin grows by
+/// `|v| · GHOST_LEAD`.
+pub const GHOST_LEAD: f64 = 3.0;
+/// Contact-proximity margin of an island, metres (each body's box grows by
+/// it; see [`space_sim::IslandQuery`]). Small: the velocity lead is what
+/// gives a moving body its reach; at rest two bodies a metre apart do not
+/// touch, and a larger margin chained whole resting groups across a border
+/// into one island (the demo area's zero-g corner, a hinged door below the
+/// octant's floor and a spring pair just above it).
+pub const ISLAND_MARGIN: f64 = 0.5;
+/// Velocity lead of an island, seconds: long enough for a player's handoff
+/// (one second) to land before two bodies closing at moderate speed meet.
+pub const ISLAND_LEAD: f64 = 1.0;
+/// How far inside another shard's territory an unowned body must be before
+/// that shard takes it over, metres.
+pub const BODY_HYSTERESIS: f64 = 2.0;
+/// A body inside another shard's territory this long in a row is settled
+/// there and taken over, however close to the border (see "Hysteresis").
+pub const SETTLE_TICKS: SimTick = 3 * space_sim::TICK_HZ as SimTick;
+/// How long an island of one shard that was in a group recently must want
+/// to go to another shard before it goes (see "Hysteresis").
+pub const HOLD_TICKS: SimTick = 3 * space_sim::TICK_HZ as SimTick;
+/// A body back on the shard that sent it home within this many ticks has
+/// its hold doubled (see "Hysteresis").
+pub const RETURN_WINDOW_TICKS: SimTick = 30 * space_sim::TICK_HZ as SimTick;
+/// The most a hold doubles: 3 s · 2⁴ = 48 s.
+pub const MAX_HOLD_DOUBLINGS: u32 = 4;
+/// Activation lead of an unowned body's handoff, ticks. No client has to
+/// connect, so the lead only has to cover the offer/accept round trip.
+pub const BODY_HANDOFF_LEAD: SimTick = 8;
+/// A full ghost refresh to every neighbour this often, ticks.
+pub const GHOST_REFRESH_TICKS: SimTick = space_sim::TICK_HZ as SimTick;
+/// A ghost with no update is dead-reckoned for at most this many ticks.
+pub const GHOST_DEAD_RECKON_TICKS: u32 = 10;
+/// A neighbour silent for this many ticks loses its ghosts here.
+pub const GHOST_SILENCE_TICKS: SimTick = 3 * space_sim::TICK_HZ as SimTick;
+
+/// The serial bit marking a scene body's guid (a shard's own counter starts
+/// at 1 and never gets near it).
+pub const SCENE_SERIAL_BIT: u64 = 1 << 63;
+/// Bits of a scene guid's serial holding the body's index in its scene.
+const SCENE_INDEX_BITS: u32 = 20;
+/// Mask of the revision bits.
+const SCENE_REVISION_MASK: u64 = (1 << (63 - SCENE_INDEX_BITS)) - 1;
+
+/// The shard that spawns a scene's bodies: the owner of the map's
+/// shallowest region (ties: the lowest shard id, then the lowest node index —
+/// the rule `space_scene::scene_anchor` picks the anchor by).
+#[must_use]
+pub fn scene_spawner(map: &ShardMap) -> Option<ShardId> {
+    map.regions
+        .iter()
+        .min_by_key(|region| (region.node.depth, region.shard.0, region.node.index))
+        .map(|region| region.shard)
+}
+
+/// The guid of body `index` of the scene at `revision`, spawned by `owner`
+/// (the scene's spawner).
+#[must_use]
+pub fn scene_guid(owner: ShardId, revision: u64, index: usize) -> EntityGuid {
+    let index = (index as u64) & ((1 << SCENE_INDEX_BITS) - 1);
+    EntityGuid::new(
+        owner,
+        SCENE_SERIAL_BIT | ((revision & SCENE_REVISION_MASK) << SCENE_INDEX_BITS) | index,
+    )
+}
+
+/// The scene revision a scene body's guid was minted for (`None` for any
+/// other guid). Compared as [`scene_guid`] stores it, i.e. modulo 2^43.
+#[must_use]
+pub fn scene_revision_of(guid: EntityGuid) -> Option<u64> {
+    (guid.serial & SCENE_SERIAL_BIT != 0)
+        .then_some((guid.serial >> SCENE_INDEX_BITS) & SCENE_REVISION_MASK)
+}
+
+/// Whether `guid` is a scene body of another revision than `revision`.
+#[must_use]
+pub fn is_stale_scene_body(guid: EntityGuid, revision: u64) -> bool {
+    scene_revision_of(guid).is_some_and(|r| r != revision & SCENE_REVISION_MASK)
+}
+
+/// Distance from `pos` to the box of `node`, metres (0 inside).
+fn box_distance(node: NodeRef, pos: WorldPos) -> f64 {
+    let (lo, hi) = octree::node_bounds(node);
+    let below = WorldPos::delta(pos, lo); // lo - pos: > 0 when pos is below
+    let above = WorldPos::delta(hi, pos); // pos - hi: > 0 when pos is above
+    (0..3)
+        .map(|k| below[k].max(above[k]).max(0.0))
+        .map(|d| d * d)
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Distance from `pos`, inside `node`, to the outside of its box.
+fn depth_inside(node: NodeRef, pos: WorldPos) -> f64 {
+    let (lo, hi) = octree::node_bounds(node);
+    let from_lo = WorldPos::delta(lo, pos);
+    let to_hi = WorldPos::delta(pos, hi);
+    (0..3)
+        .map(|k| from_lo[k].min(to_hi[k]))
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0)
+}
+
+/// How far `pos` is from the part of the world `map` gives `shard`, metres:
+/// 0 where `shard` owns `pos`. Never more than the true distance (it may be
+/// less around carved-out regions), so a margin test built on it errs on the
+/// side of sending a ghost.
+#[must_use]
+pub fn territory_distance(map: &ShardMap, shard: ShardId, pos: WorldPos) -> f64 {
+    if map.lookup(&pos) == Some(shard) {
+        return 0.0;
+    }
+    // The deepest region covering `pos`: what carves `pos` out of a shallower
+    // region of `shard` that also covers it.
+    let deepest = map
+        .regions
+        .iter()
+        .filter(|r| r.contains(&pos))
+        .max_by_key(|r| r.node.depth)
+        .map(|r| r.node);
+    map.regions
+        .iter()
+        .filter(|r| r.shard == shard)
+        .map(|r| {
+            if r.contains(&pos) {
+                deepest.map_or(0.0, |carve| depth_inside(carve, pos))
+            } else {
+                box_distance(r.node, pos)
+            }
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The shard a body belongs on by its own position: the shard simulating it
+/// (`simulator`) while it is in that shard's territory or within
+/// `hysteresis` metres of it, otherwise the shard the map names (or the
+/// simulator again, where the map names nobody).
+#[must_use]
+pub fn home(map: &ShardMap, pos: WorldPos, simulator: ShardId, hysteresis: f64) -> ShardId {
+    match map.lookup(&pos) {
+        Some(owner) if owner == simulator => simulator,
+        Some(owner) if owner != ShardId::NONE => {
+            if hysteresis > 0.0 && territory_distance(map, simulator, pos) <= hysteresis {
+                simulator
+            } else {
+                owner
+            }
+        }
+        _ => simulator,
+    }
+}
+
+/// The shards of `map` other than `own`, ascending, each once.
+#[must_use]
+pub fn neighbours(map: &ShardMap, own: ShardId) -> Vec<ShardId> {
+    let mut out: Vec<ShardId> = map
+        .regions
+        .iter()
+        .map(|r| r.shard)
+        .filter(|s| *s != own && *s != ShardId::NONE)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The margin a body moving at `speed` m/s is ghosted within.
+#[must_use]
+pub fn ghost_reach(speed: f64) -> f64 {
+    GHOST_MARGIN + speed * GHOST_LEAD
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use space_protocol::ShardRegion;
+    use std::net::SocketAddr;
+
+    fn region(depth: u8, index: [i64; 3], shard: u32) -> ShardRegion {
+        ShardRegion::new(
+            NodeRef::new(depth, index),
+            ShardId::new(shard),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+    }
+
+    /// Distances to a neighbour's region, to a carved-out octant and back
+    /// out of it, and hysteresis.
+    #[test]
+    fn territory_distance_and_home_follow_the_map() {
+        let a = ShardId::new(1);
+        let b = ShardId::new(2);
+        // Two cells side by side: a owns cell 0, b cell 1 (border at x = 512).
+        let side = ShardMap::new(1, vec![region(64, [0, 0, 0], 1), region(64, [1, 0, 0], 2)]);
+        let at = |x: f32| WorldPos::new([0, 0, 0], [0.0, 0.0, 0.0]).offset([x, 0.0, 0.0]);
+        assert_eq!(territory_distance(&side, a, at(100.0)), 0.0);
+        assert!((territory_distance(&side, b, at(500.0)) - 12.0).abs() < 1e-3);
+        assert!((territory_distance(&side, a, at(515.0)) - 3.0).abs() < 1e-3);
+        // Hysteresis: 1 m into b's cell stays with a, 3 m in goes to b.
+        assert_eq!(home(&side, at(513.0), a, BODY_HYSTERESIS), a);
+        assert_eq!(home(&side, at(515.0), a, BODY_HYSTERESIS), b);
+        assert_eq!(home(&side, at(513.0), a, 0.0), b, "ships have none");
+        assert_eq!(home(&side, at(100.0), b, BODY_HYSTERESIS), a);
+        // A carved-out octant: b owns the +x+y+z child of a's two-cell node.
+        let carved = ShardMap::new(1, vec![region(63, [0, 0, 0], 1), region(64, [1, 1, 1], 2)]);
+        let inside = WorldPos::new([1, 1, 1], [0.0; 3]); // centre of b's cell
+        assert_eq!(carved.lookup(&inside), Some(b));
+        assert!(
+            (territory_distance(&carved, a, inside) - 512.0).abs() < 1e-3,
+            "a's territory starts where b's octant ends"
+        );
+        assert_eq!(territory_distance(&carved, b, inside), 0.0);
+        assert_eq!(neighbours(&carved, a), vec![b]);
+    }
+
+    /// The same distances hold far from the origin (a border at ~1e13 m).
+    #[test]
+    fn border_geometry_is_exact_far_from_the_origin() {
+        let far = 9_765_625_000i64; // 1e13 m / 1024 m
+        let side = ShardMap::new(
+            1,
+            vec![region(64, [far, 0, 0], 1), region(64, [far + 1, 0, 0], 2)],
+        );
+        let p = WorldPos::new([far, 0, 0], [511.5, 0.0, 0.0]);
+        assert!((territory_distance(&side, ShardId::new(2), p) - 0.5).abs() < 1e-3);
+        assert_eq!(home(&side, p, ShardId::new(2), 1.0), ShardId::new(2));
+        assert_eq!(home(&side, p, ShardId::new(2), 0.0), ShardId::new(1));
+    }
+
+    #[test]
+    fn scene_guids_carry_their_revision_and_never_meet_counter_guids() {
+        let g = scene_guid(ShardId::new(3), 7, 12);
+        assert_eq!(scene_revision_of(g), Some(7));
+        assert!(is_stale_scene_body(g, 8));
+        assert!(!is_stale_scene_body(g, 7));
+        assert_eq!(
+            scene_revision_of(EntityGuid::new(ShardId::new(3), 12)),
+            None
+        );
+        assert_ne!(
+            scene_guid(ShardId::new(3), 7, 12),
+            scene_guid(ShardId::new(3), 7, 13)
+        );
+        assert_ne!(
+            scene_guid(ShardId::new(3), 7, 12),
+            scene_guid(ShardId::new(4), 7, 12)
+        );
+    }
+}

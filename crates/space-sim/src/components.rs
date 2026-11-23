@@ -1,15 +1,27 @@
 //! The ship components and the replication registry.
 //!
-//! Four components, with the ids fixed here (ids are part of the wire format:
-//! an [`space_protocol::EntitySnapshot`] carries them, so they are appended,
+//! The component ids are fixed here (ids are part of the wire format: an
+//! [`space_protocol::EntitySnapshot`] carries them, so they are appended,
 //! never renumbered):
 //!
-//! | id | component        | replicated |
-//! |----|------------------|------------|
-//! | 0  | [`ShipState`]    | yes        |
-//! | 1  | [`ShipControls`] | yes        |
-//! | 2  | [`Owner`]        | yes        |
-//! | 3  | [`ShardAuthority`]| no        |
+//! | id | component        | replicated | wire form |
+//! |----|------------------|------------|-----------|
+//! | 0  | [`ShipState`]    | yes        | [`crate::wire`], 76 B |
+//! | 1  | [`ShipControls`] | yes        | bincode, 24 B |
+//! | 2  | [`Owner`]        | yes        | bincode `u64`, 8 B |
+//! | 3  | [`ShardAuthority`]| no        | — |
+//! | 4  | [`crate::Body`]  | yes        | [`crate::body`], versioned |
+//! | 5  | [`crate::Visual`]| yes        | [`crate::body`], 5 B |
+//! | 6  | [`crate::Springs`]| yes       | [`crate::spring`], versioned |
+//! | 7  | [`crate::Articulation`]| yes  | [`crate::articulation`], versioned |
+//! | 8  | [`crate::PartStates`]| yes    | [`crate::articulation`], versioned |
+//! | 9  | [`Ghost`]        | no         | — |
+//! | 10 | [`crate::PosResidual`]| yes   | [`crate::body`], versioned |
+//!
+//! Ids 4–10 arrived with the physics core. A peer that does not know them
+//! cannot read an entity snapshot carrying them, so the phase that first puts
+//! them on the wire bumps `PROTOCOL_VERSION` (client, shards and orchestrator
+//! ship from one commit, so the bump costs nothing but the version check).
 //!
 //! [`ShipState`] is the only component the physics writes; [`ShipControls`]
 //! holds the input a tick's step consumes, [`Owner`] maps the ship back to the
@@ -122,14 +134,37 @@ impl ComponentDef for ShardAuthority {
     type Data = Self;
 }
 
+/// Marker: the entity is a **ghost** — a kinematic copy of a body another
+/// shard (or, on a client, the server) simulates. Its [`ShipState`] is driven
+/// from outside ([`crate::SimWorld::drive_ghost`]) and never integrated here;
+/// dynamic bodies of this world collide with it as with a moving wall. Not
+/// replicated: whether a copy is a ghost is a property of this process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ghost;
+
+impl ComponentDef for Ghost {
+    const ID: u16 = 9;
+    type Data = Self;
+}
+
 mod registry {
-    use super::{Owner, ShardAuthority, ShipControls, ShipState};
+    use super::{Ghost, Owner, ShardAuthority, ShipControls, ShipState};
+    use crate::articulation::{Articulation, PartStates};
+    use crate::body::{Body, PosResidual, Visual};
+    use crate::spring::Springs;
 
     space_ecs::register_components!(
         (0, ShipState, replicated = true),
         (1, ShipControls, replicated = true),
         (2, Owner, replicated = true),
         (3, ShardAuthority),
+        (4, Body, replicated = true),
+        (5, Visual, replicated = true),
+        (6, Springs, replicated = true),
+        (7, Articulation, replicated = true),
+        (8, PartStates, replicated = true),
+        (9, Ghost),
+        (10, PosResidual, replicated = true),
     );
 
     /// The macro's `const` is module-private; re-expose it as a `pub(crate)`
@@ -158,11 +193,18 @@ pub static COMPONENT_REGISTRY: [::core::option::Option<space_ecs::ComponentInfo>
     space_ecs::MAX_COMPONENTS] = registry::REGISTRY;
 
 /// The component ids this crate registers, in id order.
-pub const IDS: [u16; 4] = [
+pub const IDS: [u16; 11] = [
     <ShipState as ComponentDef>::ID,
     <ShipControls as ComponentDef>::ID,
     <Owner as ComponentDef>::ID,
     <ShardAuthority as ComponentDef>::ID,
+    <crate::body::Body as ComponentDef>::ID,
+    <crate::body::Visual as ComponentDef>::ID,
+    <crate::spring::Springs as ComponentDef>::ID,
+    <crate::articulation::Articulation as ComponentDef>::ID,
+    <crate::articulation::PartStates as ComponentDef>::ID,
+    <Ghost as ComponentDef>::ID,
+    <crate::body::PosResidual as ComponentDef>::ID,
 ];
 
 #[cfg(test)]
@@ -172,7 +214,7 @@ mod tests {
 
     #[test]
     fn registry_matches_the_component_ids() {
-        assert_eq!(IDS, [0, 1, 2, 3]);
+        assert_eq!(IDS, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(ShipState::ID, 0);
         assert_eq!(ShipControls::ID, 1);
         assert_eq!(Owner::ID, 2);
@@ -182,12 +224,19 @@ mod tests {
         assert!(COMPONENT_REGISTRY[0].unwrap().replicated);
         assert!(COMPONENT_REGISTRY[1].unwrap().replicated);
         assert!(COMPONENT_REGISTRY[2].unwrap().replicated);
-        // The authority marker is local-only.
+        // The authority and ghost markers are local-only; the physics
+        // components are replicated.
         assert!(!COMPONENT_REGISTRY[3].unwrap().replicated);
+        assert!(!COMPONENT_REGISTRY[9].unwrap().replicated);
+        for (id, info) in COMPONENT_REGISTRY.iter().enumerate().take(9).skip(4) {
+            assert!(info.unwrap().replicated, "id {id}");
+        }
+        assert_eq!(COMPONENT_REGISTRY[4].unwrap().name, "Body");
         for id in IDS {
             assert!(COMPONENT_REGISTRY[usize::from(id)].is_some());
         }
-        assert!(COMPONENT_REGISTRY[4].is_none());
+        assert!(COMPONENT_REGISTRY[10].unwrap().replicated);
+        assert!(COMPONENT_REGISTRY[11].is_none());
     }
 
     #[test]

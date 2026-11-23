@@ -5,6 +5,17 @@
 //! `<meta http-equiv="refresh">` (which a `?refresh=0` link switches off) and
 //! acts through plain `<form method="post">` buttons.
 //!
+//! # No control holds a choice
+//!
+//! A reload puts every form control back to what the server rendered, and
+//! this page reloads itself. So nothing on it is *chosen first and sent
+//! later*: no `<select>`, no text field, no checkbox. Every action is one
+//! `<button name="…" value="…">` inside a form of hidden fields, and the click
+//! carries the whole request. (The scene was once picked in a `<select>`: the
+//! auto-refresh put it back to the running scene within three seconds, and
+//! the button next to it then posted exactly that — "accepted", and nothing
+//! changed.)
+//!
 //! # Escaping
 //!
 //! Markup can only enter the page through the private writer's `Html::raw`,
@@ -35,7 +46,7 @@ use crate::config::{
 };
 use crate::events::{Event, EventKind, Severity};
 use crate::snapshot::{
-    node_path, octant_signs, RegionView, SceneSync, ShardRole, ShardView, Snapshot,
+    node_path, octant_signs, RegionView, SceneProgress, SceneSync, ShardRole, ShardView, Snapshot,
 };
 
 /// Append `text` to `out` with the five HTML-significant characters escaped.
@@ -139,6 +150,40 @@ pub struct PageInput<'a> {
     pub refresh: u32,
     /// The operator request whose outcome is shown on top, if any.
     pub notice: Option<&'a Event>,
+    /// The scene request whose outcome is shown on top, if any (it takes the
+    /// place of `notice`).
+    pub scene_notice: Option<SceneNotice>,
+}
+
+/// What the redirect of a scene request asks the dashboard to say on top.
+///
+/// Only two numbers travel in the URL. Everything the banner *says* — which
+/// scene, which revision, who has confirmed and who has not — is read from
+/// the snapshot when the page is rendered, so it is true at that moment and
+/// stays true through every reload, and a link cannot make it say otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneNotice {
+    /// The revision the request was about. A banner is only shown for a
+    /// revision the cluster has reached.
+    pub revision: u64,
+    /// The scene asked for was already running: nothing was changed.
+    pub unchanged: bool,
+}
+
+/// Seconds between reloads while a connected shard has not confirmed the
+/// current scene, whatever interval was chosen (also "off"): a page that says
+/// "behind" and then never looks again reads as "it did not work".
+pub const SCENE_PENDING_REFRESH_SECS: u32 = 1;
+
+/// The reload interval the page really uses: the chosen one, or
+/// [`SCENE_PENDING_REFRESH_SECS`] while a scene change is still on its way to
+/// a connected shard.
+fn effective_refresh(chosen: u32, progress: &SceneProgress) -> u32 {
+    if progress.settled() {
+        chosen
+    } else {
+        SCENE_PENDING_REFRESH_SECS
+    }
 }
 
 /// Ticks as seconds.
@@ -233,7 +278,7 @@ const STYLE: &str = r#"
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
-code,.mono,button,select{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;font-size:13px}
+code,.mono,button{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;font-size:13px}
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 header{display:flex;flex-wrap:wrap;align-items:center;gap:.45rem .9rem;padding:.6rem 1rem;
@@ -276,10 +321,8 @@ td form.inline{flex-wrap:nowrap}
 button{color:var(--text);background:var(--btn);border:1px solid var(--btnline);border-radius:5px;
 padding:.12rem .5rem;line-height:1.5;cursor:pointer}
 td button{padding:.1rem .42rem}
-button:hover,select:hover{border-color:var(--link)}
+button:hover{border-color:var(--link)}
 button:disabled{color:#5b636e;border-color:var(--line);background:transparent;cursor:not-allowed}
-select{color:var(--text);background:var(--btn);border:1px solid var(--btnline);border-radius:5px;
-padding:.14rem .3rem;line-height:1.5}
 button.taken{text-decoration:line-through}
 .why{color:var(--dim);font-size:.82rem;white-space:normal;min-width:11rem;max-width:21rem;margin-top:.2rem}
 .notice{border:1px solid currentColor;border-radius:6px;padding:.55rem .9rem;display:flex;
@@ -302,12 +345,10 @@ pub fn dashboard(input: &PageInput<'_>) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"robots\" content=\"noindex, nofollow\">\n",
     );
-    if input.refresh > 0 {
-        h.wrapped(
-            "<meta http-equiv=\"refresh\" content=\"",
-            input.refresh,
-            "\">\n",
-        );
+    let progress = input.snapshot.scene_progress();
+    let refresh = effective_refresh(input.refresh, &progress);
+    if refresh > 0 {
+        h.wrapped("<meta http-equiv=\"refresh\" content=\"", refresh, "\">\n");
     }
     h.wrapped(
         "<title>",
@@ -317,9 +358,11 @@ pub fn dashboard(input: &PageInput<'_>) -> String {
     h.wrapped("<style nonce=\"", input.style_nonce, "\">");
     h.raw(STYLE);
     h.raw("</style>\n</head>\n<body>\n");
-    header(&mut h, input);
+    header(&mut h, input, &progress);
     h.raw("<main>\n");
-    notice(&mut h, input);
+    if !scene_notice(&mut h, input, &progress) {
+        notice(&mut h, input);
+    }
     cards(&mut h, input);
     in_flight(&mut h, input);
     shards(&mut h, input);
@@ -331,7 +374,7 @@ pub fn dashboard(input: &PageInput<'_>) -> String {
     h.finish()
 }
 
-fn header(h: &mut Html, input: &PageInput<'_>) {
+fn header(h: &mut Html, input: &PageInput<'_>, progress: &SceneProgress) {
     let s = input.snapshot;
     h.raw("<header>\n<h1>space-orchestrator</h1>\n");
     h.wrapped(
@@ -355,6 +398,14 @@ fn header(h: &mut Html, input: &PageInput<'_>) {
         h.pill("ok", "autoscaler active");
     }
     h.raw("\n<nav class=\"refresh\">auto-refresh");
+    if !progress.settled() {
+        // The chosen interval is overridden for now; say so where it is chosen.
+        h.wrapped(
+            "<strong class=\"warn\">every ",
+            SCENE_PENDING_REFRESH_SECS,
+            " s while a shard is switching scene</strong> <span>then</span>",
+        );
+    }
     let mut choices: Vec<u32> = REFRESH_CHOICES.to_vec();
     if !choices.contains(&input.refresh) {
         choices.push(input.refresh);
@@ -374,6 +425,57 @@ fn header(h: &mut Html, input: &PageInput<'_>) {
         h.raw(if current { "</strong>" } else { "</a>" });
     }
     h.raw("</nav>\n</header>\n");
+}
+
+/// The banner for a scene request: how far the scene has got **right now**
+/// (see [`SceneNotice`]). Returns whether it was shown.
+fn scene_notice(h: &mut Html, input: &PageInput<'_>, progress: &SceneProgress) -> bool {
+    let Some(asked) = input.scene_notice else {
+        return false;
+    };
+    // Not for a revision the cluster has not reached: such a link is stale
+    // (the orchestrator was restarted) or made up.
+    if asked.revision == 0 || asked.revision > progress.revision {
+        return false;
+    }
+    // "Already running" is a statement about one revision: once the scene has
+    // been changed again it is not shown as if it were about the new one.
+    if asked.unchanged && asked.revision != progress.revision {
+        return false;
+    }
+    let everyone_has_it = progress.settled() && progress.connected() > 0;
+    h.raw("<div class=\"notice ");
+    h.raw(match (everyone_has_it, asked.unchanged) {
+        (true, false) => "ok",
+        // Nothing was changed: not the colour of a switch that went through.
+        (true, true) => "info",
+        (false, _) => "warn",
+    });
+    h.raw("\"><span>");
+    if asked.unchanged {
+        h.text(format_args!(
+            "Already running {} (revision {}); nothing to do.",
+            progress.scene, progress.revision
+        ));
+        if !everyone_has_it {
+            h.text(format_args!(" {}.", progress.sentence()));
+        }
+    } else {
+        h.text(format_args!("{}.", progress.sentence()));
+    }
+    if !progress.settled() {
+        h.wrapped(
+            " <span class=\"dim\">(this page reloads every ",
+            SCENE_PENDING_REFRESH_SECS,
+            " s until every connected shard has confirmed)</span>",
+        );
+    }
+    h.wrapped(
+        "</span><a href=\"?refresh=",
+        input.refresh,
+        "\">dismiss</a></div>\n",
+    );
+    true
 }
 
 fn notice(h: &mut Html, input: &PageInput<'_>) {
@@ -613,8 +715,10 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
     h.raw("</section>\n");
 }
 
-/// The Scene card: what the cluster shows, who has confirmed it, and the form
-/// that switches every shard to another scene.
+/// The Scene card: what the cluster shows, who has confirmed it, and one
+/// button per scene of the catalogue that switches every shard to it. The
+/// button of the running scene is there too, disabled and marked, so the row
+/// is the catalogue and never shifts under the pointer.
 fn scene_card(h: &mut Html, input: &PageInput<'_>) {
     let s = input.snapshot;
     let scene = &s.scene;
@@ -629,24 +733,40 @@ fn scene_card(h: &mut Html, input: &PageInput<'_>) {
         ),
         None => h.fact("last change", "none since start"),
     }
-    // Who has it: of the shards that hold a control link.
-    let connected: Vec<&ShardView> = s.shards.iter().filter(|v| v.connected).collect();
-    let in_sync = connected
-        .iter()
-        .filter(|v| scene.sync_of(v.scene) == SceneSync::InSync)
-        .count();
+    // Who has it: of the shards that hold a control link. While one of them
+    // has not confirmed, the card says that a switch is under way and for whom
+    // it is waiting, not only how many.
+    let progress = s.scene_progress();
     h.raw("<dt>confirmed by</dt><dd>");
-    if connected.is_empty() {
+    if progress.connected() == 0 {
         h.raw("<span class=\"dim\">no shard is connected</span>");
+    } else if progress.settled() {
+        h.pill(
+            "ok",
+            format_args!(
+                "{} of {} connected shards",
+                progress.confirmed.len(),
+                progress.connected()
+            ),
+        );
     } else {
         h.pill(
-            if in_sync == connected.len() {
-                "ok"
-            } else {
-                "warn"
-            },
-            format_args!("{in_sync} of {} connected shards", connected.len()),
+            "warn",
+            format_args!(
+                "switching → {}, {} of {} confirmed",
+                progress.scene,
+                progress.confirmed.len(),
+                progress.connected()
+            ),
         );
+        h.raw("<div class=\"sub\">waiting for ");
+        for (n, shard) in progress.waiting.iter().enumerate() {
+            if n > 0 {
+                h.raw(", ");
+            }
+            h.text(shard);
+        }
+        h.raw("</div>");
     }
     h.raw("</dd>\n");
     match &scene.path {
@@ -655,27 +775,30 @@ fn scene_card(h: &mut Html, input: &PageInput<'_>) {
     }
     h.raw("</dl>\n<p>");
     form_open(h, input, "action/scene");
-    h.raw(
-        "<select name=\"scene\" title=\"The scene every shard is switched to. Clients follow \
-         their shard.\">",
-    );
     for choice in space_protocol::Scene::ALL {
-        h.wrapped("<option value=\"", choice.name(), "\"");
+        h.wrapped("<button name=\"scene\" value=\"", choice.name(), "\"");
         if choice == scene.scene {
-            h.raw(" selected");
+            h.wrapped(
+                " disabled title=\"This is the scene that is running: every shard is told to \
+                 show it.\">",
+                choice.name(),
+                " (current)</button>",
+            );
+        } else {
+            h.wrapped(
+                " title=\"Save the scene, tell every connected shard and, through the shards, \
+                 every client. A shard that registers later is told at once. This is not a map \
+                 change: it does not wait for an epoch and does not delay one.\">Switch all \
+                 shards to ",
+                choice.name(),
+                "</button>",
+            );
         }
-        h.wrapped(">", choice.name(), "");
-        if choice == scene.scene {
-            h.raw(" (current)");
-        }
-        h.raw("</option>");
     }
     h.raw(
-        "</select><button title=\"Save the scene, tell every connected shard and, through the \
-         shards, every client. A shard that registers later is told at once. This is not a \
-         map change: it does not wait for an epoch and does not delay one.\">Switch all \
-         shards</button></form></p>\n<p class=\"note\">A shard confirms the revision it runs; \
-         one that has not confirmed the current revision is told again every second.</p></div>\n",
+        "</form></p>\n<p class=\"note\">One click switches; the answer comes when the shards \
+         have confirmed. A shard confirms the revision it runs; one that has not confirmed the \
+         current revision is told again every second.</p></div>\n",
     );
 }
 

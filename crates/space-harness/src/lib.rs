@@ -58,8 +58,8 @@ pub mod image;
 pub mod script;
 
 pub use control::{
-    key_from_name, key_name, key_names, ClientState, Control, ControlError, Frame, Key, Screen,
-    ViewerInput,
+    key_from_name, key_name, key_names, BodyState, ClientState, Control, ControlError, Frame, Key,
+    Screen, ViewerInput,
 };
 pub use hub::{Command, Hub};
 pub use script::{

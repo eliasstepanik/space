@@ -15,8 +15,15 @@
 //! | `list_ships`    | every live ship: guid, owning session, offset, velocity   |
 //! | `spawn_ship`    | spawn an unowned ship inside the region, returns its guid |
 //! | `ship_state`    | position / velocity / orientation of one ship by guid     |
-//! | `despawn_ship`  | remove a ship by guid                                     |
+//! | `despawn_ship`  | remove a ship (or a body) by guid                         |
 //! | `advance_ticks` | run N simulation ticks right now (deterministic stepping) |
+//! | `set_scene`     | the scene the shard simulates (statics, gravity, bodies)  |
+//! | `list_bodies`   | every physics entity: ships, bodies, ghosts, with state   |
+//! | `spawn_body`    | spawn a ball or a crate with a position and a velocity    |
+//!
+//! The shard starts with no scene (an empty world, no gravity) until
+//! `set_scene` names one; `set_scene demo-area` builds the demo area's
+//! statics, gravity room and physics showcase.
 //!
 //! `trigger_split` / `trigger_merge` are deliberately **not** offered: topology
 //! changes belong to the orchestrator (`Orchestrator::handle_admin` over its
@@ -33,9 +40,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use space_mcp::tool::{arg_u64_opt, BoxFuture};
 use space_mcp::{McpServer, Tool, ToolRegistry};
-use space_protocol::{EntityGuid, ShardId};
+use space_protocol::{EntityGuid, Scene, SceneState, ShardId};
 use space_server::net::ShardNet;
 use space_server::{Shard, ShardConfig};
+use space_sim::body::{Body, MassSpec};
+use space_sim::shape::ShapeRef;
+use space_sim::{BodySpawn, ShipState};
 use space_world::{NodeRef, WorldPos};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -224,9 +234,46 @@ pub fn registry(harness: &Arc<ShardHarness>) -> ToolRegistry {
     let this = h(harness);
     r.register(tool(
         "despawn_ship",
-        "Remove the ship with this guid from the shard.",
+        "Remove the ship (or body) with this guid from the shard.",
         guid_schema,
         move |args| despawn_ship(h(&this), args),
+    ));
+
+    let this = h(harness);
+    r.register(tool(
+        "set_scene",
+        "Make the shard simulate `scene` (demo-area, materials, solar or galaxy): its static colliders, its gravity and its bodies (the demo area's physics showcase). Clients are told to draw it too. Each call is a new revision.",
+        json!({
+            "type": "object",
+            "properties": {"scene": {"type": "string", "enum": ["demo-area", "materials", "solar", "galaxy"]}},
+            "required": ["scene"],
+        }),
+        move |args| set_scene(h(&this), args),
+    ));
+
+    let this = h(harness);
+    r.register(tool(
+        "list_bodies",
+        "Every physics entity on the shard: ships, bodies and ghosts (copies of a neighbour's bodies near the border), with guid, kind, the shard simulating it, the model id a client draws (`visual`), offset from the region centre (m), velocity and whether it sleeps.",
+        json!({"type": "object", "properties": {}}),
+        move |_| list_bodies(h(&this)),
+    ));
+
+    let this = h(harness);
+    r.register(tool(
+        "spawn_body",
+        "Spawn a dynamic body: `shape` \"ball\" (radius = size/2) or \"crate\" (a cube of edge `size`), `size` metres (0.05..=10, default 0.5), `mass` kg (default 10), at `offset` metres from the region centre (each axis within +-500) moving at `velocity` m/s. Returns its guid.",
+        json!({
+            "type": "object",
+            "properties": {
+                "shape": {"type": "string", "enum": ["ball", "crate"]},
+                "size": {"type": "number"},
+                "mass": {"type": "number"},
+                "offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                "velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+            },
+        }),
+        move |args| spawn_body(h(&this), args),
     ));
 
     let this = h(harness);
@@ -257,6 +304,9 @@ fn status(h: Arc<ShardHarness>) -> BoxFuture<Result<String, String>> {
             "handed_off": stats.handed_off,
             "received": stats.received,
             "aborted": stats.aborted,
+            "bodies": stats.bodies,
+            "ghosts": stats.ghosts,
+            "scene": shard.scene().to_string(),
             "state_hash": format!("{:016x}", shard.sim().state_hash()),
         }))
     })
@@ -323,6 +373,108 @@ fn spawn_ship(h: Arc<ShardHarness>, args: Value) -> BoxFuture<Result<String, Str
         // Session 0 is never issued (sessions start at 1): an unowned ship.
         let guid = shard.spawn_ship_for(0, pos);
         pretty(&ship_json(guid, &shard).ok_or("spawned ship vanished")?)
+    })
+}
+
+/// Three finite numbers within `limit` from `args[key]`, or `default`.
+fn vec3_arg(args: &Value, key: &str, limit: f64, default: [f64; 3]) -> Result<[f64; 3], String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let a = v
+                .as_array()
+                .filter(|a| a.len() == 3)
+                .ok_or(format!("`{key}` must be an array of 3 numbers"))?;
+            let mut o = [0.0; 3];
+            for (slot, n) in o.iter_mut().zip(a) {
+                *slot = n
+                    .as_f64()
+                    .filter(|n| n.is_finite() && n.abs() <= limit)
+                    .ok_or(format!(
+                        "`{key}` components must be finite numbers within +-{limit}"
+                    ))?;
+            }
+            Ok(o)
+        }
+    }
+}
+
+fn set_scene(h: Arc<ShardHarness>, args: Value) -> BoxFuture<Result<String, String>> {
+    Box::pin(async move {
+        let name = space_mcp::tool::arg_str(&args, "scene")?;
+        let scene: Scene = name.parse().map_err(|e| format!("{e}"))?;
+        let mut shard = h.shard.lock().await;
+        let revision = shard.scene().revision + 1;
+        shard.set_scene(SceneState::new(scene.id(), revision));
+        let stats = shard.stats();
+        pretty(&json!({
+            "scene": shard.scene().to_string(),
+            "bodies": stats.bodies,
+        }))
+    })
+}
+
+fn list_bodies(h: Arc<ShardHarness>) -> BoxFuture<Result<String, String>> {
+    Box::pin(async move {
+        let shard = h.shard.lock().await;
+        let centre = shard.region().center();
+        let bodies: Vec<Value> = shard
+            .body_list()
+            .into_iter()
+            .map(|b| {
+                json!({
+                    "guid": guid_text(b.guid),
+                    "kind": if b.ghost { "ghost" } else if b.ship { "ship" } else { "body" },
+                    "simulated_by": b.simulator.0,
+                    "visual": b.visual,
+                    "offset_from_region_centre_m": WorldPos::delta(centre, b.state.pos),
+                    "velocity_mps": b.state.vel,
+                    "sleeping": b.sleeping,
+                })
+            })
+            .collect();
+        pretty(&json!({"count": bodies.len(), "bodies": bodies}))
+    })
+}
+
+fn spawn_body(h: Arc<ShardHarness>, args: Value) -> BoxFuture<Result<String, String>> {
+    Box::pin(async move {
+        let shape = match args.get("shape").and_then(Value::as_str).unwrap_or("ball") {
+            "ball" | "crate" => args.get("shape").and_then(Value::as_str).unwrap_or("ball"),
+            other => {
+                return Err(format!(
+                    "`shape` must be \"ball\" or \"crate\", not {other:?}"
+                ))
+            }
+        };
+        let number = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f32, String> {
+            let v = args.get(key).and_then(Value::as_f64).unwrap_or(default);
+            if v.is_finite() && (lo..=hi).contains(&v) {
+                Ok(v as f32)
+            } else {
+                Err(format!("`{key}` must be within {lo}..={hi}"))
+            }
+        };
+        let size = number("size", 0.5, 0.05, 10.0)?;
+        let mass = number("mass", 10.0, 0.01, 1.0e6)?;
+        let offset = vec3_arg(&args, "offset", MAX_SPAWN_OFFSET_M, [0.0; 3])?;
+        let velocity = vec3_arg(&args, "velocity", 1000.0, [0.0; 3])?;
+        let mut body = Body::dynamic(if shape == "ball" {
+            ShapeRef::Ball { radius: size / 2.0 }
+        } else {
+            ShapeRef::cuboid([size; 3])
+        });
+        body.mass = MassSpec::Mass(mass);
+        let mut shard = h.shard.lock().await;
+        let pos = WorldPos::from_f64_metres_around(shard.region().center(), offset);
+        let state = ShipState {
+            vel: velocity.map(|v| v as f32),
+            ..ShipState::at_rest(pos)
+        };
+        let guid = shard
+            .spawn_body(BodySpawn::new(state, body))
+            .map_err(|e| e.to_string())?;
+        pretty(&json!({"guid": guid_text(guid)}))
     })
 }
 

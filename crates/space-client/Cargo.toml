@@ -21,6 +21,9 @@ space-harness = { workspace = true }
 space-net = { path = "../space-net" }
 space-protocol = { workspace = true }
 space-sim = { workspace = true }
+# The shared physical definition of the scenes: the anchor rule, the statics
+# the showcase draws, the shape catalogue, the prediction world's environment.
+space-scene = { workspace = true }
 space-ecs = { workspace = true }
 tokio = { workspace = true }
 winit = { workspace = true }

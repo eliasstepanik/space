@@ -793,8 +793,10 @@ fn handoff_keeps_the_guid_position_and_inputs_continuous() {
 ///
 /// The observer stays on shard A the whole time (it never leaves A's region), so
 /// the only thing that changes for it is that the ship it was watching stops
-/// existing in A's world and starts existing in B's. It must see the guid
-/// disappear from A and appear in B, with no tick where it received nothing.
+/// being simulated by A and starts being simulated by B. Since physics crossed
+/// shards (protocol 5) A keeps showing it — as a ghost of B's ship, updated by
+/// B's ghost frames — so the observer is never told it left, the ship never
+/// jumps, and no tick goes without a frame.
 #[test]
 fn an_observer_sees_no_gap_across_a_handoff() {
     let mut pair = Pair::new();
@@ -808,6 +810,8 @@ fn an_observer_sees_no_gap_across_a_handoff() {
     let mut observer_ticks: Vec<u64> = Vec::new();
     let mut saw_removal = false;
     let mut saw_reappear = false;
+    // What the observer was told about the ship, by A's tick.
+    let mut observed: Vec<(u64, WorldPos)> = Vec::new();
 
     for _ in 0..600 {
         pair.thrust(id_a, session_a, 0, 1.0);
@@ -827,8 +831,16 @@ fn an_observer_sees_no_gap_across_a_handoff() {
                     if d.removed.contains(&guid) {
                         saw_removal = true;
                     }
+                    if let Some(e) = d.entities.iter().find(|e| e.guid == guid) {
+                        observed.push((d.tick, ship_state_of(e).pos));
+                    }
                 }
-                Message::Snapshot(s) => observer_ticks.push(s.tick),
+                Message::Snapshot(s) => {
+                    observer_ticks.push(s.tick);
+                    if let Some(e) = s.entities.iter().find(|e| e.guid == guid) {
+                        observed.push((s.tick, ship_state_of(e).pos));
+                    }
+                }
                 _ => {}
             }
         }
@@ -863,14 +875,35 @@ fn an_observer_sees_no_gap_across_a_handoff() {
             if pair.b.sim().ship_state(guid).is_some() {
                 pair.thrust(id_b, session_b, 0, 1.0);
             }
-            if saw_reappear && r.activation_tick < pair.b.sim().tick() {
+            if saw_reappear && r.activation_tick + 30 < pair.b.sim().tick() {
                 break;
             }
         }
     }
 
-    assert!(saw_removal, "the observer must be told the ship left A");
-    assert!(saw_reappear, "the observer must see the ship arrive in B");
+    assert!(
+        !saw_removal,
+        "the ship is still in sight: A shows it as a ghost of B's, it is never removed"
+    );
+    assert!(saw_reappear, "the mover must see its ship arrive in B");
+    assert!(
+        pair.a.ghost_owner(guid) == Some(id_b),
+        "A holds a ghost of the ship B simulates now"
+    );
+    let activation = redirect.as_ref().expect("redirected").activation_tick;
+    assert!(
+        observed.iter().any(|(tick, _)| *tick > activation + 10),
+        "the observer keeps being told where the ship is after the handoff"
+    );
+    // No jump: every step of what the observer saw is a few ticks of travel.
+    for pair_of in observed.windows(2) {
+        let ((t0, p0), (t1, p1)) = (pair_of[0], pair_of[1]);
+        let step = WorldPos::distance(p0, p1) / (t1 - t0).max(1) as f64;
+        assert!(
+            step < 8.0,
+            "the observed ship jumped {step:.2} m per tick between ticks {t0} and {t1}"
+        );
+    }
 
     // Every tick between the first and last frame the observer got was covered.
     let mut ticks = observer_ticks;
@@ -2063,10 +2096,13 @@ fn the_installed_state_hashes_identically_to_the_committed_state() {
     }
     let installed_at = installed_at.expect("B must install the commit");
 
-    // A reference world: the commit's state, one entity, stepped once.
+    // A reference world: the commit's state, one entity, stepped once. A
+    // player's ship carries the player model (what every client draws it
+    // as), so the reference ship does too.
     let mut reference =
         space_sim::SimWorld::with_tick(id_b, space_sim::ShipParams::default(), installed_at - 1);
     reference.spawn_ship(guid, session_b, committed);
+    reference.set_visual(guid, space_sim::Visual(space_scene::visual::PLAYER));
     reference.step();
     assert_eq!(
         reference.guid_state_hash(),

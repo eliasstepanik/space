@@ -7,18 +7,22 @@
 //!
 //! ## Feature matrix
 //!
-//! | preset | fog | fog density (1/m) | SSR | SSR steps | SSR max roughness | refraction | shadows |
-//! |--------|-----|-------------------|-----|-----------|-------------------|------------|---------|
-//! | High   | on  | 2.0e-3            | on  | 32        | 0.5               | on         | on      |
-//! | Medium | on  | 1.0e-3            | on  | 16        | 0.3               | on         | on      |
-//! | Low    | off | —                 | off | —         | —                 | off        | off     |
-//! | Ci     | off | —                 | off | —         | —                 | off        | off     |
+//! | preset | fog | fog density (1/m) | SSR | SSR steps | SSR max roughness | refraction | shadows | sky rays |
+//! |--------|-----|-------------------|-----|-----------|-------------------|------------|---------|----------|
+//! | High   | on  | 2.0e-3            | on  | 32        | 0.5               | on         | on      | 8        |
+//! | Medium | on  | 1.0e-3            | on  | 16        | 0.3               | on         | on      | 4        |
+//! | Low    | off | —                 | off | —         | —                 | off        | off     | 0        |
+//! | Ci     | off | —                 | off | —         | —                 | off        | off     | 0        |
 //!
 //! `Ci` is the deterministic, cheapest tier: every optional feature is off so
 //! golden-pixel tests are independent of feature work. `Low` also has all
 //! optional features off. Fog is exponential-squared on distance from the
-//! camera and applies to shaded surfaces (after lighting, before tone map);
-//! the empty background is not fogged.
+//! camera and applies to shaded surfaces (after lighting, before tone map).
+//! A surface fades into what is behind it: the scene's environment along the
+//! view ray where that is painted as the background
+//! ([`crate::Environment::background`]) — far geometry melts into the sky at
+//! whatever height it stands — and [`FOG_COLOR`] otherwise. The background
+//! itself is not fogged: it is where the fog ends up.
 //!
 //! Shadows are ray traced: the forward pass's fragment shaders cast one ray
 //! per light against the scene's acceleration structure (the same one probe
@@ -30,6 +34,44 @@
 //! and a sphere or box instance that *contains* a light — it is that light's
 //! lamp, like the Sun around the solar scene's point light. Mesh models
 //! always cast shadows, so keep lights outside closed meshes.
+//!
+//! The same rays keep the sky out of where it cannot get. A scene's
+//! environment ([`crate::Environment`]) lights every surface from the
+//! hemisphere it faces; with **sky rays**, each pixel asks that hemisphere
+//! first — `sky rays` rays, spread so that each stands for the same share of
+//! the light, up to [`SKY_RANGE`] metres long — and takes only the share that
+//! got out. A room is then as dark as its openings make it. The directions
+//! are fixed in the surface's own frame and turned by the pixel's place in a
+//! 4 x 4 tile of the frame — an ordered pattern, no random numbers, so a
+//! frame is the same every time it is drawn — and the post pass averages the
+//! share over the 4 x 4 block of the same surface around each pixel (it
+//! travels in the colour target's alpha), which holds sixteen differently
+//! turned sets: the result is as smooth as 128 rays a pixel (64 on
+//! `Medium`) would make it, with no noise to flicker or to cost a video
+//! stream bits. Only what is seen through glass keeps its own count. The environment's
+//! reflection is occluded the same way, by one more ray along the mirror
+//! direction for a smooth surface. Like shadows this needs ray query
+//! (`RenderContext::sky_occlusion_active`); `Low` and `Ci` cast none, and
+//! there the sky lights everything — unless probe GI is on, whose probes know
+//! how open their surroundings are and pass that on (coarsely: per probe and
+//! axis).
+//!
+//! What the post pass mirrors is weighted by the surface's own specular
+//! colour (the forward pass writes it to a third target, `rgba8`): the same
+//! factor for a reflection found on screen and for the environment where the
+//! screen has nothing, so gold mirrors everything in gold. The forward pass
+//! leaves the environment's reflection on such a surface (a metal no rougher
+//! than `SSR max roughness`) to the post pass.
+//!
+//! Glass, with ray query: a ray is followed through the sphere or box it
+//! enters — bent going in and coming out, reflected inside when it cannot
+//! get out (`glass_bounces` times at most: 3 on `High`, 1 on `Medium`) — and
+//! then into the scene, where it takes the frame's colour of what it hits if
+//! that is in the frame, a rough shading of it if not, and the environment
+//! where it hits nothing. A ball turns what is behind it upside down; a slab
+//! shifts it. Without ray query the old stand-in remains: one bend at the
+//! surface and a lookup two metres along (`RenderContext::glass_rays_active`
+//! says which).
 //!
 //! SSR (screen-space reflections) and refraction are done by the `post.wgsl`
 //! compute pass, which runs between the forward pass(es) and the tone map and
@@ -68,6 +110,11 @@ pub const FEATURE_REFRACT: u32 = 1 << 2;
 /// forward pipelines, a frame without them with the plain ones.)
 pub const FEATURE_SHADOWS: u32 = 1 << 3;
 
+/// How far a sky ray looks for something between a surface and the sky,
+/// metres (`SKY_RANGE` in `shaders/forward.wgsl`): whatever is farther away
+/// than this does not keep the environment's light off a surface.
+pub const SKY_RANGE: f32 = 60.0;
+
 /// Mask of the features that need the post pass.
 pub const POST_FEATURES: u32 = FEATURE_SSR | FEATURE_REFRACT;
 
@@ -101,6 +148,8 @@ impl QualityPreset {
                 ssr_max_roughness: 0.5,
                 refraction: true,
                 shadows: true,
+                sky_rays: 8,
+                glass_bounces: 3,
             },
             Self::Medium => RenderFeatures {
                 fog: true,
@@ -110,6 +159,8 @@ impl QualityPreset {
                 ssr_max_roughness: 0.3,
                 refraction: true,
                 shadows: true,
+                sky_rays: 4,
+                glass_bounces: 1,
             },
             Self::Low | Self::Ci => RenderFeatures {
                 fog: false,
@@ -119,6 +170,8 @@ impl QualityPreset {
                 ssr_max_roughness: 0.0,
                 refraction: false,
                 shadows: false,
+                sky_rays: 0,
+                glass_bounces: 0,
             },
         }
     }
@@ -190,6 +243,14 @@ pub struct RenderFeatures {
     /// Ray-traced hard shadows from the point lights (needs ray query; see
     /// the module docs).
     pub shadows: bool,
+    /// Rays per pixel that ask how much of the environment's light reaches a
+    /// surface (needs ray query; see the module docs). 0 = none: the
+    /// environment lights everything.
+    pub sky_rays: u32,
+    /// With ray-traced refraction: how often a ray may be reflected inside a
+    /// piece of glass (total internal reflection) before it is let out
+    /// wherever it is.
+    pub glass_bounces: u32,
 }
 
 impl RenderFeatures {
@@ -275,6 +336,10 @@ mod tests {
         assert_eq!(medium.ssr_max_roughness, 0.3);
         // Shadows: High and Medium on, Low and Ci off; they need no post pass.
         assert!(high.shadows && medium.shadows);
+        // Sky rays: with the shadows, more of them on High.
+        assert_eq!((high.sky_rays, medium.sky_rays), (8, 4));
+        assert_eq!(QualityPreset::Low.features().sky_rays, 0);
+        assert_eq!(QualityPreset::Ci.features().sky_rays, 0);
         assert_eq!(FEATURE_SHADOWS & POST_FEATURES, 0);
         for p in [QualityPreset::Low, QualityPreset::Ci] {
             let f = p.features();

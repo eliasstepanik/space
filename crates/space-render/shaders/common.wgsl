@@ -27,6 +27,8 @@ struct MeshInstance {
     model_z: vec4<f32>,
     albedo: vec4<f32>,   // rgb base-colour factor + metallic in .w
     emissive: vec4<f32>, // rgb radiance + roughness in .w
+    surface: vec4<f32>,  // x = 1 for an open surface (a sheet: both its sides
+                         // face the open), 0 for a closed solid; yzw unused
 }
 //#endif
 
@@ -38,7 +40,7 @@ struct MeshInstance {
 // or composite, see build.rs.)
 struct Environment {
     zenith: vec4<f32>,  // rgb from straight up; w > 0 when the scene has an environment
-    horizon: vec4<f32>, // rgb from the horizon
+    horizon: vec4<f32>, // rgb from the horizon; w > 0 when it is also painted as the background
     ground: vec4<f32>,  // rgb from straight down
 }
 
@@ -62,6 +64,22 @@ fn env_hemisphere(y: f32) -> f32 {
 // Ambient light on a surface with unit normal `n` (irradiance over pi).
 fn env_ambient(env: Environment, n: vec3<f32>) -> vec3<f32> {
     return env_blend(env, env_hemisphere(n.y), env_hemisphere(-n.y));
+}
+
+// Scale and bias of the specular reflection of a uniform surrounding (the
+// "environment BRDF" of the split-sum approximation, as fitted by Karis for
+// mobile): how much of what a surface with specular colour `f0` and
+// `roughness` reflects reaches a viewer at cosine `nov` from its normal. It
+// rises to 1 at grazing angles (Fresnel). Everything a surface mirrors — the
+// environment and a screen-space reflection alike — is weighted with this, so
+// a metal's reflection has one colour whatever it shows.
+fn env_brdf(f0: vec3<f32>, roughness: f32, nov: f32) -> vec3<f32> {
+    let c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * nov)) * r.x + r.y;
+    let ab = vec2(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + vec3(ab.y);
 }
 
 // The gradient as a surface of `roughness` reflects it along the unit mirror

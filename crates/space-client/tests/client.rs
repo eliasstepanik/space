@@ -573,11 +573,22 @@ fn the_scene_switches_live_when_the_shards_scene_changes() {
         // The world that is drawn is the new scene's, around the same ship.
         let world = World::new(scene);
         let expected = world.build(&client.app.scene(640, 360).camera);
+        let bodies = client.app.client_state(640, 360).bodies.len();
         let drawn = client.app.scene(640, 360);
-        assert_eq!(drawn.instances.len(), expected.instances.len(), "{scene}");
         assert_eq!(drawn.lights.len(), expected.lights.len(), "{scene}");
-        // ...plus the player's own character (chase camera).
-        assert_eq!(drawn.models.len(), expected.models.len() + 1, "{scene}");
+        if bodies == 0 {
+            assert_eq!(drawn.instances.len(), expected.instances.len(), "{scene}");
+            // ...plus the player's own character (chase camera).
+            assert_eq!(drawn.models.len(), expected.models.len() + 1, "{scene}");
+        } else {
+            // ...plus the scene's physics bodies (the demo area's showcase):
+            // a model per part, and coils of beads for their springs.
+            assert!(drawn.instances.len() > expected.instances.len(), "{scene}");
+            assert!(
+                drawn.models.len() > expected.models.len() + 1 + bodies,
+                "{scene}"
+            );
+        }
         assert!(!drawn.overlay.is_empty(), "{scene}: the HUD");
         // The camera is where the ship is in that scene: the spawn point
         // plus what the ship has flown, plus the chase offset behind it.
@@ -693,25 +704,42 @@ fn players_see_each_other_as_characters_and_unowned_ships_as_ships() {
     };
     alice.frame();
     let before = seen_at(&mut alice.app);
-    // Both spawned on the same spot: his feet are straight below her eyes.
-    assert!(
-        before[0].abs() < 0.01 && before[2].abs() < 0.01,
-        "{before:?}"
+    // Each joined on a free spawn point of its own: his feet are where the
+    // server has him, seen from her eyes.
+    let (her, his) = (
+        alice.app.client_state(1, 1).position.expect("her ship"),
+        bob.app.client_state(1, 1).position.expect("his ship"),
     );
-    assert!((before[1] + space_client::scenes::EYE_HEIGHT).abs() < 0.01);
+    let apart: f64 = (0..3)
+        .map(|i| (his[i] - her[i]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!(apart > 0.6, "two solid ships {apart} m apart");
+    assert!(
+        (f64::from(before[0]) - (his[0] - her[0])).abs() < 0.01
+            && (f64::from(before[2]) - (his[2] - her[2])).abs() < 0.01,
+        "{before:?} for {his:?} seen from {her:?}"
+    );
+    assert!(
+        (f64::from(before[1]) - (his[1] - her[1]) + f64::from(space_client::scenes::EYE_HEIGHT))
+            .abs()
+            < 0.01
+    );
     bob.app.input(ViewerInput::Key {
         key: Key::Up,
         down: true,
     });
     bob.until("climbed", |app| {
-        app.client_state(1, 1).position.is_some_and(|p| p[1] > 3.0)
+        app.client_state(1, 1)
+            .position
+            .is_some_and(|p| p[1] > his[1] + 3.0)
     });
     bob.app.input(ViewerInput::Key {
         key: Key::Up,
         down: false,
     });
     bob.until("stopped", |app| app.client_state(1, 1).speed < 0.01);
-    let height = bob.app.client_state(1, 1).position.expect("a ship")[1];
+    let height = bob.app.client_state(1, 1).position.expect("a ship")[1] - his[1];
     let deadline = Instant::now() + LONG;
     loop {
         alice.frame();
@@ -1102,9 +1130,10 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// Players who join through different shards see one world: both derive the
 /// same anchor from the map their shard sent, so the scene's objects — and
 /// each other — are in the same places for both. The one who joined through
-/// the root shard arrives on the scene's spawn point; the other one sees the
-/// scene from where its own shard put it, 887 m away. The handoff of the
-/// first one (it spawns in the carved-out octant) does not move anything.
+/// the root shard arrives on the scene's spawn point; the other one where its
+/// own shard put it (the shard that owns the spawn point puts its players on
+/// the free point nearest to it). The handoff of the first one (it spawns in
+/// the carved-out octant) does not move anything.
 #[test]
 fn two_clients_on_two_shards_agree_where_the_scene_is() {
     let rt = runtime();
@@ -1145,19 +1174,23 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
         "{:?}",
         from_scene(&alice)
     );
-    let expected = WorldPos::delta(root_centre, far_centre);
-    assert!((expected[0] - 512.0).abs() < 1e-6, "{expected:?}");
-    for (got, want) in from_scene(&bob).iter().zip(expected) {
-        assert!((got - want).abs() < 0.05, "{:?}", from_scene(&bob));
-    }
+    // (B owns the scene's spawn point, so it spawns Bob on the free point
+    // of its spawn grid nearest to it, beside Alice.)
+    let _ = far_centre;
     // The harness is told both: where the ship is in the world, and where it
-    // is in the scene.
+    // is in the scene — the same place, measured from the world's origin and
+    // from the anchor.
     let told = bob.app.client_state(640, 360);
     assert_eq!(told.scene_position, Some(from_scene(&bob)));
     let world = told.position.expect("a ship");
-    let far = WorldPos::delta(WorldPos::ZERO, far_centre);
-    assert!((world[0] - far[0]).abs() < 0.05, "{world:?}");
-    assert!((world[0] - from_scene(&bob)[0]).abs() > 100.0, "{world:?}");
+    let origin = WorldPos::delta(WorldPos::ZERO, root_centre);
+    for i in 0..3 {
+        assert!(
+            (world[i] - origin[i] - from_scene(&bob)[i]).abs() < 0.05,
+            "{world:?} vs {:?}",
+            from_scene(&bob)
+        );
+    }
 
     // One world: where a player stands relative to the chart's first sphere
     // is the same in the player's own picture (the character in the chase
@@ -1175,11 +1208,6 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
         distance(bob_by_alice, bob_by_himself) < 0.05,
         "Alice has Bob at {bob_by_alice:?} from the landmark, Bob has himself at {bob_by_himself:?}"
     );
-    // ...and that is far away: Bob really is looking at the scene from afar.
-    assert!(
-        distance(bob_by_himself, [0.0; 3]) > 800.0,
-        "{bob_by_himself:?}"
-    );
     let alice_by_herself = from_landmark(&mut alice, 0);
     let alice_by_bob = from_landmark(&mut bob, 1);
     assert!(
@@ -1188,6 +1216,82 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
     );
     assert!(distance(alice_by_herself, [0.0; 3]) < 30.0);
 
+    drop(alice);
+    drop(bob);
+    a.stop();
+    b.stop();
+}
+
+/// Players on neighbouring shards see each other as characters: each is
+/// near the border on its own shard, and the other one arrives as the ghost
+/// the neighbour sends — owner 0 there, but marked with the player visual —
+/// and is drawn as a character, not as the ship model of a ship nobody flies.
+///
+/// Needs the shard to put `Visual(PLAYER)` on every player's ship (phase 2 of
+/// the physics work).
+#[test]
+fn players_on_neighbouring_shards_see_each_other_as_characters() {
+    let rt = runtime();
+    let (a, b) = {
+        let _inside = rt.enter();
+        let region_a = NodeRef::new(64, [0, 0, 0]);
+        let region_b = NodeRef::new(64, [1, 0, 0]);
+        let a = start_shard_at(1, region_a, SocketAddr::from(([127, 0, 0, 1], 0)));
+        let b = start_shard_at(2, region_b, SocketAddr::from(([127, 0, 0, 1], 0)));
+        let map = ShardMap::new(
+            1,
+            vec![
+                ShardRegion {
+                    node: region_a,
+                    shard: ShardId::new(1),
+                    endpoint: a.addr(),
+                },
+                ShardRegion {
+                    node: region_b,
+                    shard: ShardId::new(2),
+                    endpoint: b.addr(),
+                },
+            ],
+        );
+        rt.block_on(async {
+            a.shard.lock().await.set_shard_map(map.clone());
+            b.shard.lock().await.set_shard_map(map);
+        });
+        (a, b)
+    };
+    // The material chart: no models of its own, every model is a player.
+    for shard in [&a, &b] {
+        set_scene(&rt, shard, SceneState::new(Scene::Materials.id(), 1));
+    }
+    let mut alice = Dry::online(&rt, a.addr());
+    let mut bob = Dry::online(&rt, b.addr());
+    // Both a few metres from the border between the two cells (x = 512 m),
+    // each on its own side.
+    let place = |shard: &Running, session: u64, x: f64| {
+        rt.block_on(async {
+            let mut shard = shard.shard.lock().await;
+            let ship = shard.ship_of(session).expect("the player's ship");
+            let at = WorldPos::from_f64_metres_around(WorldPos::ZERO, [x, 0.0, 0.0]);
+            assert!(shard.set_state(ship, space_sim::ShipState::at_rest(at)));
+        });
+    };
+    let session = |client: &Dry| client.app.replica().expect("online").session;
+    place(&a, session(&alice), 505.0);
+    place(&b, session(&bob), 519.0);
+    for client in [&mut alice, &mut bob] {
+        client.until("saw the player across the border", |app| {
+            app.replica()
+                .is_some_and(|r| r.other_ships().any(|t| t.is_player()))
+        });
+    }
+    let (character, ship) = (character_mesh(), ship_mesh());
+    for (name, client) in [("Alice", &mut alice), ("Bob", &mut bob)] {
+        assert_eq!(client.app.replica().unwrap().handoffs, 0, "{name} stayed");
+        let scene = client.app.scene(640, 360);
+        assert_eq!(count_mesh(scene, &character), 2, "{name}: both characters");
+        assert_eq!(count_mesh(scene, &ship), 0, "{name}: no ship model");
+        assert_eq!(client.app.client_state(1, 1).bodies.len(), 0, "{name}");
+    }
     drop(alice);
     drop(bob);
     a.stop();

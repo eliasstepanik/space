@@ -70,13 +70,185 @@
 //! An entity is encoded once per tick ([`PassCache`]) however many clients can
 //! see it; each client's frame then takes a copy of those bytes. Its encoded
 //! size is computed, not measured ([`EntitySnapshot::encoded_len`]).
+//!
+//! # Every body, and only what changed
+//!
+//! Every physics entity in a client's interest is replicated — ships, bodies
+//! and the ghosts of a neighbour's bodies near the border — with its whole
+//! replicated component set ([`replicated_components`]: `ShipState` and, for
+//! a ship, `ShipControls` and `Owner` — and, for a ship a client flies, the
+//! player model as its `Visual` (`space_scene::visual::PLAYER`), so a client
+//! draws a character for it even where its `Owner` names nobody it knows,
+//! as on a ghost; for a body its `Body`, `Visual`, `Springs`,
+//! `Articulation`, `PartStates` and `PosResidual`).
+//!
+//! The [`ComponentLog`] remembers, per entity and component, the bytes last
+//! seen and the tick they changed. A snapshot, and a delta entry for an entity
+//! the client does not hold yet (or one a lost frame owes), carries the full
+//! set; any other delta entry carries the `ShipState` and the `Owner` (always:
+//! they name the entity's motion and its player) plus only the components
+//! whose bytes changed since the client's change base — so a crate's shape,
+//! a chain's joints and a pendulum's spring go out once, and a moving body
+//! costs its state, its residual and its part states. A component that went
+//! away is listed with an empty payload (protocol 5, [`Delta::entities`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use space_ecs::{ComponentDef, Entity, WithEntity};
+use space_ecs::{ComponentDef, ComponentId, Entity, WithEntity};
 use space_protocol::{Delta, EntityGuid, EntitySnapshot, ShardId, Snapshot, SnapshotBuilder};
-use space_sim::{Owner, ShipControls, ShipState, SimWorld};
+use space_sim::{Body, Owner, ShipControls, ShipState, SimWorld};
 use space_world::{InterestGrid, WorldPos};
+
+/// A replicated component list: `(id, encoded payload)` in id order.
+pub type Components = Vec<(ComponentId, Vec<u8>)>;
+
+/// How long a component removal is remembered for deltas, ticks. A client is
+/// sent a frame every tick, so its change base is never older than its frames
+/// in flight ([`MAX_IN_FLIGHT_FRAMES`]); a client further behind is re-sent in
+/// full anyway (presumed lost frames owe their entities).
+const TOMBSTONE_TICKS: u64 = 4 * MAX_IN_FLIGHT_FRAMES as u64;
+
+/// The replicated component list of the entity `guid` this world simulates:
+/// [`SimWorld::export_entity`], except that a ship's `Body` is left out — it
+/// is always [`Body::ship`] of the shard's parameters, which the receiver
+/// already knows (`SimWorld::import_entity` gives a ship without one exactly
+/// that), and leaving it out keeps a ship at its 158 bytes.
+#[must_use]
+pub fn replicated_components(sim: &SimWorld, guid: EntityGuid) -> Option<Components> {
+    let mut list = sim.export_entity(guid)?;
+    if list
+        .iter()
+        .any(|(id, _)| *id == <ShipControls as ComponentDef>::ID)
+    {
+        list.retain(|(id, _)| *id != <Body as ComponentDef>::ID);
+    }
+    Some(list)
+}
+
+/// Per entity, the bytes of each replicated component and the tick they last
+/// changed (see the module docs, "Every body, and only what changed").
+#[derive(Debug, Default)]
+pub struct ComponentLog {
+    entries: HashMap<EntityGuid, LogEntry>,
+    /// The sim tick of the last [`ComponentLog::refresh`].
+    scanned: u64,
+}
+
+#[derive(Debug, Default)]
+struct LogEntry {
+    /// `(id, bytes, tick the bytes last changed)`, in id order.
+    components: Vec<(ComponentId, Vec<u8>, u64)>,
+    /// Components that went away, and when.
+    removed: Vec<(ComponentId, u64)>,
+}
+
+impl ComponentLog {
+    /// An empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of entities logged.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is logged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Record `guid`'s current components at `tick`: a component whose bytes
+    /// differ from the last record (or is new) is stamped `tick`; one that is
+    /// gone is remembered as removed at `tick`.
+    pub fn record(&mut self, guid: EntityGuid, components: Components, tick: u64) {
+        let entry = self.entries.entry(guid).or_default();
+        let mut next: Vec<(ComponentId, Vec<u8>, u64)> = Vec::with_capacity(components.len());
+        for (id, bytes) in components {
+            let changed_at = match entry.components.iter().find(|(old, _, _)| *old == id) {
+                Some((_, old, at)) if *old == bytes => *at,
+                _ => tick,
+            };
+            entry.removed.retain(|(gone, _)| *gone != id);
+            next.push((id, bytes, changed_at));
+        }
+        for (id, _, _) in &entry.components {
+            if !next.iter().any(|(n, _, _)| n == id) {
+                entry.removed.push((*id, tick));
+            }
+        }
+        entry
+            .removed
+            .retain(|(_, at)| tick.saturating_sub(*at) <= TOMBSTONE_TICKS);
+        entry.components = next;
+    }
+
+    /// Forget `guid` (it left this shard's world).
+    pub fn forget(&mut self, guid: EntityGuid) {
+        self.entries.remove(&guid);
+    }
+
+    /// Record every entity whose row changed since the last refresh, with
+    /// `components` naming each one's replicated list (`None`: not
+    /// replicated — it is forgotten).
+    pub fn refresh(
+        &mut self,
+        sim: &mut SimWorld,
+        guids: &GuidIndex,
+        mut components: impl FnMut(&SimWorld, EntityGuid) -> Option<Components>,
+    ) {
+        let tick = sim.tick();
+        let changed = changed_since(sim, guids, self.scanned);
+        for guid in changed {
+            match components(sim, guid) {
+                Some(list) => self.record(guid, list, tick),
+                None => self.forget(guid),
+            }
+        }
+        self.scanned = tick;
+    }
+
+    /// The full component set of `guid`, as a snapshot entity.
+    #[must_use]
+    pub fn full(&self, guid: EntityGuid) -> Option<EntitySnapshot> {
+        let entry = self.entries.get(&guid)?;
+        Some(EntitySnapshot::new(
+            guid,
+            entry
+                .components
+                .iter()
+                .map(|(id, bytes, _)| (*id, bytes.clone()))
+                .collect(),
+        ))
+    }
+
+    /// What changed about `guid` after tick `base`: its `ShipState` and
+    /// `Owner` always, every other component stamped after `base`, and an
+    /// empty payload for each component removed after `base`.
+    #[must_use]
+    pub fn since(&self, guid: EntityGuid, base: u64) -> Option<EntitySnapshot> {
+        let entry = self.entries.get(&guid)?;
+        let always = |id: ComponentId| {
+            id == <ShipState as ComponentDef>::ID || id == <Owner as ComponentDef>::ID
+        };
+        let mut list: Components = entry
+            .components
+            .iter()
+            .filter(|(id, _, at)| always(*id) || *at > base)
+            .map(|(id, bytes, _)| (*id, bytes.clone()))
+            .collect();
+        for (id, at) in &entry.removed {
+            if *at > base {
+                list.push((*id, Vec::new()));
+            }
+        }
+        list.sort_by_key(|(id, _)| *id);
+        Some(EntitySnapshot::new(guid, list))
+    }
+}
 
 /// How many unacknowledged frames are remembered per client.
 ///
@@ -128,9 +300,13 @@ impl GuidIndex {
         Self::default()
     }
 
-    /// Record `guid` ↔ `entity`.
+    /// Record `guid` ↔ `entity` (replacing what `guid` named before).
     pub fn insert(&mut self, guid: EntityGuid, entity: Entity) {
-        self.to_entity.insert(guid, entity);
+        if let Some(old) = self.to_entity.insert(guid, entity) {
+            if old != entity && self.to_guid.get(&old) == Some(&guid) {
+                self.to_guid.remove(&old);
+            }
+        }
         self.to_guid.insert(entity, guid);
     }
 
@@ -426,8 +602,8 @@ pub fn snapshot_of(sim: &SimWorld, guids: &GuidIndex, entity: Entity) -> Option<
     ))
 }
 
-/// Every entity whose replicated state changed since `base_tick`, in the ECS's
-/// own row order.
+/// Every physics entity (ship, body or ghost) whose row changed since
+/// `base_tick`, in the ECS's own row order.
 ///
 /// The change filter is a tick compare per row, so an idle fleet costs nothing
 /// here — the whole point of the change tick model. The result is the same for
@@ -436,8 +612,8 @@ pub fn snapshot_of(sim: &SimWorld, guids: &GuidIndex, entity: Entity) -> Option<
 #[must_use]
 pub fn changed_since(sim: &mut SimWorld, guids: &GuidIndex, base_tick: u64) -> Vec<EntityGuid> {
     let mut out = Vec::new();
-    let query = sim.world_mut().query::<WithEntity<(&ShipState, &Owner)>>();
-    query.changed_since(base_tick).for_each(|((_, _), entity)| {
+    let query = sim.world_mut().query::<WithEntity<&ShipState>>();
+    query.changed_since(base_tick).for_each(|(_, entity)| {
         if let Some(guid) = guids.guid_of(entity) {
             out.push(guid);
         }
@@ -452,8 +628,9 @@ pub fn changed_since(sim: &mut SimWorld, guids: &GuidIndex, base_tick: u64) -> V
 /// entity's encoded snapshot. Both are computed on first use and reused.
 #[derive(Debug, Default)]
 pub struct PassCache {
-    /// guid → its encoded snapshot this tick (`None`: not alive here).
-    snapshots: HashMap<EntityGuid, Option<EntitySnapshot>>,
+    /// `(guid, change base)` → its encoded entry this tick: the full set for
+    /// `None`, what changed after the base otherwise (`None`: not logged).
+    snapshots: HashMap<(EntityGuid, Option<u64>), Option<EntitySnapshot>>,
     /// change base → every guid changed since it.
     changed: HashMap<u64, Vec<EntityGuid>>,
 }
@@ -465,18 +642,19 @@ impl PassCache {
         Self::default()
     }
 
-    /// `guid`'s snapshot as of this tick, encoded on first request.
+    /// `guid`'s entry as of this tick — its full set (`base` `None`) or what
+    /// changed after `base` — built on first request.
     fn snapshot(
         &mut self,
-        sim: &SimWorld,
-        guids: &GuidIndex,
+        log: &ComponentLog,
         guid: EntityGuid,
+        base: Option<u64>,
     ) -> Option<&EntitySnapshot> {
         self.snapshots
-            .entry(guid)
-            .or_insert_with(|| {
-                sim.entity_of(guid)
-                    .and_then(|entity| snapshot_of(sim, guids, entity))
+            .entry((guid, base))
+            .or_insert_with(|| match base {
+                None => log.full(guid),
+                Some(base) => log.since(guid, base),
             })
             .as_ref()
     }
@@ -518,6 +696,8 @@ pub struct FrameContext<'a> {
     pub budget: usize,
     /// The guid index used to name entities.
     pub guids: &'a GuidIndex,
+    /// What every entity's components are (refreshed before the pass).
+    pub log: &'a ComponentLog,
 }
 
 /// One client's interest set this tick, in both shapes the frame needs.
@@ -560,7 +740,7 @@ pub fn build_frame(
         let mut builder = SnapshotBuilder::with_budget(cx.budget, tick, cx.shard, cx.epoch);
         let mut sent = Vec::new();
         while let Some(&guid) = replica.pending_snapshot.front() {
-            let Some(snap) = cache.snapshot(sim, cx.guids, guid) else {
+            let Some(snap) = cache.snapshot(cx.log, guid, None) else {
                 // Despawned between planning and sending.
                 replica.pending_snapshot.pop_front();
                 continue;
@@ -608,10 +788,18 @@ pub fn build_frame(
     // interest without changing — an entity at rest never shows up in the change
     // scan, so entering the sphere has to be a reason to send it in its own
     // right. Deduplicated, and restricted to what is visible now.
+    //
+    // What goes out in full: the unconfirmed own ship, debt (a lost frame may
+    // have carried the only copy of a component) and anything the client does
+    // not hold. A changed entity it holds goes out as what changed since the
+    // change base.
+    let change_base = replica.change_base;
     let mut candidates: Vec<EntityGuid> = Vec::new();
+    let mut full: HashSet<EntityGuid> = HashSet::new();
     let mut seen: HashSet<EntityGuid> = HashSet::new();
     let own_ship = replica.ship_is_unconfirmed(tick).then_some(replica.ship);
     let owed = std::mem::take(&mut replica.owed);
+    full.extend(own_ship.iter().chain(owed.iter()).copied());
     let changed = cache.changed_since(sim, cx.guids, replica.change_base);
     let entered = visible
         .ordered
@@ -634,7 +822,8 @@ pub fn build_frame(
     let mut sent = Vec::new();
     let mut taken = 0usize;
     for guid in &candidates {
-        let Some(snap) = cache.snapshot(sim, cx.guids, *guid) else {
+        let base = (!full.contains(guid) && replica.known.contains(guid)).then_some(change_base);
+        let Some(snap) = cache.snapshot(cx.log, *guid, base) else {
             taken += 1; // gone: not owed, not sent
             continue;
         };
@@ -779,20 +968,24 @@ mod tests {
         (sim, guids, all)
     }
 
-    /// One frame for `replica`, with a fresh per-tick cache.
+    /// One frame for `replica`, with a fresh per-tick cache and the log
+    /// refreshed from the world first (what the shard's pass does).
     fn frame_for(
         sim: &mut SimWorld,
         guids: &GuidIndex,
+        log: &mut ComponentLog,
         replica: &mut ClientReplica,
         visible: &[EntityGuid],
         budget: usize,
     ) -> Frame {
+        log.refresh(sim, guids, replicated_components);
         let set: HashSet<EntityGuid> = visible.iter().copied().collect();
         let cx = FrameContext {
             shard: ShardId::new(1),
             epoch: 1,
             budget,
             guids,
+            log,
         };
         build_frame(
             sim,
@@ -827,9 +1020,10 @@ mod tests {
         const BUDGET: usize = 400;
         let (mut sim, guids, all) = parked_fleet(6);
         let mut replica = ClientReplica::new(all[0]);
+        let mut log = ComponentLog::new();
 
         sim.step();
-        let first = frame_for(&mut sim, &guids, &mut replica, &all, BUDGET);
+        let first = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
         assert!(matches!(first, Frame::Snapshot(_)));
         assert_eq!(guids_in(&first), vec![all[0], all[1]], "chunk 1");
 
@@ -841,11 +1035,11 @@ mod tests {
             .expect("ship state") = ShipState::at_rest(moved_to);
 
         sim.step();
-        let second = frame_for(&mut sim, &guids, &mut replica, &all, BUDGET);
+        let second = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
         assert!(matches!(second, Frame::Snapshot(_)));
         assert_eq!(guids_in(&second), vec![all[2], all[3]], "chunk 2");
         sim.step();
-        let third = frame_for(&mut sim, &guids, &mut replica, &all, BUDGET);
+        let third = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
         assert!(matches!(third, Frame::Snapshot(_)));
         assert_eq!(guids_in(&third), vec![all[4], all[5]], "chunk 3");
 
@@ -854,7 +1048,7 @@ mod tests {
         sim.step();
         let mut carried = None;
         for _ in 0..4 {
-            let frame = frame_for(&mut sim, &guids, &mut replica, &all, BUDGET);
+            let frame = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
             let Frame::Delta(delta) = frame else {
                 panic!("the snapshot is complete, so this must be a delta");
             };

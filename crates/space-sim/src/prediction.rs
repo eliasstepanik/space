@@ -31,15 +31,32 @@
 //! [`PredictedShip`] is deliberately free of any network or ECS dependency: it is
 //! a state machine over [`ShipState`] and [`PlayerInput`], so the same type works
 //! on a native client, in a test, and on a server that wants to keep a predicted
-//! view of a neighbouring shard's ship.
+//! view of a neighbouring shard's ship. It predicts **free flight** exactly
+//! (the server steps a ship that touches nothing with the same
+//! [`crate::step_ship`]), but knows nothing of gravity, springs or contacts.
+//!
+//! [`PredictedPhysics`] is the replacement for a world with physics: the same
+//! pending-input queue and reconciliation rules, but the replay steps the own
+//! ship through a private [`SimWorld`] holding the scene's statics, its
+//! gravity field and **kinematic copies** (ghosts) of the bodies near the
+//! ship, so the predicted ship lands on the floor, bumps into crates and falls
+//! in the gravity room exactly as the server's would (to the extent the
+//! copies' motion is known: a copy is extrapolated with its last replicated
+//! velocity and cannot be pushed, so a collision with a *dynamic* body is
+//! predicted as one with an immovable one — reconciliation corrects it). The
+//! private world forms its own physics bubble around the ship, so prediction
+//! works the same anywhere in the world.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
-use space_protocol::PlayerInput;
+use space_ecs::ComponentId;
+use space_protocol::{EntityGuid, PlayerInput};
 use space_world::WorldPos;
 
 use crate::params::ShipParams;
 use crate::physics::step_ship;
+use crate::rigid::PhysicsError;
+use crate::sim_world::SimWorld;
 use crate::tick::SimTick;
 use crate::ShipState;
 
@@ -247,6 +264,214 @@ impl PredictedShip {
     /// seeded from that shard's first snapshot: its pending inputs are tagged in
     /// the old clock, and this guard would otherwise sit out every snapshot of a
     /// shard whose clock is behind.
+    pub fn reconcile(
+        &mut self,
+        new_authority: ShipState,
+        new_tick: SimTick,
+        input_ack: SimTick,
+    ) -> f32 {
+        if new_tick < self.last_tick {
+            return 0.0;
+        }
+        let predicted = self.predict(new_tick);
+        let correction = WorldPos::distance(predicted.pos, new_authority.pos) as f32;
+        let covered = input_ack.max(new_tick);
+        self.pending.retain(|i| i.tick > covered);
+        self.authoritative = new_authority;
+        self.last_tick = new_tick;
+        correction
+    }
+
+    /// How many ticks of prediction are currently unacknowledged.
+    #[must_use]
+    pub fn pending_ticks(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// What [`PredictedPhysics`] knows of a body near the ship: its last
+/// replicated state and the tick it is from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Nearby {
+    state: ShipState,
+    tick: SimTick,
+}
+
+/// Client prediction through the full physics (see the [module docs](self)).
+///
+/// Same contract as [`PredictedShip`] — [`apply_input`](Self::apply_input),
+/// [`predict`](Self::predict), [`reconcile`](Self::reconcile), the same
+/// pending-queue invariant and the same [`MAX_PREDICT_TICKS`] bound — with
+/// two differences: `predict` takes `&mut self` (it steps a world), and the
+/// caller keeps the copies of nearby bodies current with
+/// [`set_nearby`](Self::set_nearby) / [`remove_nearby`](Self::remove_nearby)
+/// from the snapshots it receives.
+///
+/// Build the private world like the server builds a shard's: the scene's
+/// catalogue, statics and gravity and the same [`ShipParams`]
+/// (`space_scene::install_environment` does all three).
+#[derive(Debug)]
+pub struct PredictedPhysics {
+    world: SimWorld,
+    own: EntityGuid,
+    /// The newest state the server has confirmed.
+    pub authoritative: ShipState,
+    /// The tick [`authoritative`](Self::authoritative) describes.
+    pub last_tick: SimTick,
+    /// Inputs sent and not yet covered by an authoritative state, oldest first.
+    pub pending: VecDeque<PlayerInput>,
+    nearby: BTreeMap<EntityGuid, Nearby>,
+}
+
+impl PredictedPhysics {
+    /// Predict the ship `own` (driven by session `owner`), whose last
+    /// authority is `state` at `last_tick`, in `world` (the scene's
+    /// environment, see the type docs; it must not contain `own`).
+    ///
+    /// # Errors
+    /// [`PhysicsError::Duplicate`] if `world` already holds `own`.
+    pub fn new(
+        mut world: SimWorld,
+        own: EntityGuid,
+        owner: u64,
+        state: ShipState,
+        last_tick: SimTick,
+    ) -> Result<Self, PhysicsError> {
+        if world.entity_of(own).is_some() {
+            return Err(PhysicsError::Duplicate(own));
+        }
+        world.reset_clock(last_tick);
+        world.spawn_ship(own, owner, state);
+        Ok(Self {
+            world,
+            own,
+            authoritative: state,
+            last_tick,
+            pending: VecDeque::new(),
+            nearby: BTreeMap::new(),
+        })
+    }
+
+    /// The private world (its bubbles, statics and copies).
+    #[must_use]
+    pub fn world(&self) -> &SimWorld {
+        &self.world
+    }
+
+    /// The flight model in use.
+    #[must_use]
+    pub fn params(&self) -> ShipParams {
+        self.world.params()
+    }
+
+    /// Record an input (same rules as [`PredictedShip::apply_input`]).
+    pub fn apply_input(&mut self, input: PlayerInput) {
+        if input.tick <= self.last_tick {
+            return;
+        }
+        if let Some(slot) = self.pending.iter_mut().find(|p| p.tick == input.tick) {
+            *slot = input;
+            return;
+        }
+        match self.pending.iter().rposition(|p| p.tick < input.tick) {
+            Some(i) => self.pending.insert(i + 1, input),
+            None => self.pending.push_front(input),
+        }
+        let cap = usize::try_from(MAX_PREDICT_TICKS).unwrap_or(usize::MAX);
+        while self.pending.len() > cap {
+            self.pending.pop_front();
+        }
+    }
+
+    /// Add or refresh the copy of a body near the ship: its replicated
+    /// component list (as a snapshot carries it) and its state at `tick`. The
+    /// copy is a ghost: it collides, it is never pushed.
+    ///
+    /// # Errors
+    /// [`PhysicsError`] if the components do not decode or are the own ship.
+    pub fn set_nearby(
+        &mut self,
+        guid: EntityGuid,
+        components: &[(ComponentId, Vec<u8>)],
+        state: ShipState,
+        tick: SimTick,
+    ) -> Result<(), PhysicsError> {
+        if guid == self.own {
+            return Err(PhysicsError::Duplicate(guid));
+        }
+        if !self.nearby.contains_key(&guid) {
+            self.world.insert_ghost(guid, components)?;
+        }
+        self.nearby.insert(guid, Nearby { state, tick });
+        Ok(())
+    }
+
+    /// Refresh only the state of a copy already known. Returns `false` for an
+    /// unknown guid.
+    pub fn update_nearby(&mut self, guid: EntityGuid, state: ShipState, tick: SimTick) -> bool {
+        match self.nearby.get_mut(&guid) {
+            Some(n) => {
+                *n = Nearby { state, tick };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget a copy (it left the area of interest).
+    pub fn remove_nearby(&mut self, guid: EntityGuid) {
+        if self.nearby.remove(&guid).is_some() {
+            self.world.despawn(guid);
+        }
+    }
+
+    /// The state the client believes its ship is in at `tick`: the authority
+    /// replayed through the physics with the pending inputs (by tick, gaps
+    /// coast, the last input is held past the end — exactly as
+    /// [`PredictedShip::predict`]), copies extrapolated with their velocity.
+    pub fn predict(&mut self, tick: SimTick) -> ShipState {
+        let steps = tick.saturating_sub(self.last_tick).min(MAX_PREDICT_TICKS);
+        self.world.reset_clock(self.last_tick);
+        if let Some(e) = self.world.entity_of(self.own) {
+            if let Some(s) = self.world.world_mut().get_mut::<ShipState>(e) {
+                *s = self.authoritative;
+            }
+        }
+        let last_pending = self.pending.back().copied();
+        let last_tick = self.pending.back().map_or(0, |i| i.tick);
+        for step in 0..steps {
+            let at = self.last_tick.wrapping_add(step);
+            let step_tick = at.wrapping_add(1);
+            for (guid, n) in &self.nearby {
+                let dt_s = (at as f64 - n.tick as f64) * f64::from(crate::tick::dt());
+                let mut s = n.state;
+                s.pos = WorldPos::from_f64_metres_around(
+                    s.pos,
+                    [
+                        f64::from(s.vel[0]) * dt_s,
+                        f64::from(s.vel[1]) * dt_s,
+                        f64::from(s.vel[2]) * dt_s,
+                    ],
+                );
+                self.world.drive_ghost(*guid, s, None);
+            }
+            let input = match self.pending.iter().find(|i| i.tick == step_tick) {
+                Some(i) => Some(*i),
+                None if step_tick > last_tick => last_pending,
+                None => None,
+            };
+            if let Some(mut i) = input {
+                i.entity = self.own;
+                i.tick = step_tick;
+                self.world.apply_inputs(self.world.tick(), &[i]);
+            }
+            self.world.step();
+        }
+        self.world.state_of(self.own).unwrap_or(self.authoritative)
+    }
+
+    /// Adopt the server's state (same rules as [`PredictedShip::reconcile`]);
+    /// returns the position correction in metres.
     pub fn reconcile(
         &mut self,
         new_authority: ShipState,

@@ -6,6 +6,9 @@
 //! ([`space_client::scenes::World`]: the demo area unless the server says
 //! otherwise) from the replicated ship's point of view offscreen (via
 //! `space-render`, so it works on lavapipe) and hand the frame back as a JPEG.
+//! The frame holds what the real client draws around the ship: the scene's
+//! physics bodies ([`space_client::bodies`]: the same meshes, the same
+//! placement) and the other players.
 //!
 //! # Tools
 //!
@@ -13,7 +16,7 @@
 //! |-----------------|---------------------------------------------------------------|
 //! | `connect`       | join the shard at `addr` (host:port, QUIC) as a player        |
 //! | `disconnect`    | leave the shard                                               |
-//! | `client_status` | session, tick, ship guid, replicated offset/velocity, scene   |
+//! | `client_status` | session, tick, ship guid, replicated offset/velocity, scene, physics bodies replicated |
 //! | `send_input`    | set thrust `[x,y,z]` (optionally for `duration_ms`, then 0)   |
 //! | `capture_frame` | render one frame offscreen, return it as base64 JPEG / a file |
 
@@ -21,16 +24,19 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use space_client::bodies::BodyRenderer;
 use space_client::input::InputState;
-use space_client::link::ServerLink;
-use space_client::scenes::{SceneKind, World};
+use space_client::link::{Replica, ServerLink};
+use space_client::scenes::{character_mesh, relative, ship_mesh, SceneKind, World, EYE_HEIGHT};
 use space_mcp::tool::{arg_str, arg_u64_opt};
 use space_mcp::{base64, McpServer, Tool, ToolRegistry};
-use space_render::{ContextOptions, QualityPreset, RenderContext, RenderOptions, Scene};
+use space_render::{
+    rotation_y, ContextOptions, ModelInstance, QualityPreset, RenderContext, RenderOptions, Scene,
+};
 use space_stream::JpegEncoder;
 use space_world::WorldPos;
 use tokio::sync::Mutex;
@@ -97,6 +103,63 @@ fn scene_at(scene: SceneKind, offset: [f64; 3], width: u32, height: u32) -> (Sce
     )
 }
 
+/// The bodies' meshes, kept across captures (the GPU cache is keyed by them).
+fn body_renderer() -> &'static StdMutex<BodyRenderer> {
+    static RENDERER: OnceLock<StdMutex<BodyRenderer>> = OnceLock::new();
+    RENDERER.get_or_init(|| StdMutex::new(BodyRenderer::new()))
+}
+
+/// Where `replica`'s ship is in its scene, metres from the spawn point (the
+/// client's mapping: as far from the spawn point as from the map's anchor);
+/// `fallback` until both are known.
+#[must_use]
+pub fn place_in_scene(replica: &Replica, fallback: [f64; 3]) -> [f64; 3] {
+    match (replica.anchor(), replica.state) {
+        (Some(anchor), Some(ship)) => WorldPos::delta(anchor, ship.pos),
+        _ => fallback,
+    }
+}
+
+/// Add what `replica` shows around the ship to `scene`: the physics bodies
+/// at the newest tick heard, and the other players (characters) and ships
+/// nobody flies (the ship model), as the client draws them.
+fn draw_replica(scene: &mut Scene, kind: SceneKind, replica: &Replica) {
+    let spawn = World::new(kind).spawn();
+    let anchor = replica.anchor();
+    let place = |pos: WorldPos| {
+        anchor.map_or(spawn, |anchor| {
+            WorldPos::from_f64_metres_around(spawn, WorldPos::delta(anchor, pos))
+        })
+    };
+    let camera = scene.camera;
+    for other in replica.other_ships() {
+        let at = place(other.ship.state.pos);
+        let model = if other.is_player() {
+            ModelInstance {
+                mesh: character_mesh(),
+                position: relative(
+                    &camera,
+                    WorldPos::from_f64_metres_around(at, [0.0, -f64::from(EYE_HEIGHT), 0.0]),
+                ),
+                rotation: rotation_y(0.0),
+                scale: 1.0,
+            }
+        } else {
+            ModelInstance {
+                mesh: ship_mesh(),
+                position: relative(&camera, at),
+                rotation: space_render::IDENTITY_ROTATION,
+                scale: 1.0,
+            }
+        };
+        scene.models.push(model);
+    }
+    let mut bodies = body_renderer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = bodies.draw(replica, replica.tick as f64, spawn, Instant::now(), scene);
+}
+
 /// A captured, JPEG-encoded frame.
 #[derive(Debug)]
 pub struct Capture {
@@ -110,8 +173,9 @@ pub struct Capture {
     pub device: String,
 }
 
-/// Render `scene` (camera displaced by `offset` metres from its spawn point)
-/// and JPEG-encode it. Blocking (GPU work).
+/// Render `scene` (camera displaced by `offset` metres from its spawn point,
+/// with what `replica` shows drawn around it) and JPEG-encode it. Blocking
+/// (GPU work).
 ///
 /// # Errors
 ///
@@ -120,6 +184,7 @@ pub fn render_jpeg(
     render: &StdMutex<Option<RenderContext>>,
     scene: SceneKind,
     offset: [f64; 3],
+    replica: Option<&Replica>,
     width: u32,
     height: u32,
 ) -> Result<Capture, String> {
@@ -131,7 +196,11 @@ pub fn render_jpeg(
         );
     }
     let ctx = slot.as_ref().ok_or("render context missing")?;
-    let (scene, options) = scene_at(scene, offset, width, height);
+    let kind = scene;
+    let (mut scene, options) = scene_at(kind, offset, width, height);
+    if let Some(replica) = replica {
+        draw_replica(&mut scene, kind, replica);
+    }
     let frame = ctx
         .render_offscreen(&scene, width, height, &options)
         .map_err(|e| format!("render failed: {}", e.message))?;
@@ -213,7 +282,7 @@ pub fn registry(state: &Arc<ClientState>) -> ToolRegistry {
     let s = Arc::clone(state);
     r.register(tool(
         "client_status",
-        "Connection state and the client's replicated view: session id, last tick, frames received, own ship guid, offset from where it first appeared (m), velocity and the scene the shard shows.",
+        "Connection state and the client's replicated view: session id, last tick, frames received, own ship guid, offset from where it first appeared (m), velocity, the scene the shard shows and how many physics bodies it replicates.",
         empty,
         move |_| {
             let s = Arc::clone(&s);
@@ -242,7 +311,7 @@ pub fn registry(state: &Arc<ClientState>) -> ToolRegistry {
     let s = Arc::clone(state);
     r.register(tool(
         "capture_frame",
-        "Render one frame offscreen (software Vulkan is fine) and return it as a JPEG: JSON with width/height/bytes/device/scene and `base64` (unless inline=false). If connected the picture is the scene the shard shows, seen from the replicated ship (first person); otherwise the default scene from its spawn point. `name` (plain file name) also saves it to the server's output directory and returns the path.",
+        "Render one frame offscreen (software Vulkan is fine) and return it as a JPEG: JSON with width/height/bytes/device/scene and `base64` (unless inline=false). If connected the picture is the scene the shard shows, seen from the replicated ship (first person), with the physics bodies and the other players the shard reports drawn as the client draws them; otherwise the default scene from its spawn point. `name` (plain file name) also saves it to the server's output directory and returns the path.",
         json!({
             "type": "object",
             "properties": {
@@ -316,6 +385,7 @@ async fn client_status(state: &ClientState) -> Result<String, String> {
         "offset_m": link.offset(),
         "velocity_mps": replica.state.map(|s| s.vel),
         "scene": replica.scene.scene.or_default().name(),
+        "bodies": replica.bodies().count(),
     }))
 }
 
@@ -375,17 +445,23 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
             )
         }
     };
-    let (scene, offset, connected) = match state.link.lock().await.as_ref() {
-        Some(link) => (link.scene().scene.or_default(), link.offset(), true),
-        None => (SceneKind::DEFAULT, [0.0; 3], false),
+    let (scene, offset, replica) = match state.link.lock().await.as_ref() {
+        Some(link) => {
+            let replica = link.replica();
+            let offset = place_in_scene(&replica, link.offset());
+            (link.scene().scene.or_default(), offset, Some(replica))
+        }
+        None => (SceneKind::DEFAULT, [0.0; 3], None),
     };
+    let connected = replica.is_some();
+    let body_count = replica.as_ref().map_or(0, |r| r.bodies().count());
     let render = Arc::clone(&state.render);
     // Rendering, encoding **and** writing the file all block, so they all run
     // on the blocking pool; the file write used to happen on an async worker.
     let save_to = name.as_ref().map(|name| state.out_dir.join(name));
     let saving = save_to.clone();
     let capture = tokio::task::spawn_blocking(move || {
-        let capture = render_jpeg(&render, scene, offset, width, height)?;
+        let capture = render_jpeg(&render, scene, offset, replica.as_ref(), width, height)?;
         if let Some(path) = saving {
             save_capture(&path, &capture.jpeg)?;
         }
@@ -402,6 +478,7 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
         "connected": connected,
         "scene": scene.name(),
         "camera_offset_m": offset,
+        "bodies": body_count,
     });
     if let Some(path) = save_to {
         reply["path"] = json!(path.display().to_string());

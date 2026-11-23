@@ -19,5 +19,9 @@ space-world = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+# The physics tools are checked against the demo area's showcase.
+space-scene = { workspace = true }
+
 [lints]
 workspace = true

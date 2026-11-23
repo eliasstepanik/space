@@ -17,7 +17,18 @@
 //!   bent view lands nor straight behind it — shows the gradient along the
 //!   bent view instead of black;
 //! * **background**, only when [`Environment::background`] is set: the pixels
-//!   no geometry covers show the gradient instead of staying black.
+//!   no geometry covers show the gradient instead of staying black, and
+//!   distance fog fades into the gradient behind each pixel instead of into
+//!   one fog colour.
+//!
+//! The one place it does not reach is the inside of a closed solid — a sphere
+//! or box instance, or a closed mesh, seen from within (a camera that has
+//! flown into it): there is no sky in there, so those faces get neither the
+//! ambient light nor the reflection. An open mesh (a sheet) has two outsides
+//! and gets both on both. Elsewhere, with ray query, the forward pass's sky
+//! rays occlude both terms per pixel (see `quality.rs`), so a room made of
+//! separate walls is as dark as its openings make it; without ray query
+//! (`Low`, `Ci`) nothing else occludes the environment.
 //!
 //! [`Environment::default`] is *no environment*: such a scene renders exactly
 //! as it would if this module did not exist.

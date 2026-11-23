@@ -581,10 +581,26 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     for needle in [
         "<h2>Scene</h2>",
         "action=\"action/scene\"",
-        "<option value=\"demo-area\" selected>demo-area (current)</option>",
-        "Switch all shards</button>",
+        "<button name=\"scene\" value=\"demo-area\" disabled",
+        ">demo-area (current)</button>",
+        "<button name=\"scene\" value=\"solar\"",
+        ">Switch all shards to solar</button>",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");
+    }
+    // Nothing on the page holds a choice that its own reloading could put
+    // back: every action is a button with its own value.
+    for control in [
+        "<select",
+        "<option",
+        "<textarea",
+        "type=\"text\"",
+        "type=\"radio\"",
+    ] {
+        assert!(
+            !page.body.contains(control),
+            "the page has a {control:?} control"
+        );
     }
     let token = form_token(&page.body);
     let switch_to = |scene: &str| format!("csrf={token}&refresh=3&scene={scene}");
@@ -593,9 +609,11 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     let accepted = post(ui, "/action/scene", &switch_to("solar")).await;
     assert_eq!(accepted.status, 303, "{accepted:?}");
     assert_eq!(accepted.header("X-Space-Result"), Some("accepted"));
+    assert_eq!(accepted.header("X-Space-Confirmed"), Some("0/0"));
     assert_eq!(
         accepted.body.trim_end(),
-        "accepted: scene demo-area -> solar (revision 2), sent to nobody"
+        "accepted: scene demo-area -> solar (revision 2), sent to nobody. No shard is \
+         connected: solar (revision 2) is saved and is handed to each shard when it registers"
     );
     let scene_file = space_orchestrator::scene::scene_path(&cluster.state_path);
     assert_eq!(
@@ -662,32 +680,89 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "2 solar\n"
     );
 
-    // ---- the page's own form: the shard switches, confirms, and tells its
-    // player.
-    let accepted = post(ui, "/action/scene", &switch_to("galaxy")).await;
+    // ---- the page's own form, with auto-refresh switched off: the answer
+    // comes when the shard has confirmed, so the shard has switched by the
+    // time the answer is here — no waiting, no polling — and the one page the
+    // browser is sent to (which will never reload) already says so.
+    let form = format!("csrf={token}&refresh=0&scene=galaxy");
+    let accepted = post(ui, "/action/scene", &form).await;
     assert_eq!(accepted.header("X-Space-Result"), Some("accepted"));
+    assert_eq!(accepted.header("X-Space-Confirmed"), Some("1/1"));
     assert_eq!(
         accepted.body.trim_end(),
-        "accepted: scene solar -> galaxy (revision 3), sent to shard 1"
+        "accepted: scene solar -> galaxy (revision 3), sent to shard 1. All 1 connected shard \
+         switched to galaxy (revision 3)"
     );
-    wait_for_scene(&root, at(Scene::Galaxy, 3), Duration::from_secs(5)).await;
-    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 3));
-    let state = wait_for_state(ui, Duration::from_secs(5), "shard 1 to confirm", |s| {
-        s.contains("\"revision\":3},\"scene_sync\":\"in-sync\"")
-    })
-    .await;
-    assert!(state.contains("shard 1 confirmed scene galaxy (revision 3)"));
+    assert_eq!(
+        scene_of(&root).await,
+        at(Scene::Galaxy, 3),
+        "confirmed means the shard runs it"
+    );
     let location = accepted.header("Location").expect("a redirect").to_owned();
+    assert!(
+        location.starts_with("../?refresh=0&notice=") && location.ends_with("&switched=3"),
+        "{location}"
+    );
     let page = get(ui, location.trim_start_matches("..")).await;
     for needle in [
-        "class=\"notice ok\"",
+        "<div class=\"notice ok\"><span>All 1 connected shard switched to galaxy (revision 3).",
         "<span class=\"pill info\">galaxy</span>",
-        "<option value=\"galaxy\" selected>galaxy (current)</option>",
+        "<button name=\"scene\" value=\"galaxy\" disabled",
+        ">galaxy (current)</button>",
+        ">Switch all shards to solar</button>",
         "galaxy, revision 3 <span class=\"pill ok\">current</span>",
         "<span class=\"pill ok\">1 of 1 connected shards</span>",
+        "shard 1 confirmed scene galaxy (revision 3)",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");
     }
+    for stale in ["behind", "switching →", "http-equiv=\"refresh\""] {
+        assert!(
+            !page.body.contains(stale),
+            "the page after the redirect must not show {stale:?}"
+        );
+    }
+    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 3));
+
+    // ---- the same scene again, at once (the second half of a double click):
+    // not a switch, and the answer says so — while the browser, which shows
+    // this answer and not the first, is sent to the banner of the switch the
+    // double click made.
+    let again = post(ui, "/action/scene", &form).await;
+    assert_eq!(again.status, 303, "{again:?}");
+    assert_eq!(
+        again.body.trim_end(),
+        "accepted: already running galaxy (revision 3); nothing to do"
+    );
+    assert_eq!(again.header("X-Space-Confirmed"), Some("1/1"));
+    // (Within two seconds of the switch; a runner that took longer to get
+    // here is sent to the "already running" page, which is checked below.)
+    assert!(
+        matches!(
+            again.header("Location"),
+            Some("../?refresh=0&switched=3" | "../?refresh=0&switched=3&same=1")
+        ),
+        "{again:?}"
+    );
+    let page = get(ui, "/?refresh=0&switched=3").await;
+    assert!(
+        page.body.contains(
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to galaxy (revision 3)."
+        ),
+        "{}",
+        page.body
+    );
+    // What a later request for the running scene is sent to (a tab that has
+    // not reloaded since somebody else switched).
+    let page = get(ui, "/?refresh=0&switched=3&same=1").await;
+    assert!(
+        page.body.contains(
+            "<div class=\"notice info\"><span>Already running galaxy (revision 3); nothing to do."
+        ),
+        "{}",
+        page.body
+    );
+    assert_eq!(scene_of(&root).await, at(Scene::Galaxy, 3));
 
     // ---- a scene change while an epoch change is in flight: both are
     // accepted, and both complete.
@@ -821,6 +896,183 @@ async fn a_token_protected_web_ui_refuses_everything_without_the_token() {
     assert!(state.contains("\"paused\":true"), "still paused: {state}");
 
     ui_task.abort();
+    cluster.stop();
+}
+
+/// A shard that restarts and registers again is handed the scene that is
+/// current **now** — also one chosen while it was away — not the one from
+/// when the orchestrator started or from the shard's first registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
+    let at = |scene: Scene, revision: u64| SceneState::new(scene.id(), revision);
+    let cluster = Cluster::boot("restart-scene").await;
+    let limits = Limits {
+        // The shard that went away may still be counted as connected for a
+        // moment; do not wait long for it.
+        scene_confirm_wait: Duration::from_millis(300),
+        ..unhurried()
+    };
+    let (ui, ui_task) = cluster.web_ui(None, limits).await;
+    let token = form_token(&get(ui, "/").await.body);
+    let switch_to = |scene: &str| format!("csrf={token}&scene={scene}");
+
+    let first = cluster.root_shard().await;
+    let (id, endpoint) = (first.shard, first.endpoint);
+    let accepted = post(ui, "/action/scene", &switch_to("solar")).await;
+    assert_eq!(
+        accepted.header("X-Space-Confirmed"),
+        Some("1/1"),
+        "{accepted:?}"
+    );
+    assert_eq!(scene_of(&first).await, at(Scene::Solar, 2));
+
+    // The shard goes away, and the scene is changed while it is gone.
+    first.abort();
+    let accepted = post(ui, "/action/scene", &switch_to("galaxy")).await;
+    assert_eq!(
+        accepted.header("X-Space-Result"),
+        Some("accepted"),
+        "{accepted:?}"
+    );
+    assert!(
+        accepted
+            .body
+            .contains("No shard is connected: galaxy (revision 3)")
+            || accepted
+                .body
+                .contains("Switching to galaxy (revision 3): waiting for shard 1"),
+        "nobody confirmed it, and the answer says so: {accepted:?}"
+    );
+    assert!(!accepted.body.contains("All 1 connected shard switched"));
+
+    // It comes back (same address, as a restarted process or container does)
+    // and is handed galaxy at revision 3 with its welcome.
+    let second = start_orchestrated(
+        OrchestratedOptions {
+            shard: ShardId::NONE,
+            bind: loopback0(),
+            advertise: Some(endpoint),
+            claim_region: None,
+            cluster: cluster.name.clone(),
+        },
+        cluster.control_addr,
+    )
+    .await
+    .expect("the restarted shard is welcomed back");
+    assert_eq!(second.shard, id, "the same shard");
+    wait_for_scene(&second, at(Scene::Galaxy, 3), Duration::from_secs(5)).await;
+    let state = wait_for_state(ui, Duration::from_secs(5), "the shard to confirm", |s| {
+        s.contains("\"confirmed_by\":[1],\"not_confirmed_by\":[],\"pending\":false")
+    })
+    .await;
+    assert!(
+        cluster_scene(&state)
+            .starts_with("\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":3,"),
+        "{state}"
+    );
+
+    second.abort();
+    ui_task.abort();
+    let _ = std::fs::remove_file(space_orchestrator::scene::scene_path(&cluster.state_path));
+    cluster.stop();
+}
+
+/// The convergence rule over real sockets: a shard that runs a **higher**
+/// revision than the orchestrator (the orchestrator lost its scene file and
+/// started counting again; the shard and its player kept theirs) does not
+/// swallow the operator's next switch. The orchestrator learns the shard's
+/// revision from its answer, re-issues its scene above it, and shard and
+/// player follow — within the one request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestrator() {
+    let at = |scene: Scene, revision: u64| SceneState::new(scene.id(), revision);
+    let cluster = Cluster::boot("ahead").await;
+    let (ui, ui_task) = cluster.web_ui(None, unhurried()).await;
+    let token = form_token(&get(ui, "/").await.body);
+    let root = cluster.root_shard().await;
+    wait_for_scene(&root, at(Scene::DemoArea, 1), Duration::from_secs(5)).await;
+
+    // The shard's state as it would be had it outlived that orchestrator:
+    // solar at revision 9, and a player who was told so.
+    assert!(root.state.lock().await.set_scene(at(Scene::Solar, 9)));
+    let endpoint = space_net::client_endpoint_for(root.endpoint).expect("client endpoint");
+    let (player, _welcome) = space_net::connect(
+        &endpoint,
+        root.endpoint,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("player"),
+    )
+    .await
+    .expect("a player joins");
+    assert_eq!(next_scene_told(&player).await, at(Scene::Solar, 9));
+
+    // The operator switches to galaxy. For the orchestrator that is revision
+    // 2 — which the shard, at 9, will not adopt.
+    let accepted = post(
+        ui,
+        "/action/scene",
+        &format!("csrf={token}&refresh=0&scene=galaxy"),
+    )
+    .await;
+    assert_eq!(
+        accepted.header("X-Space-Result"),
+        Some("accepted"),
+        "{accepted:?}"
+    );
+    assert_eq!(
+        accepted.header("X-Space-Confirmed"),
+        Some("1/1"),
+        "the answer waits until the shard really runs it: {accepted:?}"
+    );
+    assert!(
+        accepted
+            .body
+            .contains("All 1 connected shard switched to galaxy (revision 10)"),
+        "re-issued one above the shard's revision: {accepted:?}"
+    );
+    assert_eq!(scene_of(&root).await, at(Scene::Galaxy, 10));
+    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 10));
+    let scene_file = space_orchestrator::scene::scene_path(&cluster.state_path);
+    assert_eq!(
+        std::fs::read_to_string(&scene_file).expect("saved"),
+        "10 galaxy\n",
+        "and the raised revision is what a restart comes back with"
+    );
+    let page = get(
+        ui,
+        accepted
+            .header("Location")
+            .expect("a redirect")
+            .trim_start_matches(".."),
+    )
+    .await;
+    for needle in [
+        "<div class=\"notice ok\"><span>All 1 connected shard switched to galaxy (revision 10).",
+        "galaxy, revision 10 <span class=\"pill ok\">current</span>",
+        "a shard runs scene revision 9",
+        "galaxy is re-issued as revision 10",
+    ] {
+        assert!(page.body.contains(needle), "the page lacks {needle:?}");
+    }
+
+    // From here on a switch is an ordinary one.
+    let accepted = post(
+        ui,
+        "/action/scene",
+        &format!("csrf={token}&scene=materials"),
+    )
+    .await;
+    assert!(
+        accepted
+            .body
+            .contains("All 1 connected shard switched to materials (revision 11)"),
+        "{accepted:?}"
+    );
+    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 11));
+
+    root.abort();
+    ui_task.abort();
+    let _ = std::fs::remove_file(&scene_file);
     cluster.stop();
 }
 

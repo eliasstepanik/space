@@ -789,8 +789,9 @@ fn orbits_deterministic() {
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
-/// The four ship components are registered in the `space-ecs` replication
-/// registry with the ids the protocol will carry.
+/// The ship and physics components are registered in the `space-ecs`
+/// replication registry with the ids the protocol will carry (ids are
+/// append-only: 0-3 are the ship's, 4-10 arrived with the physics core).
 #[test]
 fn components_are_registered() {
     use space_ecs::{ComponentInfo, MAX_COMPONENTS};
@@ -803,11 +804,18 @@ fn components_are_registered() {
     assert_eq!(<Owner as ComponentDef>::ID, 2);
     assert_eq!(<ShardAuthority as ComponentDef>::ID, 3);
 
-    let expected: [(u16, &str, bool); 4] = [
+    let expected: [(u16, &str, bool); 11] = [
         (0, "ShipState", true),
         (1, "ShipControls", true),
         (2, "Owner", true),
         (3, "ShardAuthority", false),
+        (4, "Body", true),
+        (5, "Visual", true),
+        (6, "Springs", true),
+        (7, "Articulation", true),
+        (8, "PartStates", true),
+        (9, "Ghost", false),
+        (10, "PosResidual", true),
     ];
     assert_eq!(COMPONENT_REGISTRY.len(), MAX_COMPONENTS);
     for (id, name, replicated) in expected {
@@ -816,10 +824,11 @@ fn components_are_registered() {
         assert_eq!(info.id, id);
         assert_eq!(info.name, name);
         assert_eq!(info.replicated, replicated, "{name} replication flag");
-        assert!(info.size > 0);
+        // `Ghost` is a marker: its presence is the information.
+        assert!(info.size > 0 || name == "Ghost", "{name} has no payload");
     }
-    // Nothing beyond id 3 is registered by this crate.
-    assert!(COMPONENT_REGISTRY[4].is_none());
+    // Nothing beyond id 10 is registered by this crate.
+    assert!(COMPONENT_REGISTRY[11].is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -835,10 +844,13 @@ fn idle_ships_are_not_replicated() {
     use space_ecs::WithEntity;
 
     let mut sim = SimWorld::new(ShardId(7));
-    // Two idle ships (at rest, no controls) and one that will be driven.
-    let idle_a = sim.spawn_ship(guid(1), 1, ShipState::IDENTITY);
-    let idle_b = sim.spawn_ship(guid(2), 2, ShipState::IDENTITY);
-    let active = sim.spawn_ship(guid(3), 3, ShipState::IDENTITY);
+    // Two idle ships (at rest, no controls) and one that will be driven, ten
+    // metres apart: ships are solid against each other, so three ships at one
+    // point would push each other apart and none would be idle.
+    let apart = |x: f32| ShipState::at_rest(space_world::WorldPos::ZERO.offset([x, 0.0, 0.0]));
+    let idle_a = sim.spawn_ship(guid(1), 1, apart(0.0));
+    let idle_b = sim.spawn_ship(guid(2), 2, apart(10.0));
+    let active = sim.spawn_ship(guid(3), 3, apart(20.0));
 
     // Settle one no-input tick: spawning stamped every row with the open tick, so
     // we let that stamp fall into the past before the driven step.

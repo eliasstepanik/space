@@ -22,6 +22,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 # A real in-process shard to connect to.
 space-mcp-server = { path = "../space-mcp-server" }
+# Its scene (`SceneState`), to give it the demo area's physics showcase.
+space-protocol = { workspace = true }
 
 [lints]
 workspace = true

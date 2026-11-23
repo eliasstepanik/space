@@ -54,16 +54,30 @@
 //!    then `v += a·dt`.
 //! 3. Angular acceleration, then `ω += α·dt`.
 //! 4. Orientation from the **new** `ω`.
-//! 5. Position from the **new** `v`, through [`WorldPos::offset`] so a ship far
-//!    from the origin keeps its precision.
+//! 5. Position from the **new** `v`, through
+//!    [`WorldPos::from_f64_metres_around`] so a ship far from the origin keeps
+//!    its precision. The displacement `v · dt` is formed in `f64` (an `f32`
+//!    times the `f32` tick widened to `f64` is exact), so the only rounding of
+//!    the step is the final one into the `f32` local of the new [`WorldPos`].
+//!    (Before the physics core the product was formed in `f32`, which added a
+//!    relative error of ~6e-8 of the displacement per tick; at 1 km/s that
+//!    was 2 µm per tick, always in the same direction.)
+//!
+//! [`ship_velocity_step`] (steps 1–3 plus the settling snap) and
+//! [`ship_pose_step`] (steps 4–5) are the two halves of [`step_ship`]; the
+//! rigid-body world ([`crate::rigid`]) calls them separately so a ship in
+//! contact takes its velocity change from the flight model and its position
+//! from the contact solver, while a ship in free flight is stepped *exactly*
+//! as [`step_ship`] steps it.
 //!
 //! Steps 2 and 3 are independent, so a future parallel scheduler may run them
 //! in either order; step 4 deliberately uses the post-torque `ω` so a ship
 //! begins turning on the same tick it was commanded.
 //!
-//! [`WorldPos::offset`]: space_world::WorldPos::offset
+//! [`WorldPos::from_f64_metres_around`]: space_world::WorldPos::from_f64_metres_around
 
 use space_protocol::PlayerInput;
+use space_world::WorldPos;
 
 use crate::params::ShipParams;
 use crate::tick::dt;
@@ -222,18 +236,39 @@ pub fn normalize_quat(q: &mut [f32; 4]) {
 ///
 /// See the module docs for the exact equations and the order of operations.
 pub fn step_ship(state: &mut ShipState, input: &PlayerInput, params: &ShipParams) {
+    ship_velocity_step(state, input.thrust, input.torque, params, [0.0; 3]);
+    ship_pose_step(state);
+}
+
+/// The velocity half of [`step_ship`]: thrust, torque, both drags and the
+/// settling snap, plus an external acceleration `ext` (gravity, springs) in
+/// m/s², world frame.
+///
+/// `ext` is added to the linear acceleration of an axis only where it is not
+/// zero, so with `ext = [0; 3]` this is bit for bit the velocity update
+/// [`step_ship`] always made (adding `+0.0` would turn a `-0.0` into `+0.0`).
+pub fn ship_velocity_step(
+    state: &mut ShipState,
+    thrust: [f32; 3],
+    torque: [f32; 3],
+    params: &ShipParams,
+    ext: [f32; 3],
+) {
     let dt = dt();
     let inv_mass = 1.0 / params.mass;
 
-    let thrust_local = clamp_unit(input.thrust);
-    let torque_local = clamp_unit(input.torque);
+    let thrust_local = clamp_unit(thrust);
+    let torque_local = clamp_unit(torque);
 
     // 1. Linear: thrust along the ship's current orientation, minus linear
     //    damping proportional to velocity.
     let thrust_world = quat_rotate(state.quat, thrust_local);
     let thrust_scale = params.thrust * inv_mass;
     for axis in 0..3 {
-        let accel = thrust_world[axis] * thrust_scale - params.drag_lin * state.vel[axis];
+        let mut accel = thrust_world[axis] * thrust_scale - params.drag_lin * state.vel[axis];
+        if ext[axis] != 0.0 {
+            accel += ext[axis];
+        }
         state.vel[axis] += accel * dt;
     }
 
@@ -250,7 +285,60 @@ pub fn step_ship(state: &mut ShipState, input: &PlayerInput, params: &ShipParams
     // stopped ship becomes bit-stable (see [`SETTLE_EPS`]).
     state.vel = settle(state.vel);
     state.ang_vel = settle(state.ang_vel);
+}
 
+/// The ship's lift engines ([`ShipParams::lift`]): the extra acceleration,
+/// m/s² in the world frame, that the input `thrust` (ship frame, clamped like
+/// [`ship_velocity_step`] clamps it) gets in the gravity `gravity` (m/s²,
+/// world frame) at the ship.
+///
+/// Only the part of the input that pushes *against* the pull counts: with
+/// `ĝ = g / |g|` and `u = max(0, −(R(q)·thrust) · ĝ)` the result is
+/// `−u · lift · g` — straight up against the pull, `u · lift · |g|` strong.
+/// Pushing sideways or with the pull adds nothing, and in weightless space
+/// (`g = 0`) nothing at all, so a ship in free flight is stepped exactly as
+/// [`step_ship`] steps it. With `lift = 1` a ship that pushes straight up
+/// climbs at `thrust / mass` whatever the pull; a ship that pushes nothing
+/// falls like any body.
+///
+/// The rigid-body world ([`crate::rigid`]) adds this to the gravity it hands
+/// [`ship_velocity_step`]; the server and a client's prediction call the same
+/// function with the same numbers.
+#[must_use]
+pub fn lift_accel(
+    quat: [f32; 4],
+    thrust: [f32; 3],
+    params: &ShipParams,
+    gravity: [f64; 3],
+) -> [f64; 3] {
+    let g2 = gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2];
+    if params.lift == 0.0 || !(g2 > 0.0 && g2.is_finite()) {
+        return [0.0; 3];
+    }
+    let t = quat_rotate(quat, clamp_unit(thrust));
+    let along =
+        f64::from(t[0]) * gravity[0] + f64::from(t[1]) * gravity[1] + f64::from(t[2]) * gravity[2];
+    // `along` is `t · g`; against the pull it is negative.
+    let u = (-along / g2.sqrt()).max(0.0);
+    if u == 0.0 {
+        return [0.0; 3];
+    }
+    let k = -u * f64::from(params.lift);
+    [k * gravity[0], k * gravity[1], k * gravity[2]]
+}
+
+/// The pose half of [`step_ship`]: orientation from the (new) angular
+/// velocity, then position from the (new) velocity.
+pub fn ship_pose_step(state: &mut ShipState) {
+    quat_step(state);
+    position_step(state);
+}
+
+/// Orientation from the body-frame angular velocity, by the small-angle rule
+/// of the [module docs](self) (and the settled-quaternion rule of
+/// [`SETTLE_EPS`]).
+pub fn quat_step(state: &mut ShipState) {
+    let dt = dt();
     // 3. Orientation: small-angle update from the *new* body-frame rate.
     if state.ang_vel == [0.0; 3] {
         // Not turning: leave the quaternion alone rather than re-normalising it —
@@ -281,12 +369,22 @@ pub fn step_ship(state: &mut ShipState, input: &PlayerInput, params: &ShipParams
         normalize_quat(&mut q);
         state.quat = q;
     }
+}
 
+/// Position from the velocity: `pos += v · dt`, the displacement formed in
+/// `f64` (exact) and added in the frame of the ship's own cell.
+pub fn position_step(state: &mut ShipState) {
+    let dt = f64::from(dt());
     // 4. Position: new velocity, through WorldPos so precision is independent of
     //    distance from the origin.
-    state.pos = state
-        .pos
-        .offset([state.vel[0] * dt, state.vel[1] * dt, state.vel[2] * dt]);
+    state.pos = WorldPos::from_f64_metres_around(
+        state.pos,
+        [
+            f64::from(state.vel[0]) * dt,
+            f64::from(state.vel[1]) * dt,
+            f64::from(state.vel[2]) * dt,
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -364,6 +462,71 @@ mod tests {
             + a.quat[2] * a.quat[2]
             + a.quat[3] * a.quat[3];
         assert!((norm - 1.0).abs() < 1e-5, "quat drifted: {norm}");
+    }
+
+    /// The lift engines push against the pull only, by `lift · |g|` at full
+    /// stick, and do nothing in weightless space or for a push along the pull.
+    #[test]
+    fn lift_pushes_against_gravity_only() {
+        use super::lift_accel;
+        let p = ShipParams::PLACEHOLDER;
+        let id = [1.0, 0.0, 0.0, 0.0];
+        let g = [0.0, -9.81, 0.0];
+        assert_eq!(lift_accel(id, [0.0, 1.0, 0.0], &p, [0.0; 3]), [0.0; 3]);
+        let up = lift_accel(id, [0.0, 1.0, 0.0], &p, g);
+        assert!(
+            (up[1] - 9.81).abs() < 1e-9 && up[0] == 0.0 && up[2] == 0.0,
+            "{up:?}"
+        );
+        assert_eq!(lift_accel(id, [1.0, 0.0, 0.0], &p, g), [0.0; 3], "sideways");
+        assert_eq!(
+            lift_accel(id, [0.0, -1.0, 0.0], &p, g),
+            [0.0; 3],
+            "with the pull"
+        );
+        assert_eq!(lift_accel(id, [0.0; 3], &p, g), [0.0; 3]);
+        // A diagonal input is clamped first: half of it pushes up.
+        let diagonal = lift_accel(id, [1.0, 1.0, 0.0], &p, g);
+        assert!((diagonal[1] - 9.81 * std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        // A ship without lift engines gets nothing.
+        let none = ShipParams { lift: 0.0, ..p };
+        assert_eq!(lift_accel(id, [0.0, 1.0, 0.0], &none, g), [0.0; 3]);
+        // Gravity in any direction (the side of a planetoid pulls along -X,
+        // its far side along a diagonal): the push against it is answered,
+        // straight against the pull, by lift times the pull's strength.
+        let cases: [([f64; 3], [f64; 3]); 3] = [
+            ([-4.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ([0.0, 0.0, 3.0], [0.0, 0.0, -1.0]),
+            ([2.0, -2.0, 1.0], [-2.0, 2.0, -1.0]),
+        ];
+        for (g, against) in cases {
+            let strength = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            let a = lift_accel(id, against.map(|c: f64| c as f32), &p, g);
+            let along: f64 = (0..3).map(|k| a[k] * -g[k] / strength).sum();
+            let push = against.map(|c: f64| c / against.iter().map(|x| x * x).sum::<f64>().sqrt());
+            let input = push
+                .iter()
+                .zip(g)
+                .map(|(t, gk)| -t * gk / strength)
+                .sum::<f64>()
+                .min(1.0);
+            assert!((along - input * strength).abs() < 1e-5, "{g:?}: {a:?}");
+            // ...and only against it: nothing across.
+            let across: Vec<f64> = (0..3).map(|k| a[k] - along * -g[k] / strength).collect();
+            assert!(across.iter().all(|c| c.abs() < 1e-9), "{g:?}: {a:?}");
+            assert_eq!(lift_accel(id, push.map(|c| -c as f32), &p, g), [0.0; 3]);
+        }
+        // A turned ship: its input is in its own frame.
+        let turned = [
+            std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ];
+        // 90° about +Z turns the ship's +X onto world +Y: pushing "forward
+        // along x" in a -Y pull is pushing up.
+        let a = lift_accel(turned, [1.0, 0.0, 0.0], &p, [0.0, -9.81, 0.0]);
+        assert!((a[1] - 9.81).abs() < 1e-5, "{a:?}");
     }
 
     #[test]

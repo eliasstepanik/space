@@ -7,7 +7,10 @@
 // the target is cleared to alpha 0, so alpha says whether any opaque surface
 // was drawn at a pixel (`post.wgsl` asks) —
 // location 1 = material buffer `rgba16float` (r = metallic, g = roughness,
-// ba = the shading normal, octahedral-encoded) read by `post.wgsl`. With
+// ba = the shading normal on the side the fragment is seen from,
+// octahedral-encoded) and location 2 = specular buffer `rgba8unorm` (rgb =
+// the specular colour F0, a = the share of the environment the mirror
+// direction sees), both read by `post.wgsl`. With
 // FEATURE_REFRACT, transmissive instances (transmission > 0) are skipped here
 // and drawn by the glass pass (`vs_glass`/`fs_glass`): colour into a separate
 // attachment (rgb = lit colour, a = transmission), so the opaque scene behind
@@ -54,14 +57,17 @@ struct Params {
     _pad1: f32,
     fog: vec4<f32>, // rgb linear fog colour, w = exp-squared density (1/m)
     features: u32,  // FEATURE_* bitmask (mirrors src/quality.rs)
-    _pad2: u32,
+    sky_rays: u32,  // rays per pixel towards the sky (0 = none); SHADOWS variants only
+    ssr_max_roughness: f32, // the post pass mirrors metals up to this roughness (with FEATURE_SSR)
     _pad3: u32,
-    _pad4: u32,
     environment: Environment, // the scene's surroundings (all zero: none)
 }
 
 const FEATURE_FOG: u32 = 1u;
+const FEATURE_SSR: u32 = 2u;
 const FEATURE_REFRACT: u32 = 4u;
+// The post pass mirrors what is at least this metallic (`METALLIC_MIN` there).
+const MIRROR_METALLIC: f32 = 0.5;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
@@ -92,6 +98,27 @@ struct FsOut {
     @location(0) color: vec4<f32>,
     // r = metallic, g = roughness, ba = octahedral shading normal
     @location(1) material: vec4<f32>,
+    // rgb = base colour, a = share of the environment in the mirror direction
+    @location(2) specular: vec4<f32>,
+}
+
+// The glass pass has no specular buffer (the post pass refracts glass, it
+// does not mirror it).
+struct GlassOut {
+    @location(0) color: vec4<f32>,
+    @location(1) material: vec4<f32>,
+}
+
+// What `shade` makes of a surface point.
+struct Shaded {
+    color: vec3<f32>,
+    // rgb = base colour, a = the share of the environment its mirror
+    // direction sees (1 in the open).
+    specular: vec4<f32>,
+    // The colour target's alpha: 1 for a surface — or, where this pixel has
+    // counted sky rays, 1.25 + half the share of them that got out, for the
+    // post pass to smooth (it takes anything from 1 up as "a surface").
+    coverage: f32,
 }
 
 // Octahedral encoding of a unit vector into [-1, 1]^2 (Cigolle et al. 2014).
@@ -105,9 +132,42 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
     return (vec2(1.0) - abs(p.yx)) * s;
 }
 
-// The material buffer texel of a surface point.
-fn material_out(in: VsOut) -> vec4<f32> {
-    return vec4(in.material.x, clamp(in.material.y, 0.05, 1.0), oct_encode(normalize(in.normal)));
+// The material buffer texel of a surface point seen on `side`.
+fn material_out(in: VsOut, side: Side) -> vec4<f32> {
+    return vec4(in.material.x, clamp(in.material.y, 0.05, 1.0), oct_encode(side.n));
+}
+
+// Which side of its surface a fragment shows. Nothing is culled, so a
+// triangle is drawn from behind as well: the inside of a box the camera is
+// in, the underside of a one-sided floor. That side is a surface of its own.
+struct Side {
+    // The unit shading normal, on the side the viewer is on.
+    n: vec3<f32>,
+    // Does the scene's surroundings (its environment) reach this side? Not
+    // the inside of a closed solid: no sky in there.
+    open: bool,
+}
+
+// The side of the surface at `world`, with vertex normal `normal`, that this
+// fragment shows; `sheet` says the surface is an open one (both of whose
+// sides are outsides) rather than the skin of a closed solid.
+//
+// Seen from behind means: the viewer is on the other side of the triangle
+// than the one the normal points to. That is asked of the triangle's own
+// plane, not of `dot(normal, view)` — on a smooth-shaded shape the
+// interpolated normal tips past the silhouette while the triangle still
+// faces the viewer — and without relying on the winding, which differs
+// between the shapes here (see `cube_mesh` in src/scene.rs): the screen-space
+// derivatives of the position span the plane, and because x runs to the right
+// of the frame and y down it, their cross product points away from the
+// viewer for every fragment there is. A normal on the same side as that is
+// one the viewer sees from behind.
+//
+// (Derivatives: call this from uniform control flow.)
+fn side_of(normal: vec3<f32>, world: vec3<f32>, sheet: bool) -> Side {
+    let n = normalize(normal);
+    let behind = dot(n, cross(dpdx(world), dpdy(world))) > 0.0;
+    return Side(select(n, -n, behind), sheet || !behind);
 }
 
 // Unit icosphere: 12 vertices, 20 triangles (60 indices). Positions are
@@ -278,6 +338,7 @@ struct MeshVsOut {
     @location(3) material: vec2<f32>, // x = metallic, y = roughness
     @location(4) emissive: vec3<f32>,
     @location(5) uv: vec2<f32>,
+    @location(6) @interpolate(flat) sheet: f32, // 1 = an open surface
 }
 
 @vertex
@@ -297,6 +358,7 @@ fn vs_mesh(
     out.material = vec2(m.albedo.w, m.emissive.w);
     out.emissive = m.emissive.rgb;
     out.uv = uv;
+    out.sheet = m.surface.x;
     out.pos = params.camera.view_proj * vec4(world, 1.0);
     return out;
 }
@@ -352,7 +414,9 @@ fn light_radiance(light: Light, world: vec3<f32>, normal: vec3<f32>, view_dir: v
 
 // Nearest probe radiance for a surface: pick the probe cell containing the
 // world XZ position and the texel of the normal's dominant axis (DDGI-lite).
-fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+// rgb = the indirect light arriving that way, a = how open to the sky the
+// probe is in that direction (the share of its rays that hit nothing).
+fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec4<f32> {
     let gx = f32(params.gi_grid_size_x);
     let gy = f32(params.gi_grid_size_y);
     let ix = clamp(round((world.x - params.gi_grid_origin.x) / params.gi_spacing), 0.0, gx - 1.0);
@@ -367,20 +431,7 @@ fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
         dir_idx = select(4u, 5u, normal.z < 0.0);
     }
     let uv = vec2((ix + 0.5) / gx, (iy * 6.0 + f32(dir_idx) + 0.5) / (gy * 6.0));
-    return textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
-}
-
-// Scale and bias of the specular reflection of a uniform environment (the
-// "environment BRDF" of the split-sum approximation, as fitted by Karis for
-// mobile): how much of what a surface of `roughness` reflects reaches a viewer
-// at cosine `nov` from its normal. Rises to 1 at grazing angles (Fresnel).
-fn env_brdf(f0: vec3<f32>, roughness: f32, nov: f32) -> vec3<f32> {
-    let c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    let c1 = vec4(1.0, 0.0425, 1.04, -0.04);
-    let r = roughness * c0 + c1;
-    let a004 = min(r.x * r.x, exp2(-9.28 * nov)) * r.x + r.y;
-    let ab = vec2(-1.04, 1.04) * a004 + r.zw;
-    return f0 * ab.x + vec3(ab.y);
+    return textureSampleLevel(gi_tex, gi_sampler, uv, 0.0);
 }
 
 //#if SHADOWS
@@ -429,11 +480,81 @@ fn light_visible(world: vec3<f32>, n: vec3<f32>, light_pos: vec3<f32>) -> bool {
     }
     return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
 }
+
+// Sky rays: how much of the environment's light gets to a surface. The same
+// rules as for shadow rays — what casts a shadow keeps the sky off, a solid
+// is not in its own way — with a fixed reach (src/quality.rs has the twin).
+const SKY_RANGE: f32 = 60.0;
+
+// Is there nothing between the surface point `world` (unit normal `n`, on the
+// viewer's side) and the sky in the unit direction `dir`?
+fn sky_visible(world: vec3<f32>, n: vec3<f32>, dir: vec3<f32>) -> bool {
+    let bias = SHADOW_BIAS * (1.0 + length(world - params.camera.position.xyz));
+    var rq: ray_query;
+    rayQueryInitialize(
+        &rq,
+        scene_as,
+        RayDesc(
+            RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT | RAY_FLAG_CULL_BACK_FACING,
+            SHADOW_MASK,
+            0.0,
+            SKY_RANGE,
+            world + n * bias,
+            dir,
+        ),
+    );
+    loop {
+        if !rayQueryProceed(&rq) {
+            break;
+        }
+    }
+    return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
+}
+
+// The share of the environment's diffuse light that reaches the surface
+// point `world` with unit normal `n`: `count` rays over the hemisphere it
+// faces, spread so that each stands for the same amount of light (a spiral
+// in the cosine-weighted disc), and the share of them that got out.
+//
+// The directions are fixed in a frame built from the normal alone (the
+// branchless one of Duff et al. 2017), turned and shifted by one of sixteen
+// amounts that depends on where the pixel is in a 4 x 4 tile of the frame —
+// an ordered pattern, not a random number: a pixel gets the same directions
+// every frame. Any 4 x 4 block of pixels thus holds sixteen different sets,
+// 16 x `count` directions in all, and the post pass, which averages the share
+// over such a block of the same surface (`sky_correction` in post.wgsl),
+// gets a smooth answer out of `count` rays a pixel.
+fn sky_share(world: vec3<f32>, n: vec3<f32>, count: u32, pixel: vec2<f32>) -> f32 {
+    var order = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
+    let k = order[(u32(pixel.y) & 3u) * 4u + (u32(pixel.x) & 3u)];
+    let turn = f32(k) * 0.39269908;
+    let shift = (f32((k * 7u + 3u) & 15u) + 0.5) / 16.0;
+    let s = select(-1.0, 1.0, n.z >= 0.0);
+    let a = -1.0 / (s + n.z);
+    let b = n.x * n.y * a;
+    let t0 = vec3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+    let t1 = vec3(b, s + n.y * n.y * a, -n.y);
+    var open = 0.0;
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let r = sqrt((f32(i) + shift) / f32(count));
+        let phi = f32(i) * 2.3999632 + turn;
+        let dir = t0 * (r * cos(phi)) + t1 * (r * sin(phi)) + n * sqrt(1.0 - r * r);
+        if sky_visible(world, n, dir) {
+            open = open + 1.0;
+        }
+    }
+    return open / f32(count);
+}
 //#endif
 
-// Lit (and fogged) colour of one surface point.
-fn shade(in: VsOut) -> vec3<f32> {
-    let n = normalize(in.normal);
+// Lit (and fogged) colour of one surface point, seen on `side`: lights,
+// shadows, GI and the environment all see the surface the viewer sees.
+// `mirrored` says the post pass may mirror this surface (it is not glass):
+// if it will — a smooth metal, with screen-space reflections on — the
+// environment's reflection is left to it, which blends it with what it finds
+// on screen and weights both alike.
+fn shade(in: VsOut, side: Side, mirrored: bool) -> Shaded {
+    let n = side.n;
     let v = normalize(params.camera.position.xyz - in.world);
     let metallic = in.material.x;
     let roughness = clamp(in.material.y, 0.05, 1.0);
@@ -451,51 +572,101 @@ fn shade(in: VsOut) -> vec3<f32> {
         color = color + light_radiance(params.lights[i], in.world, n, v, in.albedo, metallic, roughness);
 //#endif
     }
+    let f0 = mix(vec3(0.04), in.albedo, metallic);
+    let by_post = mirrored && (params.features & FEATURE_SSR) != 0u
+        && metallic >= MIRROR_METALLIC && roughness <= params.ssr_max_roughness;
+    // How much of the environment's light gets to this point: all of it,
+    // unless something knows better.
+    var sky = 1.0;
     if params.gi_enabled == 1u {
         // Indirect diffuse: probe radiance along the surface normal's dominant
         // axis, Lambertian albedo, dielectric only (metallic is specular-only).
         let gi = probe_radiance(in.world, n);
-        color = color + gi * in.albedo * (1.0 - metallic) / PI;
+        color = color + gi.rgb * in.albedo * (1.0 - metallic) / PI;
+        // The probes have looked: the nearest one is this open that way.
+        sky = gi.a;
     }
-    if params.environment.zenith.w > 0.0 {
+    // ... and how much of its reflection: the same for a rough surface, what
+    // is in the mirror direction for a smooth one.
+    var sky_mirror = sky;
+    // (What the post pass is told of the mirror direction, for a surface it
+    // mirrors: the one ray's answer, not the counted share.)
+    var ahead = sky;
+    var coverage = 1.0;
+//#if SHADOWS
+    if params.sky_rays > 0u && side.open {
+        // This pixel can look for itself.
+        sky = sky_share(in.world, n, params.sky_rays, in.pos.xy);
+        sky_mirror = sky;
+        ahead = sky;
+        if roughness < 0.6 {
+            ahead = f32(sky_visible(in.world, n, reflect(-v, n)));
+            sky_mirror = mix(ahead, sky, roughness * roughness);
+        }
+        if mirrored {
+            coverage = 1.25 + 0.5 * sky;
+        }
+    }
+//#endif
+    if params.environment.zenith.w > 0.0 && side.open {
         // The environment (a scene without one stops at the test above): its
         // light from the hemisphere the surface faces, on the diffuse colour,
         // and its reflection along the mirror direction, blurred by roughness
         // and weighted by Fresnel. Shadows do not touch either — this is the
         // light that is left where no lamp reaches — and where the post pass
         // finds a screen-space reflection it blends that over this one.
-        // (Nothing is culled: for a surface seen from behind, the side that
-        // is visible is the one that counts.)
-        let side = select(n, -n, dot(n, v) < 0.0);
-        let f0 = mix(vec3(0.04), in.albedo, metallic);
-        let reflected = env_reflection(params.environment, reflect(-v, side), roughness);
-        color = color
-            + env_ambient(params.environment, side) * in.albedo * (1.0 - metallic)
-            + reflected * env_brdf(f0, roughness, clamp(dot(side, v), 0.0, 1.0));
+        // The one place it does not reach is the inside of a closed solid.
+        color = color + sky * env_ambient(params.environment, n) * in.albedo * (1.0 - metallic);
+        if !by_post {
+            let reflected = env_reflection(params.environment, reflect(-v, n), roughness);
+            color = color
+                + sky_mirror * reflected * env_brdf(f0, roughness, clamp(dot(n, v), 0.0, 1.0));
+        }
     }
     if (params.features & FEATURE_FOG) != 0u {
         // Exponential-squared fog on camera distance, after lighting and
-        // before the tone map: f = 1 - exp(-(d * density)^2).
+        // before the tone map: f = 1 - exp(-(d * density)^2). What a surface
+        // fades into is what is behind it: the environment along the view
+        // ray where that is painted as the background (so far geometry melts
+        // into the sky at whatever height it stands, without a seam), the
+        // fog colour otherwise.
         let d = length(in.world - params.camera.position.xyz) * params.fog.w;
         let f = 1.0 - exp(-d * d);
-        color = mix(color, params.fog.rgb, f);
+        var fog_color = params.fog.rgb;
+        if params.environment.horizon.w > 0.0 {
+            fog_color = env_radiance(params.environment, -v);
+        }
+        color = mix(color, fog_color, f);
     }
-    return max(color, vec3(0.0));
+    // (Alpha 0 is kept for the inside of a solid, which mirrors no
+    // surroundings at all; an open surface whose mirror direction is blocked
+    // gets the smallest value above it, which the post pass reads as "none of
+    // the environment, but ask what is there".)
+    return Shaded(
+        max(color, vec3(0.0)),
+        vec4(clamp(in.albedo, vec3(0.0), vec3(1.0)), select(0.0, max(ahead, 0.008), side.open)),
+        coverage,
+    );
 }
 
 @fragment
 fn fs_main(in: VsOut) -> FsOut {
+    // (A sphere or box instance is a closed solid.)
+    let side = side_of(in.normal, in.world, false);
+    let shaded = shade(in, side, true);
     var out: FsOut;
-    out.color = vec4(shade(in), 1.0);
-    out.material = material_out(in);
+    out.color = vec4(shaded.color, shaded.coverage);
+    out.material = material_out(in, side);
+    out.specular = shaded.specular;
     return out;
 }
 
 @fragment
-fn fs_glass(in: VsOut) -> FsOut {
-    var out: FsOut;
-    out.color = vec4(shade(in), in.transmission);
-    out.material = material_out(in);
+fn fs_glass(in: VsOut) -> GlassOut {
+    let side = side_of(in.normal, in.world, false);
+    var out: GlassOut;
+    out.color = vec4(shade(in, side, false).color, in.transmission);
+    out.material = material_out(in, side);
     return out;
 }
 
@@ -528,6 +699,7 @@ fn fs_sky(in: SkyOut) -> FsOut {
     // Alpha 0, like the clear colour: there is still no surface here.
     out.color = vec4(env_radiance(params.environment, dir), 0.0);
     out.material = vec4(0.0);
+    out.specular = vec4(0.0);
     return out;
 }
 //#endif
@@ -539,6 +711,7 @@ fn fs_sky(in: SkyOut) -> FsOut {
 fn fs_mesh(in: MeshVsOut) -> FsOut {
     // Sampled unconditionally: implicit derivatives need uniform control flow.
     let texel = textureSample(base_color_tex, base_color_sampler, in.uv);
+    let side = side_of(in.normal, in.world, in.sheet > 0.5);
     var surface: VsOut;
     surface.pos = in.pos;
     surface.world = in.world;
@@ -547,9 +720,11 @@ fn fs_mesh(in: MeshVsOut) -> FsOut {
     surface.material = in.material;
     surface.emissive = in.emissive;
     surface.transmission = 0.0;
+    let shaded = shade(surface, side, true);
     var out: FsOut;
-    out.color = vec4(shade(surface), 1.0);
-    out.material = material_out(surface);
+    out.color = vec4(shaded.color, shaded.coverage);
+    out.material = material_out(surface, side);
+    out.specular = shaded.specular;
     return out;
 }
 //#endif

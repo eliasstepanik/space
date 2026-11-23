@@ -22,6 +22,33 @@
 //! | `POST` | `/action/push-map` | re-send the committed map to every shard |
 //! | `POST` | `/action/scene` | `scene` = a name of the scene catalogue (`demo-area`, `materials`, `solar`, `galaxy`): switch every shard to it |
 //!
+//! # A scene switch answers when the shards have it
+//!
+//! `/action/scene` does not redirect the moment the orchestrator has accepted
+//! the change: it first waits — for at most [`Limits::scene_confirm_wait`], by
+//! reading the snapshots the run loop publishes anyway, never by asking the
+//! loop — until every connected shard has confirmed the new revision. So the
+//! page the browser lands on says *All 2 connected shards switched to solar
+//! (revision 4)*, and the plain-text answer says the same with an
+//! `X-Space-Confirmed: 2/2` header. If the wait runs out it says *Switching to
+//! solar (revision 4): waiting for shard 2 …*, and the dashboard reloads every
+//! second — whatever `?refresh=` says, also "off" — until nobody is waited
+//! for.
+//!
+//! A request for the scene that is already running is answered *already
+//! running solar (revision 4); nothing to do* without going to the run loop at
+//! all, so it can be told from a switch at a glance and never runs into the
+//! spacing between actions. The page cannot send one in the ordinary way — the
+//! button of the running scene is disabled, and no control holds a choice a
+//! reload could reset (see [`page`]) — only as the second half of a double
+//! click, or from a tab that has not reloaded since somebody else switched.
+//! If a shard has not confirmed that scene yet (the first half of the double
+//! click was the switch), this answer waits for the confirmations too, so
+//! both halves report the same count. And a request that repeats a switch made
+//! within the last [`SCENE_TWIN_WINDOW_TICKS`] is redirected to *that switch's*
+//! banner: the browser shows the answer to the second click, and "nothing to
+//! do" would read as if the button had done nothing.
+//!
 //! Every `POST` takes an `application/x-www-form-urlencoded` body that must
 //! carry the form token (`csrf`), and answers `303 See Other` back to the
 //! dashboard, which shows whether the request was accepted or why it was
@@ -156,6 +183,11 @@ pub struct Limits {
     /// sooner is answered `429`. Long enough to stop a loop, short enough that
     /// a person clicking two buttons does not notice.
     pub min_action_spacing: Duration,
+    /// How long an accepted scene switch waits for every connected shard to
+    /// confirm it before it answers anyway (see the module docs). A shard
+    /// confirms within a tick or two, so this only ever runs out when one is
+    /// stuck — and then the answer names it.
+    pub scene_confirm_wait: Duration,
 }
 
 impl Default for Limits {
@@ -168,9 +200,21 @@ impl Default for Limits {
             write_timeout: Duration::from_secs(10),
             wrong_token_delay: Duration::from_millis(500),
             min_action_spacing: Duration::from_millis(250),
+            scene_confirm_wait: Duration::from_millis(1_500),
         }
     }
 }
+
+/// How long a scene request that found another request in flight waits to see
+/// whether that one was its own twin (a double click) before it is answered
+/// `429` like any other hurried request.
+const SCENE_TWIN_GRACE: Duration = Duration::from_millis(300);
+
+/// For how long after a scene change a request for that same scene is taken
+/// for the second half of a double click on the button that made the change
+/// (two seconds): its redirect then shows the switch's banner instead of
+/// "already running; nothing to do".
+pub const SCENE_TWIN_WINDOW_TICKS: u64 = 2 * TICK_HZ;
 
 /// How the web UI is set up. Built with [`WebUiConfig::new`], which is where
 /// the "no open bind without a token" rule lives.
@@ -562,6 +606,14 @@ impl Service {
                 event.kind == EventKind::Operator
                     && snapshot.tick.saturating_sub(event.tick) <= NOTICE_TICKS
             });
+        // The redirect of a scene request: two numbers. What the banner says
+        // is read from the snapshot (see `page::SceneNotice`).
+        let scene_notice = field(&query, "switched")
+            .and_then(|revision| revision.parse::<u64>().ok())
+            .map(|revision| page::SceneNotice {
+                revision,
+                unchanged: field(&query, "same") == Some("1"),
+            });
         let nonce = auth::random_token();
         let body = page::dashboard(&page::PageInput {
             snapshot: &snapshot,
@@ -570,6 +622,7 @@ impl Service {
             style_nonce: &nonce,
             refresh,
             notice,
+            scene_notice,
         });
         let mut response = Response::new(200, "text/html; charset=utf-8", body);
         response.style_nonce = Some(nonce);
@@ -624,26 +677,52 @@ impl Service {
         }
         let command = command_of(request.path(), &fields)?;
         let refresh = refresh_of(&fields);
+        // A request for the scene that is already running asks the control
+        // loop for nothing: it is answered from the published snapshot, says
+        // so in as many words, and does not count against the spacing below.
+        // (This is what the second half of a double click is, and what a tab
+        // that has not reloaded since somebody else's switch posts.)
+        let asked_scene = match &command {
+            OperatorCommand::SetScene { scene } => Some(*scene),
+            _ => None,
+        };
+        if let Some(scene) = asked_scene {
+            let snapshot = self.ops.snapshot();
+            if snapshot.scene.scene == scene {
+                return Ok(self.scene_already_running(snapshot, refresh).await);
+            }
+        }
         // One action at a time, a moment apart: everything up to here was
         // free for the control loop, from here on it is not. The permit is
         // held until the loop has answered.
-        let _permit = self
-            .gate
-            .enter(self.config.limits.min_action_spacing)
-            .ok_or_else(|| {
-                Refusal::new(
-                    429,
-                    "another operator request was carried out a moment ago (they are taken \
-                     one at a time, a moment apart). Nothing was changed: look at the \
-                     dashboard, then send it again.",
-                )
-                .with_header("Retry-After", "1")
-            })?;
+        let Some(permit) = self.gate.enter(self.config.limits.min_action_spacing) else {
+            // A scene request may have lost the race against its own twin:
+            // once that one has been carried out there is nothing left to do,
+            // and saying "nothing was changed" would be wrong.
+            if let Some(scene) = asked_scene {
+                let snapshot = self
+                    .ops
+                    .wait_until(SCENE_TWIN_GRACE, |s| s.scene.scene == scene)
+                    .await;
+                if snapshot.scene.scene == scene {
+                    return Ok(self.scene_already_running(snapshot, refresh).await);
+                }
+            }
+            return Err(Refusal::new(
+                429,
+                "another operator request was carried out a moment ago (they are taken \
+                 one at a time, a moment apart). Nothing was changed: look at the \
+                 dashboard, then send it again.",
+            )
+            .with_header("Retry-After", "1"));
+        };
         let reply = self
             .ops
             .request(command)
             .await
             .map_err(|error| Refusal::new(503, error.to_string()))?;
+        // The loop has done its part; what follows only reads snapshots.
+        drop(permit);
         let verdict = if reply.accepted {
             "accepted"
         } else {
@@ -651,10 +730,61 @@ impl Service {
         };
         // Relative to /action/<name>, so it also works behind a path prefix.
         // Only numbers go into it.
-        let location = format!("../?refresh={refresh}&notice={}", reply.event);
-        Ok(Response::text(303, format!("{verdict}: {}", reply.message))
+        let mut location = format!("../?refresh={refresh}&notice={}", reply.event);
+        let mut text = format!("{verdict}: {}", reply.message);
+        let mut confirmed = None;
+        if let Some(target) = reply.scene_changed {
+            // The scene changed. Do not send the browser to a page that was
+            // rendered before any shard could answer: wait (bounded, and
+            // without asking the loop for anything) until every connected
+            // shard has confirmed, then say how far it got.
+            let snapshot = self
+                .ops
+                .wait_until(self.config.limits.scene_confirm_wait, |s| {
+                    s.scene.revision >= target.revision && s.scene_progress().settled()
+                })
+                .await;
+            let progress = snapshot.scene_progress();
+            text = format!("{text}. {}", progress.sentence());
+            location = format!("{location}&switched={}", target.revision);
+            confirmed = Some(confirmed_header(&progress));
+        }
+        let mut response = Response::text(303, text)
             .with_header("Location", location)
-            .with_header("X-Space-Result", verdict))
+            .with_header("X-Space-Result", verdict);
+        if let Some(confirmed) = confirmed {
+            response = response.with_header("X-Space-Confirmed", confirmed);
+        }
+        Ok(response)
+    }
+
+    /// Answer a request for the scene `seen` shows as running (see
+    /// [`scene_unchanged`]). When a connected shard has not confirmed that
+    /// scene yet — the request is the second half of a double click and the
+    /// first half was the switch, an instant ago — the answer waits for the
+    /// confirmations exactly as the switch itself does: the browser follows
+    /// the *last* answer it gets, and that one must not say "0 of 1" about a
+    /// switch that is a few milliseconds from done. Reads snapshots only.
+    async fn scene_already_running(
+        &self,
+        seen: Arc<crate::snapshot::Snapshot>,
+        refresh: u32,
+    ) -> Response {
+        let asked = seen.scene.current();
+        let latest = self
+            .ops
+            .wait_until(self.config.limits.scene_confirm_wait, |s| {
+                s.scene.current() != asked || s.scene_progress().settled()
+            })
+            .await;
+        // Changed again while this waited (another operator): what was seen
+        // was true when asked, and is what the answer is about.
+        let shown = if latest.scene.current() == asked {
+            latest
+        } else {
+            seen
+        };
+        scene_unchanged(&shown, refresh)
     }
 
     /// Read one request from `stream`, answer it, close.
@@ -686,6 +816,43 @@ impl Service {
         )
         .await;
     }
+}
+
+/// `confirmed/connected`: how many of the shards that hold a control link have
+/// confirmed the current scene (the `X-Space-Confirmed` header).
+fn confirmed_header(progress: &crate::snapshot::SceneProgress) -> String {
+    format!("{}/{}", progress.confirmed.len(), progress.connected())
+}
+
+/// The answer to a request for the scene that is already running: nothing
+/// was sent to the run loop, nothing changed, and the answer says exactly
+/// that — plus who is still being waited for, if anyone is, or that no shard
+/// is connected at all (the same additions the dashboard's banner makes).
+fn scene_unchanged(snapshot: &crate::snapshot::Snapshot, refresh: u32) -> Response {
+    let progress = snapshot.scene_progress();
+    let mut text = format!(
+        "accepted: already running {} (revision {}); nothing to do",
+        progress.scene, progress.revision
+    );
+    if !progress.settled() || progress.connected() == 0 {
+        text = format!("{text}. {}", progress.sentence());
+    }
+    // The second half of a double click on the button that switched: the
+    // browser shows the answer to *this* request, and what the person did was
+    // switch — so they land on the switch's banner ("All 2 connected shards
+    // switched to solar"), not on "nothing to do".
+    let just_switched = snapshot
+        .scene
+        .changed_tick
+        .is_some_and(|at| snapshot.tick.saturating_sub(at) <= SCENE_TWIN_WINDOW_TICKS);
+    let same = if just_switched { "" } else { "&same=1" };
+    Response::text(303, text)
+        .with_header(
+            "Location",
+            format!("../?refresh={refresh}&switched={}{same}", progress.revision),
+        )
+        .with_header("X-Space-Result", "accepted")
+        .with_header("X-Space-Confirmed", confirmed_header(&progress))
 }
 
 /// The addresses a form can be posted to (see the module docs, "Routes").
@@ -1003,6 +1170,13 @@ mod tests {
         })
         .expect("the root owner registers");
         orch.note_connected([ShardId::new(1)]);
+        // The shard confirms the scene it was handed with its welcome, as a
+        // real one does within a tick: the baseline is a settled cluster.
+        let scene = orch.scene();
+        orch.handle_scene_ack(&space_protocol::SceneAck {
+            shard: ShardId::new(1),
+            applied: scene,
+        });
         orch
     }
 
@@ -1018,6 +1192,9 @@ mod tests {
             // These tests post actions back to back; the spacing between
             // actions has a test of its own.
             min_action_spacing: Duration::ZERO,
+            // Long enough for the test loop's shard to confirm (it takes
+            // 20 ms), short enough that a test of a stuck shard is quick.
+            scene_confirm_wait: Duration::from_millis(400),
             ..Limits::default()
         });
         Service {
@@ -1209,20 +1386,24 @@ mod tests {
             "<meta http-equiv=\"refresh\" content=\"3\">",
             "action=\"action/split\"",
             "name=\"csrf\" value=\"",
-            // The Scene card: the current scene, and the form that changes it.
+            // The Scene card: the current scene, and one button per scene.
             "<h2>Scene</h2>",
             "<span class=\"pill info\">demo-area</span>",
             "action=\"action/scene\"",
-            "<select name=\"scene\"",
-            "<option value=\"demo-area\" selected>demo-area (current)</option>",
-            "<option value=\"materials\">materials</option>",
-            "<option value=\"solar\">solar</option>",
-            "<option value=\"galaxy\">galaxy</option>",
-            "Switch all shards</button>",
-            "not confirmed yet",
+            "<button name=\"scene\" value=\"demo-area\" disabled",
+            ">demo-area (current)</button>",
+            ">Switch all shards to materials</button>",
+            ">Switch all shards to solar</button>",
+            ">Switch all shards to galaxy</button>",
+            "demo-area, revision 1 <span class=\"pill ok\">current</span>",
+            "<span class=\"pill ok\">1 of 1 connected shards</span>",
         ] {
             assert!(page.contains(needle), "missing {needle:?}");
         }
+        assert!(
+            !page.contains("while a shard is switching scene"),
+            "nothing is pending, so the chosen refresh interval applies"
+        );
         assert!(page.contains(&service.form_token));
         // No script, no inline style attribute, no event handler: the policy
         // would block them, and the page has none to block.
@@ -1331,12 +1512,14 @@ mod tests {
             "\"epoch_in_flight\":null",
             "\"free_octants\":[0,1,2,3,4,5,6,7]",
             "\"scene\":{\"name\":\"demo-area\",\"id\":0,\"revision\":1,\"changed_tick\":null",
-            "\"confirmed_by\":[],\"not_confirmed_by\":[1]",
+            "\"confirmed_by\":[1],\"not_confirmed_by\":[],\"pending\":false,\
+             \"status\":\"All 1 connected shard switched to demo-area (revision 1)\"",
             "\"catalogue\":[{\"name\":\"demo-area\",\"id\":0,\"current\":true},\
              {\"name\":\"materials\",\"id\":1,\"current\":false},\
              {\"name\":\"solar\",\"id\":2,\"current\":false},\
              {\"name\":\"galaxy\",\"id\":3,\"current\":false}]",
-            "\"scene\":null,\"scene_sync\":\"unconfirmed\"",
+            "\"scene\":{\"name\":\"demo-area\",\"id\":0,\"revision\":1},\
+             \"scene_sync\":\"in-sync\"",
         ] {
             assert!(json.contains(needle), "missing {needle} in {json}");
         }
@@ -1655,6 +1838,7 @@ mod tests {
             accepted: true,
             message: "done".into(),
             event: 1,
+            scene_changed: None,
         });
         assert_eq!(first.await.expect("the first request").status, 303);
         let third = {
@@ -1723,13 +1907,37 @@ mod tests {
 
     // ------------------------------------------------------ cross-site posts
 
-    /// Answer every request on `port` with the orchestrator's real handler.
-    fn run_loop(mut orch: Orchestrator<NoLauncher>, mut port: OpsPort) {
+    /// How the test loop's one shard treats a scene change.
+    #[derive(Clone)]
+    enum ShardAnswers {
+        /// It confirms 20 ms later, as a live shard does within a tick or two.
+        Promptly,
+        /// It confirms when the test says so (and not before).
+        WhenTold(Arc<tokio::sync::Notify>),
+    }
+
+    /// Answer every request on `port` with the orchestrator's real handler,
+    /// and have shard 1 confirm each scene change as `shard` says.
+    fn run_loop(mut orch: Orchestrator<NoLauncher>, mut port: OpsPort, shard: ShardAnswers) {
         tokio::spawn(async move {
             while let Some(request) = port.next_request().await {
                 let reply = orch.handle_operator(&request.command);
                 port.publish(orch.snapshot());
+                let changed = reply.scene_changed;
                 let _ = request.reply.send(reply);
+                if let Some(applied) = changed {
+                    match &shard {
+                        ShardAnswers::Promptly => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        ShardAnswers::WhenTold(told) => told.notified().await,
+                    }
+                    orch.handle_scene_ack(&space_protocol::SceneAck {
+                        shard: ShardId::new(1),
+                        applied,
+                    });
+                    port.publish(orch.snapshot());
+                }
             }
         });
     }
@@ -1737,8 +1945,70 @@ mod tests {
     fn served() -> Service {
         let orch = orchestrator("space-test");
         let (handle, port) = crate::ops::channel(orch.snapshot());
-        run_loop(orch, port);
+        run_loop(orch, port, ShardAnswers::Promptly);
         service_with(handle, None, &[])
+    }
+
+    /// Every form control in `page` that holds a value a reload would put
+    /// back: `<select>`, `<textarea>`, `<datalist>`, and every `<input>` that
+    /// is not hidden (text, checkbox, radio, …), as the lower-cased tags.
+    fn controls_a_reload_resets(page: &str) -> Vec<String> {
+        let lower = page.to_ascii_lowercase();
+        let mut found = Vec::new();
+        for (at, _) in lower.match_indices('<') {
+            let rest = &lower[at..];
+            let tag = &rest[..rest.find('>').map_or(rest.len(), |end| end + 1)];
+            let holds_a_choice = ["<select", "<textarea", "<datalist", "<option"]
+                .iter()
+                .any(|name| tag.starts_with(name))
+                || (tag.starts_with("<input") && !tag.contains("type=\"hidden\""));
+            if holds_a_choice {
+                found.push(tag.to_owned());
+            }
+        }
+        found
+    }
+
+    /// The scene form of the dashboard: from its `action` to its end.
+    fn scene_form(page: &str) -> &str {
+        let start = page
+            .find("action=\"action/scene\"")
+            .expect("the page has a scene form");
+        let length = page[start..].find("</form>").expect("the form ends");
+        &page[start..start + length]
+    }
+
+    /// What a browser posts when the scene button with `value` is pressed:
+    /// the form's hidden fields and that button's own `name=value` — nothing
+    /// a person had to choose beforehand.
+    fn pressing(form: &str, value: &str) -> String {
+        let mut fields = Vec::new();
+        for input in form.split("<input type=\"hidden\" name=\"").skip(1) {
+            let (name, rest) = input.split_once("\" value=\"").expect("a value");
+            let (held, _) = rest.split_once('"').expect("a closed value");
+            fields.push(format!("{name}={held}"));
+        }
+        let button = format!("<button name=\"scene\" value=\"{value}\"");
+        let at = form
+            .find(&button)
+            .unwrap_or_else(|| panic!("no button for {value}"));
+        let tag = &form[at..at + form[at..].find('>').expect("a closed tag")];
+        assert!(
+            !tag.contains(" disabled"),
+            "the button for {value} cannot be pressed"
+        );
+        fields.push(format!("scene={value}"));
+        fields.join("&")
+    }
+
+    /// The page a response redirects to, as the browser would fetch it.
+    async fn follow(service: &Service, response: &Response) -> String {
+        let location = response.header("location").expect("a redirect");
+        text(
+            &service
+                .handle(&get(location.trim_start_matches("..")))
+                .await,
+        )
     }
 
     #[tokio::test]
@@ -1926,37 +2196,44 @@ mod tests {
             "no refusal changed the scene"
         );
 
-        // Accepted: the page's own form.
+        // Accepted: the page's own form. The answer comes once the shard has
+        // confirmed, and says so — to a script in the body and a header, to a
+        // person on the page the redirect leads to.
         let response = service
-            .handle(&post(
-                "/action/scene",
-                &format!("{body}&refresh=10&epoch=1"),
-            ))
+            .handle(&post("/action/scene", &format!("{body}&refresh=0&epoch=1")))
             .await;
         assert_eq!(response.status, 303, "{}", text(&response));
         assert_eq!(response.header("x-space-result"), Some("accepted"));
-        assert!(
-            text(&response).starts_with("accepted: scene demo-area -> solar (revision 2)"),
-            "{}",
-            text(&response)
+        assert_eq!(response.header("x-space-confirmed"), Some("1/1"));
+        assert_eq!(
+            text(&response).trim_end(),
+            "accepted: scene demo-area -> solar (revision 2), sent to shard 1. All 1 connected \
+             shard switched to solar (revision 2)"
         );
         let location = response.header("location").expect("a redirect").to_owned();
-        assert!(location.starts_with("../?refresh=10&notice="), "{location}");
-        let page = text(
-            &service
-                .handle(&get(location.trim_start_matches("..")))
-                .await,
+        assert!(
+            location.starts_with("../?refresh=0&notice=") && location.ends_with("&switched=2"),
+            "{location}"
         );
+        // Auto-refresh is off (`refresh=0` came back with the redirect) and
+        // the page is right all the same: it was rendered after the shard
+        // answered, not before.
+        let page = follow(&service, &response).await;
         for needle in [
-            "class=\"notice ok\"",
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to solar (revision 2).",
             "<span class=\"pill info\">solar</span>",
-            "<option value=\"solar\" selected>solar (current)</option>",
-            "<option value=\"demo-area\">demo-area</option>",
+            "<button name=\"scene\" value=\"solar\" disabled",
+            ">solar (current)</button>",
+            ">Switch all shards to demo-area</button>",
             "<dt>revision</dt><dd>2</dd>",
+            "<span class=\"pill ok\">1 of 1 connected shards</span>",
+            "solar, revision 2 <span class=\"pill ok\">current</span>",
             "switch every shard to scene solar: accepted",
         ] {
             assert!(page.contains(needle), "missing {needle:?}");
         }
+        assert!(!page.contains("http-equiv=\"refresh\""), "off stays off");
+        assert!(!page.contains("behind") && !page.contains("switching →"));
         let json = text(&service.handle(&get("/api/state")).await);
         check_json(&json).expect("well-formed");
         assert!(
@@ -1965,11 +2242,531 @@ mod tests {
             ),
             "{json}"
         );
+        assert!(json.contains("\"pending\":false"), "{json}");
+    }
 
-        // The scene that is already current: accepted, and nothing changes.
-        let response = service.handle(&post("/action/scene", &body)).await;
+    /// The dashboard reloads itself, and a reload puts every form control back
+    /// to what the server rendered. So the page must not hold a choice in a
+    /// control — in any of its states — and the scene card in particular
+    /// posts a fixed `scene=NAME` per button: one click carries the request.
+    ///
+    /// Mutation this catches: a `<select>` (or any other control with a value)
+    /// next to a submit button. That is what the scene card had: the
+    /// auto-refresh put the choice back to the running scene within three
+    /// seconds, the button then posted exactly that, and the answer was a
+    /// green "accepted" with nothing changed.
+    #[tokio::test]
+    async fn no_control_on_the_page_holds_a_choice_a_reload_could_reset() {
+        let orch = orchestrator("space-test");
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        let confirm = Arc::new(tokio::sync::Notify::new());
+        run_loop(orch, port, ShardAnswers::WhenTold(Arc::clone(&confirm)));
+        let service = service_with(handle, None, &[]);
+        let nothing = Vec::<String>::new();
+
+        let page = text(&service.handle(&get("/")).await);
+        assert_eq!(controls_a_reload_resets(&page), nothing);
+        assert!(
+            page.contains("<input type=\"hidden\" name=\"csrf\""),
+            "hidden fields are what the forms are made of"
+        );
+
+        // The scene card: one button per scene of the catalogue, in catalogue
+        // order, each with its own fixed value; the running one is disabled
+        // and marked, every other one says what it does.
+        let form = scene_form(&page);
+        assert_eq!(form.matches("<button").count(), Scene::ALL.len());
+        let mut last = 0;
+        for scene in Scene::ALL {
+            let button = format!("<button name=\"scene\" value=\"{}\"", scene.name());
+            assert_eq!(form.matches(&button).count(), 1, "{button}");
+            let at = form.find(&button).expect("counted");
+            assert!(at >= last, "catalogue order");
+            last = at;
+        }
+        assert_eq!(form.matches(" disabled").count(), 1);
+        assert!(form.contains("<button name=\"scene\" value=\"demo-area\" disabled"));
+        assert!(form.contains(">demo-area (current)</button>"));
+        for name in ["materials", "solar", "galaxy"] {
+            assert!(
+                form.contains(&format!(">Switch all shards to {name}</button>")),
+                "the label says what the click does: {form}"
+            );
+        }
+
+        // Pressing a button is the whole request: what it posts — hidden
+        // fields plus its own name=value — switches to exactly that scene,
+        // however long ago and however often the page was reloaded.
+        let reloaded = text(&service.handle(&get("/")).await);
+        assert_eq!(
+            pressing(scene_form(&reloaded), "galaxy"),
+            pressing(form, "galaxy")
+        );
+        let response = service
+            .handle(&post("/action/scene", &pressing(form, "galaxy")))
+            .await;
+        assert!(
+            text(&response).starts_with("accepted: scene demo-area -> galaxy (revision 2)"),
+            "{}",
+            text(&response)
+        );
+
+        // While the shard has not confirmed (the page reloads every second
+        // now): still nothing to reset, and the buttons have moved on.
+        let pending = follow(&service, &response).await;
+        assert!(pending.contains("<meta http-equiv=\"refresh\" content=\"1\">"));
+        assert_eq!(controls_a_reload_resets(&pending), nothing);
+        let form = scene_form(&pending);
+        assert!(form.contains("<button name=\"scene\" value=\"galaxy\" disabled"));
+        assert!(form.contains(">Switch all shards to demo-area</button>"));
+        assert_eq!(form.matches(" disabled").count(), 1);
+
+        // And once it has, and on a refusal page.
+        confirm.notify_one();
+        let settled = service
+            .ops
+            .wait_until(Duration::from_secs(5), |s| s.scene_progress().settled())
+            .await;
+        assert!(settled.scene_progress().settled());
+        let page = follow(&service, &response).await;
+        assert_eq!(controls_a_reload_resets(&page), nothing);
+        let refused = service.handle(&post("/action/scene", "scene=solar")).await;
+        assert_eq!(refused.status, 403);
+        assert_eq!(controls_a_reload_resets(&text(&refused)), nothing);
+    }
+
+    /// Asking for the scene that is already running is not a switch, and
+    /// cannot be mistaken for one: the answer says "already running …; nothing
+    /// to do", the banner is not the green of a switch, and the control loop
+    /// is not even asked — so it also never runs into the pause between
+    /// actions. (A double click is this, and so is a click in a tab that
+    /// still shows the buttons from before somebody else's switch.)
+    ///
+    /// Mutation this catches: answering "accepted" with a generic text and a
+    /// green banner (reads as "switched" while nothing changed), or sending
+    /// the request to the loop (the second half of a double click then gets a
+    /// 429 saying "nothing was changed" — right after the first half changed
+    /// it).
+    #[tokio::test]
+    async fn asking_for_the_scene_that_is_running_says_nothing_to_do_and_is_never_refused() {
+        // The limits the binary runs with: the pause between actions is on.
+        let orch = orchestrator("space-test");
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        run_loop(orch, port, ShardAnswers::Promptly);
+        let mut service = service_with(handle, None, &[]);
+        service.config.limits.min_action_spacing = Limits::default().min_action_spacing;
+        assert!(service.config.limits.min_action_spacing >= Duration::from_millis(100));
+        let token = service.form_token.clone();
+        let operator_entries = |json: &str| json.matches("\"kind\":\"operator\"").count();
+
+        // The scene that is running when the page is first opened.
+        let same = format!("csrf={token}&refresh=0&scene=demo-area");
+        let response = service.handle(&post("/action/scene", &same)).await;
+        assert_eq!(response.status, 303, "{}", text(&response));
         assert_eq!(response.header("x-space-result"), Some("accepted"));
-        assert!(text(&response).contains("already solar (revision 2)"));
+        assert_eq!(response.header("x-space-confirmed"), Some("1/1"));
+        assert_eq!(
+            text(&response).trim_end(),
+            "accepted: already running demo-area (revision 1); nothing to do"
+        );
+        assert_eq!(
+            response.header("location"),
+            Some("../?refresh=0&switched=1&same=1")
+        );
+        let page = follow(&service, &response).await;
+        assert!(
+            page.contains(
+                "<div class=\"notice info\"><span>Already running demo-area (revision 1); \
+                 nothing to do."
+            ),
+            "the banner says it, and not in the colour of a switch"
+        );
+        assert!(!page.contains("class=\"notice ok\""));
+        let json = text(&service.handle(&get("/api/state")).await);
+        assert_eq!(operator_entries(&json), 0, "the loop was not asked: {json}");
+        assert!(json.contains("\"name\":\"demo-area\",\"id\":0,\"revision\":1"));
+
+        // A double click on a real switch: the first half switches, the
+        // second — an instant later, well inside the pause — is told that it
+        // is already so. Neither is refused.
+        let solar = format!("csrf={token}&refresh=0&scene=solar");
+        let first = service.handle(&post("/action/scene", &solar)).await;
+        assert!(
+            text(&first).starts_with("accepted: scene demo-area -> solar (revision 2)"),
+            "{}",
+            text(&first)
+        );
+        let second = service.handle(&post("/action/scene", &solar)).await;
+        assert_eq!(second.status, 303, "{}", text(&second));
+        assert_eq!(
+            text(&second).trim_end(),
+            "accepted: already running solar (revision 2); nothing to do"
+        );
+        // The browser shows the answer to the second click. What the person
+        // did was switch, so that is the banner they land on — not "nothing
+        // to do", which would read as if the button had done nothing.
+        assert_eq!(
+            second.header("location"),
+            Some("../?refresh=0&switched=2"),
+            "the second half of a double click is sent to the switch's banner"
+        );
+        let landed = follow(&service, &second).await;
+        assert!(
+            landed.contains(
+                "<div class=\"notice ok\"><span>All 1 connected shard switched to solar \
+                 (revision 2)."
+            ),
+            "{landed}"
+        );
+        assert!(!landed.contains("Already running"));
+        let json = text(&service.handle(&get("/api/state")).await);
+        assert_eq!(operator_entries(&json), 1, "one switch, one entry: {json}");
+
+        // A *different* scene inside the pause is still refused — loudly, and
+        // truthfully: that one really did not happen.
+        let galaxy = format!("csrf={token}&scene=galaxy");
+        let hurried = service.handle(&post("/action/scene", &galaxy)).await;
+        assert_eq!(hurried.status, 429, "{}", text(&hurried));
+        assert!(text(&hurried).contains("Nothing was changed"));
+        let json = text(&service.handle(&get("/api/state")).await);
+        assert!(
+            json.contains("\"name\":\"solar\",\"id\":2,\"revision\":2"),
+            "{json}"
+        );
+        // ...and goes through once the pause is over.
+        tokio::time::sleep(service.config.limits.min_action_spacing * 2).await;
+        let patient = service.handle(&post("/action/scene", &galaxy)).await;
+        assert!(
+            text(&patient).starts_with("accepted: scene solar -> galaxy (revision 3)"),
+            "{}",
+            text(&patient)
+        );
+    }
+
+    /// The two halves of a double click can also arrive while the first is
+    /// still with the run loop. The second must not be told "nothing was
+    /// changed": it waits a moment for the first, and is then answered like
+    /// any request for the scene that is running.
+    #[tokio::test]
+    async fn a_scene_request_that_races_its_twin_is_answered_once_the_twin_is_done() {
+        let mut orch = orchestrator("space-test");
+        let (handle, mut port) = crate::ops::channel(orch.snapshot());
+        let service = Arc::new(service_with(handle, None, &[]));
+        let body = format!("csrf={}&scene=solar", service.form_token);
+        let click = |service: &Arc<Service>| {
+            let (service, body) = (Arc::clone(service), body.clone());
+            tokio::spawn(async move { service.handle(&post("/action/scene", &body)).await })
+        };
+
+        let first = click(&service);
+        let held = tokio::time::timeout(Duration::from_secs(5), port.next_request())
+            .await
+            .expect("the first half reaches the loop")
+            .expect("a request");
+        let second = click(&service);
+        // The loop is still busy with the first for a moment...
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!second.is_finished(), "the second half waits for its twin");
+        // ...then carries it out...
+        let reply = orch.handle_operator(&held.command);
+        port.publish(orch.snapshot());
+        let applied = reply.scene_changed.expect("the scene changed");
+        let _ = held.reply.send(reply);
+        // ...and the shard confirms a moment later. Neither half answers
+        // before that: the browser follows the second half's answer, and it
+        // must not say "0 of 1" about a switch that is about to be done.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!first.is_finished(), "the switch waits for the shard");
+        assert!(
+            !second.is_finished(),
+            "and so does the request for the scene that is now running"
+        );
+        orch.handle_scene_ack(&space_protocol::SceneAck {
+            shard: ShardId::new(1),
+            applied,
+        });
+        port.publish(orch.snapshot());
+
+        let first = first.await.expect("the first half");
+        let second = second.await.expect("the second half");
+        assert!(
+            text(&first).starts_with("accepted: scene demo-area -> solar (revision 2)"),
+            "{}",
+            text(&first)
+        );
+        assert_eq!(first.header("x-space-confirmed"), Some("1/1"));
+        assert_eq!(second.status, 303, "{}", text(&second));
+        assert_eq!(
+            text(&second).trim_end(),
+            "accepted: already running solar (revision 2); nothing to do"
+        );
+        assert_eq!(second.header("x-space-confirmed"), Some("1/1"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), port.next_request())
+                .await
+                .is_err(),
+            "only one of the two reached the loop"
+        );
+    }
+
+    /// A shard that does not confirm in time: the answer comes anyway, names
+    /// who is being waited for, and the dashboard keeps reloading every second
+    /// — whatever `?refresh=` says, "off" included — until the shard has
+    /// confirmed. Then it says so and goes back to the chosen interval.
+    ///
+    /// Mutation this catches: redirecting as soon as the loop has accepted
+    /// (the page is rendered before any shard can answer, says "behind", and
+    /// with auto-refresh off says it for ever — which reads as "the switch did
+    /// not work"), or waiting without a bound for a shard that is stuck.
+    #[tokio::test]
+    async fn a_switch_a_shard_has_not_confirmed_names_it_and_the_page_reloads_until_it_has() {
+        let orch = orchestrator("space-test");
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        let confirm = Arc::new(tokio::sync::Notify::new());
+        run_loop(orch, port, ShardAnswers::WhenTold(Arc::clone(&confirm)));
+        let service = service_with(handle, None, &[]);
+        let wait = service.config.limits.scene_confirm_wait;
+        let body = format!("csrf={}&refresh=0&scene=solar", service.form_token);
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            wait + Duration::from_secs(5),
+            service.handle(&post("/action/scene", &body)),
+        )
+        .await
+        .expect("the wait for a stuck shard is bounded");
+        assert!(started.elapsed() >= wait, "it did wait for the shard");
+        assert_eq!(response.status, 303, "{}", text(&response));
+        assert_eq!(response.header("x-space-result"), Some("accepted"));
+        assert_eq!(response.header("x-space-confirmed"), Some("0/1"));
+        assert_eq!(
+            text(&response).trim_end(),
+            "accepted: scene demo-area -> solar (revision 2), sent to shard 1. Switching to \
+             solar (revision 2): waiting for shard 1 … (0 of 1 connected shard confirmed)"
+        );
+
+        // The page: pending, said in the banner, in the Scene card and next to
+        // the auto-refresh control — and reloading although refresh is off.
+        let pending = follow(&service, &response).await;
+        for needle in [
+            "<meta http-equiv=\"refresh\" content=\"1\">",
+            "<strong class=\"warn\">every 1 s while a shard is switching scene</strong>",
+            "<div class=\"notice warn\"><span>Switching to solar (revision 2): waiting for \
+             shard 1 … (0 of 1 connected shard confirmed).",
+            "this page reloads every 1 s until every connected shard has confirmed",
+            "<span class=\"pill warn\">switching → solar, 0 of 1 confirmed</span>",
+            "<div class=\"sub\">waiting for shard 1</div>",
+            "demo-area, revision 1 <span class=\"pill warn\">behind</span>",
+            // The chosen interval is kept for afterwards, and in every form.
+            "<strong>off</strong>",
+            "name=\"refresh\" value=\"0\"",
+        ] {
+            assert!(pending.contains(needle), "missing {needle:?}");
+        }
+        // The same without the redirect's parameters: any view of the
+        // dashboard reloads while a shard is behind.
+        let plain = text(&service.handle(&get("/?refresh=0")).await);
+        assert!(plain.contains("<meta http-equiv=\"refresh\" content=\"1\">"));
+        let slow = text(&service.handle(&get("/?refresh=10")).await);
+        assert!(slow.contains("content=\"1\"") && !slow.contains("content=\"10\""));
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).expect("well-formed");
+        assert!(
+            json.contains("\"confirmed_by\":[],\"not_confirmed_by\":[1],\"pending\":true"),
+            "{json}"
+        );
+        // Asking for the same scene again changes nothing and is not refused;
+        // it waits as long as the switch did, and names the same shard.
+        let started = Instant::now();
+        let again = service.handle(&post("/action/scene", &body)).await;
+        assert!(started.elapsed() >= wait, "it waited for the shard as well");
+        assert_eq!(again.status, 303, "{}", text(&again));
+        assert_eq!(again.header("x-space-confirmed"), Some("0/1"));
+        assert_eq!(
+            text(&again).trim_end(),
+            "accepted: already running solar (revision 2); nothing to do. Switching to solar \
+             (revision 2): waiting for shard 1 … (0 of 1 connected shard confirmed)"
+        );
+
+        // The shard confirms. The very page the browser is on (same address,
+        // reloaded by the meta refresh) now says so, and stops reloading.
+        confirm.notify_one();
+        let mut settled = String::new();
+        for _ in 0..100 {
+            settled = follow(&service, &response).await;
+            if settled.contains("class=\"notice ok\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for needle in [
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to solar (revision 2).",
+            "<span class=\"pill ok\">1 of 1 connected shards</span>",
+            "solar, revision 2 <span class=\"pill ok\">current</span>",
+        ] {
+            assert!(settled.contains(needle), "missing {needle:?}");
+        }
+        assert!(!settled.contains("http-equiv=\"refresh\""), "back to off");
+        assert!(!settled.contains("while a shard is switching scene"));
+        let slow = text(&service.handle(&get("/?refresh=10")).await);
+        assert!(
+            slow.contains("content=\"10\""),
+            "back to the chosen interval"
+        );
+    }
+
+    /// With no shard connected a switch is saved and nothing more — and the
+    /// answer says exactly that instead of a bare "accepted". (This is also
+    /// what an operator sees after restarting only the orchestrator: the
+    /// shards that were running do not come back by themselves.)
+    #[tokio::test]
+    async fn a_switch_with_no_shard_connected_says_that_nobody_was_told() {
+        let mut orch = orchestrator("space-test");
+        orch.note_connected([]);
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        run_loop(orch, port, ShardAnswers::Promptly);
+        let service = service_with(handle, None, &[]);
+        let body = format!("csrf={}&scene=galaxy", service.form_token);
+        let started = Instant::now();
+        let response = service.handle(&post("/action/scene", &body)).await;
+        assert!(
+            started.elapsed() < service.config.limits.scene_confirm_wait,
+            "nobody to wait for"
+        );
+        assert_eq!(response.header("x-space-confirmed"), Some("0/0"));
+        let answer = text(&response);
+        assert!(
+            answer.contains("No shard is connected: galaxy (revision 2) is saved"),
+            "{answer}"
+        );
+        let page = follow(&service, &response).await;
+        assert!(
+            page.contains("<div class=\"notice warn\"><span>No shard is connected: galaxy"),
+            "not the green of a switch that reached somebody"
+        );
+        assert!(page.contains("<span class=\"dim\">no shard is connected</span>"));
+        assert!(
+            page.contains("<meta http-equiv=\"refresh\" content=\"3\">"),
+            "nobody is behind, so the chosen interval applies"
+        );
+
+        // Asked again: nothing to do, and still nobody who runs it — said in
+        // the answer and on the page alike, at once (nobody to wait for).
+        let started = Instant::now();
+        let again = service.handle(&post("/action/scene", &body)).await;
+        assert!(started.elapsed() < service.config.limits.scene_confirm_wait);
+        assert_eq!(again.header("x-space-confirmed"), Some("0/0"));
+        assert_eq!(
+            text(&again).trim_end(),
+            "accepted: already running galaxy (revision 2); nothing to do. No shard is \
+             connected: galaxy (revision 2) is saved and is handed to each shard when it registers"
+        );
+        // (Asked right after the switch, so the page it leads to is the
+        // switch's; a later request leads to the "already running" one.)
+        let page = follow(&service, &again).await;
+        assert!(
+            page.contains("<div class=\"notice warn\"><span>No shard is connected: galaxy"),
+            "{page}"
+        );
+        let page = text(&service.handle(&get("/?switched=2&same=1")).await);
+        assert!(
+            page.contains(
+                "<div class=\"notice warn\"><span>Already running galaxy (revision 2); nothing \
+                 to do. No shard is connected: galaxy"
+            ),
+            "{page}"
+        );
+    }
+
+    /// For two seconds after a scene change, a request for that scene is the
+    /// second half of a double click and is sent to the switch's banner; after
+    /// that — and for a scene that has not changed since startup — it is a
+    /// request for nothing, and is sent to the page that says so.
+    #[test]
+    fn a_request_that_repeats_a_fresh_switch_is_sent_to_the_switchs_banner() {
+        let mut orch = orchestrator("space-test");
+        let location = |orch: &Orchestrator<NoLauncher>| {
+            scene_unchanged(&orch.snapshot(), 3)
+                .header("location")
+                .expect("a redirect")
+                .to_owned()
+        };
+        assert_eq!(location(&orch), "../?refresh=3&switched=1&same=1");
+
+        let reply = orch.handle_operator(&OperatorCommand::SetScene {
+            scene: Scene::Solar,
+        });
+        orch.handle_scene_ack(&space_protocol::SceneAck {
+            shard: ShardId::new(1),
+            applied: reply.scene_changed.expect("the scene changed"),
+        });
+        assert_eq!(location(&orch), "../?refresh=3&switched=2");
+        for _ in 0..SCENE_TWIN_WINDOW_TICKS {
+            orch.tick();
+        }
+        assert_eq!(
+            location(&orch),
+            "../?refresh=3&switched=2",
+            "still within two seconds"
+        );
+        orch.tick();
+        assert_eq!(location(&orch), "../?refresh=3&switched=2&same=1");
+    }
+
+    /// The banner is read from the state, not from the link: a link naming a
+    /// revision the cluster has not reached (a stale tab after a restart, or
+    /// a made-up one) shows no banner at all.
+    #[tokio::test]
+    async fn a_scene_banner_cannot_be_conjured_by_a_link() {
+        let (service, _port, _) = service(None);
+        for target in [
+            "/?switched=7",
+            "/?switched=0",
+            "/?switched=x&same=1",
+            "/?same=1",
+        ] {
+            let page = text(&service.handle(&get(target)).await);
+            assert!(!page.contains("class=\"notice"), "{target}");
+        }
+        // The revision the cluster is at: the banner says what is true now.
+        let page = text(&service.handle(&get("/?switched=1")).await);
+        assert!(page.contains(
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to demo-area \
+             (revision 1)."
+        ));
+        let page = text(&service.handle(&get("/?switched=1&same=1")).await);
+        assert!(page.contains(
+            "<div class=\"notice info\"><span>Already running demo-area (revision 1); nothing \
+             to do."
+        ));
+    }
+
+    /// "Already running X" is about one revision. Once the scene has been
+    /// changed again, a tab still showing that answer must not turn it into
+    /// "already running" the *new* scene, which nobody asked that tab for.
+    #[tokio::test]
+    async fn an_already_running_banner_does_not_outlive_its_revision() {
+        let orch = orchestrator("space-test");
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        run_loop(orch, port, ShardAnswers::Promptly);
+        let service = service_with(handle, None, &[]);
+        let same = format!("csrf={}&scene=demo-area", service.form_token);
+        let asked = service.handle(&post("/action/scene", &same)).await;
+        assert!(follow(&service, &asked)
+            .await
+            .contains("Already running demo-area (revision 1)"));
+
+        let solar = format!("csrf={}&scene=solar", service.form_token);
+        let switched = service.handle(&post("/action/scene", &solar)).await;
+        assert_eq!(switched.header("x-space-confirmed"), Some("1/1"));
+        // The old tab reloads.
+        let stale = follow(&service, &asked).await;
+        assert!(!stale.contains("Already running"), "{stale}");
+        assert!(!stale.contains("class=\"notice"));
+        // The switch's own banner stays what it was.
+        assert!(follow(&service, &switched)
+            .await
+            .contains("All 1 connected shard switched to solar (revision 2)."));
     }
 
     /// What each shard confirmed is on the page next to it, and a shard that
@@ -2022,15 +2819,21 @@ mod tests {
             page.contains("demo-area, revision 1 <span class=\"pill warn\">behind</span>"),
             "a shard on the old revision is marked"
         );
-        assert!(page.contains("<span class=\"pill warn\">0 of 1 connected shards</span>"));
+        assert!(
+            page.contains("<span class=\"pill warn\">switching → galaxy, 0 of 1 confirmed</span>"),
+            "the card says a switch is under way, and how far it is"
+        );
+        assert!(page.contains("<div class=\"sub\">waiting for shard 1</div>"));
         assert!(json.contains("\"scene_sync\":\"behind\""), "{json}");
         assert!(json.contains("\"confirmed_by\":[],\"not_confirmed_by\":[1]"));
 
-        // It answers with something the cluster never had.
-        ack(&mut orch, Scene::Solar, 7);
+        // It answers with something far past anything the cluster ever had.
+        let nonsense = crate::scene::MAX_REVISION_CATCH_UP * 4;
+        ack(&mut orch, Scene::Solar, nonsense);
         let (page, json) = render(&orch).await;
-        assert!(page
-            .contains("solar, revision 7 <span class=\"pill bad\">not the cluster&#39;s</span>"));
+        assert!(page.contains(&format!(
+            "solar, revision {nonsense} <span class=\"pill bad\">not the cluster&#39;s</span>"
+        )));
         assert!(json.contains("\"scene_sync\":\"differs\""), "{json}");
         check_json(&json).expect("well-formed");
     }

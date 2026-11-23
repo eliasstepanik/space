@@ -1439,10 +1439,12 @@ fn is_green(p: [u16; 3]) -> bool {
     p[1] > 40 && p[1] > 3 * p[0].max(p[2]).max(1)
 }
 
-/// Refraction: the marker seen through the lens is displaced, in the direction
-/// a convex lens magnifies (away from the lens centre), relative to the same
-/// scene without the lens; with refraction off (Low/Ci) the lens is opaque and
-/// the marker is hidden.
+/// Refraction: the marker seen through the ball lens is where Snell's law
+/// puts it — for a marker this far behind the ball, on the other side of the
+/// ball's centre: a ball lens turns what is behind it round. `optics` traces
+/// the same rays on the CPU (through an ideal ball) and says which pixels
+/// show the marker. With refraction off (Low/Ci) the lens is opaque and the
+/// marker is hidden.
 /// Mutation: `QualityPreset::Ci` (no glass pass, no post pass) is the "off" side.
 #[test]
 fn refraction_displaces_the_background_seen_through_glass() {
@@ -1476,13 +1478,17 @@ fn refraction_displaces_the_background_seen_through_glass() {
             "{preset}: marker n={n} centroid=({x:.2},{y:.2}); reference n={ref_n} ({ref_x:.2},{ref_y:.2})"
         );
         assert!(
-            x > ref_x + 1.0,
-            "{preset}: marker should be displaced outward (+x) by the lens: {x:.2} vs {ref_x:.2}"
+            ref_x > 64.0 && x < 64.0,
+            "{preset}: the ball turns the picture round: {x:.2} (without it: {ref_x:.2})"
         );
         assert!(
             (y - ref_y).abs() < 1.0,
             "{preset}: no vertical displacement expected: {y:.2} vs {ref_y:.2}"
         );
+        let expected = optics::ball_lens_image(size, preset, |origin, dir| {
+            optics::hits_ball(origin, dir, [1.6, 0.0, -9.0], 0.6).is_some()
+        });
+        optics::assert_same_pixels(&format!("{preset}: marker"), &out, &expected, is_green);
     }
 }
 
@@ -2153,8 +2159,8 @@ fn a_model_is_visible_in_a_mirror_reflection() {
 
 /// A mesh model is seen through glass: the green marker of
 /// `refraction_scene`, as a mesh cube, hidden behind the lens with refraction
-/// off and visible through it — displaced outwards, as a convex lens does —
-/// with refraction on.
+/// off and visible through it — where Snell's law puts it, on the other side
+/// of the ball — with refraction on.
 #[test]
 fn a_model_is_seen_through_glass() {
     let Some(mut ctx) = context() else { return };
@@ -2190,10 +2196,14 @@ fn a_model_is_seen_through_glass() {
         );
         assert!(n >= 100, "{preset}: only {n} px of the model show through");
         assert!(
-            x > ref_x + 1.0,
-            "{preset}: the lens should displace the model outwards: {x:.2} vs {ref_x:.2}"
+            ref_x > 64.0 && x < 64.0,
+            "{preset}: the ball turns the picture round: {x:.2} (without it: {ref_x:.2})"
         );
         assert!((y - ref_y).abs() < 1.5, "{preset}: {y:.2} vs {ref_y:.2}");
+        let expected = optics::ball_lens_image(size, preset, |origin, dir| {
+            optics::hits_box(origin, dir, [1.6, 0.0, -9.0], [0.5; 3]).is_some()
+        });
+        optics::assert_same_pixels(&format!("{preset}: model"), &out, &expected, is_green);
     }
 }
 
@@ -2894,30 +2904,31 @@ fn dominant(p: [u16; 3], channel: usize) -> bool {
 
 /// Glass seen from a few metres, from close range, at a grazing angle and
 /// from above, by cameras turned towards the corner, with bright checkered
-/// panels behind it: the glass must show those panels, not darkness.
+/// panels behind it and nothing else around: the glass shows what its rays
+/// really reach. `optics` follows every glass pixel's ray on the CPU — into
+/// the cube or the ball, to the far side (reflected inside as often as the
+/// preset allows), out again — and says whether it ends on a panel or in the
+/// empty dark. Where it ends on a panel the glass is bright; where it ends in
+/// the void, dark.
 ///
-/// It used to show black for whole faces of a cube and half a sphere, for two
-/// reasons. The refracted lookups went to the wrong places (the test above
-/// has the cause), and a lookup that found a part of the frame where nothing
-/// was drawn showed that nothing. Now the glass falls back to what is
-/// straight behind it. The view from above is the one that needs the fallback
-/// even with the lookups in the right place: bent downwards, the ray ends
-/// below the panels, in empty space.
+/// (Glass used to show black for whole faces of a cube and half a ball,
+/// whatever was behind it — the test above has the cause. And before rays
+/// were followed through the glass, a lookup a fixed distance along the bent
+/// ray stood in for all this; it is still what a device without ray queries
+/// does.)
 ///
-/// For every glass pixel with a lit panel straight behind it — the glass
-/// pixels are those of the same shapes drawn opaque and glowing — the frame
-/// must be about as bright as the same frame without the glass, and next to
-/// none of it dark.
-///
-/// Mutations: without the fallback for a lookup that finds nothing
-/// (`found.a` in `post.wgsl`), a third of the glass seen from above is dark.
-/// With the code as it was (the wrong inverse, no fallback, no easing at the
-/// frame's edge), so is a third of the glass seen from a few metres, and
-/// parts of it close up. The wrong inverse alone does not fail here — the
-/// fallback covers for it — but it fails the test above.
+/// Only rays that enter the glass at less than 60 degrees from its normal
+/// count: flatter than that, more and more of what one sees is the
+/// reflection on the glass, which here is of nothing.
+/// Mutation: without the second refraction (the ray leaving the glass as it
+/// travelled inside), the panels are not where the test expects them.
 #[test]
 fn glass_seen_from_close_up_and_at_a_grazing_angle_is_not_dark() {
     let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
     let (width, height) = (320u32, 180u32);
     let room = GlassRoom::new();
     let mut render = |scene: &Scene, preset: QualityPreset| {
@@ -2962,61 +2973,335 @@ fn glass_seen_from_close_up_and_at_a_grazing_angle_is_not_dark() {
             "{name}: the glass covers only {} pixels",
             glass_pixels.len()
         );
+        // The room, as `GlassRoom::scene` builds it, around this eye.
+        let at = |p: [f64; 3]| {
+            [
+                p[0] - f64::from(eye[0]),
+                p[1] - f64::from(eye[1]),
+                p[2] - f64::from(eye[2]),
+            ]
+        };
+        let glass = [
+            optics::Glass::Cube(at([-5.8, -0.2, -6.6]), 0.5),
+            optics::Glass::Ball(at([-7.0, -0.15, -5.2]), 0.55),
+        ];
+        let panels = [
+            (at([-6.4, -0.1, -7.9]), [1.6, 1.6, 0.08]),
+            (at([-8.08, -0.1, -6.3]), [0.08, 1.6, 1.6]),
+        ];
+        let camera = optics::Camera::looking(yaw, pitch, 16.0 / 9.0, width, height);
         for preset in [QualityPreset::Medium, QualityPreset::High] {
             let with = render(&room.scene(eye, yaw, pitch, Middle::Glass), preset);
-            let without = render(&room.scene(eye, yaw, pitch, Middle::Nothing), preset);
-            // The glass pixels with a lit panel straight behind them.
-            let lit: Vec<(u32, u32)> = glass_pixels
-                .iter()
-                .copied()
-                .filter(|&(x, y)| luma(rgb(&without, x, y)) > 150)
-                .collect();
-            assert!(
-                lit.len() > 800,
-                "{name}: only {} glass pixels have a panel behind them",
-                lit.len()
-            );
-            let (mut dark, mut through, mut behind) = (0usize, 0u64, 0u64);
-            for &(x, y) in &lit {
-                let p = rgb(&with, x, y);
-                dark += usize::from(luma(p) < 40);
-                through += u64::from(luma(p));
-                behind += u64::from(luma(rgb(&without, x, y)));
+            let bounces = preset.features().glass_bounces;
+            // (pixels whose ray ends on a panel, of those the bright ones;
+            // pixels whose ray ends in the void, of those the dark ones)
+            let (mut lit, mut lit_ok, mut void, mut void_ok) = (0usize, 0usize, 0usize, 0usize);
+            for &(x, y) in &glass_pixels {
+                let dir = camera.ray(x, y);
+                let Some(seen) = optics::through_glass(&glass, [0.0; 3], dir, bounces) else {
+                    continue;
+                };
+                if seen.cos_in < 0.5 {
+                    continue;
+                }
+                let on_panel = panels
+                    .iter()
+                    .any(|&(c, half)| optics::hits_box(seen.origin, seen.dir, c, half).is_some());
+                let brightness = luma(rgb(&with, x, y));
+                if on_panel {
+                    lit += 1;
+                    lit_ok += usize::from(brightness >= 100);
+                } else {
+                    void += 1;
+                    void_ok += usize::from(brightness < 60);
+                }
             }
-            let n = lit.len() as u64;
             eprintln!(
-                "{name}, {preset}: {} glass pixels, {n} of them over a lit panel: {dark} dark, \
-                 mean brightness {} through the glass, {} without it",
-                glass_pixels.len(),
-                through / n,
-                behind / n
+                "{name}, {preset}: {} glass pixels; {lit_ok} of {lit} that look at a panel are \
+                 bright, {void_ok} of {void} that look into the void are dark",
+                glass_pixels.len()
             );
-            assert!(
-                behind / n > 150,
-                "{name}: what is behind the glass is bright"
-            );
-            if dark * 100 > lit.len() {
+            if lit < 300 {
                 problems.push(format!(
-                    "{name}, {preset}: {dark} of {n} glass pixels are dark"
+                    "{name}, {preset}: only {lit} pixels look at a panel"
                 ));
             }
-            if through * 10 < behind * 9 {
+            if lit_ok * 100 < lit * 95 {
                 problems.push(format!(
-                    "{name}, {preset}: the glass is darker ({}) than what is behind it ({})",
-                    through / n,
-                    behind / n
+                    "{name}, {preset}: only {lit_ok} of {lit} pixels that look at a panel are bright"
+                ));
+            }
+            if void >= 50 && void_ok * 100 < void * 90 {
+                problems.push(format!(
+                    "{name}, {preset}: only {void_ok} of {void} pixels that look into the void are dark"
                 ));
             }
         }
     }
-    assert!(
-        problems.is_empty(),
-        "{}",
-        problems.join(
-            "
-"
-        )
-    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Rays through glass, traced on the CPU: the twin of `through_glass` in
+/// `shaders/post.wgsl`, for the tests to say what a pixel must show. Ideal
+/// shapes, double precision, the same rules: index 1.5, bent on the way in
+/// and on the way out, reflected inside when it cannot get out, let out as
+/// it is after `bounces` reflections.
+mod optics {
+    use super::{pixel, QualityPreset};
+
+    pub type V = [f64; 3];
+    const INDEX: f64 = 1.5;
+
+    fn add(a: V, b: V) -> V {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    }
+    fn sub(a: V, b: V) -> V {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+    fn mul(a: V, s: f64) -> V {
+        [a[0] * s, a[1] * s, a[2] * s]
+    }
+    fn dot(a: V, b: V) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    fn cross(a: V, b: V) -> V {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn unit(a: V) -> V {
+        mul(a, 1.0 / dot(a, a).sqrt())
+    }
+
+    /// `i` refracted at a surface with unit normal `n` (against `i`), for the
+    /// ratio `eta` of the indices before and after; `None`: total reflection.
+    fn refract(i: V, n: V, eta: f64) -> Option<V> {
+        let c = dot(n, i);
+        let k = 1.0 - eta * eta * (1.0 - c * c);
+        (k >= 0.0).then(|| sub(mul(i, eta), mul(n, eta * c + k.sqrt())))
+    }
+
+    /// Where the ray meets the ball, entering it: distance, or `None`.
+    pub fn hits_ball(origin: V, dir: V, center: V, radius: f64) -> Option<f64> {
+        let oc = sub(origin, center);
+        let b = dot(oc, dir);
+        let disc = b * b - (dot(oc, oc) - radius * radius);
+        let t = -b - disc.max(0.0).sqrt();
+        (disc >= 0.0 && t > 0.0).then_some(t)
+    }
+
+    /// Where the ray enters the box and where it leaves it (slab test).
+    fn box_span(origin: V, dir: V, center: V, half: V) -> Option<(f64, f64)> {
+        let (mut near, mut far) = (f64::NEG_INFINITY, f64::INFINITY);
+        for a in 0..3 {
+            let (o, d) = (origin[a] - center[a], dir[a]);
+            if d.abs() < 1e-12 {
+                if o.abs() > half[a] {
+                    return None;
+                }
+                continue;
+            }
+            let (t0, t1) = ((-half[a] - o) / d, (half[a] - o) / d);
+            near = near.max(t0.min(t1));
+            far = far.min(t0.max(t1));
+        }
+        (near <= far).then_some((near, far))
+    }
+
+    /// Where the ray meets the box, entering it: distance, or `None`.
+    pub fn hits_box(origin: V, dir: V, center: V, half: V) -> Option<f64> {
+        box_span(origin, dir, center, half).and_then(|(near, _)| (near > 0.0).then_some(near))
+    }
+
+    /// A piece of glass: a cube (centre, half edge) or a ball (centre, radius).
+    #[derive(Clone, Copy)]
+    pub enum Glass {
+        Cube(V, f64),
+        Ball(V, f64),
+    }
+
+    impl Glass {
+        fn entry(&self, origin: V, dir: V) -> Option<f64> {
+            match *self {
+                Glass::Cube(c, h) => hits_box(origin, dir, c, [h; 3]),
+                Glass::Ball(c, r) => hits_ball(origin, dir, c, r),
+            }
+        }
+
+        /// How far a ray from `origin`, inside, has to its surface.
+        fn way_out(&self, origin: V, dir: V) -> f64 {
+            match *self {
+                Glass::Cube(c, h) => box_span(origin, dir, c, [h; 3]).map_or(0.0, |(_, far)| far),
+                Glass::Ball(c, r) => {
+                    let oc = sub(origin, c);
+                    let b = dot(oc, dir);
+                    (b * b - (dot(oc, oc) - r * r)).max(0.0).sqrt() - b
+                }
+            }
+        }
+
+        /// The outward unit normal at a point of its surface.
+        fn normal(&self, at: V) -> V {
+            match *self {
+                Glass::Ball(c, _) => unit(sub(at, c)),
+                Glass::Cube(c, _) => {
+                    let l = sub(at, c);
+                    let a = (0..3)
+                        .max_by(|&i, &j| l[i].abs().total_cmp(&l[j].abs()))
+                        .unwrap_or(0);
+                    let mut n = [0.0; 3];
+                    n[a] = l[a].signum();
+                    n
+                }
+            }
+        }
+    }
+
+    /// A ray as it leaves the glass, and how steeply it went in.
+    pub struct Seen {
+        pub origin: V,
+        pub dir: V,
+        /// Cosine of the angle between the ray and the normal where it entered.
+        pub cos_in: f64,
+    }
+
+    /// The ray from `origin` along `dir` through the first piece of `glass`
+    /// it meets; `None` if it meets none.
+    pub fn through_glass(glass: &[Glass], origin: V, dir: V, bounces: u32) -> Option<Seen> {
+        let (t, piece) = glass
+            .iter()
+            .filter_map(|g| g.entry(origin, dir).map(|t| (t, g)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        let entry = add(origin, mul(dir, t));
+        let n = piece.normal(entry);
+        let cos_in = -dot(n, dir);
+        let mut dir = refract(dir, n, 1.0 / INDEX)?;
+        let mut at = add(entry, mul(n, -1e-6));
+        for _ in 0..=bounces {
+            let t = piece.way_out(at, dir);
+            if t <= 0.0 {
+                break;
+            }
+            let exit = add(at, mul(dir, t));
+            let m = piece.normal(exit);
+            if let Some(out) = refract(dir, mul(m, -1.0), INDEX) {
+                return Some(Seen {
+                    origin: add(exit, mul(m, 1e-6)),
+                    dir: out,
+                    cos_in,
+                });
+            }
+            dir = sub(dir, mul(m, 2.0 * dot(dir, m)));
+            at = add(exit, mul(m, -1e-6));
+        }
+        // Still inside after the last reflection: let out as it is.
+        let t = piece.way_out(at, dir).max(0.0);
+        Some(Seen {
+            origin: add(at, mul(dir, t + 1e-6)),
+            dir,
+            cos_in,
+        })
+    }
+
+    /// A pinhole camera at the origin: the ray through the middle of a pixel.
+    pub struct Camera {
+        forward: V,
+        right: V,
+        up: V,
+        size: (u32, u32),
+    }
+
+    impl Camera {
+        /// Looking along `yaw` / `pitch` degrees (as `camera_looking`), 60
+        /// degrees of vertical field, `aspect` wide.
+        pub fn looking(yaw: f32, pitch: f32, aspect: f64, width: u32, height: u32) -> Self {
+            let (yaw, pitch) = (f64::from(yaw).to_radians(), f64::from(pitch).to_radians());
+            let forward = [
+                -yaw.sin() * pitch.cos(),
+                pitch.sin(),
+                -yaw.cos() * pitch.cos(),
+            ];
+            let right = unit(cross(forward, [0.0, 1.0, 0.0]));
+            let tan = (30.0f64).to_radians().tan();
+            Self {
+                forward,
+                right: mul(right, tan * aspect),
+                up: mul(cross(right, forward), tan),
+                size: (width, height),
+            }
+        }
+
+        pub fn ray(&self, x: u32, y: u32) -> V {
+            let nx = (f64::from(x) + 0.5) / f64::from(self.size.0) * 2.0 - 1.0;
+            let ny = 1.0 - (f64::from(y) + 0.5) / f64::from(self.size.1) * 2.0;
+            unit(add(
+                self.forward,
+                add(mul(self.right, nx), mul(self.up, ny)),
+            ))
+        }
+    }
+
+    /// The pixels of a `size` x `size` frame of `refraction_scene`'s camera in
+    /// which its ball lens (radius 2, centre (0, 0, -4)) shows something that
+    /// `target` says the ray leaving the ball hits.
+    pub fn ball_lens_image(
+        size: u32,
+        preset: QualityPreset,
+        target: impl Fn(V, V) -> bool,
+    ) -> Vec<(u32, u32)> {
+        let camera = Camera::looking(0.0, 0.0, 1.0, size, size);
+        let lens = [Glass::Ball([0.0, 0.0, -4.0], 2.0)];
+        let bounces = preset.features().glass_bounces;
+        (0..size)
+            .flat_map(|y| (0..size).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                through_glass(&lens, [0.0; 3], camera.ray(x, y), bounces)
+                    .is_some_and(|seen| target(seen.origin, seen.dir))
+            })
+            .collect()
+    }
+
+    /// The pixels of `out` for which `shows` holds are the `expected` ones,
+    /// give or take the outline: nine in ten of the expected ones show it,
+    /// and at most a fifth (plus a few) of those that show it were not
+    /// expected to.
+    pub fn assert_same_pixels(
+        what: &str,
+        out: &space_render::FrameOutput,
+        expected: &[(u32, u32)],
+        shows: impl Fn([u16; 3]) -> bool,
+    ) {
+        let shown = |x: u32, y: u32| {
+            let p = pixel(out, x, y);
+            shows([p[0], p[1], p[2]])
+        };
+        let hit = expected.iter().filter(|&&(x, y)| shown(x, y)).count();
+        let total = (0..out.height)
+            .flat_map(|y| (0..out.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| shown(x, y))
+            .count();
+        eprintln!(
+            "{what}: {} pixels expected, {hit} of them shown, {total} shown in all",
+            expected.len()
+        );
+        assert!(
+            expected.len() >= 30,
+            "{what}: only {} pixels expected",
+            expected.len()
+        );
+        assert!(
+            hit * 10 >= expected.len() * 9,
+            "{what}: {hit} of {} expected pixels",
+            expected.len()
+        );
+        assert!(
+            (total - hit) * 5 <= total + 40,
+            "{what}: {} pixels show it that should not",
+            total - hit
+        );
+    }
 }
 
 /// What the tone map makes of a linear radiance: ACES, then gamma 2.2, in
@@ -3200,9 +3485,15 @@ fn the_environment_lights_what_is_in_shadow() {
         "and still darker than the lit floor beside it"
     );
     assert!(at(cube_front) > 50 && at(cube_front) + 40 < at(cube_top));
-    // A floor faces the zenith, a wall the horizon: more light from above.
+    // A floor faces the zenith, a wall the horizon: more light from above —
+    // where nothing is in the sky's way. (`Low` casts no sky rays; with them,
+    // the floor at the foot of the cube sees less of the sky than the cube's
+    // side does.)
+    let mut lampless = scene.clone_with(studio);
+    lampless.lights.clear();
+    let open = render_clear(&mut ctx, &lampless, size, QualityPreset::Low);
     assert!(
-        at(in_shadow) > at(cube_front),
+        luma(rgb(&open, in_shadow.0, in_shadow.1)) > luma(rgb(&open, cube_front.0, cube_front.1)),
         "up-facing gets more than side-facing"
     );
     // The lit pixels gained the same ambient term: brighter than before, or
@@ -3404,5 +3695,775 @@ impl WithEnvironment for Scene {
         scene.models = self.models.clone();
         scene.overlay = self.overlay.clone();
         scene
+    }
+}
+
+// ---- surfaces seen from behind ---------------------------------------------
+
+/// What the floor of [`floor_scene`] is made of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Floor {
+    /// A slab 20 cm thick (a closed mesh): its underside is a face of its own.
+    Slab,
+    /// A sheet without thickness (an open mesh): its underside is the back of
+    /// its top.
+    Sheet,
+    /// A 12 m box instance whose top face is the floor: a camera under that
+    /// floor is inside the box, looking at the back of its top face.
+    Box,
+    /// The same box in polished metal: a "mirror let into the floor" made
+    /// from a box instance, which is a cube.
+    MirrorBox,
+}
+
+/// A bright sky over a black ground, painted into the background.
+const BRIGHT_SKY: Environment =
+    Environment::gradient([0.6, 0.8, 1.6], [0.5, 0.6, 0.7], [0.03, 0.03, 0.03])
+        .with_background(true);
+
+/// A 12 m square floor whose top is the plane y = 0 (a checkerboard of 2 m
+/// cells where it is a mesh), under [`BRIGHT_SKY`], seen from `eye` looking
+/// `pitch` degrees up; with `lamp`, a strong light hangs 4 m above its middle.
+fn floor_scene(floor: Floor, eye: [f32; 3], pitch: f32, lamp: bool) -> Scene {
+    let at = |p: [f32; 3]| [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+    let checkered = |mut mesh: MeshData| {
+        let slot = mesh.add_texture(Texture::checkerboard(64, 2, [230; 3], [60; 3]));
+        mesh.parts[0].material.base_color_texture = Some(slot);
+        Arc::new(mesh)
+    };
+    let (mut instances, mut models) = (Vec::new(), Vec::new());
+    match floor {
+        Floor::Slab => models.push(placed(
+            &checkered(MeshData::cuboid([6.0, 0.1, 6.0], 4.0, matte([1.0; 3]))),
+            at([0.0, -0.1, 0.0]),
+        )),
+        Floor::Sheet => models.push(placed(
+            &checkered(MeshData::plane([6.0, 6.0], [3.0, 3.0], matte([1.0; 3]))),
+            at([0.0; 3]),
+        )),
+        Floor::Box | Floor::MirrorBox => {
+            let [x, y, z] = at([0.0, -6.0, 0.0]);
+            let mirror = floor == Floor::MirrorBox;
+            instances.push(GpuInstance {
+                center: [x, y, z, 6.0],
+                albedo: [0.8, 0.8, 0.8, if mirror { 1.0 } else { 0.0 }],
+                emissive: [0.0; 4],
+                roughness: if mirror { 0.04 } else { 1.0 },
+                shape: space_render::SHAPE_BOX,
+                transmission: 0.0,
+                _pad1: 0.0,
+            });
+        }
+    }
+    let mut scene =
+        Scene::from_instances(camera_looking(0.0, pitch), instances).with_environment(BRIGHT_SKY);
+    scene.models = models;
+    if lamp {
+        scene.lights = vec![light_at(at([0.0, 4.0, 0.0]).map(f64::from), 300.0)];
+    }
+    scene
+}
+
+/// The brightness below which `percent` per cent of the pixels of `out`'s
+/// rows `rows` lie.
+fn luma_percentile(
+    out: &space_render::FrameOutput,
+    rows: std::ops::Range<u32>,
+    percent: usize,
+) -> u32 {
+    let mut values: Vec<u32> = rows
+        .flat_map(|y| (0..out.width).map(move |x| (x, y)))
+        .map(|(x, y)| luma(rgb(out, x, y)))
+        .collect();
+    values.sort_unstable();
+    values[(values.len() - 1) * percent / 100]
+}
+
+/// The largest difference in any channel between `a` and `b` in rows `rows`.
+fn largest_difference(
+    a: &space_render::FrameOutput,
+    b: &space_render::FrameOutput,
+    rows: std::ops::Range<u32>,
+) -> u16 {
+    rows.flat_map(|y| (0..a.width).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let (p, q) = (rgb(a, x, y), rgb(b, x, y));
+            (0..3).map(|c| p[c].abs_diff(q[c])).max().unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Nothing is culled, so a camera under a floor sees it from below — and what
+/// it sees there is the floor's *underside*: a surface of its own that faces
+/// down. Not the top seen through from behind (lit by the lamp above it and
+/// by the sky), and not the sky.
+///
+/// The owner's report was a mirror in the floor "transparent from the bottom":
+/// that mirror was a box instance — a cube, nearly all of it under the floor —
+/// and a camera inside it saw the cube's inner faces reflect the sky. The
+/// inside of a closed solid has no sky: it is dark now. So is the back of a
+/// box's top face, which the lamp above used to light like the top itself;
+/// and the back of a one-sided sheet is lit from the side it is seen from.
+///
+/// For each kind of floor, in every preset, from 1.5 m below it:
+///
+/// * looking up, the lamp above changes nothing (within rounding) and the
+///   underside is far darker than the top is from above;
+/// * a slab or a sheet shows its checkerboard, its light cells exactly as
+///   bright as the half of the environment below the horizon makes them
+///   ([`Environment::ambient`] for a normal pointing down), its dark cells
+///   dark;
+/// * the inside of a box, matte or mirror, is black;
+/// * looking sideways, the underside is darker than the sky seen past the
+///   floor's edge.
+///
+/// Mutations of `side_of` in `forward.wgsl`: if it never turns the normal
+/// (and with the shader as it was), the sheet and the matte box are lit like
+/// their tops and the mirror box shows the sky; if it calls every side open,
+/// both boxes are lit by the environment from within.
+#[test]
+fn a_floor_seen_from_below_shows_its_underside_not_its_top_or_the_sky() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let (below, above) = ([0.0, -1.5, 0.0], [0.0, 1.5, 0.0]);
+    // A light cell of the checkerboard (sRGB 230), lit by the environment
+    // from below: its diffuse light, and the 1.6 % a fully rough dielectric
+    // reflects of it.
+    let albedo = ((230.0f32 / 255.0 + 0.055) / 1.055).powf(2.4);
+    let expected = tone_mapped(
+        BRIGHT_SKY
+            .ambient([0.0, -1.0, 0.0])
+            .map(|c| c * (albedo + 0.0157)),
+    );
+    let mut problems = Vec::new();
+    for floor in [Floor::Slab, Floor::Sheet, Floor::Box, Floor::MirrorBox] {
+        for preset in [
+            QualityPreset::Ci,
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+        ] {
+            let mut render = |eye, pitch, lamp| {
+                render_clear(
+                    &mut ctx,
+                    &floor_scene(floor, eye, pitch, lamp),
+                    size,
+                    preset,
+                )
+            };
+            let top = luma_percentile(&render(above, -70.0, true), 0..size, 90);
+            // Looking up: the frame is all underside.
+            let (up, unlit) = (render(below, 70.0, true), render(below, 70.0, false));
+            let (bright, dark) = (
+                luma_percentile(&up, 0..size, 90),
+                luma_percentile(&up, 0..size, 10),
+            );
+            let lamp = largest_difference(&up, &unlit, 0..size);
+            // Looking sideways: the underside above, and (past the edge of a
+            // slab or sheet, 6 m away) the sky below.
+            let side = render(below, 15.0, true);
+            let (under, sky) = (luma_percentile(&side, 0..56, 90), luma(rgb(&side, 64, 100)));
+            eprintln!(
+                "{floor:?}, {preset}: top {top}; from below {dark}..{bright}, the lamp changes \
+                 {lamp}; sideways {under} under sky {sky}"
+            );
+            let mut check = |ok: bool, what: String| {
+                if !ok {
+                    problems.push(format!("{floor:?}, {preset}: {what}"));
+                }
+            };
+            check(top > 200, format!("the top is lit: {top}"));
+            check(
+                bright + 60 < top,
+                format!("the underside ({bright}) is lit like the top ({top})"),
+            );
+            check(
+                lamp <= 2,
+                format!("the lamp above changes the underside by {lamp}"),
+            );
+            match floor {
+                Floor::Slab | Floor::Sheet => {
+                    // The light cells: the brightest quarter of the frame.
+                    let cells: Vec<[u16; 3]> = (0..size)
+                        .flat_map(|y| (0..size).map(move |x| (x, y)))
+                        .map(|(x, y)| rgb(&up, x, y))
+                        .filter(|&p| luma(p) >= bright)
+                        .collect();
+                    let mean = [0, 1, 2].map(|c| {
+                        cells.iter().map(|p| u32::from(p[c])).sum::<u32>() / cells.len() as u32
+                    });
+                    check(
+                        (0..3).all(|c| mean[c].abs_diff(u32::from(expected[c])) <= 6),
+                        format!("light cells are {mean:?}, not {expected:?}"),
+                    );
+                    check(
+                        dark < 80 && dark + 40 < bright,
+                        format!("the checkerboard is washed out: {dark}..{bright}"),
+                    );
+                    check(
+                        under + 40 < sky,
+                        format!("the underside ({under}) looks like the sky ({sky})"),
+                    );
+                }
+                Floor::Box | Floor::MirrorBox => {
+                    check(
+                        bright < 12,
+                        format!("the inside of a solid is lit: {bright}"),
+                    );
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Every face of a box faces outwards, the instance's and the mesh's alike:
+/// seen from outside under an environment and no lamp, each face shows the
+/// environment's light for the direction it faces — the sky's blue on top,
+/// the ground's red underneath, mostly the horizon's green on the sides —
+/// to the value [`Environment::ambient`] gives for its normal. (A face whose
+/// normal pointed into the box would count as the inside of a closed solid
+/// and stay black; one with another face's normal would have its colour.)
+#[test]
+fn every_face_of_a_box_is_lit_by_the_environment_from_the_side_it_faces() {
+    let Some(mut ctx) = context() else { return };
+    let size = 64;
+    let sky = rgb_sky();
+    let mesh = Arc::new(MeshData::cuboid([1.0; 3], 1.0, matte([0.8; 3])));
+    let faces: [(&str, [f32; 3]); 6] = [
+        ("+x", [1.0, 0.0, 0.0]),
+        ("-x", [-1.0, 0.0, 0.0]),
+        ("+y", [0.0, 1.0, 0.0]),
+        ("-y", [0.0, -1.0, 0.0]),
+        ("+z", [0.0, 0.0, 1.0]),
+        ("-z", [0.0, 0.0, -1.0]),
+    ];
+    let mut seen = Vec::new();
+    for (name, normal) in faces {
+        // The box 5 m in front of a camera that looks at this face head-on.
+        let forward = normal.map(|c| -c);
+        let center = forward.map(|c| c * 5.0);
+        let camera = space_render::CameraPose {
+            forward,
+            up: if normal[1] == 0.0 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [0.0, 0.0, -1.0]
+            },
+            ..post_camera()
+        };
+        // A matte dielectric reflects 1.57 % of the same light on top.
+        let expected = tone_mapped(sky.ambient(normal).map(|c| c * (0.8 + 0.0157)));
+        let instance = GpuInstance {
+            center: [center[0], center[1], center[2], 1.0],
+            albedo: [0.8, 0.8, 0.8, 0.0],
+            emissive: [0.0; 4],
+            roughness: 1.0,
+            shape: space_render::SHAPE_BOX,
+            transmission: 0.0,
+            _pad1: 0.0,
+        };
+        let as_instance = Scene::from_instances(camera, vec![instance]).with_environment(sky);
+        let mut as_mesh = Scene::from_instances(camera, Vec::new()).with_environment(sky);
+        as_mesh.models = vec![placed(&mesh, center)];
+        for (kind, scene) in [("instance", &as_instance), ("mesh", &as_mesh)] {
+            for preset in [QualityPreset::Ci, QualityPreset::High] {
+                let p = rgb(&render_clear(&mut ctx, scene, size, preset), 32, 32);
+                assert!(
+                    (0..3).all(|c| p[c].abs_diff(expected[c]) <= 4),
+                    "{kind} face {name}, {preset}: {p:?}, not {expected:?}"
+                );
+            }
+        }
+        seen.push((name, expected));
+    }
+    eprintln!("faces under the environment: {seen:?}");
+    // The six faces are told apart by three colours: top, bottom, sides.
+    let (top, bottom, side) = (seen[2].1, seen[3].1, seen[0].1);
+    assert!(dominant(top, 2) || top[2] > top[0] + 60, "{top:?}");
+    assert!(bottom[0] > bottom[2] + 60, "{bottom:?}");
+    assert!(side[1] > side[0] && side[1] > side[2], "{side:?}");
+}
+
+// ---- the environment, continued: fog, probes, occlusion -----------------------
+
+/// Fog fades a surface into what is behind it. With a painted environment
+/// that is the sky along the view ray: a wall far enough away to be all fog
+/// is indistinguishable from the sky beside it, at every height — no seam at
+/// the horizon, and none above it where the sky has another colour. Without a
+/// painted background it is the fog colour, as ever.
+///
+/// The wall covers the left of the frame, 1 km away, in fog that is opaque by
+/// then; each of its pixels is compared with the sky pixel mirrored about the
+/// frame's centre (the same elevation).
+/// Mutation: with the fog colour constant in `forward.wgsl`, the wall is one
+/// colour from top to bottom in front of a sky that is three.
+#[test]
+fn fog_fades_into_the_painted_sky_behind_it() {
+    let Some(mut ctx) = context() else { return };
+    let size = 64;
+    let wall = GpuInstance {
+        center: [-600.0, 0.0, -1500.0, 500.0],
+        albedo: [0.6, 0.6, 0.6, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape: space_render::SHAPE_BOX,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let scene = |environment: Environment| {
+        Scene::from_instances(post_camera(), vec![wall]).with_environment(environment)
+    };
+    let mut render = |scene: &Scene, preset: QualityPreset| {
+        let opts = RenderOptions {
+            gi_enabled: false,
+            quality: Quality::CI,
+            preset,
+            // Twice the preset's density: all fog well before a kilometre.
+            fog_scale: 4.0,
+            ..Default::default()
+        };
+        let out = ctx.render_frame(scene, size, size, &opts).expect("render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        out
+    };
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let painted = render(&scene(rgb_sky().with_background(true)), preset);
+        let (top, middle, bottom) = (
+            rgb(&painted, 10, 8),
+            rgb(&painted, 10, 32),
+            rgb(&painted, 10, 56),
+        );
+        eprintln!(
+            "{preset}: the wall in fog is {top:?} / {middle:?} / {bottom:?} from top to bottom"
+        );
+        for y in 8..57 {
+            let (wall, sky) = (rgb(&painted, 10, y), rgb(&painted, 53, y));
+            assert!(
+                (0..3).all(|c| wall[c].abs_diff(sky[c]) <= 2),
+                "{preset}, row {y}: the wall is {wall:?} in front of a sky that is {sky:?}"
+            );
+        }
+        // ... and the sky is not one colour: blue above, red below.
+        assert!(
+            top[2] > top[0] + 60 && bottom[0] > bottom[2] + 60,
+            "{top:?} / {bottom:?}"
+        );
+
+        // Not painted: the same wall fades into the fog colour, like a wall
+        // in a scene without an environment.
+        let unpainted = render(&scene(rgb_sky()), preset);
+        let none = render(&scene(Environment::NONE), preset);
+        for y in [8, 32, 56] {
+            let (a, b) = (rgb(&unpainted, 10, y), rgb(&none, 10, y));
+            assert!(
+                (0..3).all(|c| a[c].abs_diff(b[c]) <= 1),
+                "{preset}: {a:?} vs {b:?}"
+            );
+            assert!(
+                rgb(&unpainted, 53, y) == [0, 0, 0],
+                "nothing is painted there"
+            );
+        }
+    }
+}
+
+/// Probe settings for the environment tests: probes 2 m apart at the
+/// camera's height, at odd x and z from -7 to 7.
+fn close_probes() -> Quality {
+    Quality {
+        grid: 8,
+        rays_per_probe: 16,
+        probe_range: 60.0,
+        spacing: 2.0,
+    }
+}
+
+fn render_with_gi(
+    ctx: &mut RenderContext,
+    scene: &Scene,
+    size: u32,
+    preset: QualityPreset,
+    gi: bool,
+) -> space_render::FrameOutput {
+    let opts = RenderOptions {
+        gi_enabled: gi,
+        quality: close_probes(),
+        preset,
+        fog_scale: 0.0,
+        ..Default::default()
+    };
+    let out = ctx.render_frame(scene, size, size, &opts).expect("render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    out
+}
+
+/// The probes see the environment: a surface a probe ray hits sends back the
+/// sky light it reflects, so sky light bounces. Under a sky that shines from
+/// straight above only, the underside of a white ball gets next to nothing
+/// directly — but below it is a red floor in full sky light, and with probe
+/// GI the ball's underside is lit by that floor: brighter, and red.
+/// Mutation: without the bounce term in `gi_probe.wgsl` GI changes nothing
+/// here.
+#[test]
+fn sky_light_bounces_off_what_the_probes_see() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 96;
+    let matte = |center: [f32; 4], shape: u32, albedo: [f32; 3]| GpuInstance {
+        center,
+        albedo: [albedo[0], albedo[1], albedo[2], 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let scene = Scene::from_instances(
+        post_camera(),
+        vec![
+            // A red floor 1.5 m below the camera, a white ball above eye level.
+            matte(
+                [0.0, -101.5, 0.0, 100.0],
+                space_render::SHAPE_BOX,
+                [0.9, 0.1, 0.1],
+            ),
+            matte(
+                [0.0, 0.9, -3.5, 0.6],
+                space_render::SHAPE_SPHERE,
+                [0.9, 0.9, 0.9],
+            ),
+        ],
+    )
+    .with_environment(Environment::gradient([2.0; 3], [0.0; 3], [0.0; 3]));
+    for preset in [QualityPreset::Ci, QualityPreset::High] {
+        let off = render_with_gi(&mut ctx, &scene, size, preset, false);
+        let on = render_with_gi(&mut ctx, &scene, size, preset, true);
+        // The lower front of the ball; and its top, for comparison.
+        let (under_off, under_on) = (rgb(&off, 48, 38), rgb(&on, 48, 38));
+        eprintln!("{preset}: the ball's underside is {under_off:?} without GI, {under_on:?} with");
+        assert!(
+            luma(under_off) < 80,
+            "{preset}: hardly any sky from below: {under_off:?}"
+        );
+        assert!(
+            under_on[0] > under_off[0] + 40 && under_on[0] > under_on[1] + 30,
+            "{preset}: the red floor's sky light reaches the underside: {under_on:?} (was {under_off:?})"
+        );
+        // The frame is the same every time (the probes use no random numbers
+        // that change).
+        assert!(on.pixels == render_with_gi(&mut ctx, &scene, size, preset, true).pixels);
+    }
+}
+
+/// A room of six slabs around the camera, 7.2 m square and 3 m high inside,
+/// its floor 1.5 m below the camera. `ceiling` leaves the top on; `door`
+/// leaves a gap 1.6 m wide, floor to ceiling, in the middle of the wall the
+/// camera faces (at z = -3.6).
+fn slab_room(ceiling: bool, door: bool, pitch: f32, environment: Environment) -> Scene {
+    let slab = |half: [f32; 3]| Arc::new(MeshData::cuboid(half, 1.0, matte([0.8; 3])));
+    let (flat, wall_x, wall_z, beside_the_door) = (
+        slab([4.0, 0.1, 4.0]),
+        slab([0.1, 1.7, 4.0]),
+        slab([4.0, 1.7, 0.1]),
+        slab([1.6, 1.7, 0.1]),
+    );
+    let mut scene =
+        Scene::from_instances(camera_looking(0.0, pitch), Vec::new()).with_environment(environment);
+    scene.models = vec![
+        placed(&flat, [0.0, -1.6, 0.0]),
+        placed(&wall_x, [-3.7, 0.0, 0.0]),
+        placed(&wall_x, [3.7, 0.0, 0.0]),
+        placed(&wall_z, [0.0, 0.0, 3.7]),
+    ];
+    if door {
+        scene
+            .models
+            .push(placed(&beside_the_door, [-2.4, 0.0, -3.7]));
+        scene
+            .models
+            .push(placed(&beside_the_door, [2.4, 0.0, -3.7]));
+    } else {
+        scene.models.push(placed(&wall_z, [0.0, 0.0, -3.7]));
+    }
+    if ceiling {
+        scene.models.push(placed(&flat, [0.0, 1.6, 0.0]));
+    }
+    scene
+}
+
+/// The probes also know how open to the sky they are: the share of a probe's
+/// rays that hit nothing. Where the forward pass casts no rays of its own
+/// (the `Ci` and `Low` presets), probe GI lets that share of the
+/// environment's light through — so with GI on, the floor of a closed room is
+/// dark there too, and lit again when the ceiling comes off. (Without GI
+/// those presets cannot tell: the sky lights the room through its ceiling.)
+#[test]
+fn the_probes_keep_the_sky_out_of_a_closed_room() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 64;
+    let sky = Environment::gradient([1.0; 3], [0.8; 3], [0.2; 3]);
+    for preset in [QualityPreset::Ci, QualityPreset::Low] {
+        let floor = |ctx: &mut RenderContext, ceiling: bool, gi: bool| {
+            let scene = slab_room(ceiling, false, -35.0, sky);
+            luma(rgb(&render_with_gi(ctx, &scene, size, preset, gi), 32, 32))
+        };
+        let (closed, open, unaware) = (
+            floor(&mut ctx, true, true),
+            floor(&mut ctx, false, true),
+            floor(&mut ctx, true, false),
+        );
+        eprintln!(
+            "{preset}: the floor of the room is {closed} closed, {open} without its ceiling \
+             ({unaware} closed without GI)"
+        );
+        assert!(closed < 20, "{preset}: no sky in a closed room: {closed}");
+        assert!(open > 120, "{preset}: the sky comes in from above: {open}");
+        assert!(
+            unaware > 120,
+            "{preset}: without rays nothing knows: {unaware}"
+        );
+    }
+}
+
+/// Sky rays keep the environment out of where it cannot get (`High` and
+/// `Medium`; needs ray query). A closed room with no lamp in it is dark — its
+/// floor, its walls, and a metal ball in it, which has no sky to mirror —
+/// where `Low`, which casts no rays, lights it all through the ceiling. With
+/// a doorway, the sky comes in by the door: the floor is brightest there and
+/// fades into the room. And nothing changes in the open: a floor under the
+/// whole sky is exactly as bright with the rays as without.
+///
+/// The rays have fixed directions, so a frame is the same every time.
+/// Mutation: with `sky_share` returning 1 in `forward.wgsl`, the closed room
+/// is as bright as on `Low`.
+#[test]
+fn the_sky_does_not_light_the_inside_of_a_closed_room() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 96;
+    let sky = Environment::gradient([1.0; 3], [0.8; 3], [0.2; 3]);
+    let ball = GpuInstance {
+        center: [1.2, -0.9, -2.2, 0.6],
+        albedo: [0.9, 0.9, 0.9, 1.0],
+        emissive: [0.0; 4],
+        roughness: 0.1,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let room = |ceiling: bool, door: bool| {
+        let mut scene = slab_room(ceiling, door, -20.0, sky);
+        scene.instances.push(ball);
+        scene
+    };
+    // Where things are in the 96 x 96 frame of a camera looking 20 degrees
+    // down at the far wall: the floor by the far wall (and the door), the
+    // floor at the camera's feet, the far wall beside the door, the ball.
+    let (by_the_door, at_the_feet, far_wall, on_the_ball) =
+        ((48, 52), (48, 92), (16, 30), (69, 62));
+    let unlit = render_clear(&mut ctx, &room(true, false), size, QualityPreset::Low);
+    let open_low = render_clear(&mut ctx, &room(false, false), size, QualityPreset::Low);
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let closed = render_clear(&mut ctx, &room(true, false), size, preset);
+        let at = |out: &space_render::FrameOutput, p: (u32, u32)| luma(rgb(out, p.0, p.1));
+        eprintln!(
+            "{preset}, closed room: floor {} / {}, wall {}, ball {} (on low: {} / {}, {}, {})",
+            at(&closed, by_the_door),
+            at(&closed, at_the_feet),
+            at(&closed, far_wall),
+            at(&closed, on_the_ball),
+            at(&unlit, by_the_door),
+            at(&unlit, at_the_feet),
+            at(&unlit, far_wall),
+            at(&unlit, on_the_ball),
+        );
+        for p in [by_the_door, at_the_feet, far_wall, on_the_ball] {
+            assert!(
+                at(&closed, p) < 12,
+                "{preset}: {p:?} is lit in a closed room: {}",
+                at(&closed, p)
+            );
+            assert!(
+                at(&unlit, p) > 80,
+                "low: {p:?} is lit through the ceiling: {}",
+                at(&unlit, p)
+            );
+        }
+        assert!(closed.pixels == render_clear(&mut ctx, &room(true, false), size, preset).pixels);
+
+        // A doorway: light by the door, less of it further in.
+        let door = render_clear(&mut ctx, &room(true, true), size, preset);
+        let (near_door, deep) = (at(&door, by_the_door), at(&door, at_the_feet));
+        eprintln!(
+            "{preset}, with a door: floor {near_door} by the door, {deep} at the camera's feet"
+        );
+        assert!(
+            near_door > 40,
+            "{preset}: the sky comes in by the door: {near_door}"
+        );
+        assert!(
+            deep + 25 < near_door,
+            "{preset}: and fades into the room: {deep} vs {near_door}"
+        );
+
+        // No ceiling: the middle of the floor is under (nearly) the whole sky
+        // again, and a floor with no room around it is exactly what it is
+        // without the rays.
+        let open = render_clear(&mut ctx, &room(false, false), size, preset);
+        assert!(
+            at(&open, at_the_feet) + 40 > at(&open_low, at_the_feet),
+            "{preset}: open to the sky"
+        );
+        let mut field =
+            Scene::from_instances(camera_looking(0.0, -20.0), Vec::new()).with_environment(sky);
+        field.models = room(false, false).models[..1].to_vec();
+        let (with, without) = (
+            render_clear(&mut ctx, &field, size, preset),
+            render_clear(&mut ctx, &field, size, QualityPreset::Low),
+        );
+        assert!(
+            largest_difference(&with, &without, 60..size) <= 1,
+            "{preset}: an open floor is unchanged"
+        );
+    }
+}
+
+/// A metal's reflection has one colour, whatever it reflects. A polished gold
+/// floor under an even white sky, with a white glowing ball of the same
+/// brightness standing on it: the floor mirrors the ball (found on screen by
+/// the post pass) and the sky (the environment, where the screen has
+/// nothing) — and both mirror images are the same gold. (The screen-space
+/// reflection used to be blended in untinted: white in a gold mirror.)
+///
+/// Mutation: with the post pass weighting what it mirrors by a grey instead
+/// of by the specular buffer's colour, neither image is gold.
+#[test]
+fn a_gold_mirror_reflects_everything_in_gold() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let gold = [1.0, 0.77, 0.34];
+    let scene = Scene::from_instances(
+        post_camera(),
+        vec![
+            GpuInstance {
+                center: [0.0, -101.5, 0.0, 100.0],
+                albedo: [gold[0], gold[1], gold[2], 1.0],
+                emissive: [0.0; 4],
+                roughness: 0.05,
+                shape: space_render::SHAPE_BOX,
+                transmission: 0.0,
+                _pad1: 0.0,
+            },
+            GpuInstance {
+                center: [0.0, -0.5, -5.0, 0.6],
+                albedo: [0.0; 4],
+                emissive: [0.5, 0.5, 0.5, 1.0],
+                roughness: 1.0,
+                shape: space_render::SHAPE_SPHERE,
+                transmission: 0.0,
+                _pad1: 0.0,
+            },
+        ],
+    )
+    .with_environment(Environment::gradient([0.5; 3], [0.5; 3], [0.5; 3]));
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_clear(&mut ctx, &scene, size, preset);
+        // The ball is at rows 62..88 of the middle column; its mirror image
+        // is centred on row 119. Beside it the floor mirrors the sky.
+        let (ball, image, sky) = (rgb(&out, 64, 75), rgb(&out, 64, 119), rgb(&out, 20, 119));
+        eprintln!("{preset}: the ball is {ball:?}, its mirror image {image:?}, the sky's {sky:?}");
+        assert!(
+            ball[0].abs_diff(ball[2]) <= 3,
+            "{preset}: the ball is white: {ball:?}"
+        );
+        for (what, p) in [("the ball's image", image), ("the sky's image", sky)] {
+            assert!(
+                p[0] > p[1] + 10 && p[1] > p[2] + 40,
+                "{preset}: {what} in a gold mirror is {p:?}"
+            );
+        }
+        assert!(
+            (0..3).all(|c| image[c].abs_diff(sky[c]) <= 8),
+            "{preset}: the ball's image is {image:?}, the sky's {sky:?}: one mirror, two colours"
+        );
+    }
+}
+
+/// The sky's shadow is smooth and steady. A ball hangs over a floor under an
+/// even sky and no lamp: the floor is darker under the ball, and the darkness
+/// fades out evenly — no steps from one ray's verdict to the next (each pixel
+/// casts only eight rays, or four; its neighbours on the floor, whose rays
+/// are turned differently, are averaged in by the post pass), and no noise.
+/// And the frame is the same every time it is drawn.
+///
+/// Along a row of the floor that crosses the shadow, neighbouring pixels
+/// differ by a few units of 255 at most, while the row as a whole spans far
+/// more than that.
+/// Mutation: without the post pass's correction (`sky_correction` returning
+/// zero) neighbours differ by a ray's worth.
+#[test]
+fn the_skys_shadow_under_a_ball_is_smooth_and_steady() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let matte = |center: [f32; 4], shape: u32| GpuInstance {
+        center,
+        albedo: [0.8, 0.8, 0.8, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    // A floor 1.5 m below the camera, a ball 1 m across just above it; the
+    // camera looks 30 degrees down at the floor under the ball.
+    let scene = Scene::from_instances(
+        camera_looking(0.0, -30.0),
+        vec![
+            matte([0.0, -101.5, 0.0, 100.0], space_render::SHAPE_BOX),
+            matte([0.0, -0.8, -2.6, 0.5], space_render::SHAPE_SPHERE),
+        ],
+    )
+    .with_environment(Environment::gradient([1.0; 3], [1.0; 3], [1.0; 3]));
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_clear(&mut ctx, &scene, size, preset);
+        // A row of floor just in front of the ball, whose lowest point is
+        // drawn a few rows higher: under its edge in the middle of the row,
+        // under the open sky at the ends.
+        let y = 70;
+        let row: Vec<u32> = (4..124).map(|x| luma(rgb(&out, x, y))).collect();
+        let (darkest, brightest) = (
+            row.iter().copied().min().unwrap_or(0),
+            row.iter().copied().max().unwrap_or(0),
+        );
+        let step = row
+            .windows(2)
+            .map(|w| w[0].abs_diff(w[1]))
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "{preset}: the floor runs from {darkest} to {brightest}, in steps of at most {step}"
+        );
+        assert!(
+            darkest + 15 < brightest,
+            "{preset}: the ball keeps sky off the floor under it"
+        );
+        assert!(step <= 5, "{preset}: neighbouring pixels differ by {step}");
+        assert!(out.pixels == render_clear(&mut ctx, &scene, size, preset).pixels);
     }
 }

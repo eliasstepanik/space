@@ -9,7 +9,8 @@ shows — the *scene* — is chosen on the server side, for everyone at once.
 
 | crate | role |
 |---|---|
-| `space-world`, `space-ecs`, `space-sim`, `space-protocol` | world/position model, ECS, deterministic simulation, wire format (incl. the scene catalogue) |
+| `space-world`, `space-ecs`, `space-sim`, `space-protocol` | world/position model, ECS, deterministic simulation (ship flight and rigid-body physics), wire format (incl. the scene catalogue) |
+| `space-scene` | what each scene is physically: static colliders, bodies, gravity, shape catalogue, scene anchor |
 | `space-net`, `space-server`, `space-orchestrator` | QUIC transport, the shard, the shard map / autoscaler / scene owner with its built-in web UI |
 | `space-render`, `space-client` | ash/Vulkan renderer (ray-traced shadows, textures, GLB models, 2D overlay), the client (window, headless, pixel stream) |
 | `space-harness` | drive a client without a human: HTTP API for state, frames and input, sandboxed Lua test scripts |
@@ -86,7 +87,7 @@ every shard**. Connected clients follow within a second.
 
 | scene | |
 |---|---|
-| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character |
+| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit |
 | `materials` | PBR chart: gold, plastic and steel from mirror-smooth to rough |
 | `solar` | the solar system at real size and distance (coloured spheres) |
 | `galaxy` | the deterministic galaxy through the LOD selector |
@@ -131,11 +132,12 @@ scripts that act as a user.
 ```sh
 space-client --headless --harness 127.0.0.1:8098
 curl http://127.0.0.1:8098/                          # the routes
-curl http://127.0.0.1:8098/state                     # screen, scene, position, speed, fps ...
+curl http://127.0.0.1:8098/state                     # screen, scene, position, speed, fps, gravity, bodies ...
 curl -o frame.png http://127.0.0.1:8098/frame.png    # or frame.jpg (much smaller)
 curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'
 
 space-client --headless --server 127.0.0.1:7777 --script scripts/harness/smoke.lua   # exit code = result
+space-client --headless --server 127.0.0.1:7777 --script scripts/harness/physics.lua --script-timeout 300
 ```
 
 The harness is loopback-only without credentials; any other address needs a
@@ -157,6 +159,11 @@ With `-Topology two-shards` the ship spawns 512 m from the border between two
 shards. Fly across (`+X`: hold `D`, about 15 s) and the first shard hands the
 ship to its neighbour: the client opens the second connection, the shards
 commit, and the HUD changes to `shard 2  handoffs 1` without the view jumping.
+
+Physics bodies cross the same way, with nobody to redirect: near a border each
+shard shows its neighbour's bodies as ghosts, bodies that may touch are moved
+onto one shard before they do, and a body that leaves a region is handed to
+the next (the rules: `crates/space-server/src/border.rs`).
 
 ## Test
 

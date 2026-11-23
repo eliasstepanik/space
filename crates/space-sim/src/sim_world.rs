@@ -22,17 +22,106 @@
 //!   for point lookups.
 //! * **No clock.** The only time source is [`SimWorld::tick`], advanced by
 //!   [`SimWorld::step`].
+//!
+//! # Physics
+//!
+//! Every simulated entity — a ship, a crate, a door, a chain — is a rigid body
+//! of the world's physics ([`crate::rigid`]): its motion is its [`ShipState`]
+//! (plus [`PartStates`] for an articulated object), what it is is its
+//! [`Body`]. A ship is a body with [`ShipControls`]: the flight model drives it
+//! ([`crate::physics`]), and in free flight it moves exactly as
+//! [`crate::step_ship`] says. The scene's static colliders
+//! ([`SimWorld::set_statics`]), its gravity ([`SimWorld::set_gravity`]) and the
+//! catalogue of big shapes ([`SimWorld::set_catalog`]) are per world.
+//!
+//! The phase-2 hooks are here too: [`SimWorld::export_entity`] /
+//! [`SimWorld::import_entity`] turn an entity into its replicated component
+//! list and back (a handoff moves a body, articulation and springs included,
+//! exactly), [`SimWorld::insert_ghost`] / [`SimWorld::drive_ghost`] keep a
+//! kinematic copy of a body simulated elsewhere, [`SimWorld::islands`] groups
+//! the bodies that may interact soon, [`SimWorld::bubbles`] shows the physics
+//! bubbles and [`SimWorld::contacts`] the contacts of the last tick.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
-use space_ecs::{Component, ComponentDef, Entity, WithEntity, World};
-use space_protocol::{EntityGuid, PlayerInput, ShardId};
+use space_ecs::{Component, ComponentDef, ComponentId, Entity, World};
+use space_protocol::{EntityGuid, EntitySnapshot, PlayerInput, ShardId};
 
-use crate::components::{Owner, ShardAuthority, ShipControls, ShipState, COMPONENT_REGISTRY};
+use crate::articulation::{
+    decode_articulation, decode_part_states, encode_articulation, encode_part_states, Articulation,
+    PartStates,
+};
+use crate::body::{
+    decode_body, decode_residual, decode_visual, encode_body, encode_residual, encode_visual, Body,
+    PosResidual, Visual,
+};
+use crate::components::{
+    Ghost, Owner, ShardAuthority, ShipControls, ShipState, COMPONENT_REGISTRY,
+};
+use crate::gravity::GravityField;
 use crate::params::ShipParams;
-use crate::physics::step_ship;
+use crate::rigid::{
+    BubbleId, BubbleInfo, ContactEvent, Island, IslandQuery, Physics, PhysicsError, StaticCollider,
+};
+use crate::shape::ShapeCatalog;
+use crate::spring::{decode_springs, encode_springs, Springs};
 use crate::tick::SimTick;
+
+/// A body to spawn with [`SimWorld::spawn_body`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodySpawn {
+    /// Initial motion (of part 0).
+    pub state: ShipState,
+    /// What the body is.
+    pub body: Body,
+    /// What a client draws.
+    pub visual: Option<Visual>,
+    /// Springs it owns.
+    pub springs: Option<Springs>,
+    /// Extra parts and joints, with the initial motion of the extra parts.
+    pub articulation: Option<(Articulation, PartStates)>,
+}
+
+impl BodySpawn {
+    /// A plain body.
+    #[must_use]
+    pub fn new(state: ShipState, body: Body) -> Self {
+        Self {
+            state,
+            body,
+            visual: None,
+            springs: None,
+            articulation: None,
+        }
+    }
+
+    /// With a visual.
+    #[must_use]
+    pub fn with_visual(mut self, visual: Visual) -> Self {
+        self.visual = Some(visual);
+        self
+    }
+
+    /// With springs.
+    #[must_use]
+    pub fn with_springs(mut self, springs: Springs) -> Self {
+        self.springs = Some(springs);
+        self
+    }
+
+    /// With extra parts and joints.
+    #[must_use]
+    pub fn with_articulation(mut self, articulation: Articulation, parts: PartStates) -> Self {
+        self.articulation = Some((articulation, parts));
+        self
+    }
+}
+
+/// Most components [`SimWorld::import_entity`] accepts for one entity (one of
+/// each replicated id).
+pub const MAX_IMPORT_COMPONENTS: usize = 9;
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -108,6 +197,8 @@ pub struct SimWorld {
     /// Highest input tick applied per [`Owner`] session — the `input_ack` a
     /// snapshot/delta carries (see [`SimWorld::input_ack`]).
     input_ack: HashMap<u64, SimTick>,
+    /// The rigid-body world (bubbles, statics, gravity).
+    physics: Physics,
 }
 
 impl SimWorld {
@@ -158,6 +249,7 @@ impl SimWorld {
             ships: BTreeSet::new(),
             input_buf: BTreeMap::new(),
             input_ack: HashMap::new(),
+            physics: Physics::new(Arc::new(ShapeCatalog::new())),
         }
     }
 
@@ -226,12 +318,32 @@ impl SimWorld {
     }
 
     /// Spawn a ship: [`ShipState`] + [`ShipControls`] + [`Owner`] +
-    /// [`ShardAuthority`] (this shard).
+    /// [`ShardAuthority`] (this shard) + [`Body::ship`] — a dynamic body that
+    /// collides with the world and pushes what it hits.
     ///
     /// The guid is registered for input routing. Spawning the same guid twice is
     /// a logic error and panics — a duplicate guid would make input routing
     /// ambiguous.
     pub fn spawn_ship(&mut self, guid: EntityGuid, owner: u64, state: ShipState) -> Entity {
+        let body = Body::ship(&self.params);
+        self.spawn_ship_with_body(guid, owner, state, body)
+            .expect("the ship body is valid")
+    }
+
+    /// [`SimWorld::spawn_ship`] with a body of the caller's choice.
+    ///
+    /// # Errors
+    /// [`PhysicsError`] if the body cannot be built (nothing is spawned).
+    ///
+    /// # Panics
+    /// If `guid` is already alive here.
+    pub fn spawn_ship_with_body(
+        &mut self,
+        guid: EntityGuid,
+        owner: u64,
+        state: ShipState,
+        body: Body,
+    ) -> Result<Entity, PhysicsError> {
         assert!(
             self.entity_of(guid).is_none(),
             "spawn_ship: guid {guid} is already alive in this world"
@@ -243,16 +355,32 @@ impl SimWorld {
             Component::new(&controls),
             Component::new(&Owner(owner)),
             Component::new(&authority),
+            Component::new(&body),
         ]);
+        if let Err(e) = self
+            .physics
+            .register(guid, entity, &self.world, false, &self.params)
+        {
+            self.world.despawn(entity);
+            return Err(e);
+        }
         self.by_guid.insert(guid, entity);
         self.ships.insert((entity.index(), entity.generation()));
-        entity
+        Ok(entity)
     }
 
     /// Despawn the ship `guid` and forget its input routing.
     ///
     /// Returns `false` if the guid is unknown here.
     pub fn despawn_ship(&mut self, guid: EntityGuid) -> bool {
+        self.despawn(guid)
+    }
+
+    /// Despawn any entity of this world (ship, body or ghost) by guid.
+    ///
+    /// Returns `false` if the guid is unknown here.
+    pub fn despawn(&mut self, guid: EntityGuid) -> bool {
+        self.physics.unregister(guid);
         match self.by_guid.remove(&guid) {
             Some(entity) => {
                 let removed = self.world.despawn(entity);
@@ -263,9 +391,498 @@ impl SimWorld {
         }
     }
 
-    /// The state of the ship `guid`, if it is alive here.
+    /// Use `catalog` for [`crate::ShapeRef::Asset`] shapes. Set it before
+    /// spawning a body or static that names an asset.
+    pub fn set_catalog(&mut self, catalog: Arc<ShapeCatalog>) {
+        self.physics.catalog = catalog;
+    }
+
+    /// The shape catalogue in use.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<ShapeCatalog> {
+        &self.physics.catalog
+    }
+
+    /// Replace the scene's static colliders (instantiated into the bubbles
+    /// that come near them from the next step on).
+    ///
+    /// # Errors
+    /// [`PhysicsError::Shape`] if a shape cannot be built; nothing changes.
+    pub fn set_statics(&mut self, statics: Vec<StaticCollider>) -> Result<(), PhysicsError> {
+        self.physics.set_statics(statics)
+    }
+
+    /// The scene's static colliders.
+    pub fn statics(&self) -> impl Iterator<Item = &StaticCollider> {
+        self.physics.statics()
+    }
+
+    /// Replace the gravity field (zones and large bodies).
+    pub fn set_gravity(&mut self, field: GravityField) {
+        self.physics.gravity = field;
+    }
+
+    /// The gravity field in force.
+    #[must_use]
+    pub fn gravity(&self) -> &GravityField {
+        &self.physics.gravity
+    }
+
+    /// Restart the clock at `tick` and drop every buffered input — for a
+    /// prediction mirror that replays from an older authoritative state (see
+    /// [`crate::prediction::PredictedPhysics`]). The ECS change tick moves
+    /// with it (see [`SimWorld::with_tick`]).
+    pub fn reset_clock(&mut self, tick: SimTick) {
+        self.tick = tick;
+        self.world.set_tick(tick.wrapping_add(1));
+        self.input_buf.clear();
+    }
+
+    /// Spawn a physics body (not a ship): see [`BodySpawn`]. It is
+    /// authoritative here ([`ShardAuthority`] = this shard).
+    ///
+    /// # Errors
+    /// [`PhysicsError::Duplicate`] for a guid alive here, [`PhysicsError`] for
+    /// a body, spring set or articulation outside the wire bounds (a spawned
+    /// body can always be exported and imported again).
+    pub fn spawn_body(
+        &mut self,
+        guid: EntityGuid,
+        spawn: BodySpawn,
+    ) -> Result<Entity, PhysicsError> {
+        if self.entity_of(guid).is_some() {
+            return Err(PhysicsError::Duplicate(guid));
+        }
+        let invalid = |e: space_protocol::CodecError| PhysicsError::Invalid(e.to_string());
+        spawn.body.validate().map_err(invalid)?;
+        let authority = ShardAuthority(self.shard.0);
+        let parts = 1 + spawn
+            .articulation
+            .as_ref()
+            .map_or(0, |(a, _)| a.parts.len());
+        let residual = PosResidual(vec![[0.0; 3]; parts]);
+        let mut components = vec![
+            Component::new(&spawn.state),
+            Component::new(&spawn.body),
+            Component::new(&authority),
+            Component::new(&residual),
+        ];
+        if let Some(v) = &spawn.visual {
+            components.push(Component::new(v));
+        }
+        if let Some(s) = &spawn.springs {
+            decode_springs(&encode_springs(s)).map_err(invalid)?;
+            components.push(Component::new(s));
+        }
+        if let Some((a, p)) = &spawn.articulation {
+            decode_articulation(&encode_articulation(a)).map_err(invalid)?;
+            decode_part_states(&encode_part_states(p)).map_err(invalid)?;
+            components.push(Component::new(a));
+            components.push(Component::new(p));
+        }
+        let entity = self.world.spawn(&components);
+        if let Err(e) = self
+            .physics
+            .register(guid, entity, &self.world, false, &self.params)
+        {
+            self.world.despawn(entity);
+            return Err(e);
+        }
+        self.by_guid.insert(guid, entity);
+        Ok(entity)
+    }
+
+    /// Every physics entity of this world (ships, bodies, ghosts) by guid,
+    /// ascending: `(guid, entity, is_ghost)`.
+    #[must_use]
+    pub fn bodies(&self) -> Vec<(EntityGuid, Entity, bool)> {
+        self.physics.guids().collect()
+    }
+
+    /// The state of any entity `guid` (ship, body or ghost).
+    #[must_use]
+    pub fn state_of(&self, guid: EntityGuid) -> Option<ShipState> {
+        self.entity_of(guid)
+            .and_then(|e| self.world.get::<ShipState>(e).copied())
+    }
+
+    /// The motion of every part of `guid`: part 0 is its [`ShipState`], the
+    /// rest its [`PartStates`].
+    #[must_use]
+    pub fn part_states_of(&self, guid: EntityGuid) -> Option<Vec<ShipState>> {
+        let e = self.entity_of(guid)?;
+        let mut out = vec![*self.world.get::<ShipState>(e)?];
+        if let Some(p) = self.world.get::<PartStates>(e) {
+            out.extend_from_slice(&p.0);
+        }
+        Some(out)
+    }
+
+    /// Whether the physics has put `guid` to sleep (at rest, not integrated
+    /// until something wakes it).
+    #[must_use]
+    pub fn is_sleeping(&self, guid: EntityGuid) -> Option<bool> {
+        self.physics.is_sleeping(guid)
+    }
+
+    /// Wake `guid` (a sleeping body is integrated again from the next step).
+    pub fn wake(&mut self, guid: EntityGuid) {
+        self.physics.wake(guid);
+    }
+
+    /// The physics bubble `guid` is in (assigned by the first step after it
+    /// joined).
+    #[must_use]
+    pub fn bubble_of(&self, guid: EntityGuid) -> Option<BubbleId> {
+        self.physics.bubble_of(guid)
+    }
+
+    /// The physics bubbles, by id (see [`crate::rigid`]).
+    #[must_use]
+    pub fn bubbles(&self) -> Vec<BubbleInfo> {
+        self.physics.bubbles()
+    }
+
+    /// The contacts the solver resolved in the last step, sorted.
+    #[must_use]
+    pub fn contacts(&self) -> &[ContactEvent] {
+        self.physics.contacts()
+    }
+
+    /// The groups of dynamic bodies that may interact within `query`'s reach
+    /// (contact proximity, springs), for co-locating each group on one shard.
+    #[must_use]
+    pub fn islands(&self, query: IslandQuery) -> Vec<Island> {
+        self.physics.islands(&self.world, query)
+    }
+
+    /// The replicated component list of `guid` — what an
+    /// [`EntitySnapshot`] (and a handoff) carries — in id order: [`ShipState`]
+    /// (`wire`), [`ShipControls`] and [`Owner`] (bincode, as `space-server`'s
+    /// `snapshot_of` sends them) and the physics components it has ([`Body`],
+    /// [`Visual`], [`Springs`], [`Articulation`], [`PartStates`],
+    /// [`PosResidual`], each in its versioned wire form). `None` if `guid` is not alive here.
+    #[must_use]
+    pub fn export_entity(&self, guid: EntityGuid) -> Option<Vec<(ComponentId, Vec<u8>)>> {
+        let e = self.entity_of(guid)?;
+        let w = &self.world;
+        let mut out = vec![(
+            ShipState::ID,
+            crate::wire::encode_ship_state(w.get::<ShipState>(e)?),
+        )];
+        if let Some(c) = w.get::<ShipControls>(e) {
+            out.push((ShipControls::ID, space_protocol::codec::encode_raw(c)));
+        }
+        if let Some(o) = w.get::<Owner>(e) {
+            out.push((Owner::ID, space_protocol::codec::encode_raw(&o.0)));
+        }
+        if let Some(b) = w.get::<Body>(e) {
+            out.push((Body::ID, encode_body(b)));
+        }
+        if let Some(v) = w.get::<Visual>(e) {
+            out.push((Visual::ID, encode_visual(*v)));
+        }
+        if let Some(s) = w.get::<Springs>(e) {
+            out.push((Springs::ID, encode_springs(s)));
+        }
+        if let Some(a) = w.get::<Articulation>(e) {
+            out.push((Articulation::ID, encode_articulation(a)));
+        }
+        if let Some(p) = w.get::<PartStates>(e) {
+            out.push((PartStates::ID, encode_part_states(p)));
+        }
+        if let Some(r) = w.get::<PosResidual>(e) {
+            out.push((PosResidual::ID, encode_residual(r)));
+        }
+        Some(out)
+    }
+
+    /// [`SimWorld::export_entity`] as an [`EntitySnapshot`].
+    #[must_use]
+    pub fn entity_snapshot(&self, guid: EntityGuid) -> Option<EntitySnapshot> {
+        Some(EntitySnapshot::new(guid, self.export_entity(guid)?))
+    }
+
+    /// Spawn `guid` from its replicated component list (the inverse of
+    /// [`SimWorld::export_entity`]), authoritative here. An entity with
+    /// [`ShipControls`] becomes a ship (its [`Owner`] routes inputs; a ship
+    /// without a [`Body`] gets [`Body::ship`]); anything else needs a [`Body`].
+    ///
+    /// Decoding is strict and total: an unknown or repeated id, more than
+    /// [`MAX_IMPORT_COMPONENTS`] entries, a payload that does not decode or a
+    /// [`PartStates`] that does not match the [`Articulation`] is an error and
+    /// nothing is spawned.
+    ///
+    /// # Errors
+    /// [`PhysicsError::Duplicate`] for a guid alive here, [`PhysicsError`]
+    /// for invalid components.
+    pub fn import_entity(
+        &mut self,
+        guid: EntityGuid,
+        components: &[(ComponentId, Vec<u8>)],
+    ) -> Result<Entity, PhysicsError> {
+        self.import(guid, components, false)
+    }
+
+    /// Insert (or replace) a **ghost**: a kinematic copy of `guid`, which
+    /// another shard simulates, built from its replicated component list.
+    /// Bodies of this world collide with it; it is never integrated here —
+    /// move it with [`SimWorld::drive_ghost`] every tick. A spring a ghost
+    /// owns pulls on this world's end of it.
+    ///
+    /// # Errors
+    /// As [`SimWorld::import_entity`]; replacing a non-ghost is
+    /// [`PhysicsError::Duplicate`].
+    pub fn insert_ghost(
+        &mut self,
+        guid: EntityGuid,
+        components: &[(ComponentId, Vec<u8>)],
+    ) -> Result<Entity, PhysicsError> {
+        if self.entity_of(guid).is_some() {
+            if !self.physics.is_ghost(guid) {
+                return Err(PhysicsError::Duplicate(guid));
+            }
+            self.despawn(guid);
+        }
+        self.import(guid, components, true)
+    }
+
+    /// Set a ghost's motion (and its parts'): what its owner says it is now.
+    /// Returns `false` if `guid` is not a ghost here.
+    pub fn drive_ghost(
+        &mut self,
+        guid: EntityGuid,
+        state: ShipState,
+        parts: Option<&[ShipState]>,
+    ) -> bool {
+        if !self.physics.is_ghost(guid) {
+            return false;
+        }
+        let Some(e) = self.entity_of(guid) else {
+            return false;
+        };
+        // Written only when the bits change: a write stamps the row, and a
+        // stamped row is replicated again (a ghost at rest costs nothing).
+        let same = |a: &ShipState, b: &ShipState| {
+            crate::wire::encode_ship_state(a) == crate::wire::encode_ship_state(b)
+        };
+        if self
+            .world
+            .get::<ShipState>(e)
+            .is_some_and(|s| !same(s, &state))
+        {
+            if let Some(s) = self.world.get_mut::<ShipState>(e) {
+                *s = state;
+            }
+        }
+        if let Some(parts) = parts {
+            let differs = self.world.get::<PartStates>(e).is_some_and(|p| {
+                p.0.len() == parts.len() && p.0.iter().zip(parts).any(|(a, b)| !same(a, b))
+            });
+            if differs {
+                if let Some(p) = self.world.get_mut::<PartStates>(e) {
+                    p.0.copy_from_slice(parts);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `guid` is a ghost here.
+    #[must_use]
+    pub fn is_ghost(&self, guid: EntityGuid) -> bool {
+        self.physics.is_ghost(guid)
+    }
+
+    /// Give the entity `guid` the [`Visual`] `visual` (replacing one it has),
+    /// e.g. the player model on a ship a client flies. Only what a client
+    /// draws changes; the physics does not read it. Returns `false` if
+    /// `guid` is not alive here.
+    pub fn set_visual(&mut self, guid: EntityGuid, visual: Visual) -> bool {
+        let Some(entity) = self.entity_of(guid) else {
+            return false;
+        };
+        if self.world.get::<Visual>(entity) == Some(&visual) {
+            return true;
+        }
+        self.world.insert(entity, Component::new(&visual))
+    }
+
+    /// Every check [`SimWorld::import_entity`] makes on `components` —
+    /// decoding, consistency and building the shapes with this world's
+    /// catalogue — without spawning anything here. A handoff's receiver runs
+    /// it on an offer, while the sender still simulates the entity and a
+    /// refusal costs nothing.
+    ///
+    /// # Errors
+    /// What the import would return.
+    pub fn check_import(&self, components: &[(ComponentId, Vec<u8>)]) -> Result<(), PhysicsError> {
+        let mut scratch = Self::with_params(self.shard, self.params);
+        scratch.set_catalog(Arc::clone(&self.physics.catalog));
+        scratch
+            .import(EntityGuid::new(self.shard, 0), components, false)
+            .map(|_| ())
+    }
+
+    /// Whether a body of `body`'s shape placed at `state` would come closer
+    /// than `clearance` metres to a static of the scene or to any entity of
+    /// this world (ghosts included), as far as the collision groups let the
+    /// two touch. For finding a free spawn point: a shard looks for a place
+    /// a new ship does not start inside anything.
+    ///
+    /// A shape pair the contact query does not support counts as
+    /// overlapping when the bounding spheres do.
+    ///
+    /// # Errors
+    /// [`PhysicsError::Shape`] if `body`'s shape cannot be built.
+    pub fn overlaps(
+        &self,
+        body: &Body,
+        state: &ShipState,
+        clearance: f64,
+    ) -> Result<bool, PhysicsError> {
+        self.physics.overlaps(&self.world, body, state, clearance)
+    }
+
+    fn import(
+        &mut self,
+        guid: EntityGuid,
+        components: &[(ComponentId, Vec<u8>)],
+        ghost: bool,
+    ) -> Result<Entity, PhysicsError> {
+        if self.entity_of(guid).is_some() {
+            return Err(PhysicsError::Duplicate(guid));
+        }
+        if components.len() > MAX_IMPORT_COMPONENTS {
+            return Err(PhysicsError::Invalid(format!(
+                "{} components, at most {MAX_IMPORT_COMPONENTS}",
+                components.len()
+            )));
+        }
+        let bad = |e: space_protocol::CodecError| PhysicsError::Invalid(e.to_string());
+        let mut seen = BTreeSet::new();
+        let mut state = None;
+        let mut controls = None;
+        let mut owner = None;
+        let mut body = None;
+        let mut visual = None;
+        let mut springs = None;
+        let mut articulation = None;
+        let mut parts = None;
+        let mut residual = None;
+        for (id, bytes) in components {
+            if !seen.insert(*id) {
+                return Err(PhysicsError::Invalid(format!("component {id} twice")));
+            }
+            match *id {
+                ShipState::ID => {
+                    state = Some(crate::wire::decode_ship_state(bytes).map_err(bad)?);
+                }
+                ShipControls::ID => {
+                    let (c, n) =
+                        space_protocol::codec::decode_raw::<ShipControls>(bytes).map_err(bad)?;
+                    if n != bytes.len() {
+                        return Err(PhysicsError::Invalid("ShipControls: trailing bytes".into()));
+                    }
+                    controls = Some(c);
+                }
+                Owner::ID => {
+                    let (o, n) = space_protocol::codec::decode_raw::<u64>(bytes).map_err(bad)?;
+                    if n != bytes.len() {
+                        return Err(PhysicsError::Invalid("Owner: trailing bytes".into()));
+                    }
+                    owner = Some(Owner(o));
+                }
+                Body::ID => body = Some(decode_body(bytes).map_err(bad)?),
+                Visual::ID => visual = Some(decode_visual(bytes).map_err(bad)?),
+                Springs::ID => springs = Some(decode_springs(bytes).map_err(bad)?),
+                Articulation::ID => {
+                    articulation = Some(decode_articulation(bytes).map_err(bad)?);
+                }
+                PartStates::ID => parts = Some(decode_part_states(bytes).map_err(bad)?),
+                PosResidual::ID => residual = Some(decode_residual(bytes).map_err(bad)?),
+                other => {
+                    return Err(PhysicsError::Invalid(format!(
+                        "unknown component id {other}"
+                    )))
+                }
+            }
+        }
+        let state = state.ok_or_else(|| PhysicsError::Invalid("no ShipState".into()))?;
+        let ship = controls.is_some() && !ghost;
+        let body = match body {
+            Some(b) => b,
+            None if controls.is_some() => Body::ship(&self.params),
+            None => return Err(PhysicsError::Invalid("no Body".into())),
+        };
+        if articulation.as_ref().map_or(0, |a| a.parts.len())
+            != parts.as_ref().map_or(0, |p| p.0.len())
+        {
+            return Err(PhysicsError::Invalid(
+                "PartStates do not match the Articulation".into(),
+            ));
+        }
+        let part_count = 1 + articulation.as_ref().map_or(0, |a| a.parts.len());
+        if residual.as_ref().is_some_and(|r| r.0.len() != part_count) {
+            return Err(PhysicsError::Invalid(
+                "PosResidual does not match the parts".into(),
+            ));
+        }
+        // A body (not a ship) always carries its residual.
+        let residual = if ship {
+            None
+        } else {
+            Some(residual.unwrap_or_else(|| PosResidual(vec![[0.0; 3]; part_count])))
+        };
+        let authority = ShardAuthority(self.shard.0);
+        let controls = controls.unwrap_or_default();
+        let owner = owner.unwrap_or_default();
+        let mut list = vec![Component::new(&state), Component::new(&body)];
+        if ship {
+            list.push(Component::new(&controls));
+            list.push(Component::new(&owner));
+        }
+        if ghost {
+            list.push(Component::new(&Ghost));
+        } else {
+            list.push(Component::new(&authority));
+        }
+        if let Some(v) = &visual {
+            list.push(Component::new(v));
+        }
+        if let Some(s) = &springs {
+            list.push(Component::new(s));
+        }
+        if let (Some(a), Some(p)) = (&articulation, &parts) {
+            list.push(Component::new(a));
+            list.push(Component::new(p));
+        }
+        if let Some(r) = &residual {
+            list.push(Component::new(r));
+        }
+        let entity = self.world.spawn(&list);
+        if let Err(e) = self
+            .physics
+            .register(guid, entity, &self.world, ghost, &self.params)
+        {
+            self.world.despawn(entity);
+            return Err(e);
+        }
+        self.by_guid.insert(guid, entity);
+        if ship {
+            self.ships.insert((entity.index(), entity.generation()));
+        }
+        Ok(entity)
+    }
+
+    /// The state of the ship (or body) `guid`, if this world simulates it —
+    /// `None` for a ghost, which another world simulates (use
+    /// [`SimWorld::state_of`] for any entity).
     #[must_use]
     pub fn ship_state(&self, guid: EntityGuid) -> Option<ShipState> {
+        if self.physics.is_ghost(guid) {
+            return None;
+        }
         self.entity_of(guid)
             .and_then(|e| self.world.get::<ShipState>(e).copied())
     }
@@ -420,7 +1037,7 @@ impl SimWorld {
         }
     }
 
-    /// Advance every ship by one fixed step and return the new tick.
+    /// Advance the world by one fixed step and return the new tick.
     ///
     /// # Inputs
     ///
@@ -430,28 +1047,23 @@ impl SimWorld {
     /// applied (see [`SimWorld::apply_inputs`]). A tick with no batch is a
     /// coasting tick.
     ///
-    /// # Which ships are stepped
+    /// # Physics
     ///
-    /// A read-only pass first collects the ships that actually have work: a
-    /// non-zero [`ShipControls`] **or** a non-zero velocity (a coasting ship
-    /// still moves, and its position must change). Only those rows are then
-    /// stepped. A ship that is at rest with no input is therefore never written,
-    /// so its change tick stays where it was and a `changed_since` replication
-    /// pass does not see it — which is the whole point: an idle fleet costs
-    /// nothing on the wire.
+    /// Every entity of the physics — ships, bodies, articulated objects;
+    /// ghosts only as obstacles — is advanced by [`crate::rigid`]: forces,
+    /// gravity and springs, then the contact and joint solver in the physics
+    /// bubbles that can have a contact, then free flight for everything the
+    /// solver did not touch. A ship's velocity change is its flight model's
+    /// ([`crate::physics::ship_velocity_step`]); in free flight its new state
+    /// is exactly what [`crate::step_ship`] gives.
     ///
     /// # Only a real change stamps the row
     ///
-    /// Linear damping is asymptotic: a coasting ship's velocity decays toward but
-    /// never reaches exactly `0.0` (it stalls in the subnormals around `1e-43`),
-    /// so the "moving" filter above keeps such a ship in the active set forever
-    /// and a naive `get_mut` would stamp it every tick — replicating a ship that
-    /// has, for every practical purpose, stopped. To avoid that, each active ship
-    /// is stepped into a **copy** and the row is written through `get_mut` (which
-    /// stamps the change tick) **only if the stepped copy's bits differ from the
-    /// pre-step bits**. A ship whose physics has settled to a bit-stable state is
-    /// therefore not stamped and not replicated, even though its velocity is a
-    /// non-zero subnormal.
+    /// Each body is stepped into a **copy** and its row is written through
+    /// `get_mut` (which stamps the change tick) **only if the copy's bits
+    /// differ from the pre-step bits**. A body at rest, a settled ship (see
+    /// [`crate::physics::SETTLE_EPS`]) and a body the physics has put to sleep
+    /// are therefore not stamped and not replicated.
     ///
     /// [`ShipControls`] are reset to zero only on the ships that had them, and
     /// only when they were non-zero, for the same reason.
@@ -470,10 +1082,11 @@ impl SimWorld {
     /// as earlier revisions did, stamps such a write with the tick a delta was
     /// already sent for, which loses it forever.)
     ///
-    /// A ship without controls (a derelict, or a ghost replica the shard only
-    /// mirrors) keeps its state untouched. [`ShardAuthority`] is the marker the
-    /// *caller* uses to decide which entities belong to this shard's world at
-    /// all; everything inside a `SimWorld` is simulated.
+    /// Only entities spawned through this world ([`SimWorld::spawn_ship`],
+    /// [`SimWorld::spawn_body`], [`SimWorld::import_entity`],
+    /// [`SimWorld::insert_ghost`]) are simulated; [`ShardAuthority`] is the
+    /// marker the *caller* uses to decide which entities belong to this
+    /// shard's world at all.
     pub fn step(&mut self) -> SimTick {
         let next_tick = self.tick.wrapping_add(1);
         let params = self.params;
@@ -481,69 +1094,23 @@ impl SimWorld {
         //    the batch for the tick this step produces.
         self.input_buf.retain(|&t, _| t > self.tick);
         self.drain_inputs(next_tick);
-        // 1. Read-only pass: which ships have work this tick? The entity term
-        //    (`WithEntity`) is what lets the pass name the rows it selects, so
-        //    the write phase below touches only those.
-        let mut active: Vec<Entity> = Vec::new();
-        {
-            let mut query = self
-                .world
-                .query::<WithEntity<(&ShipState, &ShipControls)>>();
-            query.for_each(|((state, controls), entity)| {
-                let moving =
-                    state.vel.iter().any(|v| *v != 0.0) || state.ang_vel.iter().any(|v| *v != 0.0);
-                let driven = controls.thrust.iter().any(|v| *v != 0.0)
-                    || controls.torque.iter().any(|v| *v != 0.0);
-                if moving || driven {
-                    active.push(entity);
-                }
-            });
-        }
-        // Canonical order: the write order below must not depend on archetype
-        // layout, so sort by entity (the same order `state_hash` uses).
-        active.sort_unstable_by_key(|&e| (e.index(), e.generation()));
-        // 2. Step exactly those ships — into a copy. The row is only written
-        //    (stamped) when the copy's bits actually changed (see the module
-        //    note "Only a real change stamps the row").
-        for entity in &active {
-            let Some(controls) = self.world.get::<ShipControls>(*entity).copied() else {
-                continue;
-            };
-            let Some(before) = self.world.get::<ShipState>(*entity).copied() else {
-                continue;
-            };
-            let mut next_state = before;
-            step_ship(
-                &mut next_state,
-                &PlayerInput {
-                    // Routing metadata; step_ship ignores it.
-                    entity: EntityGuid::new(ShardId::NONE, 0),
-                    thrust: controls.thrust,
-                    torque: controls.torque,
-                    tick: next_tick,
-                },
-                &params,
-            );
-            if state_bits_changed(&before, &next_state) {
-                if let Some(state) = self.world.get_mut::<ShipState>(*entity) {
-                    *state = next_state;
-                }
-            }
-        }
-        // 3. Consume the controls of the ships that had them: a ship with no
+        // 1. Physics, with gravity sampled at the start of the step.
+        self.physics.step(&mut self.world, self.tick, &params);
+        // 2. Consume the controls of the ships that had them: a ship with no
         //    input next tick coasts. Only non-zero controls are reset, so the
         //    write does not stamp an already-idle row.
-        for entity in &active {
-            let zero = self.world.get::<ShipControls>(*entity).is_some_and(|c| {
+        let ships: Vec<Entity> = self.live_ships().collect();
+        for entity in ships {
+            let zero = self.world.get::<ShipControls>(entity).is_none_or(|c| {
                 c.thrust.iter().all(|v| *v == 0.0) && c.torque.iter().all(|v| *v == 0.0)
             });
             if !zero {
-                if let Some(controls) = self.world.get_mut::<ShipControls>(*entity) {
+                if let Some(controls) = self.world.get_mut::<ShipControls>(entity) {
                     *controls = ShipControls::default();
                 }
             }
         }
-        // 4. Close the tick: both counters move together (see the tick-ordering
+        // 3. Close the tick: both counters move together (see the tick-ordering
         //    note above).
         self.world.tick();
         self.tick = next_tick;
@@ -573,11 +1140,14 @@ impl SimWorld {
     ///
     /// Unlike [`SimWorld::state_hash`], which is keyed by the local
     /// [`space_ecs::Entity`] index (so two worlds that spawned the same logical
-    /// ships in a different order hash differently), this hash is keyed by
-    /// [`EntityGuid`]: it walks the live ships **sorted by guid** and hashes, for
-    /// each, only the components the replication registry marks
-    /// `replicated == true` — [`ShipState`] and [`Owner`] — using the lossless
-    /// wire bytes (the same bytes a snapshot/delta carries).
+    /// entities in a different order hash differently), this hash is keyed by
+    /// [`EntityGuid`]: it walks the live entities (ghosts excluded: they are
+    /// another world's state) **sorted by guid** and hashes, for each, the
+    /// components the replication registry marks `replicated == true` —
+    /// [`ShipState`], [`Owner`] and the physics components [`Body`],
+    /// [`Visual`], [`Springs`], [`Articulation`], [`PartStates`],
+    /// [`PosResidual`] — using the
+    /// lossless wire bytes (the same bytes a snapshot/delta carries).
     ///
     /// Two components are deliberately excluded:
     ///
@@ -596,13 +1166,10 @@ impl SimWorld {
     /// exactly the property a handoff / ghost-replica check needs.
     #[must_use]
     pub fn guid_state_hash(&self) -> u64 {
-        // Live (guid, entity) pairs, sorted by guid. `by_guid` is only ever used
-        // for point lookups elsewhere; here it is the guid-keyed source of truth,
-        // and sorting by guid makes the hash independent of ECS index.
         let mut ships: Vec<(EntityGuid, Entity)> = self
             .by_guid
             .iter()
-            .filter(|(_, &e)| self.world.entity_is_alive(e))
+            .filter(|(g, &e)| self.world.entity_is_alive(e) && !self.physics.is_ghost(**g))
             .map(|(&g, &e)| (g, e))
             .collect();
         ships.sort_unstable_by_key(|&(g, _)| g);
@@ -629,23 +1196,58 @@ impl SimWorld {
                 put_int(&mut out, i128::from(owner.0), 8);
             }
             // ShardAuthority (id 3, not replicated) — skipped by design.
+            // The physics components (ids 4..=8): id, length, wire bytes.
+            self.put_physics_components(&mut out, entity);
         }
         fnv1a(FNV_OFFSET, &out)
     }
 
+    /// Append the wire bytes of `entity`'s physics components (ids 4..=8, in
+    /// id order) as `id u8, length u32, bytes`.
+    fn put_physics_components(&self, out: &mut Vec<u8>, entity: Entity) {
+        let w = &self.world;
+        let mut put = |id: ComponentId, bytes: Vec<u8>| {
+            out.push(id as u8);
+            put_int(out, i128::try_from(bytes.len()).unwrap_or(0), 4);
+            out.extend_from_slice(&bytes);
+        };
+        if let Some(b) = w.get::<Body>(entity) {
+            put(Body::ID, encode_body(b));
+        }
+        if let Some(v) = w.get::<Visual>(entity) {
+            put(Visual::ID, encode_visual(*v));
+        }
+        if let Some(s) = w.get::<Springs>(entity) {
+            put(Springs::ID, encode_springs(s));
+        }
+        if let Some(a) = w.get::<Articulation>(entity) {
+            put(Articulation::ID, encode_articulation(a));
+        }
+        if let Some(p) = w.get::<PartStates>(entity) {
+            put(PartStates::ID, encode_part_states(p));
+        }
+        if let Some(r) = w.get::<PosResidual>(entity) {
+            put(PosResidual::ID, encode_residual(r));
+        }
+    }
+
     /// The canonical serialisation of every entity's state, sorted by
-    /// [`space_ecs::Entity`].
+    /// [`space_ecs::Entity`], followed by the physics' derived state.
     ///
     /// Layout (all integers big endian, all floats as their IEEE-754 bits, big
     /// endian — the same byte order as [`space_protocol::codec`]):
     ///
     /// ```text
     /// tick:u64 | entity_count:u64
-    /// entity: index:u32 | generation:u32 | present:u8 | components in id order
+    /// entity: index:u32 | generation:u32 | present:u16 | components in id order
     ///   ShipState      : cell 3×i64 | local 3×f32 | vel 3×f32 | quat 4×f32 | ang_vel 3×f32
     ///   ShipControls   : thrust 3×f32 | torque 3×f32
     ///   Owner          : u64
     ///   ShardAuthority : u32
+    ///   Body .. PartStates (ids 4..=8), PosResidual (10): id:u8 | len:u32 | wire bytes
+    ///   Ghost          : (marker, no payload)
+    /// bubble_count:u64, per bubble: id:u64 | anchor cell 3×i64 | member_count:u64 | members (shard:u32 serial:u64)…
+    /// sleeping_count:u64, sleeping guids (shard:u32 serial:u64)…
     /// ```
     ///
     /// `present` is a bitmask over [`crate::components::IDS`] (bit `i` = id `i`),
@@ -654,8 +1256,17 @@ impl SimWorld {
     pub fn serialize_state(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_int(&mut out, i128::from(self.tick), 8);
-        // Already in the canonical order (ascending index, then generation).
-        let entities = self.ships();
+        // Ships and every physics entity, in the canonical order (ascending
+        // index, then generation).
+        let mut entities: Vec<Entity> = self.ships();
+        entities.extend(
+            self.physics
+                .guids()
+                .map(|(_, e, _)| e)
+                .filter(|&e| self.world.entity_is_alive(e)),
+        );
+        entities.sort_unstable_by_key(|e| (e.index(), e.generation()));
+        entities.dedup();
         put_int(
             &mut out,
             i128::try_from(entities.len()).unwrap_or(i128::MAX),
@@ -664,22 +1275,30 @@ impl SimWorld {
         for entity in entities {
             put_int(&mut out, i128::from(entity.index()), 4);
             put_int(&mut out, i128::from(entity.generation()), 4);
-            let mut present = 0u8;
-            if self.world.get::<ShipState>(entity).is_some() {
-                present |= 1;
+            let w = &self.world;
+            let mut present = 0u16;
+            for (bit, has) in [
+                w.get::<ShipState>(entity).is_some(),
+                w.get::<ShipControls>(entity).is_some(),
+                w.get::<Owner>(entity).is_some(),
+                w.get::<ShardAuthority>(entity).is_some(),
+                w.get::<Body>(entity).is_some(),
+                w.get::<Visual>(entity).is_some(),
+                w.get::<Springs>(entity).is_some(),
+                w.get::<Articulation>(entity).is_some(),
+                w.get::<PartStates>(entity).is_some(),
+                w.get::<Ghost>(entity).is_some(),
+                w.get::<PosResidual>(entity).is_some(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if has {
+                    present |= 1 << bit;
+                }
             }
-            if self.world.get::<ShipControls>(entity).is_some() {
-                present |= 2;
-            }
-            if self.world.get::<Owner>(entity).is_some() {
-                present |= 4;
-            }
-            if self.world.get::<ShardAuthority>(entity).is_some() {
-                present |= 8;
-            }
-            out.push(present);
-            if present & 1 != 0 {
-                let s = self.world.get::<ShipState>(entity).unwrap();
+            put_int(&mut out, i128::from(present), 2);
+            if let Some(s) = w.get::<ShipState>(entity) {
                 for &v in &s.pos.cell {
                     put_int(&mut out, i128::from(v), 8);
                 }
@@ -696,8 +1315,7 @@ impl SimWorld {
                     put_f32(&mut out, v);
                 }
             }
-            if present & 2 != 0 {
-                let c = self.world.get::<ShipControls>(entity).unwrap();
+            if let Some(c) = w.get::<ShipControls>(entity) {
                 for &v in &c.thrust {
                     put_f32(&mut out, v);
                 }
@@ -705,21 +1323,15 @@ impl SimWorld {
                     put_f32(&mut out, v);
                 }
             }
-            if present & 4 != 0 {
-                put_int(
-                    &mut out,
-                    i128::from(self.world.get::<Owner>(entity).unwrap().0),
-                    8,
-                );
+            if let Some(o) = w.get::<Owner>(entity) {
+                put_int(&mut out, i128::from(o.0), 8);
             }
-            if present & 8 != 0 {
-                put_int(
-                    &mut out,
-                    i128::from(self.world.get::<ShardAuthority>(entity).unwrap().0),
-                    4,
-                );
+            if let Some(a) = w.get::<ShardAuthority>(entity) {
+                put_int(&mut out, i128::from(a.0), 4);
             }
+            self.put_physics_components(&mut out, entity);
         }
+        self.physics.hash_bytes(&mut out);
         out
     }
 }
@@ -739,24 +1351,6 @@ fn input_bits(input: &PlayerInput) -> ([u32; 3], [u32; 3]) {
             input.torque[2].to_bits(),
         ],
     )
-}
-
-/// `true` if any field of `after` has different bits than `before`.
-///
-/// Compares the IEEE-754 **bits** (not `==`), so `-0.0` vs `0.0` and two NaN
-/// payloads count as a change — the same lossless reading [`SimWorld`] hashes
-/// with. This is the "did the physics actually move this ship this tick" test
-/// that decides whether to stamp the row (see [`SimWorld::step`]).
-fn state_bits_changed(before: &ShipState, after: &ShipState) -> bool {
-    if before.pos.cell != after.pos.cell {
-        return true;
-    }
-    let f32s_changed =
-        |a: &[f32], b: &[f32]| a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits());
-    f32s_changed(&before.pos.local, &after.pos.local)
-        || f32s_changed(&before.vel, &after.vel)
-        || f32s_changed(&before.quat, &after.quat)
-        || f32s_changed(&before.ang_vel, &after.ang_vel)
 }
 
 #[cfg(test)]

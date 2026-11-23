@@ -17,7 +17,11 @@ describes current behaviour, not intent.
 * **Shard.** `Shard::peer_message` checks only that the claimed shard id is in
   the shard's own map (and a commit must come from the shard that staged the
   transfer). A party that can reach a shard's port and guesses a valid
-  neighbour id can speak the handoff protocol as that neighbour.
+  neighbour id can speak the handoff protocol as that neighbour — and send
+  `GhostUpdate`s as it (ghosts are kinematic copies the receiver's bodies
+  collide with; their component lists are decoded with the same strict,
+  total decoders as a handoff's; a ghost never replaces a body the receiver
+  simulates, and a removal is honoured only from the shard that sent it).
 * **Control port.** The orchestrator's control endpoint binds to `127.0.0.1` by
   default. That is the only mitigation for the items below.
 

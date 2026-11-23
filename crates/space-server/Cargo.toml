@@ -15,6 +15,7 @@ space-world = { workspace = true }
 space-ecs = { workspace = true }
 space-protocol = { workspace = true }
 space-sim = { workspace = true }
+space-scene = { workspace = true }
 space-net = { path = "../space-net" }
 quinn = { workspace = true }
 tokio = { workspace = true }

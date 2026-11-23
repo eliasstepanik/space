@@ -6,13 +6,19 @@
 //! types. The pipeline is:
 //!
 //! * a **forward PBR pass** (Cook-Torrance GGX + Smith visibility, analytic
-//!   point lights) into an HDR `rgba16f` target,
+//!   point lights) into an HDR `rgba16f` target. Nothing is culled: a
+//!   triangle seen from behind is drawn too, and shaded as the surface that
+//!   side is — the underside of a sheet, the inside of a box the camera is in
+//!   — with its normal turned to the viewer,
 //! * optional **ray-traced shadows** from those lights (one ray query per
 //!   light in the forward pass's fragment shaders, see [`quality`]),
 //! * **ray-query probe GI** (`VK_KHR_ray_query`, DDGI-style, 1-bounce diffuse)
-//!   feeding that pass as indirect diffuse,
-//! * an optional **post pass** (screen-space reflections + refraction, see
-//!   [`quality`]) skipped entirely on the `Ci`/`Low` presets,
+//!   feeding that pass as indirect diffuse — what surfaces emit and, under an
+//!   environment, the sky light they reflect,
+//! * an optional **post pass** (screen-space reflections, tinted by each
+//!   surface's specular colour, + refraction, ray traced through the glass
+//!   where the device can; see [`quality`]) skipped entirely on the
+//!   `Ci`/`Low` presets,
 //! * an optional **environment** ([`Environment`]): a sky-and-ground gradient
 //!   that gives every surface ambient light and something to reflect, glass
 //!   something to show where there is no geometry, and — if asked — the frame

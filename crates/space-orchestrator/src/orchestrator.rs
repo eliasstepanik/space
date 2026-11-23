@@ -72,6 +72,28 @@
 //! None of this goes near the epoch publisher: a scene change is accepted
 //! while a prepare is outstanding, and a split or merge is accepted while a
 //! scene change is unconfirmed.
+//!
+//! ## The orchestrator's revision is never below a shard's
+//!
+//! Shards and clients adopt a scene only at a **higher** revision than the
+//! one they hold. That makes late and repeated messages harmless — and it
+//! would make an orchestrator that has fallen *behind* inaudible for ever: one
+//! whose scene file was lost or deleted starts counting at 1 again, and
+//! nothing it says below the revision a shard (and that shard's clients)
+//! already holds is ever adopted. Every switch would be "accepted" and change
+//! nothing.
+//!
+//! So the rule is: **when a shard reports a revision at or above the
+//! orchestrator's that is not the orchestrator's own state, the orchestrator
+//! re-issues its current scene one above it** ([`Orchestrator::reconcile_scene`],
+//! through [`crate::scene::SceneStore::raise_above`]: saved first, at most
+//! once a second, logged). The orchestrator stays the authority on *which*
+//! scene; only the number catches up, and from then on everybody hears it
+//! again — the shards, and through them the clients, with no change to the
+//! wire or to either of them. A reported revision absurdly far ahead
+//! ([`crate::scene::MAX_REVISION_CATCH_UP`]) is not followed: it is shown and
+//! logged as "not the cluster's", so one forged message cannot push the
+//! revision to its ceiling.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -87,7 +109,7 @@ use crate::epoch::{Outbound, Phase};
 use crate::events::{EventKind, EventLog, Severity};
 use crate::launcher::{Launcher, Poll, SpawnSpec};
 use crate::ops::{OperatorCommand, OperatorReply, OperatorRequest, OpsHandle, OpsPort};
-use crate::scene::SCENE_RESEND_INTERVAL_TICKS;
+use crate::scene::{MAX_REVISION_CATCH_UP, SCENE_RESEND_INTERVAL_TICKS};
 use crate::snapshot::{
     node_path, octant_of, octant_signs, AutoscalerView, Decision, EpochInFlight, Heard, HeardKind,
     RegionView, ReportView, SceneView, ShardRole, ShardView, Snapshot,
@@ -189,6 +211,12 @@ pub struct Orchestrator<L: Launcher> {
     scene_push_pending: bool,
     /// The tick of the last scene change since startup.
     scene_changed_tick: Option<u64>,
+    /// The highest revision a shard reported that this orchestrator has to
+    /// get above (see the module docs); carried out by
+    /// [`Self::reconcile_scene`].
+    scene_raise_wanted: Option<u64>,
+    /// The tick the revision was last raised to get above a shard's.
+    scene_raised_tick: Option<u64>,
     /// An operator asked for the committed map to be sent again; done once,
     /// when the outbox is next drained, however often it was asked for.
     map_push_pending: bool,
@@ -245,6 +273,8 @@ impl<L: Launcher> Orchestrator<L> {
             scene_confirmed: BTreeMap::new(),
             scene_push_pending: false,
             scene_changed_tick: None,
+            scene_raise_wanted: None,
+            scene_raised_tick: None,
             map_push_pending: false,
             peer_prints: PeerPrintBudget::default(),
         }
@@ -524,9 +554,13 @@ impl<L: Launcher> Orchestrator<L> {
     /// believed about a shard the orchestrator knows, and it only ever moves
     /// what that shard confirmed to a **higher** revision. Together these keep
     /// the table — and the event log, which gets one "confirmed" entry per
-    /// shard per revision — bounded whatever a peer sends. The answer is for
-    /// the operator view only; no decision reads it except
-    /// [`Self::remind_scene_laggards`], which stops reminding.
+    /// shard per revision — bounded whatever a peer sends.
+    ///
+    /// Two things read what a shard confirmed: [`Self::remind_scene_laggards`],
+    /// which stops reminding it, and — when the shard turns out to run a
+    /// revision at or above this orchestrator's that is not this
+    /// orchestrator's — [`Self::reconcile_scene`], which gets above it (see
+    /// the module docs). Nothing else: no ack changes *which* scene it is.
     pub fn handle_scene_ack(&mut self, ack: &SceneAck) {
         let shard = ack.shard;
         if !(self.endpoints.contains_key(&shard) || self.connected.contains(&shard)) {
@@ -545,19 +579,94 @@ impl<L: Launcher> Orchestrator<L> {
                 Severity::Good,
                 format!("{shard} confirmed scene {}", ack.applied),
             );
-        } else if ack.applied.revision >= current.revision
-            && before.is_none_or(|held| held.revision <= current.revision)
-        {
+        } else if ack.applied.revision >= current.revision {
             // A revision this orchestrator never issued (or its own revision
-            // with another scene). Said once; the page keeps showing it.
-            self.log(
-                EventKind::Shard,
-                Severity::Warn,
-                format!(
-                    "{shard} reports scene {}, which is not the cluster's ({current})",
-                    ack.applied
-                ),
-            );
+            // with another scene): the shard will not adopt anything said at
+            // the current revision, and neither will its clients.
+            if ack.applied.revision - current.revision <= MAX_REVISION_CATCH_UP {
+                // The orchestrator is the one that is behind (its scene file
+                // was lost): get above the shard, on the next beat.
+                self.scene_raise_wanted = Some(
+                    self.scene_raise_wanted
+                        .map_or(ack.applied.revision, |seen| seen.max(ack.applied.revision)),
+                );
+            } else if before.is_none_or(|held| held.revision <= current.revision) {
+                // Too far ahead to be anything but nonsense. Said once; the
+                // page keeps showing it.
+                self.log(
+                    EventKind::Shard,
+                    Severity::Warn,
+                    format!(
+                        "{shard} reports scene {}, which is not the cluster's ({current})",
+                        ack.applied
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The once-a-beat upkeep of the scene: first get above a revision a shard
+    /// reported (the rule of the module docs, "The orchestrator's revision is
+    /// never below a shard's"), then remind whoever has not confirmed
+    /// ([`Self::remind_scene_laggards`]). The run loop calls this on every
+    /// beat.
+    pub fn reconcile_scene(&mut self) {
+        self.catch_up_scene_revision();
+        self.remind_scene_laggards();
+    }
+
+    /// Re-issue the current scene above the highest revision a shard reported,
+    /// if one reported a revision this orchestrator is not above (see the
+    /// module docs). At most once per [`SCENE_RESEND_INTERVAL_TICKS`]: each
+    /// raise is a write to the scene file on the control loop, and whoever can
+    /// send acks must not be able to turn that into a stream of them.
+    fn catch_up_scene_revision(&mut self) {
+        let Some(seen) = self.scene_raise_wanted else {
+            return;
+        };
+        let before = self.scene();
+        if seen < before.revision {
+            // Already above it (an operator's change got there first).
+            self.scene_raise_wanted = None;
+            return;
+        }
+        if self
+            .scene_raised_tick
+            .is_some_and(|at| self.tick.saturating_sub(at) < SCENE_RESEND_INTERVAL_TICKS)
+        {
+            return; // not yet: it stays wanted
+        }
+        self.scene_raised_tick = Some(self.tick);
+        match self.control.scene.raise_above(seen) {
+            Ok(now) => {
+                self.scene_raise_wanted = None;
+                self.scene_changed_tick = Some(self.tick);
+                self.scene_push_pending = true;
+                self.log(
+                    EventKind::Scene,
+                    Severity::Warn,
+                    format!(
+                        "a shard runs scene revision {seen}, which this orchestrator is not \
+                         above (it is at revision {}: was its scene file lost?). The scene {} \
+                         is re-issued as revision {} so that every shard and client follows \
+                         the orchestrator again",
+                        before.revision, now.scene, now.revision
+                    ),
+                );
+            }
+            Err(err) => {
+                // It stays wanted and is tried again in a second.
+                self.log(
+                    EventKind::Scene,
+                    Severity::Warn,
+                    format!(
+                        "a shard runs scene revision {seen}, above this orchestrator's {}, and \
+                         the revision could not be raised above it ({err}): that shard will \
+                         not follow a scene change until it can",
+                        before.revision
+                    ),
+                );
+            }
         }
     }
 
@@ -596,21 +705,37 @@ impl<L: Launcher> Orchestrator<L> {
     /// Deliberately **no** look at the epoch publisher: the map does not
     /// change, so there is nothing to wait for and nothing to hold up.
     ///
+    /// The second value is the new state when the scene changed, `None` when
+    /// the scene asked for was already running.
+    ///
     /// # Errors
     ///
     /// The new scene could not be persisted. Nothing changed then: the shards
     /// keep the scene they have, and so does a restart.
-    fn set_scene(&mut self, scene: Scene) -> Result<String, String> {
+    fn set_scene(&mut self, scene: Scene) -> Result<(String, Option<SceneState>), String> {
         let before = self.control.scene.current();
-        let told = list_shards(&self.scene_recipients().into_iter().collect::<Vec<_>>());
         if self.control.scene.scene() == scene {
-            // Nothing to change. Sending it again is free and is what an
-            // operator pressing the button twice is asking for.
-            self.scene_push_pending = true;
-            return Ok(format!(
-                "the scene is already {before}; it is sent again to {told}"
-            ));
+            // Nothing to change, and the answer must not read as if something
+            // had been: no new revision, nothing sent. (A shard that has not
+            // confirmed is reminded every second anyway.)
+            let waiting: Vec<ShardId> = self
+                .connected
+                .iter()
+                .copied()
+                .filter(|shard| self.scene_confirmed.get(shard) != Some(&before))
+                .collect();
+            let message = if waiting.is_empty() {
+                format!("already running {before}; nothing to do")
+            } else {
+                format!(
+                    "already running {before}; nothing to change. Still waiting for {} to \
+                     confirm it (told again every second)",
+                    list_shards(&waiting)
+                )
+            };
+            return Ok((message, None));
         }
+        let told = list_shards(&self.scene_recipients().into_iter().collect::<Vec<_>>());
         let now = self.control.scene.set(scene).map_err(|err| {
             format!(
                 "the scene could not be saved ({err}), so it was not changed: it is still {before}"
@@ -618,9 +743,12 @@ impl<L: Launcher> Orchestrator<L> {
         })?;
         self.scene_changed_tick = Some(self.tick);
         self.scene_push_pending = true;
-        Ok(format!(
-            "scene {} -> {} (revision {}), sent to {told}",
-            before.scene, now.scene, now.revision
+        Ok((
+            format!(
+                "scene {} -> {} (revision {}), sent to {told}",
+                before.scene, now.scene, now.revision
+            ),
+            Some(now),
         ))
     }
 
@@ -1137,6 +1265,7 @@ impl<L: Launcher> Orchestrator<L> {
     /// Nothing is queued for later. Either way the request is recorded in the
     /// event log, and [`OperatorReply::event`] is that entry's number.
     pub fn handle_operator(&mut self, command: &OperatorCommand) -> OperatorReply {
+        let mut scene_changed = None;
         let outcome = match command {
             OperatorCommand::Split {
                 shard,
@@ -1150,7 +1279,12 @@ impl<L: Launcher> Orchestrator<L> {
             OperatorCommand::PauseAutoscaler => Ok(self.set_autoscaler_paused(true)),
             OperatorCommand::ResumeAutoscaler => Ok(self.set_autoscaler_paused(false)),
             OperatorCommand::PushMap => Ok(self.push_map()),
-            OperatorCommand::SetScene { scene } => self.set_scene(*scene),
+            OperatorCommand::SetScene { scene } => {
+                self.set_scene(*scene).map(|(message, changed)| {
+                    scene_changed = changed;
+                    message
+                })
+            }
         };
         let (accepted, severity, verdict, message) = match outcome {
             Ok(message) => (true, Severity::Info, "accepted", message),
@@ -1165,6 +1299,7 @@ impl<L: Launcher> Orchestrator<L> {
             accepted,
             message,
             event,
+            scene_changed,
         }
     }
 
@@ -1632,8 +1767,9 @@ impl<L: Launcher + 'static> Orchestrator<L> {
     /// order — epoch messages out, launches started, kills carried out.
     async fn beat(&mut self, server: &crate::control::ControlServer) {
         self.tick();
-        // Once a second: the scene again, for whoever has not confirmed it.
-        self.remind_scene_laggards();
+        // The scene's upkeep: get above a revision a shard reported, and (once
+        // a second) say the scene again to whoever has not confirmed it.
+        self.reconcile_scene();
         // Deliver the epoch messages the tick (and the inbound handlers since
         // the last beat) produced. Before the kills below: a shard that is about
         // to be killed is told the outcome of its epoch first.
@@ -3681,16 +3817,35 @@ mod tests {
             "one message each, with the latest scene"
         );
 
-        // The same scene again: no new revision, but it is sent again.
+        // The same scene again: no new revision, nothing sent, and an answer
+        // that cannot be taken for a switch. Nobody has confirmed yet, so it
+        // also says who is still being waited for.
         let reply = orch.handle_operator(&set_scene(Scene::Solar));
         assert!(reply.accepted, "{reply:?}");
-        assert!(
-            reply.message.contains("already solar (revision 5)"),
-            "{reply:?}"
+        assert_eq!(reply.scene_changed, None, "nothing changed");
+        assert_eq!(
+            reply.message,
+            "already running solar (revision 5); nothing to change. Still waiting for shard 1, \
+             shard 2 to confirm it (told again every second)"
         );
         assert_eq!(orch.scene(), at(Scene::Solar, 5));
         assert_eq!(orch.snapshot().scene.changed_tick, Some(0));
-        assert_eq!(scene_sets(&orch.drain_outbox()).len(), 2);
+        assert!(orch.drain_outbox().is_empty(), "nothing is sent for it");
+        // Once everybody has confirmed, there is simply nothing to do.
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 5)));
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Solar, 5)));
+        let reply = orch.handle_operator(&set_scene(Scene::Solar));
+        assert_eq!(
+            reply.message,
+            "already running solar (revision 5); nothing to do"
+        );
+        assert!(reply.accepted && reply.scene_changed.is_none());
+        // A real change, by contrast, names the state it made current.
+        let reply = orch.handle_operator(&set_scene(Scene::Galaxy));
+        assert_eq!(reply.scene_changed, Some(at(Scene::Galaxy, 6)));
+        // And nothing else an operator can ask for claims to have changed it.
+        let reply = orch.handle_operator(&OperatorCommand::PauseAutoscaler);
+        assert_eq!(reply.scene_changed, None);
     }
 
     /// A connected shard that has not confirmed the current revision is told
@@ -3738,12 +3893,216 @@ mod tests {
         }
         assert_eq!(reminders, vec![(ShardId::new(1), at(Scene::Solar, 2))]);
 
-        // A shard reporting a revision the orchestrator never issued is not
-        // asked again: it would change nothing.
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Galaxy, 40)));
+        // A shard reporting a revision too far ahead to be anything but
+        // nonsense is not asked again: it would change nothing.
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Galaxy, NONSENSE_REVISION)));
         for _ in 0..(2 * SCENE_RESEND_INTERVAL_TICKS) {
             assert!(beat(&mut orch).is_empty());
         }
+        assert_eq!(sync_of(&orch, 1), SceneSync::Differs);
+    }
+
+    /// A revision no real cluster reaches: past what the orchestrator will
+    /// catch up with ([`MAX_REVISION_CATCH_UP`]).
+    const NONSENSE_REVISION: u64 = MAX_REVISION_CATCH_UP * 4;
+
+    /// The convergence rule, with a real shard state machine on the other
+    /// end: an orchestrator that restarted **without its scene file** counts
+    /// from 1 again while a shard (and that shard's clients) still holds a
+    /// higher revision. Left alone, nothing the orchestrator says is ever
+    /// adopted. It finds out from the shard's answer, re-issues its scene
+    /// above the shard's revision, and from then on is heard again — by the
+    /// shard and by its client.
+    ///
+    /// Mutation this catches: treating a shard that is ahead as merely "not
+    /// the cluster's" (every later switch is accepted, saved, sent — and
+    /// ignored by that shard for ever), or adopting the *shard's* scene (the
+    /// orchestrator would stop being the authority).
+    #[test]
+    fn an_orchestrator_that_lost_its_scene_file_gets_back_above_a_shard_that_kept_running() {
+        use space_server::shard::{Destination, Shard};
+        use space_server::ShardConfig;
+
+        // The shard has been running since before the restart: solar, rev 9,
+        // with one client connected that was told so.
+        let mut shard = Shard::new(ShardConfig::new(
+            ShardId::new(1),
+            addr(9_001),
+            OrchestratorConfig::default().root_node(),
+        ));
+        assert!(shard.set_scene(at(Scene::Solar, 9)));
+        let player = shard
+            .join(&space_protocol::Hello {
+                protocol: space_protocol::PROTOCOL_VERSION,
+                player_token: "player".into(),
+            })
+            .expect("joins")
+            .session;
+        let _ = shard.take_outbox();
+
+        // The orchestrator starts over: the default scene at revision 1.
+        let mut orch = orchestrator_with_first_id(100);
+        orch.handle_shard_hello(&ShardHello {
+            cluster: OrchestratorConfig::default().cluster,
+            shard: ShardId::new(1),
+            endpoint: addr(9_001),
+            region: None,
+        })
+        .expect("the shard registers");
+        orch.note_connected([ShardId::new(1)]);
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 1));
+
+        // Everything the two say to each other, until nothing is left to say.
+        // Returns what the shard told its client on the way.
+        let exchange = |orch: &mut Orchestrator<MockLauncher>, shard: &mut Shard| {
+            let mut told_the_client = Vec::new();
+            let mut to_shard = vec![orch.scene_message()];
+            for _ in 0..10 {
+                for message in to_shard.drain(..) {
+                    shard.orchestrator_message(message);
+                }
+                for out in shard.take_outbox() {
+                    match (out.dest, out.message) {
+                        (Destination::Orchestrator, Message::SceneAck(ack)) => {
+                            orch.handle_scene_ack(&ack);
+                        }
+                        (Destination::Client(session), Message::SceneUpdate(state)) => {
+                            told_the_client.push((session, state));
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+                // One beat of the run loop (well over a second apart, so the
+                // once-a-second limit on raises is not what is being tested).
+                for _ in 0..=SCENE_RESEND_INTERVAL_TICKS {
+                    orch.tick();
+                }
+                orch.reconcile_scene();
+                to_shard = orch
+                    .drain_outbox()
+                    .into_iter()
+                    .filter(|(to, _)| *to == ShardId::new(1))
+                    .map(|(_, message)| message)
+                    .collect();
+                if to_shard.is_empty() {
+                    break;
+                }
+            }
+            told_the_client
+        };
+
+        // The welcome's scene (demo-area, 1) is not adopted by the shard; its
+        // answer makes the orchestrator re-issue demo-area above revision 9.
+        let told = exchange(&mut orch, &mut shard);
+        assert_eq!(
+            orch.scene(),
+            at(Scene::DemoArea, 10),
+            "the orchestrator's scene, one above the shard's revision"
+        );
+        assert_eq!(
+            shard.scene(),
+            at(Scene::DemoArea, 10),
+            "and the shard follows"
+        );
+        assert_eq!(told, vec![(player, at(Scene::DemoArea, 10))]);
+        assert_eq!(sync_of(&orch, 1), SceneSync::InSync);
+        assert_eq!(orch.snapshot().scene.revision, 10);
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("a shard runs scene revision 9")
+                    && t.contains("demo-area is re-issued as revision 10")),
+            "{texts:?}"
+        );
+
+        // From here on a switch works like any other: accepted, adopted, told.
+        let reply = orch.handle_operator(&set_scene(Scene::Galaxy));
+        assert_eq!(reply.scene_changed, Some(at(Scene::Galaxy, 11)));
+        let told = exchange(&mut orch, &mut shard);
+        assert_eq!(shard.scene(), at(Scene::Galaxy, 11));
+        assert_eq!(told, vec![(player, at(Scene::Galaxy, 11))]);
+        assert_eq!(sync_of(&orch, 1), SceneSync::InSync);
+    }
+
+    /// The same rule in the three shapes it can take, and its two limits.
+    #[test]
+    fn the_orchestrator_gets_above_a_reported_revision_once_a_second_and_within_reason() {
+        let mut orch = two_registered_shards();
+        let _ = orch.drain_outbox();
+        let log_before = orch.events().len();
+
+        // The same revision with another scene is "not above" too.
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 1)));
+        assert_eq!(
+            orch.scene(),
+            at(Scene::DemoArea, 1),
+            "nothing until the beat"
+        );
+        orch.tick();
+        orch.reconcile_scene();
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 2));
+        assert_eq!(
+            scene_sets(&orch.drain_outbox()),
+            vec![
+                (ShardId::new(1), at(Scene::DemoArea, 2)),
+                (ShardId::new(2), at(Scene::DemoArea, 2))
+            ],
+            "re-issued to every shard"
+        );
+        assert_eq!(orch.snapshot().scene.changed_tick, Some(1));
+
+        // Several shards ahead, several answers: one raise, above the highest,
+        // and not before a second has passed since the last one.
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 7)));
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, 30)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 12)));
+        for _ in 1..SCENE_RESEND_INTERVAL_TICKS {
+            orch.tick();
+            orch.reconcile_scene();
+            assert_eq!(
+                orch.scene(),
+                at(Scene::DemoArea, 2),
+                "at most one raise (one write of the scene file) a second"
+            );
+        }
+        orch.tick();
+        orch.reconcile_scene();
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 31));
+        assert_eq!(orch.events().len(), log_before + 2, "one entry per raise");
+
+        // Nonsense is not followed (it would leave no revision above it): it
+        // is shown and said once, and the scene can still be changed.
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, u64::MAX - 1)));
+        for _ in 0..(2 * SCENE_RESEND_INTERVAL_TICKS) {
+            orch.tick();
+            orch.reconcile_scene();
+        }
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 31));
+        assert_eq!(sync_of(&orch, 2), SceneSync::Differs);
+        assert!(event_texts(&orch)[0].starts_with("shard 2 reports scene galaxy"));
+        assert!(orch.handle_operator(&set_scene(Scene::Solar)).accepted);
+        assert_eq!(orch.scene(), at(Scene::Solar, 32));
+
+        // An operator's change that already got above a reported revision
+        // leaves nothing to catch up with.
+        let mut orch = two_registered_shards();
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 1)));
+        assert!(orch.handle_operator(&set_scene(Scene::Galaxy)).accepted);
+        orch.tick();
+        orch.reconcile_scene();
+        assert_eq!(orch.scene(), at(Scene::Galaxy, 2), "no second bump");
+
+        // A raise that cannot be saved is not made, says so, and is tried
+        // again; the shard stays visibly out of step meanwhile.
+        let mut orch = two_registered_shards();
+        orch.control.scene =
+            crate::scene::SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSceneSink));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 9)));
+        orch.tick();
+        orch.reconcile_scene();
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 1));
+        assert!(event_texts(&orch)[0].contains("could not be raised above it"));
         assert_eq!(sync_of(&orch, 1), SceneSync::Differs);
     }
 
@@ -3785,17 +4144,22 @@ mod tests {
         );
         assert_eq!(orch.events().len(), logged, "and nothing more is logged");
 
-        // A revision that was never issued is recorded and said once.
-        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, 9)));
+        // A revision far past anything this cluster could have issued is
+        // recorded and said once.
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, NONSENSE_REVISION)));
         assert_eq!(sync_of(&orch, 2), SceneSync::Differs);
         assert!(
-            event_texts(&orch)[0].starts_with("shard 2 reports scene galaxy (revision 9)"),
+            event_texts(&orch)[0].starts_with("shard 2 reports scene galaxy (revision "),
             "{:?}",
             event_texts(&orch)[0]
         );
         let logged = orch.events().len();
-        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, 10)));
-        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, 11)));
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, NONSENSE_REVISION + 1)));
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, NONSENSE_REVISION + 2)));
+        for _ in 0..(2 * SCENE_RESEND_INTERVAL_TICKS) {
+            orch.tick();
+            orch.reconcile_scene();
+        }
         assert_eq!(orch.events().len(), logged, "once, not for every repeat");
         assert_eq!(orch.scene(), at(Scene::Solar, 2), "and it changes no scene");
     }

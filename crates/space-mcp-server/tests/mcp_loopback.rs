@@ -10,13 +10,16 @@ use space_mcp_server::{mcp_server, ShardHarness};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 10] = [
     "shard_status",
     "topology",
     "list_ships",
     "spawn_ship",
     "ship_state",
     "despawn_ship",
+    "set_scene",
+    "list_bodies",
+    "spawn_body",
     "advance_ticks",
 ];
 
@@ -277,6 +280,66 @@ async fn mcp_over_streamable_http_drives_a_real_shard() {
     )
     .await;
     assert_eq!(tool_json(&r.rpc())["count"], 0);
+
+    // physics: a scene with bodies, a body of our own, and every entity listed
+    let r = post(
+        addr,
+        BOTH,
+        Some(&session),
+        &call(20, "set_scene", &json!({"scene": "demo-area"})),
+    )
+    .await;
+    let set = tool_json(&r.rpc());
+    let showcase = space_scene::body_defs(space_protocol::Scene::DemoArea).len();
+    assert_eq!(set["bodies"], json!(showcase), "the showcase was spawned");
+    let r = post(
+        addr,
+        BOTH,
+        Some(&session),
+        &call(
+            21,
+            "spawn_body",
+            &json!({"shape": "crate", "size": 0.5, "offset": [200.0, 0.0, 0.0], "velocity": [1.0, 0.0, 0.0]}),
+        ),
+    )
+    .await;
+    assert_eq!(r.rpc()["result"]["isError"], false, "{}", r.body);
+    let r = post(
+        addr,
+        BOTH,
+        Some(&session),
+        &call(22, "advance_ticks", &json!({"ticks": 30})),
+    )
+    .await;
+    assert_eq!(r.rpc()["result"]["isError"], false);
+    let r = post(
+        addr,
+        BOTH,
+        Some(&session),
+        &call(23, "list_bodies", &json!({})),
+    )
+    .await;
+    let listed = tool_json(&r.rpc());
+    assert_eq!(listed["count"], json!(showcase + 1));
+    let ours = listed["bodies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["offset_from_region_centre_m"][0].as_f64().unwrap() > 150.0)
+        .expect("the spawned crate");
+    assert_eq!(ours["kind"], "body");
+    assert!(
+        (ours["offset_from_region_centre_m"][0].as_f64().unwrap() - 201.0).abs() < 0.01,
+        "it flew a metre in a second: {ours}"
+    );
+    for (name, args) in [
+        ("set_scene", json!({"scene": "nowhere"})),
+        ("spawn_body", json!({"shape": "teapot"})),
+        ("spawn_body", json!({"size": 99.0})),
+    ] {
+        let r = post(addr, BOTH, Some(&session), &call(24, name, &args)).await;
+        assert_eq!(r.rpc()["result"]["isError"], true, "{name} {args}");
+    }
 
     // an unknown method is a JSON-RPC error; an unknown tool is invalid params
     let r = post(

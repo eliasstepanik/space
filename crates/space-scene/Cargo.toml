@@ -1,0 +1,26 @@
+[package]
+name = "space-scene"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The shared physical definition of every server scene: static colliders, bodies to spawn, gravity zones and large bodies, the shape catalogue (with the Kestrel collider read from its GLB) and the scene anchor rule"
+
+[dependencies]
+space-world = { workspace = true }
+space-sim = { workspace = true }
+space-protocol = { workspace = true }
+# The GLB reader parses the file's JSON chunk. Already in the lockfile (xtask,
+# the MCP crates), pure Rust: no new crate.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The geometric checks of the tests (shape overlap) use parry directly.
+rapier3d-f64 = { workspace = true }
+# The demo area's statics are checked against what the client draws
+# (`space_client::demo_area`). An integration-test-only dependency: when the
+# client depends on this crate (phase 3) the cycle stays legal for Cargo.
+space-client = { path = "../space-client" }
+
+[lints]
+workspace = true

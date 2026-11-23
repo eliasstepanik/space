@@ -250,7 +250,7 @@ struct Shell {
 
 impl Shell {
     fn new(
-        app: App,
+        mut app: App,
         config: &WindowConfig,
         display: RawDisplayHandle,
     ) -> Result<Self, RenderError> {
@@ -258,6 +258,7 @@ impl Shell {
             window_display: Some(display),
             ..ContextOptions::default()
         })?;
+        app.set_render_device(ctx.device_name());
         eprintln!(
             "space-client: device {:?} ray_query={}",
             ctx.device_name(),

@@ -458,9 +458,9 @@ fn process_secret() -> [u64; 2] {
 /// one source of operating-system randomness the standard library exposes:
 /// the keys of a [`std::collections::hash_map::RandomState`]. Each half of a
 /// token is a SipHash, under a fresh such state, of a process-wide secret
-/// ([`process_secret`]: keyed hashes drawn on two threads), a process-wide
+/// (`process_secret`: keyed hashes drawn on two threads), a process-wide
 /// counter (no two tokens hash the same input), and the process id, both
-/// clocks and a stack and a code address ([`ambient_entropy`]).
+/// clocks and a stack and a code address (`ambient_entropy`).
 ///
 /// # What this relies on
 ///

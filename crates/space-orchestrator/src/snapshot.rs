@@ -102,6 +102,84 @@ impl SceneView {
     }
 }
 
+/// How far a scene has got: of the shards that hold a control link, who runs
+/// the current scene and who does not yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneProgress {
+    /// The current scene.
+    pub scene: Scene,
+    /// Its revision.
+    pub revision: u64,
+    /// The connected shards that have confirmed exactly this scene and
+    /// revision.
+    pub confirmed: Vec<ShardId>,
+    /// The connected shards that have not (yet): nothing confirmed, an older
+    /// revision, or something that is not the cluster's.
+    pub waiting: Vec<ShardId>,
+}
+
+impl SceneProgress {
+    /// How many shards hold a control link.
+    #[must_use]
+    pub fn connected(&self) -> usize {
+        self.confirmed.len() + self.waiting.len()
+    }
+
+    /// Whether nobody is being waited for (also true when nobody is
+    /// connected).
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// The state in one sentence, for a person and for a script alike:
+    /// `All 2 connected shards switched to solar (revision 4)`,
+    /// `Switching to solar (revision 4): waiting for shard 2 … (1 of 2
+    /// connected shards confirmed)`, or that no shard is connected.
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        let (scene, revision) = (self.scene, self.revision);
+        let connected = self.connected();
+        let shards = if connected == 1 { "shard" } else { "shards" };
+        if connected == 0 {
+            format!(
+                "No shard is connected: {scene} (revision {revision}) is saved and is handed \
+                 to each shard when it registers"
+            )
+        } else if self.waiting.is_empty() {
+            format!("All {connected} connected {shards} switched to {scene} (revision {revision})")
+        } else {
+            let waiting: Vec<String> = self.waiting.iter().map(ToString::to_string).collect();
+            format!(
+                "Switching to {scene} (revision {revision}): waiting for {} … ({} of \
+                 {connected} connected {shards} confirmed)",
+                waiting.join(", "),
+                self.confirmed.len()
+            )
+        }
+    }
+}
+
+impl Snapshot {
+    /// How far the current scene has got (see [`SceneProgress`]).
+    #[must_use]
+    pub fn scene_progress(&self) -> SceneProgress {
+        let (confirmed, waiting) = self
+            .shards
+            .iter()
+            .filter(|shard| shard.connected)
+            .partition::<Vec<&ShardView>, _>(|shard| {
+                self.scene.sync_of(shard.scene) == SceneSync::InSync
+            });
+        SceneProgress {
+            scene: self.scene.scene,
+            revision: self.scene.revision,
+            confirmed: confirmed.into_iter().map(|shard| shard.shard).collect(),
+            waiting: waiting.into_iter().map(|shard| shard.shard).collect(),
+        }
+    }
+}
+
 /// How a shard's confirmed scene compares with the cluster's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneSync {
@@ -386,6 +464,43 @@ mod tests {
         );
         assert_eq!(view.sync_of(at(Scene::Solar, 9)), SceneSync::Differs);
         assert_eq!(SceneSync::Behind.label(), "behind");
+    }
+
+    #[test]
+    fn the_progress_of_a_scene_reads_as_one_sentence() {
+        let progress = |confirmed: &[u32], waiting: &[u32]| SceneProgress {
+            scene: Scene::Solar,
+            revision: 4,
+            confirmed: confirmed.iter().copied().map(ShardId::new).collect(),
+            waiting: waiting.iter().copied().map(ShardId::new).collect(),
+        };
+        let all = progress(&[1, 2], &[]);
+        assert!(all.settled());
+        assert_eq!(
+            all.sentence(),
+            "All 2 connected shards switched to solar (revision 4)"
+        );
+        assert_eq!(
+            progress(&[1], &[]).sentence(),
+            "All 1 connected shard switched to solar (revision 4)"
+        );
+        let pending = progress(&[1], &[2, 3]);
+        assert!(!pending.settled());
+        assert_eq!(pending.connected(), 3);
+        assert_eq!(
+            pending.sentence(),
+            "Switching to solar (revision 4): waiting for shard 2, shard 3 … (1 of 3 connected \
+             shards confirmed)"
+        );
+        let nobody = progress(&[], &[]);
+        assert!(nobody.settled(), "nobody to wait for");
+        assert!(
+            nobody
+                .sentence()
+                .starts_with("No shard is connected: solar (revision 4) is saved"),
+            "{}",
+            nobody.sentence()
+        );
     }
 
     #[test]

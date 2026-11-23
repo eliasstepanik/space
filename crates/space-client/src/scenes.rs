@@ -25,6 +25,7 @@ use space_render::{
 use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 
 use crate::demo_area::DemoArea;
+use crate::kestrel::Detail;
 
 /// The catalogue of scenes ([`space_protocol::Scene`]), for programs that use
 /// this module without depending on the protocol crate.
@@ -248,13 +249,33 @@ pub struct Lens {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct World {
     scene: space_protocol::Scene,
+    /// What draws it: decides how soon the costly models are shown in full.
+    detail: Detail,
 }
 
 impl World {
-    /// The world of `scene`.
+    /// The world of `scene`, as a GPU draws it.
     #[must_use]
     pub const fn new(scene: space_protocol::Scene) -> Self {
-        Self { scene }
+        Self {
+            scene,
+            detail: Detail::Hardware,
+        }
+    }
+
+    /// The same world, built for a renderer of this `detail` (a front end
+    /// passes [`Detail::for_device`] of its render context: a software
+    /// rasteriser is shown the Kestrel's proxy for longer).
+    #[must_use]
+    pub const fn with_detail(mut self, detail: Detail) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    /// What this world is built for.
+    #[must_use]
+    pub const fn detail(&self) -> Detail {
+        self.detail
     }
 
     /// Which scene this is.
@@ -352,7 +373,7 @@ impl World {
     #[must_use]
     pub fn build(&self, camera: &CameraPose) -> Scene {
         let scene = match self.scene {
-            space_protocol::Scene::DemoArea => DemoArea::shared().scene(camera),
+            space_protocol::Scene::DemoArea => DemoArea::shared().scene_for(camera, self.detail),
             space_protocol::Scene::Materials => materials_scene(camera),
             space_protocol::Scene::Solar => solar_scene(camera),
             space_protocol::Scene::Galaxy => galaxy_scene(camera),

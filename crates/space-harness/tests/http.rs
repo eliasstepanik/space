@@ -253,6 +253,12 @@ fn state_is_the_clients_snapshot_as_json() {
         "retry_in_s",
         "frame",
         "fps",
+        "gravity",
+        "landed",
+        "bodies",
+        "bodies_in_view",
+        "correction_m",
+        "correction_max_m",
     ] {
         assert!(now.get(field).is_some(), "no {field} in {now}");
     }

@@ -765,6 +765,30 @@ impl RenderContext {
             && !scene.lights.is_empty()
     }
 
+    /// Does a frame of `scene` with `options` trace rays through its glass —
+    /// refract it through its real shape instead of bending the view once at
+    /// its surface? Only when the preset has refraction, the device can
+    /// trace rays and there is glass in the scene.
+    #[must_use]
+    pub fn glass_rays_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
+        options.preset.features().refraction
+            && self.ray_query.complete()
+            && !options.ray_probe
+            && scene.instances.iter().any(|i| i.transmission > 0.0)
+    }
+
+    /// Does a frame of `scene` with `options` cast sky rays — ask, per pixel,
+    /// how much of the environment's light reaches a surface? Only when the
+    /// preset has them ([`crate::quality`]), the device can trace rays and
+    /// the scene has an environment to keep out.
+    #[must_use]
+    pub fn sky_occlusion_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
+        options.preset.features().sky_rays > 0
+            && self.ray_query.complete()
+            && !options.ray_probe
+            && !scene.environment.is_none()
+    }
+
     /// Render one frame of `scene` offscreen and read the pixels back.
     ///
     /// `options.gi_enabled` is honoured only when the device supports ray
@@ -978,8 +1002,15 @@ impl RenderContext {
         }
 
         // Acceleration structures only for a frame that actually traces rays.
-        let shadows = self.shadows_active(scene, options);
-        let traces_rays = options.gi_enabled || options.ray_probe || shadows;
+        // (Shadow rays and sky rays come out of the same forward shaders.)
+        let shadows =
+            self.shadows_active(scene, options) || self.sky_occlusion_active(scene, options);
+        // The post pass follows rays for glass, and for what a mirror
+        // reflects from off screen (which the environment would otherwise
+        // shine through).
+        let glass_rays = self.glass_rays_active(scene, options)
+            || (options.preset.features().ssr && self.sky_occlusion_active(scene, options));
+        let traces_rays = options.gi_enabled || options.ray_probe || shadows || glass_rays;
 
         // Mesh models: upload any model seen for the first time (buffers and
         // textures; its BLAS when a frame first traces rays against it), drop
@@ -1041,7 +1072,7 @@ impl RenderContext {
                     record: mesh_records.len() as u32,
                     texture_set: part.texture_set,
                 });
-                mesh_records.push(mesh_record(model, &source.material));
+                mesh_records.push(mesh_record(model, &source.material, gpu.is_sheet()));
             }
             // A placement the rays can see: its records start at `first_record`
             // and follow the BLAS's geometry order (one per drawn part).
@@ -1210,6 +1241,7 @@ impl RenderContext {
                 tlas,
                 gi_dispatch: options.gi_enabled && !options.mutate_skip_gi_dispatch,
                 shadows: shadows && tlas.is_some(),
+                glass_rays: glass_rays && tlas.is_some(),
                 sky: scene.environment.background && !scene.environment.is_none(),
                 overlay,
             },
@@ -1251,8 +1283,13 @@ fn is_placeable(model: &ModelInstance) -> bool {
     finite && model.scale.is_finite() && model.scale != 0.0
 }
 
-/// The GPU record of one part of `model`: its placement and `material`.
-fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> MeshInstanceGpu {
+/// The GPU record of one part of `model`: its placement and `material`, and
+/// whether its mesh is an open surface (`sheet`) rather than a closed solid.
+fn mesh_record(
+    model: &ModelInstance,
+    material: &crate::mesh::MeshMaterial,
+    sheet: bool,
+) -> MeshInstanceGpu {
     let [model_x, model_y, model_z] = model_rows(model);
     let [r, g, b] = material.base_color;
     let [er, eg, eb] = material.emissive;
@@ -1262,6 +1299,7 @@ fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> M
         model_z,
         albedo: [r, g, b, material.metallic],
         emissive: [er, eg, eb, material.roughness],
+        surface: [f32::from(u8::from(sheet)), 0.0, 0.0, 0.0],
     }
 }
 
@@ -1440,7 +1478,13 @@ fn build_uniforms(
             fog_density,
         ],
         features: feature_flags,
-        _pad2: [0; 3],
+        sky_rays: if scene.environment.is_none() {
+            0
+        } else {
+            features.sky_rays
+        },
+        ssr_max_roughness: features.ssr_max_roughness,
+        _pad2: 0,
         environment: environment_gpu(&scene.environment),
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {
@@ -1468,6 +1512,7 @@ fn build_uniforms(
             grid_size: [q.grid, q.grid],
             rays_per_probe: q.rays_per_probe,
             _pad: [0.0; 3],
+            environment: forward.environment,
         })
     } else {
         None
@@ -1507,15 +1552,24 @@ fn build_post_params(
         ssr_max_roughness: features.ssr_max_roughness,
         refract_distance: REFRACT_DISTANCE_M,
         refract_eta: REFRACT_ETA,
-        _pad: 0.0,
+        fog_density: if forward.features & quality::FEATURE_FOG != 0 {
+            forward.fog[3]
+        } else {
+            0.0
+        },
         environment: forward.environment,
+        lights: forward.lights,
+        light_count: forward.light_count,
+        glass_bounces: features.glass_bounces,
+        _pad1: [0; 2],
     }
 }
 
 /// The scene's environment as the shaders read it: the three colours times
-/// the intensity, with the "there is one" flag in `zenith.w`. All zero for a
-/// scene without an environment ([`Environment::is_none`]), so its shaders
-/// skip every environment term after reading that one value.
+/// the intensity, with the "there is one" flag in `zenith.w` and "it is the
+/// painted background" in `horizon.w`. All zero for a scene without an
+/// environment ([`Environment::is_none`]), so its shaders skip every
+/// environment term after reading that one value.
 fn environment_gpu(environment: &Environment) -> params::EnvironmentGpu {
     if environment.is_none() {
         return params::EnvironmentGpu::default();
@@ -1524,7 +1578,7 @@ fn environment_gpu(environment: &Environment) -> params::EnvironmentGpu {
     let rgb = |c: [f32; 3], w: f32| [c[0], c[1], c[2], w];
     params::EnvironmentGpu {
         zenith: rgb(zenith, 1.0),
-        horizon: rgb(horizon, 0.0),
+        horizon: rgb(horizon, f32::from(u8::from(environment.background))),
         ground: rgb(ground, 0.0),
     }
 }

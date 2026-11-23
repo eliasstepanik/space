@@ -49,6 +49,18 @@ use space_protocol::{Scene, SceneState};
 /// The revision a scene has when nothing was persisted before it.
 pub const FIRST_REVISION: u64 = 1;
 
+/// The largest gap between this orchestrator's revision and one a shard
+/// reports that is still taken for the truth ("my scene file was lost") rather
+/// than for nonsense.
+///
+/// The orchestrator catches up with a revision a shard reports (see
+/// [`SceneStore::raise_above`]). Without a bound, a single message naming a
+/// revision near `u64::MAX` — the control port checks a cluster name and
+/// nothing else — would leave no revision above it, and the scene could never
+/// change again. A real gap is the number of scene changes ever made; four
+/// billion is far above that and far below the ceiling.
+pub const MAX_REVISION_CATCH_UP: u64 = 1 << 32;
+
 /// How often the run loop offers the scene again to a connected shard that has
 /// not confirmed the current revision, in ticks (once a second).
 ///
@@ -340,6 +352,32 @@ impl SceneStore {
         self.restored = false;
         Ok(next)
     }
+
+    /// Re-issue the **current** scene at a revision above `seen` (and above
+    /// the current one), persisting it first, and return the new state.
+    ///
+    /// This is how the orchestrator stays the authority when it finds a shard
+    /// running a revision it does not have — its scene file was lost or
+    /// replaced, so it restarted counting at 1 while shards and clients still
+    /// hold a higher number. Receivers only ever adopt a higher revision, so
+    /// from below nothing it says would be heard, by anyone, for ever. The
+    /// scene stays the orchestrator's; only the number moves.
+    ///
+    /// # Errors
+    ///
+    /// The sink's error, or an error when no higher revision exists. Nothing
+    /// changed then.
+    pub fn raise_above(&mut self, seen: u64) -> io::Result<SceneState> {
+        let revision = seen
+            .max(self.revision)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("the scene revision cannot rise any further"))?;
+        let next = SceneState::new(self.scene.id(), revision);
+        self.sink.persist(next)?;
+        self.revision = revision;
+        self.restored = false;
+        Ok(next)
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +598,37 @@ mod tests {
         );
         assert!(store.set(Scene::Solar).is_err());
         assert_eq!(store.scene(), Scene::DemoArea);
+    }
+
+    /// Mutation this catches: re-issuing at `seen` itself (the shard that
+    /// holds `seen` would still not adopt it), changing the scene along the
+    /// way, or raising without saving (a restart would fall behind again).
+    #[test]
+    fn raising_above_a_seen_revision_keeps_the_scene_and_saves_the_number() {
+        let state = temp_path("raise");
+        remove(&state);
+        let path = scene_path(&state);
+        let mut store = SceneStore::open(&path, Scene::Solar);
+        assert_eq!(store.current(), SceneState::new(Scene::Solar.id(), 1));
+        assert_eq!(
+            store.raise_above(9).expect("saved"),
+            SceneState::new(Scene::Solar.id(), 10)
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("saved"), "10 solar\n");
+        // Something at or below the current revision still moves one up.
+        assert_eq!(store.raise_above(3).expect("saved").revision, 11);
+        assert_eq!(store.raise_above(11).expect("saved").revision, 12);
+        assert_eq!(store.scene(), Scene::Solar);
+        // The ceiling is an error, not a wrap-around.
+        assert!(store.raise_above(u64::MAX).is_err());
+        assert_eq!(store.revision(), 12);
+        // A restart resumes from the raised number.
+        assert_eq!(SceneStore::open(&path, Scene::DemoArea).revision(), 12);
+        remove(&state);
+
+        let mut broken = SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSink));
+        assert!(broken.raise_above(9).is_err());
+        assert_eq!(broken.revision(), 1, "nothing changed");
     }
 
     #[test]

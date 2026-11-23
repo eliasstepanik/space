@@ -63,8 +63,8 @@ pub use control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, Load
 pub use guid::EntityGuid;
 pub use messages::{
     Delta, EntitySnapshot, GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer,
-    HandoffReason, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, Reject,
-    RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
+    HandoffReason, Hello, InputTick, IslandKey, Message, NeighbourStatus, PlayerInput, Redirect,
+    Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
 pub use scene::{Scene, SceneAck, SceneId, SceneState, UnknownScene};

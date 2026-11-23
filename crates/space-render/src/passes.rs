@@ -34,6 +34,13 @@ use crate::texture::Texture;
 /// shading normal (octahedral, signed), so it has to be a float format.
 const MATERIAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// Format of the specular buffer: rgb = a surface's base colour (with its
+/// metalness, from the material buffer, that gives the specular colour F0
+/// the post pass tints reflections with, and the diffuse colour it needs to
+/// smooth the sky's share of light), a = the share of the environment its
+/// mirror direction can see. Four bytes a pixel.
+const SPECULAR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
 /// Format of the tone-mapped output image (what is read back or blitted to
 /// the swapchain, and what the overlay is blended onto).
 const OUT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -65,6 +72,8 @@ pub(crate) struct Shaders {
     pub forward_sky_vs: Vec<u32>,
     pub forward_sky_fs: Vec<u32>,
     pub post: Vec<u32>,
+    /// The post pass with ray queries (glass refracted through its shape).
+    pub post_rq: Vec<u32>,
     pub overlay_vs: Vec<u32>,
     pub overlay_fs: Vec<u32>,
 }
@@ -123,6 +132,7 @@ impl Shaders {
                 "/forward_sky_fs.spv"
             ))),
             post: words(include_bytes!(concat!(env!("OUT_DIR"), "/post.spv"))),
+            post_rq: words(include_bytes!(concat!(env!("OUT_DIR"), "/post_rq.spv"))),
             overlay_vs: words(include_bytes!(concat!(env!("OUT_DIR"), "/overlay_vs.spv"))),
             overlay_fs: words(include_bytes!(concat!(env!("OUT_DIR"), "/overlay_fs.spv"))),
         }
@@ -168,6 +178,8 @@ pub(crate) struct Pipelines {
     pub tone_pipeline: vk::Pipeline,
     pub rq_pipeline: vk::Pipeline,
     pub post_pipeline: vk::Pipeline,
+    /// The post pass with ray queries; null on a device without them.
+    pub post_pipeline_rq: vk::Pipeline,
     /// Overlay pass: the tone-mapped output image, LOADed and blended onto.
     pub render_pass_overlay: vk::RenderPass,
     pub overlay_layout: vk::PipelineLayout,
@@ -346,6 +358,9 @@ impl Created<'_> {
                                 .depth_clamp_enable(false)
                                 .rasterizer_discard_enable(false)
                                 .polygon_mode(vk::PolygonMode::FILL)
+                                // Both sides of every triangle are drawn;
+                                // `side_of` in shaders/forward.wgsl tells
+                                // them apart (not by the winding).
                                 .cull_mode(vk::CullModeFlags::NONE)
                                 .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                                 .depth_bias_enable(false)
@@ -620,7 +635,9 @@ impl Pipelines {
                 .map_err(|e| RenderError::new(format!("rq set layout: {e}")))?
         };
 
-        // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out
+        // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out,
+        // 6 specular; and for the ray-query variant only (left unwritten
+        // otherwise): 7 the scene's TLAS, 8 instances, 9 mesh part records
         let post_set_layout = unsafe {
             let sampled = |b| {
                 binding(
@@ -646,6 +663,25 @@ impl Pipelines {
                         binding(
                             5,
                             vk::DescriptorType::STORAGE_IMAGE,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                        sampled(6),
+                        binding(
+                            7,
+                            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                        binding(
+                            8,
+                            vk::DescriptorType::STORAGE_BUFFER,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                        binding(
+                            9,
+                            vk::DescriptorType::STORAGE_BUFFER,
                             1,
                             vk::ShaderStageFlags::COMPUTE,
                         ),
@@ -692,7 +728,7 @@ impl Pipelines {
 
         // ---- render passes ------------------------------------------------------
         // Opaque pass: attachment 0 = HDR colour, 1 = material + shading normal
-        // (rgba16f), 2 = depth.
+        // (rgba16f), 2 = specular colour (rgba8), 3 = depth.
         // Depth is STOREd and ends in a read-only layout so the post pass can
         // sample it.
         let color_ref = |attachment: u32| {
@@ -720,9 +756,9 @@ impl Pipelines {
             | vk::AccessFlags::COLOR_ATTACHMENT_READ
             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ;
         let render_pass = unsafe {
-            let color_refs = [color_ref(0), color_ref(1)];
+            let color_refs = [color_ref(0), color_ref(1), color_ref(2)];
             let depth_ref = vk::AttachmentReference::default()
-                .attachment(2)
+                .attachment(3)
                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             device
                 .create_render_pass(
@@ -730,6 +766,7 @@ impl Pipelines {
                         .attachments(&[
                             color_attachment(vk::Format::R16G16B16A16_SFLOAT),
                             color_attachment(MATERIAL_FORMAT),
+                            color_attachment(SPECULAR_FORMAT),
                             vk::AttachmentDescription::default()
                                 .format(vk::Format::D32_SFLOAT)
                                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -878,7 +915,10 @@ impl Pipelines {
                        fs: (vk::ShaderModule, &'static std::ffi::CStr),
                        pass: vk::RenderPass,
                        vertex: VertexInput| {
-            c.graphics_pipeline(vs, fs, forward_layout, pass, 2, vertex)
+            // (The glass pass has no specular buffer: glass is not mirrored
+            // by the post pass.)
+            let targets = if pass == render_pass { 3 } else { 2 };
+            c.graphics_pipeline(vs, fs, forward_layout, pass, targets, vertex)
         };
         let (procedural, mesh) = (VertexInput::Procedural, VertexInput::Mesh);
         let graphics = forward(
@@ -937,6 +977,14 @@ impl Pipelines {
         let tone_pipeline = c.compute_pipeline(m_tone, tone_layout, "tone pipeline")?;
         let rq_pipeline = c.compute_pipeline(m_rq, rq_layout, "rq pipeline")?;
         let post_pipeline = c.compute_pipeline(m_post, post_layout, "post pipeline")?;
+        // Its ray-query variant only exists where ray queries do.
+        let post_pipeline_rq = if config.ray_query {
+            let module = c.module(&shaders.post_rq, "post_rq")?;
+            modules.push(module);
+            c.compute_pipeline(module, post_layout, "post pipeline (ray queries)")?
+        } else {
+            vk::Pipeline::null()
+        };
 
         let sampler = unsafe {
             device
@@ -1001,6 +1049,7 @@ impl Pipelines {
             tone_pipeline,
             rq_pipeline,
             post_pipeline,
+            post_pipeline_rq,
             render_pass_overlay,
             overlay_layout,
             overlay_pipeline,
@@ -1041,6 +1090,9 @@ impl Pipelines {
         device.destroy_pipeline(self.graphics_sky, None);
         device.destroy_pipeline(self.overlay_pipeline, None);
         device.destroy_pipeline(self.post_pipeline, None);
+        if self.post_pipeline_rq != vk::Pipeline::null() {
+            device.destroy_pipeline(self.post_pipeline_rq, None);
+        }
         device.destroy_pipeline(self.gi_pipeline, None);
         device.destroy_pipeline(self.tone_pipeline, None);
         device.destroy_pipeline(self.rq_pipeline, None);
@@ -1495,6 +1547,12 @@ impl ShapeBlas {
 /// (`SHADOW_MASK` in shaders/forward.wgsl). Rays with a full mask — GI, the
 /// ray probe — see every instance whatever this bit says.
 const MASK_SHADOW_CASTER: u8 = 0x01;
+/// Instance mask bit of glass (a transmissive instance), and of everything
+/// that is not: a ray through glass looks for the far side of the glass with
+/// the first and for what is behind it with the second (`MASK_GLASS`,
+/// `MASK_OPAQUE` in shaders/post.wgsl).
+const MASK_GLASS: u8 = 0x02;
+const MASK_OPAQUE: u8 = 0x04;
 const MASK_EVERYTHING: u8 = 0xff;
 
 /// Instance flags of a closed solid wound counter-clockwise seen from outside
@@ -1678,10 +1736,15 @@ impl Tlas {
         let mut records: Vec<vk::AccelerationStructureInstanceKHR> = Vec::with_capacity(total);
         records.extend(instances.iter().map(|inst| {
             let [x, y, z, scale] = inst.center;
-            let mask = if casts_shadow(inst) {
+            let mut mask = if casts_shadow(inst) {
                 MASK_EVERYTHING
             } else {
                 MASK_EVERYTHING & !MASK_SHADOW_CASTER
+            };
+            mask &= if inst.transmission > 0.0 {
+                !MASK_OPAQUE
+            } else {
+                !MASK_GLASS
             };
             record(
                 [
@@ -1699,7 +1762,7 @@ impl Tlas {
             record(
                 mesh.transform,
                 mesh.custom_index.min(MAX_CUSTOM_INDEX),
-                MASK_EVERYTHING,
+                MASK_EVERYTHING & !MASK_GLASS,
                 mesh.flags,
                 mesh.blas,
             )
@@ -2162,6 +2225,14 @@ pub(crate) struct MeshGpu {
 }
 
 impl MeshGpu {
+    /// Is the model an open surface — a sheet, both of whose sides face the
+    /// open — rather than a closed solid? (The question shadow rays ask of
+    /// it too: see [`instance_flags_for`].)
+    pub fn is_sheet(&self) -> bool {
+        self.instance_flags
+            .contains(vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE)
+    }
+
     /// Upload `mesh` — vertices and indices into device-local buffers (through
     /// staging buffers), every texture with its mip chain — in fenced
     /// submissions (nothing else may be pending on `queue`'s pool). `white` is
@@ -2452,6 +2523,8 @@ pub(crate) struct FrameGpu {
     /// Material buffer: r = metallic, g = roughness, ba = shading normal.
     _material: Image,
     material_view: vk::ImageView,
+    _specular: Image,
+    specular_view: vk::ImageView,
     /// SSR / refraction resources; `None` when the preset needs no post pass.
     post: Option<PostGpu>,
     /// The tone-mapped `rgba8unorm` result.
@@ -2532,6 +2605,10 @@ pub(crate) struct FrameDraw<'a> {
     /// Draw with the shadowed forward pipelines, whose fragment shaders trace
     /// a ray to every light. Only ever set together with `tlas`.
     pub shadows: bool,
+    /// Run the post pass with ray queries: glass is refracted through its
+    /// real shape, and a mirror shows what is off screen. Only ever set
+    /// together with `tlas`.
+    pub glass_rays: bool,
     /// Draw the scene's environment as the background (after the opaque
     /// geometry, on the pixels it left empty). False for a scene without an
     /// environment or one that only wants its light: nothing is drawn then.
@@ -2731,6 +2808,14 @@ impl FrameGpu {
             "material-image",
             &mut partial,
         )?;
+        let (specular, specular_view) = image(
+            width,
+            height,
+            SPECULAR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            "specular-image",
+            &mut partial,
+        )?;
         let (out, out_view) = image(
             width,
             height,
@@ -2745,7 +2830,7 @@ impl FrameGpu {
         )?;
         let main_framebuffer = framebuffer(
             pipelines.render_pass,
-            &[hdr_view, material_view, depth_view],
+            &[hdr_view, material_view, specular_view, depth_view],
             &mut partial,
         )?;
         let overlay_framebuffer =
@@ -3005,7 +3090,8 @@ impl FrameGpu {
                     .map(|info| (binding, info))
                 };
                 let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out
+                // post: 0 params, 1 scene, 2 depth, 3 material, 4 glass, 5 out,
+                // 6 specular
                 let images = [
                     sampled(1, hdr_view, read_only),
                     sampled(
@@ -3015,6 +3101,7 @@ impl FrameGpu {
                     ),
                     sampled(3, material_view, read_only),
                     sampled(4, glass_bound, read_only),
+                    sampled(6, specular_view, read_only),
                 ];
                 let out_info = [img_info(out_view_p, vk::ImageLayout::GENERAL)];
                 let params_info = [ub(&params_buf, std::mem::size_of::<PostParams>())];
@@ -3076,6 +3163,8 @@ impl FrameGpu {
             depth_view,
             _material: material,
             material_view,
+            _specular: specular,
+            specular_view,
             post,
             out,
             out_view,
@@ -3139,6 +3228,8 @@ impl FrameGpu {
             .acceleration_structures(&structures);
         let mut as_write_forward = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&structures);
+        let mut as_write_post = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+            .acceleration_structures(&structures);
         let mesh_write = |set: vk::DescriptorSet| {
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
@@ -3152,6 +3243,28 @@ impl FrameGpu {
             mesh_write(self.forward_set),
             mesh_write(self.gi_set),
         ];
+        // The post pass's ray-query variant looks up what its rays hit.
+        if let Some(post) = &self.post {
+            writes.push(instance_write(post.set, 8));
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(post.set)
+                    .dst_binding(9)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mesh_info),
+            );
+            if tlas.is_some() {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(post.set)
+                        .dst_binding(7)
+                        .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                        .descriptor_count(1)
+                        .dst_array_element(0)
+                        .push_next(&mut as_write_post),
+                );
+            }
+        }
         if tlas.is_some() {
             // (The forward set's TLAS is only read by the shadowed pipelines.)
             for (set, binding, next) in [
@@ -3560,6 +3673,12 @@ impl FrameGpu {
                                 float32: [0.0, 0.0, 0.0, 0.0],
                             },
                         },
+                        // Specular colour: nothing there reflects anything.
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 0.0],
+                            },
+                        },
                         // Reversed depth: 0 is "infinitely far".
                         vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
@@ -3648,7 +3767,11 @@ impl FrameGpu {
                 device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
-                    pipelines.post_pipeline,
+                    if draw.glass_rays && pipelines.post_pipeline_rq != vk::Pipeline::null() {
+                        pipelines.post_pipeline_rq
+                    } else {
+                        pipelines.post_pipeline
+                    },
                 );
                 device.cmd_bind_descriptor_sets(
                     cmd,
@@ -3874,6 +3997,7 @@ impl Drop for FrameGpu {
             d.destroy_image_view(self.hdr_view, None);
             d.destroy_image_view(self.depth_view, None);
             d.destroy_image_view(self.material_view, None);
+            d.destroy_image_view(self.specular_view, None);
             d.destroy_image_view(self.out_view, None);
             if let Some(post) = &self.post {
                 if let Some(fb) = post.glass_framebuffer {

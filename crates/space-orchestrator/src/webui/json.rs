@@ -325,6 +325,11 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         o.array("not_confirmed_by", ids(false), |out, id| {
             let _ = write!(out, "{id}");
         });
+        // The same in one word and one sentence: is a switch still on its way
+        // to a connected shard, and what the page says about it.
+        let progress = snapshot.scene_progress();
+        o.boolean("pending", !progress.settled());
+        o.string("status", &progress.sentence());
         o.objects("catalogue", space_protocol::Scene::ALL, |o, choice| {
             o.string("name", choice.name());
             o.uint("id", u64::from(choice.id().0));

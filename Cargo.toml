@@ -17,6 +17,7 @@ members = [
     "crates/space-mcp-server",
     "crates/space-mcp-client",
     "crates/space-harness",
+    "crates/space-scene",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ space-world = { path = "crates/space-world" }
 space-ecs = { path = "crates/space-ecs" }
 space-protocol = { path = "crates/space-protocol" }
 space-sim = { path = "crates/space-sim" }
+space-scene = { path = "crates/space-scene" }
 space-render = { path = "crates/space-render" }
 space-stream = { path = "crates/space-stream", default-features = false }
 # Wire format: `serde` (derive) + `bincode` 2.x, both pure Rust.
@@ -116,6 +118,22 @@ jpeg-decoder = { version = "0.3", default-features = false }
 # interpreter is in that one file, should it ever be replaced.
 space-harness = { path = "crates/space-harness" }
 lunita = "=0.1.2"
+
+# Rigid-body physics for `space-sim` (contacts, joints, CCD) and its collision
+# shapes (`parry3d-f64`, re-exported as `rapier3d_f64::parry`). Pure Rust,
+# Apache-2.0, no build script compiles C (checked with `cargo tree`; see
+# crates/space-sim/src/rigid.rs for the list it adds to the lockfile).
+# * `-f64`: the physics runs in floating-origin "bubbles" (local frames a few
+#   kilometres across, anchored at cells of the i64 world); f64 keeps contacts
+#   far below the WorldPos resolution there (precision table and bubble rules
+#   in crates/space-sim/src/rigid.rs).
+# * `enhanced-determinism`: same platform + same inputs = bit-identical state
+#   (libm for transcendentals, no hash-map iteration order); the crate's
+#   determinism contract depends on it. NOT `parallel` (thread scheduling would
+#   be a second source of order).
+# Pinned to the minor version: a rapier minor release changes the solver, and
+# with it every simulated trajectory, so an upgrade is a reviewed change.
+rapier3d-f64 = { version = "0.36", default-features = false, features = ["dim3", "f64", "std", "block-solver", "enhanced-determinism"] }
 
 [workspace.lints.cargo]
 # `space-world` in [workspace.dependencies] is reserved for the later Phase-1

@@ -22,9 +22,12 @@
 //!
 //! 1. drain the inputs received since the last tick into [`SimWorld::apply_inputs`]
 //!    (which buffers them by their own tick — see its docs);
-//! 2. [`SimWorld::step`];
+//! 2. install what neighbours committed to us, then [`SimWorld::step`] —
+//!    ships, the scene's bodies, ghosts as obstacles — and move the ghosts on;
 //! 3. refresh the interest grid from the new positions;
-//! 4. detect shard-boundary crossings and start a handoff ([`crate::handoff`]);
+//! 4. group the bodies into islands and hand every ship, body or island whose
+//!    home is another shard to it ([`crate::border`], [`crate::handoff`]), and
+//!    send the neighbours the ghosts of what is near their borders;
 //! 5. build one frame per client ([`crate::replicate::build_frame`]) — every
 //!    tick, even when nothing changed: the frame is also the client's clock.
 //!
@@ -47,6 +50,7 @@
 //!
 //! * [`config`] — [`ShardConfig`] and the tuning constants
 //! * [`alloc`] — monotonic, never-reused [`ShardId`] allocation
+//! * [`border`] — physics across shard borders: ghosts, islands, hysteresis
 //! * [`replicate`] — interest grid, change-tick deltas, the frame budget
 //! * [`handoff`] — the seamless handoff state machine
 //! * [`shard`] — [`Shard`], the state the tick loop drives
@@ -58,6 +62,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 pub mod alloc;
+pub mod border;
 pub mod config;
 pub mod epoch;
 pub mod handoff;

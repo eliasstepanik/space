@@ -29,7 +29,7 @@ const FRAGMENT: naga::ShaderStage = naga::ShaderStage::Fragment;
 #[rustfmt::skip]
 const SHADERS: &[(&str, &str, naga::ShaderStage, &str, &[&str])] = &[
     ("rq_triangle.wgsl", "rq_triangle", COMPUTE, "main", &[]),
-    ("gi_probe.wgsl", "gi_probe", COMPUTE, "main", &["MESH"]),
+    ("gi_probe.wgsl", "gi_probe", COMPUTE, "main", &["MESH", "ENV"]),
     ("tonemap.wgsl", "tonemap", COMPUTE, "main", &[]),
     ("forward.wgsl", "forward_vs", VERTEX, "vs_main", &["ENV"]),
     ("forward.wgsl", "forward_fs", FRAGMENT, "fs_main", &["ENV"]),
@@ -43,6 +43,8 @@ const SHADERS: &[(&str, &str, naga::ShaderStage, &str, &[&str])] = &[
     ("forward.wgsl", "forward_sky_vs", VERTEX, "vs_sky", &["ENV", "SKY"]),
     ("forward.wgsl", "forward_sky_fs", FRAGMENT, "fs_sky", &["ENV", "SKY"]),
     ("post.wgsl", "post", COMPUTE, "main", &["ENV"]),
+    // The same with ray queries: glass refracted through its real shape.
+    ("post.wgsl", "post_rq", COMPUTE, "main", &["ENV", "MESH", "RQ"]),
     ("overlay.wgsl", "overlay_vs", VERTEX, "vs_overlay", &[]),
     ("overlay.wgsl", "overlay_fs", FRAGMENT, "fs_overlay", &[]),
 ];

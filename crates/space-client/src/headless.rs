@@ -99,6 +99,7 @@ pub fn run_headless(
     stream: Option<&StreamClient>,
     stop: &AtomicBool,
 ) -> Result<HeadlessReport, RenderError> {
+    app.set_render_device(ctx.device_name());
     let encoder = JpegEncoder::default();
     let mut flags = FLAG_KEYFRAME;
     if encoder.downscale() > 1 {

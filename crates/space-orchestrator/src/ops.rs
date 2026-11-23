@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use space_protocol::shard::ShardId;
-use space_protocol::Scene;
+use space_protocol::{Scene, SceneState};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::snapshot::{octant_signs, Snapshot};
@@ -122,6 +122,11 @@ pub struct OperatorReply {
     pub message: String,
     /// The number of the event-log entry recording this request.
     pub event: u64,
+    /// The scene and revision this request made current, when it changed the
+    /// scene (`None` for every other command, for a refusal, and for a request
+    /// for the scene that was already running). A front end uses it to wait
+    /// for the shards' confirmations before it shows the result.
+    pub scene_changed: Option<SceneState>,
 }
 
 /// Why a request got no [`OperatorReply`].
@@ -199,6 +204,34 @@ impl OpsHandle {
         // The borrow is released before this returns: nothing holds the
         // channel's lock while a page is rendered.
         self.state.borrow().clone()
+    }
+
+    /// Wait until the loop has published a snapshot `done` is satisfied with,
+    /// for at most `limit`, and return the latest snapshot either way.
+    ///
+    /// This only ever *reads* what the loop publishes of its own accord (after
+    /// every logged event, and several times a second regardless): it asks the
+    /// loop for nothing, so however many front-end requests wait here, the
+    /// loop does not notice.
+    pub async fn wait_until(
+        &self,
+        limit: Duration,
+        done: impl Fn(&Snapshot) -> bool,
+    ) -> Arc<Snapshot> {
+        let mut state = self.state.clone();
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let latest = state.borrow_and_update().clone();
+            if done(&latest) {
+                return latest;
+            }
+            match tokio::time::timeout_at(deadline, state.changed()).await {
+                Ok(Ok(())) => {}
+                // Out of time, or the loop is gone: what there is, is all
+                // there will be.
+                _ => return state.borrow().clone(),
+            }
+        }
     }
 
     /// Ask the loop to carry out `command` and wait for its answer.

@@ -225,6 +225,62 @@ async fn capture_frame_returns_a_jpeg_on_a_gpu() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Connected to a shard that runs the demo area, a capture draws the
+/// physics bodies the shard replicates, like the client does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_frame_draws_the_bodies_the_shard_replicates() {
+    if let Err(e) = RenderContext::new(&ContextOptions::default()) {
+        eprintln!(
+            "SKIP: no Vulkan device ({}); see spikes/ENVIRONMENT.md",
+            e.message
+        );
+        return;
+    }
+    let harness = Arc::new(
+        ShardHarness::boot(([127, 0, 0, 1], 0).into(), true)
+            .await
+            .expect("boot shard"),
+    );
+    assert!(harness
+        .shard
+        .lock()
+        .await
+        .set_scene(space_protocol::SceneState::new(
+            space_protocol::Scene::DemoArea.id(),
+            1
+        )));
+    let dir = out_dir("bodies");
+    let client = mcp_server(&ClientState::new(dir.clone()));
+    call_json(
+        &client,
+        "connect",
+        json!({"addr": harness.addr.to_string()}),
+    )
+    .await;
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        status = call_json(&client, "client_status", json!({})).await;
+        if status["bodies"].as_u64().unwrap_or(0) > 20 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let bodies = status["bodies"].as_u64().unwrap_or(0);
+    assert!(bodies > 20, "the showcase never arrived: {status}");
+    let frame = call_json(
+        &client,
+        "capture_frame",
+        json!({"width": 320, "height": 180, "name": "bodies.jpg"}),
+    )
+    .await;
+    assert_eq!(frame["bodies"].as_u64(), Some(bodies), "{frame}");
+    assert_eq!(frame["scene"], "demo-area");
+    let jpeg = space_mcp::base64::decode(frame["base64"].as_str().unwrap()).expect("valid base64");
+    assert_eq!(space_stream::jpeg_dimensions(&jpeg), Some((320, 180)));
+    call(&client, "disconnect", json!({})).await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A `connect` that is still dialling must not make every other tool wait.
 ///
 /// Mutation this catches: holding the link mutex across the dial. Against a

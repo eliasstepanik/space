@@ -4,12 +4,23 @@
 //! files, to be looked at:
 //!
 //! ```sh
-//! cargo run -p space-render --example demo_shots -- out_dir [--no-environment]
+//! cargo run -p space-render --example demo_shots -- out_dir [--no-environment] [--model ship.glb]
 //! ```
 //!
 //! The scenes stand under an evening sky (an [`Environment`]): it lights what
 //! no lamp reaches, shows in metal and glass, and fills the background.
 //! `--no-environment` renders the same pictures without one, to compare.
+//!
+//! The `under_*` pictures are taken from below the floor: its underside, and
+//! what a mirror in the floor looks like from there — as a thin slab, and as
+//! the cube a box instance is (see [`Mirror`]).
+//!
+//! The `sky_*` pictures are about the environment and what keeps it out: a
+//! room with a doorway and no lamp (the sky lights it by the door only), a
+//! white ball over a red floor with probe GI (the floor's sky light on its
+//! underside), towers far off in the fog (which fades them into the sky
+//! behind them), and — with `--model`, a `.glb` whose origin is on its deck,
+//! such as the Kestrel of `assets/ships/kestrel/` — two views from inside it.
 //!
 //! It needs a Vulkan device with ray query (the shadows) and prints how long
 //! a frame of the main scene takes.
@@ -39,9 +50,13 @@ fn evening_sky() -> Environment {
 fn main() {
     let mut dir = PathBuf::from("demo_shots");
     let mut environment = evening_sky();
-    for arg in std::env::args_os().skip(1) {
+    let mut model = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
         if arg == "--no-environment" {
             environment = Environment::NONE;
+        } else if arg == "--model" {
+            model = args.next().map(PathBuf::from);
         } else {
             dir = PathBuf::from(arg);
         }
@@ -88,15 +103,43 @@ fn main() {
     }
 
     // The same area from close by: what the environment does to metal, a
-    // mirror, glass and a corner no lamp reaches.
+    // mirror, glass and a corner no lamp reaches. Then from 1.2 m under the
+    // floor, below the mirror (inside it, when it is a block) and beside it.
     let high = options(QualityPreset::High, false);
-    for (name, eye, forward) in [
-        ("metal_spheres", [6.4, -0.7, -5.6], [0.25, -0.4, -3.3]),
-        ("mirror", [3.6, 0.3, -1.6], [0.0, -0.42, -1.0]),
-        ("glass_close", [-3.8, 0.0, -2.1], looking(38.0, -3.0)),
-        ("shadowed_corner", [-12.4, -0.3, -2.4], [1.2, -0.7, -4.2]),
+    let (slab, block) = (Mirror::Slab, Mirror::Block);
+    let below = [3.9, -2.9, -4.9];
+    for (name, mirror, eye, forward) in [
+        ("metal_spheres", slab, [6.4, -0.7, -5.6], [0.25, -0.4, -3.3]),
+        ("mirror", slab, [3.6, 0.3, -1.6], [0.0, -0.42, -1.0]),
+        ("glass_close", slab, [-3.8, 0.0, -2.1], looking(38.0, -3.0)),
+        (
+            "shadowed_corner",
+            slab,
+            [-12.4, -0.3, -2.4],
+            [1.2, -0.7, -4.2],
+        ),
+        ("under_slab_up", slab, below, looking(0.0, 75.0)),
+        ("under_slab_sideways", slab, below, looking(0.0, 20.0)),
+        ("under_block_inside_up", block, below, looking(0.0, 75.0)),
+        (
+            "under_block_inside_sideways",
+            block,
+            below,
+            looking(0.0, 20.0),
+        ),
+        (
+            "under_block_outside",
+            block,
+            [-0.5, -3.3, -1.5],
+            [4.1, 0.8, -4.1],
+        ),
+        // Close to the glass ball: the corner behind it, upside down.
+        ("glass_ball", slab, [-5.7, 0.0, -3.5], [-1.3, -0.15, -1.7]),
+        // The towers far off, in the fog and against the sky.
+        ("sky_fog_towers", slab, [0.0, 3.0, 4.0], [0.0, 0.16, -1.0]),
     ] {
-        let scene = seen_from(demo_area(width, height), eye, forward).with_environment(environment);
+        let scene = seen_from(demo_area_with(width, height, mirror), eye, forward)
+            .with_environment(environment);
         save(&dir, name, &render(&ctx, &scene, width, height, &high));
     }
 
@@ -112,14 +155,41 @@ fn main() {
         ),
         ("ship", ship_view()),
         ("textures", texture_wall()),
+        ("sky_room", sky_room()),
+        ("sky_gi_bounce", bounce_ball()),
     ] {
-        let size = if name == "textures" {
-            (1280, 420)
-        } else {
-            (560, 700)
+        let size = match name {
+            "textures" => (1280, 420),
+            "sky_room" | "sky_gi_bounce" => (1280, 720),
+            _ => (560, 700),
         };
         let scene = with_aspect(scene, size.0, size.1).with_environment(environment);
-        save(&dir, name, &render(&ctx, &scene, size.0, size.1, &high));
+        let options = options(QualityPreset::High, name == "sky_gi_bounce");
+        save(&dir, name, &render(&ctx, &scene, size.0, size.1, &options));
+    }
+    if let Some(path) = model {
+        match MeshData::load(&path) {
+            Ok(mesh) => {
+                let mesh = Arc::new(mesh);
+                // From the pilot's seat looking aft, and from amidships
+                // looking forward (the Kestrel's deck plan; any model with
+                // its origin on its deck shows something).
+                for (name, eye, forward) in [
+                    ("sky_model_cockpit", [0.0, 1.85, -6.85], [0.0, -0.2, -1.0]),
+                    ("sky_model_cabin", [0.0, 1.15, 1.3], [0.2, -0.05, -1.0]),
+                    (
+                        "sky_model_outside",
+                        [-13.0, 2.5, -15.0],
+                        [0.66, -0.12, 0.75],
+                    ),
+                ] {
+                    let scene = model_view(&mesh, eye, forward, width, height)
+                        .with_environment(environment);
+                    save(&dir, name, &render(&ctx, &scene, width, height, &high));
+                }
+            }
+            Err(e) => eprintln!("demo_shots: {}: {e}", path.display()),
+        }
     }
     save(
         &dir,
@@ -303,8 +373,25 @@ fn checker_floor(y: f32, z: f32) -> ModelInstance {
     place(&floor, [0.0, y - 0.1, z], 0.0, 1.0)
 }
 
+/// How the mirror in the demo area's floor is built.
+#[derive(Clone, Copy, PartialEq)]
+enum Mirror {
+    /// A thin polished slab let into the floor (a mesh): its top is 2 cm
+    /// proud of the floor and none of it is below the floor's underside.
+    Slab,
+    /// A box instance, which is always a cube: for the 3 m square that shows
+    /// in the floor, 3 m of mirror hang below it. From under the floor that
+    /// is a block of mirror, reflecting whatever surrounds it — and a camera
+    /// can fly into it. Here to show what that looks like; use a slab.
+    Block,
+}
+
 /// The demo area: everything at once, seen from eye height.
 fn demo_area(width: u32, height: u32) -> Scene {
+    demo_area_with(width, height, Mirror::Slab)
+}
+
+fn demo_area_with(width: u32, height: u32, mirror: Mirror) -> Scene {
     const FLOOR: f32 = -1.7;
     let character = Arc::new(sample_character());
     let ship = Arc::new(sample_ship());
@@ -367,16 +454,12 @@ fn demo_area(width: u32, height: u32) -> Scene {
         1.0,
         paint([0.75, 0.72, 0.68], 0.0, 0.8),
     ));
+    let mirror_slab = Arc::new(MeshData::cuboid(
+        [1.5, 0.1, 1.5],
+        1.0,
+        paint([0.9, 0.92, 0.95], 1.0, 0.04),
+    ));
     let mut instances = vec![
-        // A mirror: a polished slab let into the floor (its top 2 cm proud).
-        instance(
-            [3.6, FLOOR - 1.48, -5.6],
-            1.5,
-            SHAPE_BOX,
-            [0.9, 0.92, 0.95],
-            1.0,
-            0.04,
-        ),
         // A chrome ball, a smooth gold one and a red plastic one.
         instance(
             [5.9, FLOOR + 0.7, -8.8],
@@ -430,6 +513,16 @@ fn demo_area(width: u32, height: u32) -> Scene {
         block.emissive = [color[0], color[1], color[2], 1.0];
         instances.push(block);
     }
+    if mirror == Mirror::Block {
+        instances.push(instance(
+            [3.6, FLOOR - 1.48, -5.6],
+            1.5,
+            SHAPE_BOX,
+            [0.9, 0.92, 0.95],
+            1.0,
+            0.04,
+        ));
+    }
     let mut scene = Scene::from_instances(camera([0.0, -0.22, -1.0], width, height), instances)
         .with_lights(vec![
             light([2.5, 3.2, -3.5], [1.0, 0.95, 0.85], 260.0),
@@ -455,6 +548,32 @@ fn demo_area(width: u32, height: u32) -> Scene {
         place(&crate_mesh, [-11.3, FLOOR + 0.5, -7.2], 0.3, 1.0),
         place(&character, [-11.7, FLOOR, -5.6], 2.9, 1.0),
     ];
+    // Towers far off, from 150 to 700 m: for the fog to fade into the sky.
+    for (i, (x, z, half_height)) in [
+        (-160.0f32, -260.0f32, 70.0f32),
+        (-70.0, -420.0, 110.0),
+        (20.0, -180.0, 45.0),
+        (90.0, -640.0, 150.0),
+        (170.0, -330.0, 90.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tower = Arc::new(MeshData::cuboid(
+            [9.0 + 2.0 * i as f32, half_height, 9.0],
+            8.0,
+            paint([0.16, 0.17, 0.2], 0.0, 0.8),
+        ));
+        scene
+            .models
+            .push(place(&tower, [x, FLOOR + half_height, z], 0.0, 1.0));
+    }
+    if mirror == Mirror::Slab {
+        // 20 cm thick like the floor it is let into, and 2 cm higher.
+        scene
+            .models
+            .push(place(&mirror_slab, [3.6, FLOOR - 0.08, -5.6], 0.0, 1.0));
+    }
     let (white, dim) = ([1.0, 1.0, 1.0, 1.0], [0.85, 0.9, 1.0, 0.9]);
     scene
         .overlay
@@ -464,6 +583,108 @@ fn demo_area(width: u32, height: u32) -> Scene {
         .overlay
         .text(24.0, 56.0, 2, dim, "connect: 192.168.0.12:7777");
     scene
+}
+
+/// A room with a doorway and no lamp: a slab hut on the checkered floor, the
+/// camera inside it. What light there is comes from the sky, through the door.
+fn sky_room() -> Scene {
+    const FLOOR: f32 = -1.5;
+    let slab = |half: [f32; 3]| {
+        Arc::new(MeshData::cuboid(
+            half,
+            1.0,
+            paint([0.82, 0.8, 0.76], 0.0, 0.9),
+        ))
+    };
+    let (flat, wall_x, wall_z, beside_the_door) = (
+        slab([4.0, 0.1, 4.0]),
+        slab([0.1, 1.7, 4.0]),
+        slab([4.0, 1.7, 0.1]),
+        slab([1.5, 1.7, 0.1]),
+    );
+    let crate_mesh = textured(
+        MeshData::cuboid([0.4; 3], 0.8, paint([1.0; 3], 0.0, 0.7)),
+        Texture::uv_grid(256),
+    );
+    let character = Arc::new(sample_character());
+    let mut scene = Scene::from_instances(
+        camera([0.0, -0.18, -1.0], 16, 9),
+        vec![
+            // A chrome ball and a gold one on the floor.
+            instance(
+                [1.6, FLOOR + 0.5, -2.0],
+                0.5,
+                SHAPE_SPHERE,
+                [0.95, 0.95, 0.97],
+                1.0,
+                0.06,
+            ),
+            instance(
+                [2.6, FLOOR + 0.35, -1.0],
+                0.35,
+                SHAPE_SPHERE,
+                [1.0, 0.77, 0.34],
+                1.0,
+                0.2,
+            ),
+        ],
+    );
+    scene.models = vec![
+        checker_floor(FLOOR - 0.02, -6.0),
+        place(&flat, [0.0, FLOOR - 0.1, 0.0], 0.0, 1.0),
+        place(&flat, [0.0, FLOOR + 3.1, 0.0], 0.0, 1.0),
+        place(&wall_x, [-3.7, FLOOR + 1.5, 0.0], 0.0, 1.0),
+        place(&wall_x, [3.7, FLOOR + 1.5, 0.0], 0.0, 1.0),
+        place(&wall_z, [0.0, FLOOR + 1.5, 3.7], 0.0, 1.0),
+        // The far wall, with a doorway 1.4 m wide in the middle.
+        place(&beside_the_door, [-2.2, FLOOR + 1.5, -3.7], 0.0, 1.0),
+        place(&beside_the_door, [2.2, FLOOR + 1.5, -3.7], 0.0, 1.0),
+        place(&crate_mesh, [-2.4, FLOOR + 0.4, -2.6], 0.5, 1.0),
+        place(&character, [-1.0, FLOOR, -1.9], 2.6, 1.0),
+    ];
+    scene
+}
+
+/// A white ball over a red floor, for probe GI: the floor's sky light on the
+/// ball's underside.
+fn bounce_ball() -> Scene {
+    let floor = Arc::new(MeshData::cuboid(
+        [8.0, 0.1, 8.0],
+        1.0,
+        paint([0.85, 0.1, 0.08], 0.0, 0.9),
+    ));
+    let mut scene = Scene::from_instances(
+        camera([0.0, 0.1, -1.0], 16, 9),
+        vec![instance(
+            [0.0, 0.5, -3.2],
+            0.9,
+            SHAPE_SPHERE,
+            [0.92, 0.92, 0.92],
+            0.0,
+            0.9,
+        )],
+    );
+    scene.models = vec![place(&floor, [0.0, -1.6, -3.0], 0.0, 1.0)];
+    scene
+}
+
+/// `mesh` on the checkered floor (3.4 m below its origin), seen from `eye` in
+/// its own coordinates, with a lamp amidships and a dim one forward (where
+/// the Kestrel has its cabin and its cockpit): inside, those are the light.
+fn model_view(
+    mesh: &Arc<MeshData>,
+    eye: [f32; 3],
+    forward: [f32; 3],
+    width: u32,
+    height: u32,
+) -> Scene {
+    let mut scene =
+        Scene::from_instances(camera(forward, width, height), Vec::new()).with_lights(vec![
+            light([0.0, 1.15, 1.3], [1.0, 0.95, 0.85], 30.0),
+            light([0.0, 1.85, -6.85], [0.8, 0.9, 1.0], 8.0),
+        ]);
+    scene.models = vec![checker_floor(-3.4, 0.0), place(mesh, [0.0; 3], 0.0, 1.0)];
+    seen_from(scene, eye, forward)
 }
 
 /// The character alone, turned by `turn` (0 = seen from behind).

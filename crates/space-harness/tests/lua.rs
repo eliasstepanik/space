@@ -517,6 +517,35 @@ fn the_number_of_screenshots_is_capped() {
     assert_eq!(report.screenshots.len(), 2);
 }
 
+/// The physics fields reach a script: the bodies as a list of tables,
+/// nearest first, and a body the ship flies into moves.
+#[test]
+fn a_script_sees_the_bodies_and_pushes_one() {
+    let (report, _fake) = run(r#"
+local s = client.state()
+assert(#s.bodies == 0 and s.gravity == 0 and s.landed == false and s.bodies_in_view == 0)
+client.connect("127.0.0.1:7777", 10)
+client.wait_until(function() return #client.state().bodies > 0 end)
+local crate = client.state().bodies[1]
+assert(crate.visual == "crate" and crate.visual_id == 1 and crate.parts == 1 and crate.in_view)
+assert(#crate.position == 3 and crate.speed == 0 and crate.distance > 5)
+local before = crate.position
+client.key_down("w")
+client.wait_until(function() return client.state().bodies[1].speed > 1 end)
+client.key_up("w")
+local after = client.state().bodies[1]
+assert(after.guid == crate.guid and after.position[3] < before[3])
+print(string.format("pushed %s at %.1f m/s", after.visual, after.speed))
+"#);
+    passed(&report);
+    assert_eq!(report.output.len(), 1);
+    assert!(
+        report.output[0].starts_with("pushed crate at "),
+        "{:?}",
+        report.output
+    );
+}
+
 #[test]
 fn state_connect_and_disconnect_as_a_script_sees_them() {
     let (report, fake) = run(r#"

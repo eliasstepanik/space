@@ -119,8 +119,8 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
 
 **Run and passing**
 - `cargo run -p xtask -- ci` with `SPACE_REQUIRE_GPU=1`: fmt, clippy `-D warnings`
-  and every test - **950 passed, 0 failed, 3 ignored**. The GPU-using suites
-  also pass under `SPACE_RENDER_VALIDATION=1` with zero validation messages.
+  and every test - **1081 passed, 0 failed, 4 ignored**, with
+  `SPACE_RENDER_VALIDATION=1` (zero validation messages).
 - `Dockerfile.orchestrator`, `Dockerfile.shard`, `Dockerfile.client` and
   `docker-compose.yaml` **built and run**, including the `stream` profile: the
   shard registers; the web UI answers 401 without the token and 200 with it; a
@@ -139,6 +139,8 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
 - GPU tests on the hosted CI runner: its Mesa is too old for the renderer, so
   that step is `continue-on-error: true` and fails visibly rather than
   reporting tests that rendered nothing.
-- Cross-shard visibility: players on different shards do not see each other
-  (the server does not replicate across a border); only the handoff itself is
-  seamless.
+- Cross-shard visibility in containers: players and physics bodies near a
+  border are ghosted to the neighbouring shard (seen live with two shards
+  outside containers: two players 24 m apart on either side of the border see
+  each other as characters), but no container setup with two shards has been
+  run.

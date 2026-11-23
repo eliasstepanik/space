@@ -19,15 +19,11 @@ pub struct RqParams {
     pub _pad: [f32; 3],
 }
 
-/// `GiParams` in `shaders/gi_probe.wgsl` (48 bytes).
+/// `GiParams` in `shaders/gi_probe.wgsl` (96 bytes).
 ///
-/// WGSL struct size rule: the size is `round_up(end_of_last_member,
-/// alignment_of_struct)`, and a struct's alignment is the largest alignment of
-/// any member — here 16, from `grid_origin: vec4<f32>`. The last real member
-/// ends at 40, so the block size is `round_up(40, 16) = 48` and the uniform
-/// buffer must be bound with range 48, not 40.
 /// Offsets: 0 grid_origin, 16 spacing, 20 probe_range, 24 grid_size,
-/// 32 rays_per_probe, 36..48 tail padding -> 48.
+/// 32 rays_per_probe, 36 padding, 48 environment (a struct of `vec4`s is
+/// aligned to 16) -> 96.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GiParams {
@@ -36,9 +32,12 @@ pub struct GiParams {
     pub probe_range: f32,
     pub grid_size: [u32; 2],
     pub rays_per_probe: u32,
-    /// Explicit tail padding so the Rust mirror is the full WGSL block size
-    /// (the shader's own `_pad: f32` plus the 8 bytes the WGSL round-up adds).
+    /// The shader's own `_pad: f32` plus the 8 bytes that align the
+    /// environment to 16.
     pub _pad: [f32; 3],
+    /// The scene's environment: what a surface a probe ray hits reflects of
+    /// it, and what counts as sky for a ray that hits nothing.
+    pub environment: EnvironmentGpu,
 }
 
 /// `Instance` in `shaders/common.wgsl` (64 bytes).
@@ -63,10 +62,11 @@ pub struct GpuInstance {
     pub _pad1: f32,
 }
 
-/// `MeshInstance` in `shaders/common.wgsl` (80 bytes): one drawn part of a
+/// `MeshInstance` in `shaders/common.wgsl` (96 bytes): one drawn part of a
 /// mesh model. The forward pass draws with it; a GI ray that hits the model
 /// reads its part's emission from it.
-/// Offsets: 0 model_x, 16 model_y, 32 model_z, 48 albedo, 64 emissive -> 80.
+/// Offsets: 0 model_x, 16 model_y, 32 model_z, 48 albedo, 64 emissive,
+/// 80 surface -> 96.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MeshInstanceGpu {
@@ -78,6 +78,10 @@ pub struct MeshInstanceGpu {
     pub albedo: [f32; 4],
     /// rgb radiance + roughness in .w.
     pub emissive: [f32; 4],
+    /// x = 1 when the mesh is an open surface — a sheet, both of whose sides
+    /// face the open — and 0 when it is a closed solid, whose inside the
+    /// scene's environment does not reach. yzw unused.
+    pub surface: [f32; 4],
 }
 
 /// One rectangle of the overlay: the instance-rate vertex of `vs_overlay` in
@@ -101,7 +105,8 @@ pub struct EnvironmentGpu {
     /// scene has an environment and 0 when it has none — the one value a
     /// shader reads to skip everything else.
     pub zenith: [f32; 4],
-    /// rgb radiance from the horizon.
+    /// rgb radiance from the horizon; w = 1 when the environment is also the
+    /// painted background (what fog then fades into).
     pub horizon: [f32; 4],
     /// rgb radiance from straight down.
     pub ground: [f32; 4],
@@ -153,7 +158,14 @@ pub struct ForwardParams {
     pub fog: [f32; 4],
     /// `FEATURE_*` bitmask from [`crate::quality`].
     pub features: u32,
-    pub _pad2: [u32; 3],
+    /// Rays per pixel asking how much of the environment reaches a surface
+    /// (0 = none: all of it does). Only read by the ray-tracing variants.
+    pub sky_rays: u32,
+    /// With `FEATURE_SSR`: the roughness up to which the post pass mirrors a
+    /// metal — and adds the environment's reflection to it, which the
+    /// forward pass then leaves out.
+    pub ssr_max_roughness: f32,
+    pub _pad2: u32,
     /// The scene's environment (all zero for none).
     pub environment: EnvironmentGpu,
 }
@@ -176,10 +188,19 @@ pub struct PostParams {
     pub refract_distance: f32,
     /// Index-of-refraction ratio entering the medium (air -> glass = 1/1.5).
     pub refract_eta: f32,
-    pub _pad: f32,
+    /// The forward pass's fog density (0 = no fog): what the post pass adds
+    /// to a surface lies behind the same fog.
+    pub fog_density: f32,
     /// The scene's environment (all zero for none): what glass shows where
     /// its refracted view finds no geometry.
     pub environment: EnvironmentGpu,
+    /// The scene's lights, as in [`ForwardParams`]: a surface that a ray
+    /// through glass hits outside the frame is lit by them (roughly).
+    pub lights: [Light; 8],
+    pub light_count: u32,
+    /// How often a ray may be reflected inside glass before it is let out.
+    pub glass_bounces: u32,
+    pub _pad1: [u32; 2],
 }
 
 /// `ToneParams` in `shaders/tonemap.wgsl` (32 bytes).
@@ -301,10 +322,10 @@ mod tests {
             probe_range => GIPARAMS_PROBE_RANGE,
             grid_size => GIPARAMS_GRID_SIZE,
             rays_per_probe => GIPARAMS_RAYS_PER_PROBE,
+            environment => GIPARAMS_ENVIRONMENT,
         } size = GIPARAMS_SIZE);
-        // The WGSL block rounds up to a multiple of 16 (40 -> 48); the uniform
-        // buffer is bound with this size, so pin it explicitly.
-        assert_eq!(GIPARAMS_SIZE, 48);
+        // The uniform buffer is bound with this size, so pin it explicitly.
+        assert_eq!(GIPARAMS_SIZE, 96);
     }
 
     #[test]
@@ -327,6 +348,7 @@ mod tests {
             model_z => MESHINSTANCEGPU_MODEL_Z,
             albedo => MESHINSTANCEGPU_ALBEDO,
             emissive => MESHINSTANCEGPU_EMISSIVE,
+            surface => MESHINSTANCEGPU_SURFACE,
         } size = MESHINSTANCEGPU_SIZE);
     }
 
@@ -343,6 +365,8 @@ mod tests {
             gi_grid_size_y => FORWARDPARAMS_GI_GRID_SIZE_Y,
             fog => FORWARDPARAMS_FOG,
             features => FORWARDPARAMS_FEATURES,
+            sky_rays => FORWARDPARAMS_SKY_RAYS,
+            ssr_max_roughness => FORWARDPARAMS_SSR_MAX_ROUGHNESS,
             environment => FORWARDPARAMS_ENVIRONMENT,
         } size = FORWARDPARAMS_SIZE);
         assert_layout!(EnvironmentGpu {
@@ -373,6 +397,9 @@ mod tests {
             refract_distance => POSTPARAMS_REFRACT_DISTANCE,
             refract_eta => POSTPARAMS_REFRACT_ETA,
             environment => POSTPARAMS_ENVIRONMENT,
+            lights => POSTPARAMS_LIGHTS,
+            light_count => POSTPARAMS_LIGHT_COUNT,
+            glass_bounces => POSTPARAMS_GLASS_BOUNCES,
         } size = POSTPARAMS_SIZE);
     }
 

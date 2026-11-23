@@ -4,13 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Shared deterministic ship-flight simulation: fixed-step semi-implicit Euler physics, ticked simulation world with a canonical state hash, on-rail orbits and client-side prediction with reconciliation"
+description = "Shared deterministic simulation: ship flight, rigid bodies with convex and concave collision shapes, springs, joints, gravity zones and large-body gravity, a ticked simulation world with a canonical state hash, on-rail orbits and client-side prediction with reconciliation"
 
 [dependencies]
 space-world = { workspace = true }
 space-ecs = { workspace = true }
 space-protocol = { workspace = true }
 serde = { workspace = true }
+rapier3d-f64 = { workspace = true }
 
 [lints]
 workspace = true

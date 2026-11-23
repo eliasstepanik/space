@@ -74,7 +74,14 @@ curl -X POST http://127.0.0.1:8098/quit
 reason in `error`; `retry_in_s` counts down when a `--server` client is
 retrying). While playing, `scene` and `scene_revision` say what the shard
 shows, `position` is the absolute world position and `scene_position` the same
-in metres from the scene's spawn point (what the HUD prints). `?wait=1` on a
+in metres from the scene's spawn point (what the HUD prints). The physics:
+`gravity` (m/s² at the ship: 9.81 in the demo area's gravity room, 0 in
+weightless space), `landed` (standing on something in gravity), `bodies` (the
+physics bodies drawn, nearest first: `guid`, `visual` — `crate`, `ball`,
+`plank`, `door`, `chain`, `pendulum` — `position` in the frame of
+`scene_position`, `distance`, `speed`, `parts`, `in_view`), `bodies_in_view`,
+and `correction_m` / `correction_max_m` (how far the client's prediction of
+its own ship was from the shard's word). `?wait=1` on a
 frame blocks until the next one. `frame.jpg` is small and fine for looking;
 `frame.png` is lossless (and large) for pixel-exact checks. Input is
 the same vocabulary a person has: keys (`w a s d space shift`, `enter backspace
@@ -98,7 +105,12 @@ curl -X POST http://127.0.0.1:8098/script --data-binary @my-test.lua           #
 
 `scripts/harness/smoke.lua` is the model: it reaches the connect screen, types
 the address, connects, holds W, checks the ship moved, turns the view, takes
-screenshots, leaves. The API:
+screenshots, leaves. `scripts/harness/physics.lua` tours the demo area's
+physics showcase and asserts the physics happened (it lands in the gravity
+room and lifts off, sets a spring pendulum swinging, pushes a floating crate
+and the door, lands on the planetoid and lifts off, watches a moon circle
+it); it flies around for a couple of minutes, so give it
+`--script-timeout 300`. The API:
 
 ```lua
 client.type("127.0.0.1:7777")  client.press("enter")
@@ -141,14 +153,22 @@ captured without touching the mouse or keyboard.
 ## 3. Operate the cluster while you watch
 
 Open `http://127.0.0.1:7980/` (no login on loopback). The **Scene** card
-switches every shard and client at once: pick `demo-area`, `materials`,
-`solar` or `galaxy`, press "Switch all shards", and the client's picture
-changes within a second. The same from a script:
+switches every shard and client at once: it has one button per scene
+("Switch all shards to solar", ...; the running one is greyed out as
+`(current)`). One click switches. The answer waits up to 1.5 s for the shards
+to confirm and then says "All 1 connected shard switched to solar (revision
+2)", or "Switching ..." if some have not confirmed yet; the page then
+refreshes every second until they have. The client's picture changes within a
+second or two. The same from a script:
 
 ```sh
 T=$(curl -s http://127.0.0.1:7980/api/state | python3 -c "import json,sys; print(json.load(sys.stdin)['webui']['form_token'])")
-curl -s -D - -o /dev/null -X POST --data "csrf=$T&scene=solar" http://127.0.0.1:7980/action/scene | grep -i x-space-result
+curl -s -D - -o /dev/null -X POST --data "csrf=$T&scene=solar" http://127.0.0.1:7980/action/scene | grep -iE "x-space-(result|confirmed)"
 ```
+
+`X-Space-Result` is `accepted` or `refused`; `X-Space-Confirmed: 1/1` says how
+many connected shards run the new revision. Shards do not re-register with an
+orchestrator that was restarted: restart the shards after the orchestrator.
 
 The page also splits and merges regions, pauses the autoscaler and shows which
 shards have confirmed the scene. Actions are rate-limited (429 when hurried).
@@ -168,12 +188,36 @@ Check what your change touches, and one step either side of it.
   fading into a painted dusk sky. Polished metal reflects that sky; nothing
   should be black. The HUD reads `pos 0.0 0.0 0.0` on arrival. Look from the
   spawn, from close up, from above and from behind.
+- **Physics showcase** (demo area; the shard simulates it): turn right from
+  the spawn point for the **gravity room** — a blue mat, cyan edges round the
+  volume gravity acts in, a `GRAVITY 9.81 M/S2` sign; inside a crate stack, a
+  pyramid, a ramp, the concave bowl with balls in it, a seesaw and a gantry
+  with two spring pendulums (steel coils that stretch) and a hanging chain
+  (pins at its joints). Turn left for the **zero-g corner** — a violet mat, a
+  `ZERO G` sign, floating crates, two crates on a spring, a door on a hinge.
+  Up to the left, beyond the floor's corner, the **planetoid**: a cratered
+  rock with its own gravity (HUD about `gravity 2 m/s2  landed` standing on
+  it — the pull is taken at the eye, 1.7 m over 4 m/s² ground), three crates
+  resting on it, three balls in orbit, a `PLANETOID 4 M/S2` sign under it.
+  Everything moves smoothly at any frame rate (no 30 Hz steps), sits on what
+  it rests on (no gap, no sinking), and a player walking into the gravity room
+  lands (HUD `gravity 9.81 m/s2  landed`) and lifts off again with Space.
 - **Other scenes:** switch to each one and back.
 - **Players:** a second client must see the first one's character.
 - **Handoff:** `--topology two-shards`, fly across (the border is at HUD
   `pos` x = 512); the picture must not jump and the scene must stay where it
-  was. Note: players on *different* shards do not see each other yet (the
-  server does not replicate across the border).
+  was. Players and bodies within 64 m (plus 3 s of their motion) of a border
+  are seen from both sides (the neighbour's *ghosts*); further apart a
+  client sees its own shard's only.
+- **Physics across a border:** run the two shards so the border cuts the
+  showcase: `space-server --shard 1 --region 63:0:0:0 --peer
+  2:127.0.0.1:<p2>:64:1:0:1 --scene demo-area` and `space-server --shard 2
+  --region 64:1:0:1 --peer 1:127.0.0.1:<p1>:63:0:0:0 --scene demo-area`
+  (shard 2 owns the gravity room's floor at z > 0), connect to shard 1, walk
+  into the room and back out over z = 0. The bodies near the player move
+  with it as one group (each shard logs `... N bodies, M ghosts; handoffs
+  ...` every 5 s when it changes); nothing may jump, sink or stay on the
+  move once the player has gone.
 - **In every frame:** nothing black that should be lit, nothing inside-out,
   no z-fighting, sane exposure, the HUD values plausible (`fps`, `shard`,
   `scene`, `speed`).

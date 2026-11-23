@@ -11,9 +11,9 @@ use space_protocol::{
     check_hello, decode_frame, encode_frame, entity_snapshot, try_encode_frame, AdminCommand,
     AdminReply, CodecError, Delta, DirectoryQuery, DirectoryReply, EntityGuid, EntitySnapshot,
     GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer, HandoffReason, Hello,
-    InputTick, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject, RejectReason,
-    Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId, ShardMap, ShardRegion, ShardWelcome,
-    Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE,
+    InputTick, IslandKey, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject,
+    RejectReason, Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId, ShardMap, ShardRegion,
+    ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE,
     PROTOCOL_VERSION,
 };
 use space_world::{NodeRef, WorldPos};
@@ -170,9 +170,17 @@ fn all_messages() -> Vec<Message> {
             reason: HandoffReason::ClientNotConnected,
         }),
         Message::GhostUpdate(GhostUpdate {
-            entity: guid(4, 77),
             from: shard(4),
-            snapshot: entity(4, 77, 4),
+            epoch: 3,
+            tick: 1_234,
+            full: true,
+            entities: vec![entity(4, 77, 4), entity(4, 78, 2)],
+            removed: vec![guid(4, 12)],
+            islands: vec![IslandKey {
+                body: guid(4, 77),
+                min: guid(1, 3),
+                home: shard(1),
+            }],
         }),
         Message::Redirect(Redirect {
             entity: guid(2, 9),
@@ -413,9 +421,13 @@ fn truncated_rejected() {
     }
     // Truncation inside a component payload must also be caught.
     let one = encode_frame(&Message::GhostUpdate(GhostUpdate {
-        entity: guid(1, 1),
         from: shard(1),
-        snapshot: entity(1, 1, 3),
+        epoch: 1,
+        tick: 9,
+        full: false,
+        entities: vec![entity(1, 1, 3)],
+        removed: Vec::new(),
+        islands: Vec::new(),
     }));
     assert_eq!(
         decode_frame(&one[..one.len() - 5]),
@@ -937,9 +949,17 @@ impl Rng {
                 },
             }),
             10 => Message::GhostUpdate(GhostUpdate {
-                entity: self.guid(),
                 from: self.shard(),
-                snapshot: self.entity(),
+                epoch: self.next_u64(),
+                tick: self.next_u64(),
+                full: self.next_u64().is_multiple_of(2),
+                entities: self.entities(),
+                removed: vec![self.guid()],
+                islands: vec![IslandKey {
+                    body: self.guid(),
+                    min: self.guid(),
+                    home: self.shard(),
+                }],
             }),
             11 => Message::Redirect(Redirect {
                 entity: self.guid(),

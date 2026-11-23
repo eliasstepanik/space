@@ -109,6 +109,53 @@ pub struct ClientState {
     pub height: u32,
     /// Frames per second, as the client measures it.
     pub fps: f32,
+    /// The strength of the gravity at the ship, m/s² (0 in weightless
+    /// space): what the client's prediction of the scene's physics finds
+    /// there (the demo area's gravity room pulls with 9.81).
+    #[serde(default)]
+    pub gravity: f64,
+    /// Whether the ship stands on something in gravity (the floor of the
+    /// gravity room, a crate).
+    #[serde(default)]
+    pub landed: bool,
+    /// The physics bodies the client draws (crates, balls, the door, ...),
+    /// nearest to the ship first, at most 64: `bodies[1]` in Lua is the
+    /// nearest one.
+    #[serde(default)]
+    pub bodies: Vec<BodyState>,
+    /// How many of [`bodies`](Self::bodies) are in the picture.
+    #[serde(default)]
+    pub bodies_in_view: u32,
+    /// The last correction the client's prediction of its own ship needed
+    /// when the server's word arrived, metres.
+    #[serde(default)]
+    pub correction_m: f64,
+    /// The largest such correction of the last five seconds, metres.
+    #[serde(default)]
+    pub correction_max_m: f64,
+}
+
+/// One physics body as the client draws it ([`ClientState::bodies`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BodyState {
+    /// The body's guid, `"shard:serial"` (stable across shard transitions).
+    pub guid: String,
+    /// What it is: the model's name (`"crate"`, `"ball"`, `"plank"`,
+    /// `"door"`, `"chain"`, `"pendulum"`, ...).
+    pub visual: String,
+    /// The model's id (`space_scene::visual`).
+    pub visual_id: u32,
+    /// Where its root part is drawn, metres from the scene's spawn point
+    /// (the frame of [`ClientState::scene_position`]).
+    pub position: [f64; 3],
+    /// How far that is from the ship (as drawn), metres.
+    pub distance: f64,
+    /// Its speed, m/s.
+    pub speed: f64,
+    /// How many rigid parts it has (a chain has six).
+    pub parts: u32,
+    /// Whether it is in the picture.
+    pub in_view: bool,
 }
 
 impl ClientState {
@@ -557,7 +604,30 @@ mod tests {
         };
         state.set_ship([3.0, 4.0, 0.0], [0.0, 3.0, 4.0]);
         state.scene_position = Some([1.0, 2.0, -3.0]);
+        state.gravity = 9.81;
+        state.landed = true;
+        state.bodies = vec![BodyState {
+            guid: "1:7".into(),
+            visual: "crate".into(),
+            visual_id: 1,
+            position: [12.0, -1.4, -1.6],
+            distance: 2.5,
+            speed: 0.25,
+            parts: 1,
+            in_view: true,
+        }];
+        state.bodies_in_view = 1;
+        state.correction_m = 0.002;
         let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["gravity"], 9.81);
+        assert_eq!(json["landed"], true);
+        assert_eq!(json["bodies"][0]["visual"], "crate");
+        assert_eq!(
+            json["bodies"][0]["position"],
+            serde_json::json!([12.0, -1.4, -1.6])
+        );
+        assert_eq!(json["bodies_in_view"], 1);
+        assert_eq!(json["correction_m"], 0.002);
         assert_eq!(json["screen"], "online");
         assert_eq!(json["error"], serde_json::Value::Null);
         assert_eq!(json["address"], "127.0.0.1:7777");
@@ -587,6 +657,27 @@ mod tests {
         assert_eq!(fresh["scene_position"], serde_json::Value::Null);
         assert_eq!(fresh["scene_revision"], 0);
         assert_eq!(fresh["retry_in_s"], serde_json::Value::Null);
+        assert_eq!(fresh["bodies"], serde_json::json!([]));
+        assert_eq!(
+            (fresh["gravity"].as_f64(), fresh["landed"].as_bool()),
+            (Some(0.0), Some(false))
+        );
+        // A state from before the physics fields still reads.
+        let mut old = serde_json::to_value(ClientState::default()).unwrap();
+        for field in [
+            "gravity",
+            "landed",
+            "bodies",
+            "bodies_in_view",
+            "correction_m",
+            "correction_max_m",
+        ] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(
+            serde_json::from_value::<ClientState>(old).unwrap(),
+            ClientState::default()
+        );
         for screen in [
             Screen::Connect,
             Screen::Connecting,

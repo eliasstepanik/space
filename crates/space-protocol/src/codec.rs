@@ -57,7 +57,18 @@ use crate::messages::Message;
 /// `ShardHello`/`ShardWelcome`, and such a peer is turned away at the hello
 /// instead, with the reason, before any session exists (`space-net` answers a
 /// hello framed at another version with a `Reject` naming both).
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// **Version 5** (physics across shards): snapshots and deltas carry every
+/// physics body in a client's interest, not only ships, with the physics
+/// components (ids 4–10: `Body`, `Visual`, `Springs`, `Articulation`,
+/// `PartStates`, `PosResidual`, see `space-sim`); a [`crate::Delta`] entry for
+/// an entity the recipient already holds lists only the components that
+/// changed (an empty payload removes one), which a v4 client would take for
+/// the whole set; [`crate::GhostUpdate`] (wire tag 10, never sent before) is
+/// now a per-tick batch of border ghosts between shards; and a handoff's state
+/// may describe an unowned body. None of it is readable by a v4 peer, so the
+/// version bumps and such a peer is refused at the hello.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Largest accepted frame payload, in bytes (1 MiB).
 ///

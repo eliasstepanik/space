@@ -25,18 +25,36 @@
 //! (with `KHR_materials_emissive_strength`) and `baseColorTexture` — a PNG or
 //! JPEG image embedded in the file (see [`crate::texture`]).
 //!
-//! Texture features the renderer does not have are **ignored with a logged
-//! warning** and the model still loads: the other texture slots
-//! (metallic-roughness, normal, occlusion, emissive), `KHR_texture_transform`,
-//! a second UV set, wrap modes other than repeat, images outside the file or
-//! in another format, and images that fail to decode or exceed the size caps
-//! (such a material is drawn with its factors only). Base-colour alpha is not
-//! used (no blending or cut-outs).
+//! **Vertex colours** (`COLOR_0`: RGB or RGBA, float or normalised integer;
+//! alpha is not used) are multiplied into the base colour *per triangle*. The
+//! renderer's vertices carry no colour, so a primitive is split into one part
+//! per face colour instead: exact for a model that uses vertex colour as paint
+//! per face — what merging many materials into one leaves behind, as in an
+//! exported low-detail proxy — and the triangle's average, with a warning, for
+//! a model that shades smoothly with it.
 //!
-//! Not supported, by design for now: vertex colours, skins, animations, morph
-//! targets, cameras and lights (ignored); sparse accessors, quantised or
-//! compressed geometry (`KHR_mesh_quantization`, Draco, meshopt) and buffers
-//! outside the file (rejected with an error rather than drawn wrongly).
+//! **Parts are merged by material**: every triangle of the file that is drawn
+//! with the same material (after the vertex colour) ends up in one
+//! [`MeshPart`], in the order the materials first appear, whatever the number
+//! of nodes and primitives it came from. A part is a draw call and a geometry
+//! of the ray-traced scene, so a model exported as a thousand objects sharing
+//! a dozen materials costs a dozen of each, not a thousand.
+//!
+//! Features the renderer does not have are **ignored with a logged warning**
+//! and the model still loads: the metallic-roughness, normal and occlusion
+//! textures (the material's factors are used alone), the emissive texture
+//! (the material glows evenly, in the texture's average colour — the factor
+//! alone would make a mostly dark screen as bright as its brightest pixel),
+//! `KHR_texture_transform`, a second UV set, wrap modes other than repeat,
+//! images outside the file or in another format, images that fail to decode
+//! or exceed the size caps (such a material is drawn with its factors only),
+//! and the alpha modes: base-colour alpha is not used, so a `BLEND` material
+//! is drawn opaque and a `MASK` material without its cut-outs.
+//!
+//! Not supported, by design for now: skins, animations, morph targets, cameras
+//! and lights (ignored); sparse accessors, quantised or compressed geometry
+//! (`KHR_mesh_quantization`, Draco, meshopt) and buffers outside the file
+//! (rejected with an error rather than drawn wrongly).
 //!
 //! The loader treats the file as untrusted input: every offset, count and
 //! index is bounds-checked, sizes are capped (decoded images at
@@ -833,6 +851,27 @@ impl Accessor<'_> {
         };
         uv.map(|c| if c.is_finite() { c } else { 0.0 })
     }
+
+    /// The rgb of a vertex colour (`COLOR_0`, linear): float, or an unsigned
+    /// integer normalised to 0..=1; a fourth component (alpha) is not read.
+    /// Clamped to 0..=1, and white where it is not a number.
+    fn color(&self, i: usize) -> [f32; 3] {
+        let e = self.element(i);
+        let rgb = match self.component {
+            COMPONENT_U8 => [0, 1, 2].map(|o| f32::from(e[o]) / 255.0),
+            COMPONENT_U16 => {
+                [0, 2, 4].map(|o| f32::from(u16::from_le_bytes([e[o], e[o + 1]])) / 65535.0)
+            }
+            _ => [0, 4, 8].map(|o| f32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]])),
+        };
+        rgb.map(|c| {
+            if c.is_finite() {
+                c.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        })
+    }
 }
 
 // ---- building the mesh ---------------------------------------------------------
@@ -848,6 +887,9 @@ struct Builder {
     images: std::collections::HashMap<usize, Option<u32>>,
     /// Bytes of decoded textures so far, against [`MAX_GLB_TEXTURE_BYTES`].
     texture_bytes: usize,
+    /// The average colour (linear rgb) of every glTF image asked for it so
+    /// far (`None`: it could not be read).
+    averages: std::collections::HashMap<usize, Option<[f32; 3]>>,
     /// What was left out on purpose; each distinct message once.
     warnings: Vec<String>,
     /// Vertex ranges (first vertex, count) already loaded, by where they came
@@ -891,10 +933,43 @@ impl Builder {
         slot
     }
 
-    fn finish(self) -> Result<MeshData, MeshError> {
+    /// The average colour of glTF image `image_index`, in linear light,
+    /// decoding it on first use (the pixels are not kept).
+    fn image_average(&mut self, doc: &Value, bin: &[u8], image_index: usize) -> Option<[f32; 3]> {
+        if let Some(average) = self.averages.get(&image_index) {
+            return *average;
+        }
+        let budget = MAX_GLB_TEXTURE_BYTES.saturating_sub(self.texture_bytes);
+        let average = load_image(doc, bin, image_index, budget).ok().map(|image| {
+            // sRGB byte -> linear light.
+            let linear: Vec<f64> = (0..256)
+                .map(|byte| {
+                    let c = f64::from(byte) / 255.0;
+                    if c <= 0.04045 {
+                        c / 12.92
+                    } else {
+                        ((c + 0.055) / 1.055).powf(2.4)
+                    }
+                })
+                .collect();
+            let mut sum = [0.0f64; 3];
+            let texels = image.pixels().as_chunks::<4>().0;
+            for texel in texels {
+                for k in 0..3 {
+                    sum[k] += linear[usize::from(texel[k])];
+                }
+            }
+            sum.map(|s| (s / texels.len().max(1) as f64) as f32)
+        });
+        self.averages.insert(image_index, average);
+        average
+    }
+
+    fn finish(mut self) -> Result<MeshData, MeshError> {
         if self.indices.is_empty() {
             return err("the file contains no triangles");
         }
+        merge_parts_by_material(&mut self.indices, &mut self.parts);
         let (mut min, mut max) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
         for v in &self.vertices {
             for a in 0..3 {
@@ -910,6 +985,159 @@ impl Builder {
             bounds_min: min,
             bounds_max: max,
         })
+    }
+}
+
+/// A material as a map key: its numbers bit for bit, and its texture.
+fn material_key(material: &MeshMaterial) -> ([u32; 8], Option<u32>) {
+    let [r, g, b] = material.base_color;
+    let [er, eg, eb] = material.emissive;
+    (
+        [r, g, b, material.metallic, material.roughness, er, eg, eb].map(f32::to_bits),
+        material.base_color_texture,
+    )
+}
+
+/// Make one part of all the parts that share a material, keeping the
+/// materials in the order they first appear and the triangles of each in file
+/// order. `parts` must cover `indices` without overlap (the loader's do); a
+/// list in which every material is already unique is left exactly as it is.
+fn merge_parts_by_material(indices: &mut Vec<u32>, parts: &mut Vec<MeshPart>) {
+    let mut groups = std::collections::HashMap::new();
+    // Per group: its material and index count; per part: its group.
+    let mut merged: Vec<(MeshMaterial, usize)> = Vec::new();
+    let mut group_of = Vec::with_capacity(parts.len());
+    for part in parts.iter() {
+        let group = *groups
+            .entry(material_key(&part.material))
+            .or_insert(merged.len());
+        if group == merged.len() {
+            merged.push((part.material, 0));
+        }
+        merged[group].1 += part.index_count as usize;
+        group_of.push(group);
+    }
+    let covered: usize = merged.iter().map(|(_, count)| count).sum();
+    if merged.len() == parts.len() || covered != indices.len() {
+        return;
+    }
+    // Where each group's run starts, then copy part after part behind it.
+    let mut cursor = Vec::with_capacity(merged.len());
+    let mut start = 0;
+    for (_, count) in &merged {
+        cursor.push(start);
+        start += count;
+    }
+    let starts = cursor.clone();
+    let mut sorted = vec![0u32; indices.len()];
+    for (part, &group) in parts.iter().zip(&group_of) {
+        let (from, count) = (part.first_index as usize, part.index_count as usize);
+        let Some(source) = indices.get(from..from + count) else {
+            return;
+        };
+        sorted[cursor[group]..cursor[group] + count].copy_from_slice(source);
+        cursor[group] += count;
+    }
+    *indices = sorted;
+    *parts = merged
+        .iter()
+        .zip(starts)
+        .map(|(&(material, count), first)| MeshPart {
+            first_index: first as u32,
+            index_count: count as u32,
+            material,
+        })
+        .collect();
+}
+
+/// The most face colours one primitive is split into; a primitive with more
+/// (a smooth gradient) has its colours rounded until they fit.
+const MAX_FACE_COLORS: usize = 256;
+
+/// Vertex colours two of which differ by more than this within one triangle
+/// make it a gradient (which is flattened to the triangle's average).
+const FACE_COLOR_TOLERANCE: f32 = 1.0 / 512.0;
+
+/// The parts of a primitive that has vertex colours: its triangles
+/// (`indices[first_index..]`, mesh-wide vertex indices starting at `base`)
+/// are reordered into runs of one face colour, and each run becomes a part
+/// whose base colour is `material`'s times that colour. See the module docs.
+fn split_by_face_color(
+    out: &mut Builder,
+    first_index: usize,
+    base: u32,
+    colors: &Accessor<'_>,
+    material: MeshMaterial,
+) {
+    let triangles: Vec<[u32; 3]> = out.indices[first_index..].as_chunks::<3>().0.to_vec();
+    let mut gradient = false;
+    let faces: Vec<[f32; 3]> = triangles
+        .iter()
+        .map(|triangle| {
+            let [a, b, c] = triangle.map(|i| colors.color((i - base) as usize));
+            if a == b && a == c {
+                return a;
+            }
+            gradient |=
+                (0..3).any(|k| (a[k] - b[k]).abs().max((a[k] - c[k]).abs()) > FACE_COLOR_TOLERANCE);
+            [0, 1, 2].map(|k| (a[k] + b[k] + c[k]) / 3.0)
+        })
+        .collect();
+    if gradient {
+        out.warn(
+            "COLOR_0 varies within triangles: each is drawn in its average colour \
+             (vertex colours are applied per face)"
+                .into(),
+        );
+    }
+    // Group the triangles by colour, to 10 bits a channel — or to fewer, if
+    // that is what it takes to stay within the limit.
+    let mut bits = 10;
+    let (group_of, groups) = loop {
+        let scale = ((1u32 << bits) - 1) as f32;
+        let mut seen = std::collections::HashMap::new();
+        let mut groups: Vec<[f32; 3]> = Vec::new();
+        let group_of: Vec<usize> = faces
+            .iter()
+            .map(|face| {
+                let key = face.map(|c| (c * scale).round() as u32);
+                *seen.entry(key).or_insert_with(|| {
+                    // The group's colour: its first triangle's, as given.
+                    groups.push(*face);
+                    groups.len() - 1
+                })
+            })
+            .collect();
+        if groups.len() <= MAX_FACE_COLORS || bits == 1 {
+            break (group_of, groups);
+        }
+        bits -= 1;
+    };
+    if bits < 10 {
+        out.warn(format!(
+            "COLOR_0 has more than {MAX_FACE_COLORS} face colours in one primitive: \
+             rounded to {bits} bits a channel"
+        ));
+    }
+    let mut order: Vec<usize> = (0..triangles.len()).collect();
+    order.sort_by_key(|&triangle| group_of[triangle]);
+    out.indices.truncate(first_index);
+    let mut run_start = first_index;
+    for (position, &triangle) in order.iter().enumerate() {
+        out.indices.extend(triangles[triangle]);
+        let group = group_of[triangle];
+        if order.get(position + 1).map(|&next| group_of[next]) != Some(group) {
+            let color = groups[group];
+            out.parts.push(MeshPart {
+                first_index: run_start as u32,
+                index_count: (out.indices.len() - run_start) as u32,
+                material: MeshMaterial {
+                    base_color: [0, 1, 2].map(|k| material.base_color[k] * color[k]),
+                    ..material
+                },
+            });
+            run_start = out.indices.len();
+        }
     }
 }
 
@@ -957,7 +1185,6 @@ fn base_color_texture(
         ),
         ("normalTexture", !material["normalTexture"].is_null()),
         ("occlusionTexture", !material["occlusionTexture"].is_null()),
-        ("emissiveTexture", !material["emissiveTexture"].is_null()),
     ] {
         if present {
             out.warn(format!(
@@ -1055,16 +1282,50 @@ fn material_of(
             .clamp(0.0, 1.0) as f32
     };
     let base = floats::<4>(&pbr["baseColorFactor"]).unwrap_or([1.0; 4]);
+    // Alpha is not used: say what that does to a material that relies on it.
+    match material["alphaMode"].as_str() {
+        Some("BLEND") => {
+            out.warn("alphaMode BLEND is not supported: the material is drawn opaque".into());
+        }
+        Some("MASK") => out
+            .warn("alphaMode MASK is not supported: the material is drawn without cut-outs".into()),
+        _ => {}
+    }
     let strength = material["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"]
         .as_f64()
         .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(1.0);
     let emissive = floats::<3>(&material["emissiveFactor"]).unwrap_or([0.0; 3]);
+    let mut emissive = emissive.map(|c| (c.clamp(0.0, 1.0) * strength).min(1.0e6) as f32);
+    // glTF: what a surface emits is this factor times its emissive texture.
+    // The renderer cannot sample that texture, so the whole surface is given
+    // the texture's average: the right amount of light, without the picture.
+    if !material["emissiveTexture"].is_null() {
+        let average = index(&material["emissiveTexture"]["index"])
+            .and_then(|i| array(&doc["textures"]).get(i))
+            .and_then(|texture| index(&texture["source"]))
+            .and_then(|image| out.image_average(doc, bin, image));
+        match average {
+            Some(average) => {
+                emissive = [0, 1, 2].map(|k| emissive[k] * average[k]);
+                out.warn(
+                    "emissiveTexture is not supported: the material glows evenly, in the \
+                     texture's average colour"
+                        .into(),
+                );
+            }
+            None => out.warn(
+                "emissiveTexture is not supported and could not be read: the emissive \
+                 factor is used alone"
+                    .into(),
+            ),
+        }
+    }
     MeshMaterial {
         base_color: [0, 1, 2].map(|i| base[i].clamp(0.0, 1.0) as f32),
         metallic: unit(&pbr["metallicFactor"], 1.0),
         roughness: unit(&pbr["roughnessFactor"], 1.0),
-        emissive: emissive.map(|c| (c.clamp(0.0, 1.0) * strength).min(1.0e6) as f32),
+        emissive,
         base_color_texture: base_color_texture(doc, bin, material, has_uv, out),
     }
 }
@@ -1117,6 +1378,29 @@ fn add_primitive(
                 return err("TEXCOORD_0 and POSITION have different counts");
             }
             Some(uvs)
+        }
+        None => None,
+    };
+    let colors = match index(&primitive["attributes"]["COLOR_0"]) {
+        Some(i) => {
+            let rgba = array(&doc["accessors"])
+                .get(i)
+                .is_some_and(|acc| acc["type"].as_str() == Some("VEC4"));
+            let colors = if rgba {
+                accessor(doc, bin, i, "VEC4", 4)?
+            } else {
+                accessor(doc, bin, i, "VEC3", 3)?
+            };
+            if !matches!(
+                colors.component,
+                COMPONENT_F32 | COMPONENT_U8 | COMPONENT_U16
+            ) {
+                return err("COLOR_0 is neither float nor a normalised unsigned integer");
+            }
+            if colors.count != positions.count {
+                return err("COLOR_0 and POSITION have different counts");
+            }
+            Some(colors)
         }
         None => None,
     };
@@ -1217,11 +1501,15 @@ fn add_primitive(
         );
     }
     let material = material_of(doc, bin, primitive, uvs.is_some(), out);
-    out.parts.push(MeshPart {
-        first_index: first_index as u32,
-        index_count: added as u32,
-        material,
-    });
+    match colors {
+        // Vertex colours: one part per face colour.
+        Some(colors) => split_by_face_color(out, first_index, base, &colors, material),
+        None => out.parts.push(MeshPart {
+            first_index: first_index as u32,
+            index_count: added as u32,
+            material,
+        }),
+    }
     Ok(())
 }
 
@@ -2247,6 +2535,9 @@ mod tests {
             .push(primitive);
         shared["textures"] = serde_json::json!([{ "source": 0 }, { "source": 0 }]);
         shared["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"]["index"] = 1.into();
+        // (A different roughness: two materials that draw exactly alike would
+        // be merged into one part.)
+        shared["materials"][1]["pbrMetallicRoughness"]["roughnessFactor"] = 0.5.into();
         let mesh = MeshData::from_glb(&glb(&shared, &bin)).expect("valid file");
         assert_eq!((mesh.parts.len(), mesh.textures.len()), (2, 1));
         assert!(mesh
@@ -2375,6 +2666,308 @@ mod tests {
         assert!(fails(&|d| {
             d["extensionsRequired"] = serde_json::json!(["KHR_texture_basisu"]);
         }));
+    }
+
+    /// Three triangles side by side (nine vertices of their own), unindexed,
+    /// with a `COLOR_0` per vertex: `colors` as float RGB.
+    fn colored_file(colors: &[[f32; 3]; 9]) -> (Value, Vec<u8>) {
+        let mut bin = Vec::new();
+        for triangle in 0..3 {
+            let x = triangle as f32 * 2.0;
+            for p in [[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]] {
+                for c in p {
+                    bin.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        for color in colors {
+            for c in color {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let doc = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": { "POSITION": 0, "COLOR_0": 1 }, "material": 0,
+            }]}],
+            "materials": [{ "pbrMetallicRoughness": {
+                "baseColorFactor": [0.5, 0.5, 1.0, 1.0],
+                "metallicFactor": 0.2, "roughnessFactor": 0.45,
+            }}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 9, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 9, "type": "VEC3" },
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 108 },
+                { "buffer": 0, "byteOffset": 108, "byteLength": 108 },
+            ],
+            "buffers": [{ "byteLength": 216 }],
+        });
+        (doc, bin)
+    }
+
+    /// Vertex colours paint whole faces: the primitive becomes one part per
+    /// face colour (base colour factor times the colour), its triangles
+    /// regrouped; the vertices are untouched. Float or normalised integer,
+    /// with or without alpha.
+    #[test]
+    fn vertex_colours_become_one_part_per_face_colour() {
+        let (red, green) = ([0.8f32, 0.1, 0.1], [0.1, 0.6, 0.2]);
+        // Red, green, red: the two red triangles end up in one part.
+        let paint = [red, red, red, green, green, green, red, red, red];
+        let (doc, bin) = colored_file(&paint);
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(mesh.vertices.len(), 9);
+        assert_eq!(mesh.indices, [0, 1, 2, 6, 7, 8, 3, 4, 5]);
+        assert_eq!(mesh.parts.len(), 2);
+        let (first, second) = (mesh.parts[0], mesh.parts[1]);
+        assert_eq!((first.first_index, first.index_count), (0, 6));
+        assert_eq!((second.first_index, second.index_count), (6, 3));
+        // The factor (0.5, 0.5, 1.0) times the face colour; the rest as is.
+        assert_eq!(first.material.base_color, [0.4, 0.05, 0.1]);
+        assert_eq!(second.material.base_color, [0.05, 0.3, 0.2]);
+        for part in &mesh.parts {
+            assert_eq!(
+                (part.material.metallic, part.material.roughness),
+                (0.2, 0.45)
+            );
+        }
+        mesh.validate().expect("a valid mesh");
+
+        // The same as normalised bytes with an alpha channel (not used).
+        let (mut doc, mut bin) = colored_file(&paint);
+        bin.truncate(108);
+        for color in paint {
+            bin.extend(color.map(|c| (c * 255.0).round() as u8));
+            bin.push(77);
+        }
+        doc["accessors"][1] = serde_json::json!({
+            "bufferView": 1, "componentType": 5121, "normalized": true,
+            "count": 9, "type": "VEC4",
+        });
+        doc["bufferViews"][1]["byteLength"] = 36.into();
+        let bytes = MeshData::from_glb(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(bytes.indices, mesh.indices);
+        assert_eq!(bytes.parts.len(), 2);
+        for (a, b) in bytes.parts.iter().zip(&mesh.parts) {
+            for k in 0..3 {
+                let (x, y) = (a.material.base_color[k], b.material.base_color[k]);
+                assert!((x - y).abs() < 0.003, "{x} / {y}");
+            }
+        }
+
+        // All one colour: one part, as without vertex colours — but painted.
+        let (doc, bin) = colored_file(&[green; 9]);
+        let plain = MeshData::from_glb(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(plain.parts.len(), 1);
+        assert_eq!(plain.indices, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(plain.parts[0].material.base_color, [0.05, 0.3, 0.2]);
+
+        // A gradient inside a triangle is flattened to its average, and said.
+        let mut shaded = [green; 9];
+        shaded[0] = [0.4, 0.6, 0.2];
+        shaded[1] = [0.7, 0.6, 0.2];
+        let (doc, bin) = colored_file(&shaded);
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("COLOR_0") && warnings[0].contains("average"));
+        assert_eq!(mesh.parts.len(), 2);
+        let average = mesh.parts[0].material.base_color;
+        assert!((average[0] - 0.5 * 0.4).abs() < 1e-6, "{average:?}");
+
+        // Broken colours are an error like any other broken attribute.
+        let fails = |edit: &dyn Fn(&mut Value)| {
+            let (mut doc, bin) = colored_file(&paint);
+            edit(&mut doc);
+            MeshData::from_glb(&glb(&doc, &bin)).is_err()
+        };
+        assert!(fails(&|d| d["accessors"][1]["count"] = 8.into()));
+        assert!(fails(&|d| d["accessors"][1]["componentType"] = 5125.into()));
+        assert!(fails(&|d| d["accessors"][1]["type"] = "VEC2".into()));
+        assert!(fails(&|d| d["bufferViews"][1]["byteLength"] = 100.into()));
+    }
+
+    /// A smooth vertex-colour gradient over many triangles stays within the
+    /// part limit: the colours are rounded, with a warning.
+    #[test]
+    fn a_vertex_colour_gradient_is_rounded_into_a_bounded_number_of_parts() {
+        // 600 triangles, each its own shade.
+        let count = 600usize;
+        let mut bin = Vec::new();
+        for triangle in 0..count {
+            let x = triangle as f32;
+            for p in [[x, 0.0, 0.0], [x + 0.5, 0.0, 0.0], [x, 1.0, 0.0]] {
+                for c in p {
+                    bin.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        for triangle in 0..count {
+            let shade = triangle as f32 / (count - 1) as f32;
+            for _ in 0..3 {
+                for c in [shade, 1.0 - shade, 0.5] {
+                    bin.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
+        let bytes = count * 36;
+        let doc = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0, "COLOR_0": 1 } }]}],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": count * 3, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": count * 3, "type": "VEC3" },
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": bytes },
+                { "buffer": 0, "byteOffset": bytes, "byteLength": bytes },
+            ],
+            "buffers": [{ "byteLength": 2 * bytes }],
+        });
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(mesh.triangle_count(), count);
+        assert!(
+            mesh.parts.len() <= MAX_FACE_COLORS && mesh.parts.len() > 100,
+            "{} parts",
+            mesh.parts.len()
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("rounded"), "{warnings:?}");
+        // Still a gradient: dark red first, bright red last.
+        let reds: Vec<f32> = mesh
+            .parts
+            .iter()
+            .map(|p| p.material.base_color[0])
+            .collect();
+        assert!(reds.windows(2).all(|w| w[0] < w[1]), "{reds:?}");
+        mesh.validate().expect("a valid mesh");
+    }
+
+    /// Everything drawn with one material is one part, however many nodes and
+    /// primitives it came from; the materials keep the order they first
+    /// appear in, and a file whose materials all differ is left as it was.
+    #[test]
+    fn parts_that_share_a_material_are_merged() {
+        let (mut doc, bin) = triangle_file();
+        // The mesh three times (the hierarchy's node, and two more beside
+        // it), and a second primitive with another material in between.
+        doc["scenes"][0]["nodes"] = serde_json::json!([0, 2, 3]);
+        doc["nodes"].as_array_mut().unwrap().extend([
+            serde_json::json!({ "translation": [0.0, 5.0, 0.0], "mesh": 1 }),
+            serde_json::json!({ "translation": [0.0, 9.0, 0.0], "mesh": 0 }),
+        ]);
+        doc["meshes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "primitives": [
+                    { "attributes": { "POSITION": 0 }, "indices": 1, "material": 1 },
+                    { "attributes": { "POSITION": 0 }, "indices": 1, "material": 0 },
+                ],
+            }));
+        doc["materials"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "pbrMetallicRoughness": { "baseColorFactor": [0.9, 0.9, 0.1, 1.0] },
+            }));
+        let mesh = MeshData::from_glb(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(mesh.triangle_count(), 4);
+        // File order: A (node 1), B then A (node 2), A (node 3) — merged into
+        // A (three triangles), B (one).
+        assert_eq!(mesh.parts.len(), 2);
+        let (a, b) = (mesh.parts[0], mesh.parts[1]);
+        assert_eq!((a.first_index, a.index_count), (0, 9));
+        assert_eq!((b.first_index, b.index_count), (9, 3));
+        assert_eq!(a.material.base_color, [0.2, 0.4, 0.6]);
+        assert_eq!(b.material.base_color, [0.9, 0.9, 0.1]);
+        // A's triangles are in file order, B's after them: the y of each
+        // triangle's first corner says which node it came from.
+        let heights: Vec<f32> = mesh
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| mesh.vertices[t[0] as usize].position[1])
+            .collect();
+        assert_eq!(heights, [0.0, 5.0, 9.0, 5.0]);
+        mesh.validate().expect("a valid mesh");
+    }
+
+    /// An emissive texture cannot be sampled, so the material glows evenly:
+    /// its factor (and strength) times the texture's average colour, taken in
+    /// linear light — not the factor alone, which is the texture's white.
+    #[test]
+    fn an_emissive_texture_dims_the_glow_to_its_average() {
+        // The file's image is half red, half blue; its material emits
+        // (1, 0.5, 0) at strength 4.
+        let (mut doc, bin) = textured_triangle_file();
+        let plain = MeshData::from_glb(&glb(&doc, &bin)).expect("valid file");
+        assert_eq!(plain.parts[0].material.emissive, [4.0, 2.0, 0.0]);
+        doc["materials"][0]["emissiveTexture"] = serde_json::json!({ "index": 0 });
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+        let glow = mesh.parts[0].material.emissive;
+        assert!(
+            (glow[0] - 2.0).abs() < 1e-4 && glow[1] == 0.0 && glow[2] == 0.0,
+            "{glow:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("emissiveTexture") && warnings[0].contains("average"));
+        // The image is decoded for its average only: one texture, the base
+        // colour's, is kept.
+        assert_eq!(mesh.textures.len(), 1);
+
+        // A texture that cannot be read: the factor alone, and a warning.
+        type Edit<'a> = &'a dyn Fn(&mut Value);
+        let no_such_texture: Edit<'_> =
+            &|d| d["materials"][0]["emissiveTexture"]["index"] = 7.into();
+        let no_such_image: Edit<'_> = &|d| {
+            d["textures"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({ "source": 9 }));
+            d["materials"][0]["emissiveTexture"]["index"] = 1.into();
+        };
+        for edit in [no_such_texture, no_such_image] {
+            let mut broken = doc.clone();
+            edit(&mut broken);
+            let (mesh, warnings) =
+                MeshData::from_glb_with_warnings(&glb(&broken, &bin)).expect("still loads");
+            assert_eq!(mesh.parts[0].material.emissive, [4.0, 2.0, 0.0]);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("could not be read"), "{warnings:?}");
+        }
+    }
+
+    /// The alpha modes are not drawn as such, and the load says so instead of
+    /// keeping quiet: `BLEND` is opaque, `MASK` has no cut-outs.
+    #[test]
+    fn alpha_modes_are_warnings() {
+        for (mode, word) in [("BLEND", "opaque"), ("MASK", "cut-outs")] {
+            let (mut doc, bin) = triangle_file();
+            doc["materials"][0]["alphaMode"] = mode.into();
+            doc["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"] =
+                serde_json::json!([0.05, 0.09, 0.12, 0.28]);
+            let (mesh, warnings) =
+                MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+            assert_eq!(warnings.len(), 1, "{mode}: {warnings:?}");
+            assert!(warnings[0].contains(mode) && warnings[0].contains(word));
+            assert_eq!(mesh.parts[0].material.base_color, [0.05, 0.09, 0.12]);
+        }
+        let (mut doc, bin) = triangle_file();
+        doc["materials"][0]["alphaMode"] = "OPAQUE".into();
+        let (_, warnings) = MeshData::from_glb_with_warnings(&glb(&doc, &bin)).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// A node that mirrors (negative determinant) reverses the winding of its

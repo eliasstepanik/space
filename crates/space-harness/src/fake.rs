@@ -19,7 +19,9 @@
 //! * **Online**: the movement keys thrust the ship along the view
 //!   ([`ACCELERATION`] m/s², [`TIME_STEP`] s per frame), `Turn` rotates the
 //!   view, the tick counts frames, and crossing `z = -`[`HANDOFF_DISTANCE`]
-//!   moves the ship to shard 2 (one handoff, a new session).
+//!   moves the ship to shard 2 (one handoff, a new session). The world is
+//!   weightless and holds one body, a crate at [`CRATE_AT`] that the ship
+//!   pushes ahead of it when it flies into it ([`ClientState::bodies`]).
 //! * **Frames**: [`picture`], a pattern that depends on the screen and the
 //!   frame number, so a test can tell exactly which frame it was given.
 
@@ -28,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::control::{ClientState, Control, Frame, Key, Screen, ViewerInput};
+use crate::control::{BodyState, ClientState, Control, Frame, Key, Screen, ViewerInput};
 use crate::hub::{Command, Hub};
 
 /// Thrust acceleration of the fake ship, m/s².
@@ -39,6 +41,11 @@ pub const TIME_STEP: f64 = 1.0 / 60.0;
 pub const HANDOFF_DISTANCE: f64 = 50.0;
 /// The view cannot pitch past this, degrees.
 pub const MAX_PITCH_DEG: f32 = 89.0;
+/// Where the fake world's one body, a crate, starts (metres from the spawn
+/// point, straight ahead).
+pub const CRATE_AT: [f64; 3] = [0.0, 0.0, -10.0];
+/// The ship pushes the crate when its centre comes this close, metres.
+const CRATE_REACH: f64 = 1.0;
 
 /// How a [`FakeClient`] behaves.
 #[derive(Clone, Debug)]
@@ -252,6 +259,9 @@ struct Sim {
     pitch: f32,
     position: [f64; 3],
     velocity: [f64; 3],
+    /// The crate: where it is and how fast it drifts.
+    crate_at: [f64; 3],
+    crate_velocity: [f64; 3],
     /// The address being connected to and the frames left until the answer.
     connecting: Option<(String, u64)>,
     sessions: u64,
@@ -276,6 +286,8 @@ impl Sim {
             pitch: 0.0,
             position: [0.0; 3],
             velocity: [0.0; 3],
+            crate_at: CRATE_AT,
+            crate_velocity: [0.0; 3],
             connecting: None,
             sessions: 0,
             quit: false,
@@ -374,6 +386,8 @@ impl Sim {
         self.state.scene = None;
         self.state.scene_revision = 0;
         self.state.clear_ship();
+        self.state.bodies.clear();
+        self.state.bodies_in_view = 0;
         self.position = [0.0; 3];
         self.velocity = [0.0; 3];
     }
@@ -434,6 +448,7 @@ impl Sim {
         self.state.set_ship(self.position, self.velocity);
         // The fake's world begins at its scene's spawn point.
         self.state.scene_position = Some(self.position);
+        self.push_crate();
         let shard = if self.position[2] < -HANDOFF_DISTANCE {
             2
         } else {
@@ -445,6 +460,44 @@ impl Sim {
             self.state.session = Some(self.sessions);
             self.state.handoffs += 1;
         }
+    }
+
+    /// The crate: it drifts on, and a ship that flies into it gives it its
+    /// own velocity (a ten-tonne ship and a crate).
+    fn push_crate(&mut self) {
+        let gap: f64 = (0..3)
+            .map(|i| (self.crate_at[i] - self.position[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if gap < CRATE_REACH {
+            let speed = |v: [f64; 3]| v.iter().map(|c| c * c).sum::<f64>().sqrt();
+            if speed(self.velocity) > speed(self.crate_velocity) {
+                self.crate_velocity = self.velocity;
+            }
+        }
+        for i in 0..3 {
+            self.crate_at[i] += self.crate_velocity[i] * TIME_STEP;
+        }
+        let distance: f64 = (0..3)
+            .map(|i| (self.crate_at[i] - self.position[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        self.state.bodies = vec![BodyState {
+            guid: "1:1".to_owned(),
+            visual: "crate".to_owned(),
+            visual_id: 1,
+            position: self.crate_at,
+            distance,
+            speed: self
+                .crate_velocity
+                .iter()
+                .map(|c| c * c)
+                .sum::<f64>()
+                .sqrt(),
+            parts: 1,
+            in_view: true,
+        }];
+        self.state.bodies_in_view = 1;
     }
 }
 
@@ -564,6 +617,14 @@ mod tests {
         );
         assert_eq!((state.shard, state.session), (Some(2), Some(2)));
         assert_eq!(state.scene_position, state.position);
+        // On the way it flew into the crate, which drifts on ahead of it.
+        let pushed = &state.bodies[0];
+        assert_eq!((pushed.visual.as_str(), pushed.parts), ("crate", 1));
+        assert!(
+            pushed.speed > 1.0 && pushed.position[2] < CRATE_AT[2],
+            "{pushed:?}"
+        );
+        assert_eq!((state.gravity, state.landed), (0.0, false));
         assert_eq!(
             (
                 state.scene.as_deref(),
@@ -587,6 +648,7 @@ mod tests {
         );
         assert_eq!((state.scene, state.scene_revision), (None, 0));
         assert_eq!(state.scene_position, None);
+        assert!(state.bodies.is_empty(), "no bodies off the server");
         assert_eq!(fake.record().disconnects, 1);
     }
 

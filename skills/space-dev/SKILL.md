@@ -20,12 +20,13 @@ server state** owned by the orchestrator; **every push to `main` is a release an
 | `space-world` | i64-cell + f32 position model (1024 m cells), octree, deterministic galaxy, LOD selector |
 | `space-ecs` | custom archetype ECS |
 | `space-protocol` | wire messages, codec, `PROTOCOL_VERSION`, `Message::VARIANT_COUNT`; `scene.rs` = the scene catalogue (`Scene`, `SceneId`, `SceneState`) |
-| `space-sim` | deterministic physics/orbits/prediction, `SimWorld` |
+| `space-sim` | deterministic simulation, `SimWorld`: ship flight (`physics.rs`), rigid bodies on `rapier3d-f64` in floating-origin **bubbles** (`rigid.rs`: merge/split/re-anchor rules, statics, islands, ghosts), components `Body`/`Visual`/`Springs`/`Articulation`/`PartStates`/`PosResidual` (ids 4-10, versioned wire forms), gravity zones + large bodies (`gravity.rs`; a `LargeBody` has a `reach`: the pull fades over its outer quarter and is exactly 0 beyond, `f64::INFINITY` = no limit, as the solar scene's bodies), orbits, prediction (`PredictedShip`, `PredictedPhysics`). Ships: `ShipParams::lift` (1.0) = lift engines, the part of the input that pushes against the local pull gets `lift × |g|` more (`physics::lift_accel`, any direction, nothing in weightless space, so free flight is bit-identical); `Body::ship` has friction 0 (half the floor's by the average rule), so a landed ship can walk |
+| `space-scene` | the physical definition of every scene, shared by shards and clients: statics (the demo area's stations with the client's numbers, the Kestrel collider read from `kestrel_lod1.glb`), the demo area's physics showcase (the gravity room, whose curbs stop balls but not ships; the zero-g corner; the planetoid at `demo::PLANETOID_CENTER`: a 4 m rock with large-body gravity, 4 m/s² on its surface, a 16 m reach, crates resting on it and three balls in orbit), gravity, the shape catalogue, the `visual` ids and names, `scene_anchor` |
 | `space-net` | quinn QUIC transport (self-signed rustls, `ring`), hello/handshake (a version mismatch is answered with a `Reject`, not a dropped connection) |
-| `space-server` | authoritative shard (`space-server` bin), `handoff.rs` seamless handoff; holds and relays the scene (`--scene` standalone only) |
+| `space-server` | authoritative shard (`space-server` bin), `handoff.rs` seamless handoff (ships and unowned bodies, island groups); holds and relays the scene (`--scene` standalone only) and simulates it (`shard_physics.rs`: the scene's bodies, spawned once per cluster by the shallowest region's shard; free spawn points; ghosts); `border.rs` = the cross-shard physics rules (ghost margin 64 m + 3 s of motion, islands 0.5 m + 1 s of motion, consolidation onto the home of an island's lowest guid; hysteresis: a body moves 2 m into a region or after 3 s in it, an island that was in a group waits until it has wanted the move for 3 s, doubling up to 48 s for a body that keeps coming back; a player's ship carries `Visual(PLAYER)`, ghosts included); `replicate.rs` = every body in interest, changed components only in deltas (`ComponentLog`) |
 | `space-orchestrator` | epoch-versioned shard map, autoscaler, ShardId counter, `--launcher local`; owns the scene (`scene.rs`, persisted in `<state>.scene`); operator path `ops.rs`/`snapshot.rs`/`events.rs`; built-in web UI `webui/` (hand-rolled HTTP, server-rendered HTML, **no JavaScript**) |
 | `space-render` | ash/Vulkan renderer, naga WGSL->SPIR-V in `build.rs`, ray-query GI and shadows, presets, reversed-Z, `mesh.rs` (GLB models, in the TLAS), `texture.rs` (PNG/JPEG decode, procedural textures), `overlay.rs` (2D rects + built-in 5x7 font), `environment.rs`, `swapchain.rs` |
-| `space-client` | the client, one core (`app.rs`) with three front ends: window (`window.rs`), `--headless` and `--stream` (`headless.rs`); `connect.rs`/`address.rs` (connect screen), `input.rs`, `ui.rs` (HUD), `scenes.rs` + `demo_area.rs` (what each server scene looks like), `link.rs` (player link, scene, shard transitions) |
+| `space-client` | the client, one core (`app.rs`) with three front ends: window (`window.rs`), `--headless` and `--stream` (`headless.rs`); `connect.rs`/`address.rs` (connect screen), `input.rs`, `ui.rs` (HUD), `scenes.rs` + `demo_area.rs` (what each server scene looks like; the physics showcase's statics drawn from `space-scene`'s definition), `link.rs` (player link, scene, shard transitions, replicated bodies merged per protocol 5), `bodies.rs` + `meshes.rs` (bodies drawn from their collision shapes, interpolated between ticks, springs as coils, joints as pins), `predict.rs` (the own ship predicted through `PredictedPhysics` with the scene's statics, gravity and nearby bodies; the draw clock) |
 | `space-harness` | drive a client without a human: `Control` trait + `Hub`, loopback HTTP API (`http.rs`), sandboxed Lua scripts (`script.rs`, interpreter `lunita`), `examples/fake.rs` |
 | `space-stream` | JPEG frame + viewer input wire format (keys, typed text, turns); feature `net` = ws:// server (tokio-tungstenite, no TLS), feature `jpeg` = encoder only |
 | `space-viewer` | wasm cdylib browser viewer (canvas + WebSocket); a local dev tool, never deployed |
@@ -44,8 +45,10 @@ TMPDIR=/workspace/.warren/tmp RUSTUP_HOME=/workspace/.warren/rustup RUSTUP_TOOLC
 test target dir `<target dir>/xtask-test`, honouring `CARGO_TARGET_DIR`). GPU-using packages run
 one test at a time: `.config/nextest.toml` group `gpu`, `--test-threads=1` in the fallback.
 Baseline history: Phase 8 394 passed; after the audit 557; after the online-only rework
-(web UI, scenes, harness, textures/shadows, connect screen): 950 passed, 0 failed, 3 ignored
-(Windows, RTX 4080, `SPACE_REQUIRE_GPU=1`).
+(web UI, scenes, harness, textures/shadows, connect screen): 950 passed, 0 failed, 3 ignored;
+after physics (bodies, ghosts, body handoff, protocol 5) and the renderer fixes (sky occlusion,
+ray-traced glass, tinted SSR, fog into the sky): 1081 passed, 0 failed, 4 ignored
+(Windows, RTX 4080, `SPACE_REQUIRE_GPU=1 SPACE_RENDER_VALIDATION=1`).
 Wasm build (also a CI job):
 `cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer`.
 Lockfile edits need a non-`--locked` cargo command first (e.g. `cargo metadata`).
@@ -100,12 +103,21 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   `MeshMaterial.base_color_texture` indexes `MeshData.textures`. Procedural: `Texture::{checkerboard, uv_grid,
   hull_panels, brushed_metal, hazard_stripes, solid}`. GLB: `TEXCOORD_0` + embedded PNG/JPEG `baseColorTexture`;
   everything else is ignored with a warning.
-- **Reflections and refraction are screen-space**: a mirror only shows what is on screen (use a mirror
-  floor), glass is for sphere/box instances only. A missed lookup falls back to the scene straight behind
-  the glass, then to the environment - never to black.
+- **Reflections are screen-space**: a mirror only shows what is on screen (use a mirror floor), weighted by
+  the surface's specular colour (a third `rgba8` target), the same tint as the environment reflection where
+  the screen has nothing - gold mirrors everything in gold.
+- **Glass** (sphere/box instances only) is ray traced with ray query: bent going in and coming out,
+  reflected inside up to `glass_bounces` (3 High, 1 Medium), then the frame's colour of what it hits, a rough
+  shading if that is off screen, or the environment - never black. Without ray query the old stand-in
+  remains (one bend, a lookup 2 m along; `RenderContext::glass_rays_active`).
 - **Environment** (`Scene.environment`, default none = frames unchanged): a sky gradient giving ambient
-  light, the reflection for polished metal when the screen-space trace misses, the last refraction
-  fallback and optionally a painted background. The ambient term is unoccluded.
+  light, reflections, the refraction fallback and optionally a painted background, into which distance fog
+  fades (far geometry melts into the sky; the background itself is not fogged). With ray query, **sky
+  rays** (8 High, 4 Medium) occlude the ambient term and the environment reflection per pixel, on a fixed
+  4x4 pattern averaged by the post pass (no noise, no flicker): rooms are as dark as their openings. GI
+  probes see the environment too (a probe ray that misses takes the sky). `Low`/`Ci` cast no sky rays.
+- Surfaces are shaded on the side the camera sees (`side_of`): closed solids are dark inside, open sheets
+  have two outsides. Nothing is see-through from behind.
 - **Overlay** (`Scene.overlay`): rectangles and 5x7 bitmap text in output pixels, drawn after tone mapping,
   identical in readback and swapchain frames; empty = no pass. The connect screen and HUD are built on it.
 - `scene::mat4_inverse` is exercised with turned cameras (`the_inverse_of_a_turned_cameras_view_projection_is_its_inverse`):
@@ -115,7 +127,9 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   reference pictures; open them after any renderer change.
 
 ## Invariants - do not break
-- **Wire gate**: `PROTOCOL_VERSION` (`space-protocol/src/codec.rs`, now 4) is checked in every hello
+- **Wire gate**: `PROTOCOL_VERSION` (`space-protocol/src/codec.rs`, now 5: bodies with component ids 4-10 in
+  snapshots/deltas, a delta entry for a known entity lists only changed components - `ShipState` and `Owner`
+  always, an empty payload removes one - and `GhostUpdate` is the per-tick batch of border ghosts) is checked in every hello
   (`check_hello`). `Message::VARIANT_COUNT` (28) = one past the highest tag; only APPEND variants,
   bump the count, add the arm to `wire_tag()`; `message_tags_are_dense_and_covered` and
   `unknown_tag_rejected` (acceptance.rs) pin it. Changing existing layouts - or adding a message an
@@ -126,7 +140,10 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   = "never set, default applies". A scene change is **not** an epoch change and must not touch the epoch
   protocol. Unknown scene ids decode and resolve to the default.
 - **Handoff freeze**: `space-server/src/handoff.rs` documents guarantees H1-H8 (one simulator per tick,
-  bounded time, ...); H9-H15 are the orchestrator's. `HandoffOffer` has no token field and space-protocol
+  bounded time, ...) for ships and for unowned bodies (no client gate, whole component list, island groups
+  commit together; `tests/physics.rs` checks the body half); H9-H15 are the orchestrator's. A settled body is
+  on the shard the map names **except** while it is in an island consolidated on another shard or within the
+  2 m body hysteresis of a border (`border.rs`). `HandoffOffer` has no token field and space-protocol
   was frozen for handoff - the owner token rides inside the state payload. Don't change the three-phase
   offer/accept/commit exchange without updating the guarantee table and its tests.
 - **Viewer wire format** (`space-stream/src/protocol.rs`): message tags 1-4 and `Key` ids 1-15 are
@@ -172,6 +189,7 @@ harness (HTTP + Lua), per-push releases.
 Both: `--stdio` (default) or `--http 127.0.0.1:PORT`.
 - `cargo run -p space-mcp-server -- [--bind 127.0.0.1:0] [--no-tick]`: real shard behind real QUIC at 30 Hz.
   Tools: `shard_status` (reports the QUIC addr), `topology`, `list_ships`, `spawn_ship`, `ship_state`,
+  `set_scene` (the shard starts with no scene: an empty world), `list_bodies` (ships, bodies, ghosts), `spawn_body`,
   `despawn_ship`, `advance_ticks` (deterministic stepping; use with `--no-tick`). No split/merge (orchestrator's job).
 - `cargo run -p space-mcp-client -- [--out-dir DIR]`: a player. Tools: `connect` (host:port from `shard_status`),
   `disconnect`, `client_status`, `send_input` (thrust, optional duration), `capture_frame` (offscreen render of

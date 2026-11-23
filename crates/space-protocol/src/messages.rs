@@ -164,8 +164,16 @@ pub struct Delta {
     pub shard: ShardId,
     /// Shard-map epoch in effect.
     pub epoch: u64,
-    /// Changed entities. A component list is the entity's full replicated set,
-    /// so an entity that lost a component is still described correctly.
+    /// Changed entities (protocol 5).
+    ///
+    /// An entity the recipient does not hold yet (it entered interest, or a
+    /// frame that introduced it was lost) arrives with its **full**
+    /// replicated component set, exactly as in a [`Snapshot`]. An entity it
+    /// already holds lists only what changed since `base_tick`: its
+    /// `ShipState` and its `Owner` (if it has one) always, and any other
+    /// component whose bytes changed; a component listed with an **empty
+    /// payload** was removed (every real component encodes to at least one
+    /// byte). A component not listed is unchanged.
     pub entities: Vec<EntitySnapshot>,
     /// Entities the recipient must **remove**: despawned, or left the recipient's
     /// interest range.
@@ -297,19 +305,51 @@ pub struct NeighbourStatus {
     pub connected: bool,
 }
 
-/// A ghost replica of an entity that lives in a neighbouring shard.
+/// One tick's border ghosts from one shard to a neighbour (protocol 5).
 ///
-/// Sent by the owning shard to the shard that borders it, so the neighbour can
-/// simulate and render the entity at reduced fidelity without a round trip. The
-/// payload is a plain [`EntitySnapshot`]: same encoding as a snapshot entity.
+/// A shard keeps, on each neighbour, a **ghost** — a kinematic copy its
+/// bodies collide with and its clients see — of every body it simulates near
+/// that neighbour's region (and of the ends of springs that cross to it). This
+/// message is how: sent after the sender's step whenever something changed,
+/// and in full every second (`full`), on the same ordered peer connection as
+/// the handoff messages.
+///
+/// The entity lists follow [`Delta`]'s rule: a ghost the receiver is not
+/// known to hold yet — and every entity of a `full` update — comes with its
+/// full replicated component set; one it holds lists only its `ShipState`
+/// and what else changed (an empty payload removes a component).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GhostUpdate {
-    /// The replicated entity.
-    pub entity: EntityGuid,
-    /// Shard that owns (simulates) it.
+    /// Shard that owns (simulates) the entities.
     pub from: ShardId,
-    /// Its current state.
-    pub snapshot: EntitySnapshot,
+    /// Shard-map epoch the sender is on.
+    pub epoch: u64,
+    /// The sender's tick the states are from (its clock, not the receiver's).
+    pub tick: u64,
+    /// A full refresh: `entities` is the sender's whole ghost set for the
+    /// receiver, with full component lists, and every ghost of the sender's
+    /// the receiver holds that is not listed is to be removed.
+    pub full: bool,
+    /// New or changed ghosts.
+    pub entities: Vec<EntitySnapshot>,
+    /// Ghosts the receiver must drop (they left the border margin, were
+    /// despawned, or were handed to another shard).
+    pub removed: Vec<EntityGuid>,
+    /// The sender's view of the interaction island each ghosted body is in,
+    /// for island consolidation (see `space-server`'s `border` module).
+    pub islands: Vec<IslandKey>,
+}
+
+/// A shard's view of the interaction island a body is in: the island's
+/// member with the lowest guid and the shard the island belongs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IslandKey {
+    /// The body.
+    pub body: EntityGuid,
+    /// The lowest guid of its island, as the sender sees it.
+    pub min: EntityGuid,
+    /// The shard the sender says that island belongs on.
+    pub home: ShardId,
 }
 
 /// Tell a client to open a connection to a neighbouring shard for `entity`.

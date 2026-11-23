@@ -8,19 +8,59 @@
 //! [`HandoffAbort`] as the escape hatch) is what buys that, and this module is the
 //! state machine that drives it on one shard.
 //!
+//! The same exchange moves **every physics body**, not only ships: a crate,
+//! a ball, a door or a whole chain whose home ([`crate::border`]) is another
+//! shard — because it left the region, or because it is in an island of
+//! bodies consolidated on that shard — is offered, accepted and committed
+//! the same way. What differs for an **unowned body** (no client drives it)
+//! is only what a player needs:
+//!
+//! * **No client gate.** Nobody has to connect anywhere, so nobody is
+//!   redirected, nobody adopts it, and the commit waits for the accept only
+//!   (an outgoing body transfer is born `client_connected`). Its activation
+//!   lead is [`crate::border::BODY_HANDOFF_LEAD`] (the offer/accept round
+//!   trip), not [`HANDOFF_LEAD`].
+//! * **The whole entity moves.** The offer and the commit carry its full
+//!   replicated component list ([`SimWorld::export_entity`]: `Body`,
+//!   `Visual`, `Springs`, `Articulation`, `PartStates`, `PosResidual`), and the
+//!   receiver restores it with [`SimWorld::import_entity`] — an articulated
+//!   object (a chain, a door, a seesaw) is one entity with all its parts and
+//!   joints, so it moves atomically, and its position residual makes the
+//!   motion continue exactly. The receiver checks the list
+//!   ([`SimWorld::check_import`]) before it accepts, while a refusal still
+//!   costs nothing.
+//! * **Clients keep seeing it.** At the commit the offering shard turns its
+//!   copy into a **ghost** of the receiver's body ([`crate::border`]), so its
+//!   clients see no gap; the receiver replaces the ghost it already showed
+//!   with the real body. Neither side's clients change connection.
+//! * **Groups.** The members of one island are offered together, with one
+//!   activation tick, and committed together only when every member is ready
+//!   (accepted, and connected for a player's ship); an abort of any member
+//!   aborts the group. The receiver installs what one sender committed for
+//!   one activation tick on one local tick.
+//!
+//! A private component of the offer's state ([`TRANSFER_COMPONENT`]) tells
+//! the receiver which kind of transfer it is and the lead in use, the same way
+//! the owner's token already rides there; the message layouts are unchanged.
+//!
 //! # The guarantees, and the mechanism behind each
 //!
 //! | # | guarantee | how it holds |
 //! |---|-----------|--------------|
-//! | 1 | **The guid never changes.** The client's own ship object survives the move; nothing it holds has to be re-keyed. | [`EntityGuid`] is `(minting shard, serial)` and is *never* rewritten on handoff ([`space_protocol::EntityGuid`]). The receiving shard adopts the existing guid instead of minting a new one. |
-//! | 2 | **Exactly one shard simulates the entity at every tick.** No double-step (which would double the physics) and no gap (which would freeze the ship). | The offering shard keeps stepping the entity until the activation tick; the accepting shard **stages** the state outside its [`SimWorld`] and only spawns it at commit. An entity is therefore in at most one world at any tick. |
-//! | 3 | **The client keeps receiving from the old shard until the new one is proven up** (make-before-break). | The [`Redirect`] tells the client the activation tick *in advance*; the old shard keeps sending deltas until it commits. The commit waits for [`NeighbourStatus`] with `connected = true`, so a client that cannot reach the new shard never loses its feed. |
-//! | 4 | **The state the new shard activates with is the state at the activation tick.** | The commit carries the *final* state as of `activation_tick` ([`HandoffCommit::state`]), replacing what the offer staged. Staging a stale snapshot and then only telling the peer "go" would leave the entity jumping backwards by the offer→activation distance. |
-//! | 5 | **Inputs are never lost or applied twice.** | Inputs are tick-keyed ([`SimWorld::apply_inputs`]), so everything the client sent up to activation is applied by the old shard, and the new shard's `input_ack` starts at the activation tick — the client's `input_ack`-based reconciliation drops exactly what the old shard already applied. |
-//! | 6 | **Any failure leaves the world exactly as it was.** | Every timeout and refusal path is an [`HandoffAbort`]: the offering shard keeps simulating, the accepting shard drops its staged copy, and the client is never told anything happened. |
+//! | 1 | **The guid never changes.** The client's own ship object survives the move; nothing it holds has to be re-keyed. | [`EntityGuid`] is `(minting shard, serial)` and is *never* rewritten on handoff ([`space_protocol::EntityGuid`]). The receiving shard adopts the existing guid instead of minting a new one — a body's exactly as a ship's. |
+//! | 2 | **Exactly one shard simulates the entity at every tick.** No double-step (which would double the physics) and no gap (which would freeze the ship). | The offering shard keeps stepping the entity until the activation tick; the accepting shard **stages** the state outside its [`SimWorld`] and only spawns it at commit. An entity is therefore in at most one world at any tick. A **ghost** of it — the receiver's before the install, the sender's after the commit — is a kinematic copy that is never integrated ([`SimWorld::insert_ghost`]), so it is not a second simulator; the install replaces the receiver's ghost. |
+//! | 3 | **The client keeps receiving from the old shard until the new one is proven up** (make-before-break). | The [`Redirect`] tells the client the activation tick *in advance*; the old shard keeps sending deltas until it commits. The commit waits for [`NeighbourStatus`] with `connected = true`, so a client that cannot reach the new shard never loses its feed. An unowned body has no client to move: the clients watching it stay where they are and keep seeing it, as a ghost on the side it left and as a body on the side it entered. |
+//! | 4 | **The state the new shard activates with is the state at the activation tick.** | The commit carries the *final* state as of `activation_tick` ([`HandoffCommit::state`]), replacing what the offer staged. Staging a stale snapshot and then only telling the peer "go" would leave the entity jumping backwards by the offer→activation distance. For a body it is the full component list, parts, joints, springs and position residual included. |
+//! | 5 | **Inputs are never lost or applied twice.** | Inputs are tick-keyed ([`SimWorld::apply_inputs`]), so everything the client sent up to activation is applied by the old shard, and the new shard's `input_ack` starts at the activation tick — the client's `input_ack`-based reconciliation drops exactly what the old shard already applied. (An unowned body takes no inputs.) |
+//! | 6 | **Any failure leaves the world exactly as it was.** | Every timeout and refusal path is an [`HandoffAbort`]: the offering shard keeps simulating, the accepting shard drops its staged copy, and the client is never told anything happened. An abort of one member of a group aborts the whole group, so an island is never left half moved by a failure. |
 //! | 7 | **A handoff cannot straddle a shard-map change.** | Offer, accept and commit all carry the [`epoch`](HandoffOffer::epoch); a message under a stale epoch is answered with [`StaleEpoch`], an in-flight transfer whose epoch no longer matches the shard's own map aborts with [`HandoffReason::EpochChanged`] the moment the tick pass sees it (before *and* after the commit gate), and a commit under a stale epoch is refused. |
-//! | 8 | **It finishes in bounded time.** | [`HANDOFF_TIMEOUT_TICKS`] bounds **every** waiting state on **both** sides: the offering shard's sweep terminates an outgoing transfer whatever it is waiting on (offer unanswered, commit waiting on the client, a commit that can no longer be built), and the accepting shard's sweep drops a staged transfer whose commit never arrived, so a dead peer degrades to "nothing happened" rather than a frozen entity or a permanently poisoned guid. |
+//! | 8 | **It finishes in bounded time.** | [`HANDOFF_TIMEOUT_TICKS`] bounds **every** waiting state on **both** sides: the offering shard's sweep terminates an outgoing transfer whatever it is waiting on (offer unanswered, commit waiting on the client, a commit that can no longer be built), and the accepting shard's sweep drops a staged transfer whose commit never arrived, so a dead peer degrades to "nothing happened" rather than a frozen entity or a permanently poisoned guid. A body's lead ([`crate::border::BODY_HANDOFF_LEAD`]) is well inside that budget; a staged body (no session to wait for) is dropped only after twice the budget, so never while the sender may still commit it — its commit would be the only copy left. |
 //!
+//! Where the table is checked: `tests/acceptance.rs` (ships, H1–H8, the
+//! mapping is in its module docs) and `tests/physics.rs` (unowned bodies and
+//! groups: `an_unowned_body_handoff_keeps_h1_to_h8`,
+//! `an_unanswered_body_offer_times_out_and_nothing_moved`,
+//! `a_refused_body_offer_leaves_the_body_where_it_was`, the island tests).
 //! # Roles
 //!
 //! The same ledger plays both sides: a shard can be *offering* one entity while
@@ -42,6 +82,57 @@ use space_protocol::{
     ShardId,
 };
 use space_sim::SimTick;
+
+/// The private component id a handoff state carries its transfer kind under:
+/// `[version = 1, kind, lead]`, `kind` 0 = a player's ship, 1 = an unowned
+/// body; `lead` the activation lead in ticks the sender used. Outside the
+/// registry's id space (like the owner token at `u16::MAX`), never sent to a
+/// client, stripped before the state is imported.
+pub const TRANSFER_COMPONENT: u16 = u16::MAX - 1;
+
+/// What a transfer moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// A ship a client drives: redirected, adopted, client-gated.
+    Ship,
+    /// Anything else (a body, or a ship nobody drives): no client gate,
+    /// installed with `SimWorld::import_entity`.
+    Body,
+}
+
+impl TransferKind {
+    /// The private component describing this kind with activation `lead`.
+    #[must_use]
+    pub fn component(self, lead: SimTick) -> (u16, Vec<u8>) {
+        let kind = match self {
+            Self::Ship => 0,
+            Self::Body => 1,
+        };
+        (
+            TRANSFER_COMPONENT,
+            vec![1, kind, u8::try_from(lead).unwrap_or(u8::MAX)],
+        )
+    }
+
+    /// The kind and lead a handoff state names: a state without the
+    /// component is a ship with [`HANDOFF_LEAD`] (what every handoff was
+    /// before bodies moved); a malformed one is `None`.
+    #[must_use]
+    pub fn of(state: &EntitySnapshot) -> Option<(Self, SimTick)> {
+        let Some((_, bytes)) = state
+            .components
+            .iter()
+            .find(|(id, _)| *id == TRANSFER_COMPONENT)
+        else {
+            return Some((Self::Ship, HANDOFF_LEAD));
+        };
+        match bytes.as_slice() {
+            [1, 0, lead] => Some((Self::Ship, SimTick::from(*lead).min(HANDOFF_LEAD))),
+            [1, 1, lead] => Some((Self::Body, SimTick::from(*lead).min(HANDOFF_LEAD))),
+            _ => None,
+        }
+    }
+}
 
 /// Ticks between an offer and the activation tick it proposes.
 ///
@@ -72,7 +163,12 @@ pub struct Outgoing {
     /// The accepting shard answered [`HandoffAccept`].
     pub accepted: bool,
     /// The client confirmed its connection to `to` ([`space_protocol::NeighbourStatus`]).
+    /// Born `true` for a transfer with no client ([`TransferKind::Body`]).
     pub client_connected: bool,
+    /// What moves.
+    pub kind: TransferKind,
+    /// The group (island) the transfer belongs to; 0 = on its own.
+    pub group: u64,
 }
 
 /// A state another shard offered us and we have staged.
@@ -109,6 +205,8 @@ pub struct Incoming {
     pub owner_token: String,
     /// The client session that confirmed its connection here, once it has.
     pub session: Option<u64>,
+    /// What moves.
+    pub kind: TransferKind,
 }
 
 /// The ledger of in-flight transfers on one shard.
@@ -151,8 +249,19 @@ impl Ledger {
         self.outgoing.contains_key(&entity) || self.incoming.contains_key(&entity)
     }
 
-    /// Record that we sent `offer` at `now`.
+    /// Record that we sent `offer` (a player's ship, on its own) at `now`.
     pub fn offer_sent(&mut self, offer: &HandoffOffer, now: SimTick) {
+        self.offer_sent_as(offer, now, TransferKind::Ship, 0);
+    }
+
+    /// Record that we sent `offer` of `kind`, in `group` (0: none), at `now`.
+    pub fn offer_sent_as(
+        &mut self,
+        offer: &HandoffOffer,
+        now: SimTick,
+        kind: TransferKind,
+        group: u64,
+    ) {
         self.outgoing.insert(
             offer.entity,
             Outgoing {
@@ -161,9 +270,27 @@ impl Ledger {
                 activation_tick: offer.activation_tick,
                 started_at: now,
                 accepted: false,
-                client_connected: false,
+                client_connected: kind == TransferKind::Body,
+                kind,
+                group,
             },
         );
+    }
+
+    /// The members of outgoing group `group` (empty for 0), ascending.
+    #[must_use]
+    pub fn group_members(&self, group: u64) -> Vec<space_protocol::EntityGuid> {
+        if group == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<_> = self
+            .outgoing
+            .iter()
+            .filter(|(_, e)| e.group == group)
+            .map(|(g, _)| *g)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// Record that we staged `accept`'s matching offer at `now`.
@@ -181,17 +308,47 @@ impl Ledger {
         owner_token: String,
         now: SimTick,
     ) {
+        self.accept_sent_as(
+            accept,
+            state,
+            owner_token,
+            now,
+            TransferKind::Ship,
+            HANDOFF_LEAD,
+        );
+    }
+
+    /// [`Ledger::accept_sent`] for a transfer of `kind` whose sender used
+    /// activation `lead`. The local activation tick is `now + lead` — or, if
+    /// this sender already has a transfer staged here for the same activation
+    /// tick (one island, offered together), that transfer's local tick, so a
+    /// group is installed on one tick.
+    pub fn accept_sent_as(
+        &mut self,
+        accept: &HandoffAccept,
+        state: EntitySnapshot,
+        owner_token: String,
+        now: SimTick,
+        kind: TransferKind,
+        lead: SimTick,
+    ) {
+        let local_activation_tick = self
+            .incoming
+            .values()
+            .find(|e| e.from == accept.from && e.activation_tick == accept.activation_tick)
+            .map_or(now.saturating_add(lead), |e| e.local_activation_tick);
         self.incoming.insert(
             accept.entity,
             Incoming {
                 from: accept.from,
                 epoch: accept.epoch,
                 activation_tick: accept.activation_tick,
-                local_activation_tick: now.saturating_add(HANDOFF_LEAD),
+                local_activation_tick,
                 started_at: now,
                 state,
                 owner_token,
                 session: None,
+                kind,
             },
         );
     }
@@ -341,13 +498,27 @@ impl Ledger {
         now: SimTick,
         state: EntitySnapshot,
     ) -> HandoffOffer {
+        Self::offer_with_lead(entity, from, to, epoch, now, state, HANDOFF_LEAD)
+    }
+
+    /// [`Ledger::offer`] with an activation lead of `lead` ticks.
+    #[must_use]
+    pub fn offer_with_lead(
+        entity: space_protocol::EntityGuid,
+        from: ShardId,
+        to: ShardId,
+        epoch: u64,
+        now: SimTick,
+        state: EntitySnapshot,
+        lead: SimTick,
+    ) -> HandoffOffer {
         HandoffOffer {
             entity,
             from,
             to,
             epoch,
             state: Box::new(state),
-            activation_tick: now.saturating_add(HANDOFF_LEAD),
+            activation_tick: now.saturating_add(lead),
         }
     }
 
