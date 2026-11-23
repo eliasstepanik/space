@@ -366,6 +366,19 @@ impl Cluster {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
+    /// [`Self::settle`], but first wait (at most 2 s) until client `idx` has
+    /// received something: a fixed 5 ms was not always a scheduling slot on a
+    /// loaded CI container, and the client then read nothing at all.
+    async fn settle_until_frames(&self, idx: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.clients[idx].frames.lock().unwrap().is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.settle().await;
+    }
+
     /// Feed the orchestrator a `LoadReport` from `id`, as a shard's control
     /// connection would every `LOAD_REPORT_INTERVAL_TICKS`.
     fn report_load(&mut self, id: ShardId, players: u32) {
@@ -1060,7 +1073,7 @@ async fn a_split_publishes_prepare_then_acks_then_commit_in_that_order() {
     // the still-current epoch: a prepare is invisible to a client.
     c.thrust(0, 0, 1.0).await;
     c.step_n(2).await;
-    c.settle().await;
+    c.settle_until_frames(0).await;
     let mid = c.take(0);
     assert!(
         !mid.frames.is_empty(),
@@ -1087,7 +1100,7 @@ async fn a_split_publishes_prepare_then_acks_then_commit_in_that_order() {
         c.thrust(0, 0, 1.0).await;
         c.step().await;
     }
-    c.settle().await;
+    c.settle_until_frames(0).await;
     let after = c.take(0);
     assert!(
         !after.frames.is_empty(),
@@ -1153,7 +1166,7 @@ async fn a_shard_that_never_acks_gets_an_abort_and_the_world_keeps_the_old_map()
     // The client's view: it never observed the aborted topology. Every frame it
     // got is stamped with the old epoch, and its ship is still simulated by the
     // shard it connected to.
-    c.settle().await;
+    c.settle_until_frames(0).await;
     let view = c.take(0);
     assert!(
         !view.frames.is_empty(),
