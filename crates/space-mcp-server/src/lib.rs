@@ -242,10 +242,10 @@ pub fn registry(harness: &Arc<ShardHarness>) -> ToolRegistry {
     let this = h(harness);
     r.register(tool(
         "set_scene",
-        "Make the shard simulate `scene` (demo-area, materials, solar or galaxy): its static colliders, its gravity and its bodies (the demo area's physics showcase). Clients are told to draw it too. Each call is a new revision.",
+        "Make the shard simulate `scene` (demo-area, materials or galaxy): its static colliders, its gravity and its bodies (the demo area's physics showcase). Clients are told to draw it too. Each call is a new revision.",
         json!({
             "type": "object",
-            "properties": {"scene": {"type": "string", "enum": ["demo-area", "materials", "solar", "galaxy"]}},
+            "properties": {"scene": {"type": "string", "enum": ["demo-area", "materials", "galaxy"]}},
             "required": ["scene"],
         }),
         move |args| set_scene(h(&this), args),

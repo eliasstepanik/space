@@ -107,13 +107,29 @@
 //!
 //! # One tick
 //!
+//! 0. **Scene time.** The tick runs from scene time `t0` (the time the last
+//!    step ended at, or the clock's time of the tick after a
+//!    [`crate::SimWorld::reset_clock`]) to `t1`, the
+//!    [`crate::SimWorld::set_scene_clock`] mapping's time of the tick being
+//!    produced. Moving statics (a planet's collider on its orbit,
+//!    [`StaticCollider::motion`]) are placed where they are at `t1`, and every
+//!    body (asleep or not) is first **carried** by the orbiting gravity
+//!    bodies it is near ([`crate::gravity::GravityField::carry`] from `t0` to
+//!    `t1`): its world position moves by that displacement, its velocity does
+//!    not change, and a body rapier holds the precise pose of is moved in its
+//!    bubble by the same vector, so a ship standing on the Moon and the Moon
+//!    move together. The rest of the tick sees the world at `t1`.
 //! 1. Read every body's state; a state written behind the physics' back
 //!    (a handoff install, a test, an admin teleport) wakes the body.
 //! 2. Springs ([`crate::spring`]), evaluated from the start-of-tick states;
-//!    gravity ([`crate::gravity`]) at each body's [`WorldPos`].
+//!    gravity ([`crate::gravity`]) at each body's [`WorldPos`], with the
+//!    orbiting bodies where they are at `t1`.
 //! 3. Velocities: ships by the flight model
 //!    ([`crate::physics::ship_velocity_step`]) plus gravity, springs and their
-//!    lift engines' answer to the gravity ([`crate::physics::lift_accel`]); other
+//!    lift engines' answer to the gravity ([`crate::physics::lift_accel`]) —
+//!    or, for a ship in fast travel, [`crate::physics::fast_velocity_step`]
+//!    with the limit [`crate::physics::fast_travel_limit`] of its distance to
+//!    the nearest surface ([`Physics::surface_distance`]); other
 //!    dynamic bodies `v += (F/m + g·scale − k·v)·dt`,
 //!    `ω += (I⁻¹·τ − k_ω·ω)·dt` (body frame, no gyroscopic term).
 //! 4. Bubble maintenance (above).
@@ -169,8 +185,12 @@ use crate::articulation::{Articulation, JointDef, JointKind, JointTarget, PartSt
 use crate::body::{Body, BodyKind, CollisionGroups, MassSpec, PosResidual, Visual};
 use crate::components::{ShipControls, ShipState};
 use crate::gravity::{GravityField, WorldPoint};
+use crate::motion::OrbitPath;
 use crate::params::ShipParams;
-use crate::physics::{lift_accel, quat_step, ship_pose_step, ship_velocity_step, SETTLE_EPS};
+use crate::physics::{
+    fast_travel_limit, fast_velocity_step, lift_accel, quat_step, ship_pose_step,
+    ship_velocity_step, top_speed, SETTLE_EPS,
+};
 use crate::shape::{quat_to_rot, ShapeCatalog, ShapeError, ShapeRef};
 use crate::spring::{evaluate, rotate, EndState, SpringTarget, Springs};
 use crate::tick::{SimTick, DT};
@@ -216,6 +236,30 @@ pub struct StaticCollider {
     /// Which bodies it stops ([`CollisionGroups::ALL`]: everything;
     /// [`CollisionGroups::NOT_SHIPS`]: everything but ships).
     pub groups: CollisionGroups,
+    /// `None`: it stays at `place`. `Some(path)`: it is at `place` plus the
+    /// path's offset at the scene time ([`crate::motion`]) — a planet's
+    /// collider moving with the planet's [`crate::gravity::BodyPlace::Orbit`]
+    /// (the same path, so the two agree to the bit). Teleported to its new
+    /// place every tick while what is near it is carried along (see the
+    /// [module docs](self), "One tick"), so nothing slides off it.
+    pub motion: Option<OrbitPath>,
+}
+
+impl StaticCollider {
+    /// Where its origin is at scene time `time_us`.
+    #[must_use]
+    pub fn place_at(&self, time_us: i64) -> WorldPoint {
+        match &self.motion {
+            None => self.place,
+            Some(path) => {
+                let o = path.offset(time_us);
+                WorldPoint::new(
+                    self.place.origin,
+                    core::array::from_fn(|k| self.place.offset[k] + o[k]),
+                )
+            }
+        }
+    }
 }
 
 /// One bubble as [`crate::SimWorld::bubbles`] reports it.
@@ -365,8 +409,27 @@ impl Entry {
 struct StaticEntry {
     def: StaticCollider,
     shape: SharedShape,
+    /// Where its origin is now (moves with [`StaticCollider::motion`]).
+    now: WorldPoint,
+    /// Its bounding sphere's centre now.
     center: WorldPoint,
+    /// The bounding sphere's centre from the origin, world frame.
+    mid: [f64; 3],
     radius: f64,
+    /// The shape's own (tight) bounding sphere: centre from the origin,
+    /// world frame, and radius — what fast travel measures the distance to
+    /// the surface by (a ball's is the ball).
+    tight: ([f64; 3], f64),
+}
+
+impl StaticEntry {
+    fn place(&mut self, time_us: i64) {
+        self.now = self.def.place_at(time_us);
+        self.center = WorldPoint::new(
+            self.now.origin,
+            core::array::from_fn(|k| self.now.offset[k] + self.mid[k]),
+        );
+    }
 }
 
 struct Bubble {
@@ -400,6 +463,8 @@ pub(crate) struct Physics {
     pub(crate) catalog: Arc<ShapeCatalog>,
     statics: Vec<StaticEntry>,
     pub(crate) gravity: GravityField,
+    /// The scene time the last step ended at (`None` after a clock reset).
+    pub(crate) last_time: Option<i64>,
     entries: BTreeMap<EntityGuid, Entry>,
     bubbles: BTreeMap<BubbleId, Bubble>,
     next_bubble: u64,
@@ -733,6 +798,7 @@ impl Physics {
             catalog,
             statics: Vec::new(),
             gravity: GravityField::none(),
+            last_time: None,
             entries: BTreeMap::new(),
             bubbles: BTreeMap::new(),
             next_bubble: 1,
@@ -757,20 +823,20 @@ impl Physics {
             let mid = (aabb.mins + aabb.maxs) * 0.5;
             let radius = (aabb.maxs - aabb.mins).length() * 0.5;
             let m = rotate(def.rotation, [mid.x, mid.y, mid.z]);
-            let center = WorldPoint::new(
-                def.place.origin,
-                [
-                    def.place.offset[0] + m[0],
-                    def.place.offset[1] + m[1],
-                    def.place.offset[2] + m[2],
-                ],
-            );
-            built.push(StaticEntry {
+            let sphere = shape.compute_local_bounding_sphere();
+            let c = sphere.center;
+            let tight = (rotate(def.rotation, [c.x, c.y, c.z]), sphere.radius);
+            let mut entry = StaticEntry {
+                tight,
+                now: def.place,
+                center: def.place,
                 def,
                 shape,
-                center,
+                mid: m,
                 radius,
-            });
+            };
+            entry.place(self.now_time());
+            built.push(entry);
         }
         // Drop every instantiated static; the next tick re-instantiates.
         for b in self.bubbles.values_mut() {
@@ -784,6 +850,150 @@ impl Physics {
 
     pub(crate) fn statics(&self) -> impl Iterator<Item = &StaticCollider> {
         self.statics.iter().map(|s| &s.def)
+    }
+
+    /// The scene time the world is at: where the last step ended, or the
+    /// clock's time of tick 0 before any.
+    fn now_time(&self) -> i64 {
+        self.last_time
+            .unwrap_or_else(|| self.gravity.clock.time_us_at(0))
+    }
+
+    /// Distance from the point `offset` metres from `p` to the nearest
+    /// surface of the scene at scene time `time_us`, metres: a large body, a
+    /// gravity zone or a static's bounding sphere (see
+    /// [`crate::physics::fast_travel_limit`]).
+    pub(crate) fn surface_distance(
+        &self,
+        p: WorldPos,
+        offset: [f64; 3],
+        tick: SimTick,
+        time_us: i64,
+    ) -> f64 {
+        self.nearest_surface(p, offset, tick, time_us).0
+    }
+
+    /// [`Physics::surface_distance`] and the unit vector from that surface
+    /// towards the point.
+    pub(crate) fn nearest_surface(
+        &self,
+        p: WorldPos,
+        offset: [f64; 3],
+        tick: SimTick,
+        time_us: i64,
+    ) -> (f64, [f64; 3]) {
+        let mut best = self.gravity.nearest_surface(p, offset, tick, time_us);
+        for s in &self.statics {
+            let (mid, radius) = s.tight;
+            let c = s.def.place_at(time_us);
+            let c = WorldPoint::new(c.origin, core::array::from_fn(|k| c.offset[k] + mid[k]));
+            let d = c.delta_to(p);
+            let d: [f64; 3] = core::array::from_fn(|k| d[k] + offset[k]);
+            let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let gap = (r - radius).max(0.0);
+            if gap < best.0 {
+                best = (gap, if r > 0.0 { d.map(|c| c / r) } else { [0.0; 3] });
+            }
+        }
+        best
+    }
+
+    /// Step 0 of a tick (see the [module docs](self)): move the moving
+    /// statics to `t1` and carry every body by the orbiting bodies from `t0`
+    /// to `t1`.
+    fn advance_scene_time(&mut self, world: &mut World, tick: SimTick, t0: i64, t1: i64) {
+        // Moving statics, also inside the bubbles that hold them.
+        let mut moved = false;
+        for s in &mut self.statics {
+            if s.def.motion.is_some() {
+                s.place(t1);
+                moved = true;
+            }
+        }
+        if moved {
+            for b in self.bubbles.values_mut() {
+                let anchor = b.anchor;
+                for (idx, h) in &b.statics {
+                    let s = &self.statics[*idx];
+                    if s.def.motion.is_none() {
+                        continue;
+                    }
+                    if let Some(rb) = b.world.bodies.get_mut(*h) {
+                        rb.set_position(
+                            Pose::from_parts(
+                                v3(local_point(anchor, &s.now)),
+                                quat_to_rot(s.def.rotation),
+                            ),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+        if t0 == t1 || !self.gravity.has_orbits() {
+            return;
+        }
+        let guids: Vec<EntityGuid> = self.entries.keys().copied().collect();
+        for g in guids {
+            let e = &self.entries[&g];
+            if e.ghost {
+                continue;
+            }
+            let Some(states) = read_states(world, e.entity, e.parts.len()) else {
+                continue;
+            };
+            let res = read_residual(world, e.entity, e.parts.len());
+            let mut out = states.clone();
+            let mut res_out = res.clone();
+            let mut shifts = vec![[0.0f64; 3]; e.parts.len()];
+            let mut any = false;
+            for (p, st) in states.iter().enumerate() {
+                let r = res.get(p).copied().unwrap_or([0.0; 3]);
+                let c = self.gravity.carry(st.pos, r, tick, t0, t1);
+                if c == [0.0; 3] {
+                    continue;
+                }
+                any = true;
+                shifts[p] = c;
+                if p == 0 && e.ship {
+                    out[p].pos = WorldPos::from_f64_metres_around(st.pos, c);
+                    continue;
+                }
+                let d: [f64; 3] = core::array::from_fn(|k| r[k] + c[k]);
+                let pos = WorldPos::from_f64_metres_around(st.pos, d);
+                let back = WorldPos::delta(st.pos, pos);
+                out[p].pos = pos;
+                if let Some(slot) = res_out.get_mut(p) {
+                    *slot = core::array::from_fn(|k| d[k] - back[k]);
+                }
+            }
+            if !any {
+                continue;
+            }
+            let entity = e.entity;
+            let was_changed = states_differ(&states, &e.last);
+            write_states(world, entity, &out);
+            write_residual(world, entity, &res_out);
+            let e = self.entries.get_mut(&g).expect("listed");
+            // A carry is not a write behind the physics' back: the body is
+            // where the physics put it, only moved with the frame.
+            if !was_changed {
+                e.last.clone_from(&out);
+            }
+            e.res.clone_from(&res_out);
+            if let Some(b) = e.bubble.and_then(|id| self.bubbles.get_mut(&id)) {
+                for (p, h) in e.handles.iter().enumerate() {
+                    if !e.synced.get(p).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(rb) = b.world.bodies.get_mut(*h) {
+                        let mut pose = *rb.position();
+                        pose.translation += v3(shifts[p]);
+                        rb.set_position(pose, false);
+                    }
+                }
+            }
+        }
     }
 
     /// Add an entity (its components are in `world`).
@@ -938,6 +1148,15 @@ impl Physics {
     /// Advance every body by one tick; `tick` is the tick being produced.
     pub(crate) fn step(&mut self, world: &mut World, tick: SimTick, params: &ShipParams) {
         self.contacts.clear();
+        // 0. Scene time: statics on orbits move, what is near an orbiting
+        //    body moves with it.
+        let next = tick.wrapping_add(1);
+        let t1 = self.gravity.clock.time_us_at(next);
+        let t0 = self
+            .last_time
+            .unwrap_or_else(|| self.gravity.clock.time_us_at(tick));
+        self.advance_scene_time(world, tick, t0, t1);
+        self.last_time = Some(t1);
         // Entities despawned behind the physics' back leave it.
         let dead: Vec<EntityGuid> = self
             .entries
@@ -1081,7 +1300,7 @@ impl Physics {
                 let grav = if part.gravity_scale != 0.0 && !self.gravity.is_empty() {
                     let r = w.res.get(p).copied().unwrap_or([0.0; 3]);
                     self.gravity
-                        .at_offset(s.pos, r, tick)
+                        .at_time(s.pos, r, tick, t1)
                         .map(|a| a * part.gravity_scale)
                 } else {
                     [0.0; 3]
@@ -1098,7 +1317,35 @@ impl Physics {
                     // weightless space: free flight is unchanged).
                     let lift = lift_accel(s.quat, c.thrust, params, grav);
                     let ext: [f64; 3] = core::array::from_fn(|k| ext[k] + lift[k]);
-                    ship_velocity_step(&mut n, c.thrust, c.torque, params, ext.map(|a| a as f32));
+                    let limit = if c.fast {
+                        let (d, away) = self.nearest_surface(s.pos, [0.0; 3], tick, t1);
+                        let v = f64s(s.vel);
+                        let closing = v[0] * away[0] + v[1] * away[1] + v[2] * away[2] < 0.0;
+                        fast_travel_limit(d, closing, params)
+                    } else {
+                        0.0
+                    };
+                    if c.fast && limit > f64::from(top_speed(params)) {
+                        fast_velocity_step(
+                            &mut n,
+                            c.thrust,
+                            c.torque,
+                            params,
+                            ext.map(|a| a as f32),
+                            limit,
+                        );
+                    } else {
+                        ship_velocity_step(
+                            &mut n,
+                            c.thrust,
+                            c.torque,
+                            params,
+                            ext.map(|a| a as f32),
+                        );
+                        if c.fast {
+                            crate::physics::limit_speed(&mut n, limit);
+                        }
+                    }
                 } else {
                     let v = f64s(s.vel);
                     let nv: [f64; 3] = core::array::from_fn(|k| {
@@ -1496,7 +1743,7 @@ impl Physics {
                         if let Some(rb) = b.world.bodies.get_mut(*h) {
                             rb.set_position(
                                 Pose::from_parts(
-                                    v3(local_point(anchor, &s.def.place)),
+                                    v3(local_point(anchor, &s.now)),
                                     quat_to_rot(s.def.rotation),
                                 ),
                                 false,
@@ -1578,7 +1825,7 @@ impl Physics {
                 let present = b.statics.contains_key(&idx);
                 if !present && reach(1.0) {
                     let pose = Pose::from_parts(
-                        v3(local_point(b.anchor, &s.def.place)),
+                        v3(local_point(b.anchor, &s.now)),
                         quat_to_rot(s.def.rotation),
                     );
                     let h = b.world.insert_body(RigidBodyBuilder::fixed().pose(pose));
@@ -1590,6 +1837,18 @@ impl Physics {
                         .build();
                     b.world.insert_collider(c, Some(h));
                     b.statics.insert(idx, h);
+                    if s.def.motion.is_some() {
+                        // A moving static is teleported every tick (and what
+                        // touches it with it): rapier's contact recycling
+                        // keeps a pair's contacts frozen in the bubble's
+                        // frame while their relative pose barely changes,
+                        // which a teleported pair defeats (the ship sinks
+                        // into the Moon until the drift forces an update).
+                        // Contacts are recomputed every step in such a bubble.
+                        b.world
+                            .integration_parameters
+                            .normalized_contact_recycle_distance = 0.0;
+                    }
                 } else if present && !reach(SPLIT_FACTOR) {
                     if let Some(h) = b.statics.remove(&idx) {
                         b.world.remove_body(h);
@@ -1635,8 +1894,8 @@ impl Physics {
             if !interact(s.def.groups) {
                 continue;
             }
-            let d = WorldPos::delta(state.pos, s.def.place.origin);
-            let offset = core::array::from_fn(|k| d[k] + s.def.place.offset[k]);
+            let d = WorldPos::delta(state.pos, s.now.origin);
+            let offset = core::array::from_fn(|k| d[k] + s.now.offset[k]);
             let c = WorldPos::delta(state.pos, s.center.origin);
             let center: [f64; 3] = core::array::from_fn(|k| c[k] + s.center.offset[k]);
             let reach = radius + s.radius + clearance;

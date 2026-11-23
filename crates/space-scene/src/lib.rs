@@ -38,10 +38,12 @@
 //!
 //! | scene | statics | bodies | gravity |
 //! |---|---|---|---|
-//! | `demo-area` | the stations (ported with the client's numbers), the Kestrel and its apron, the showcase's curbs, bowl, ramp, fulcrum, gantry, door post, the planetoid | the showcase ([`demo`]), crates resting on the planetoid and balls orbiting it | the gravity room; the planetoid (4 m/s² on its surface, a reach of 16 m) |
+//! | `demo-area` | the stations (ported with the client's numbers), the Kestrel and its apron, the showcase's curbs, bowl, ramp, fulcrum, gantry, door post, the planetoid; Earth, the Moon, the Sun and the planets as balls moving on their orbits ([`solar`]) | the showcase ([`demo`]), crates resting on the planetoid and balls orbiting it | the gravity room; the planetoid (4 m/s² on its surface, a reach of 16 m); the solar system's ten bodies (real `GM`, each with a finite reach that ends far from the demo area) |
 //! | `materials` | the chart's 21 spheres, the glass and lamp spheres, the floor slab | none | none (a chart to fly around) |
-//! | `solar` | the Sun, the eight planets and the Moon as balls, where the client draws them | none | the same ten bodies as point masses (real `GM`) |
 //! | `galaxy` | the spawn cube | none | none (stars are light-years apart) |
+//!
+//! (Scene id 2, `solar`, is retired: the solar system is part of the demo
+//! area now.)
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
@@ -49,6 +51,7 @@
 pub mod demo;
 pub mod glb;
 pub mod others;
+pub mod solar;
 
 use std::sync::{Arc, OnceLock};
 
@@ -56,6 +59,7 @@ use space_protocol::{EntityGuid, Scene, ShardMap};
 use space_sim::articulation::{Articulation, JointTarget, PartStates};
 use space_sim::body::{Body, CollisionGroups, Visual};
 use space_sim::gravity::{BodyPlace, GravityField, GravityZone, LargeBody, WorldPoint, ZoneShape};
+use space_sim::motion::OrbitPath;
 use space_sim::rigid::{PhysicsError, StaticCollider};
 use space_sim::shape::{AssetId, MeshGeometry, ShapeCatalog, ShapeRef};
 use space_sim::spring::{Spring, SpringTarget, Springs};
@@ -155,6 +159,9 @@ pub struct StaticDef {
     pub visual: Visual,
     /// Which bodies it stops.
     pub groups: CollisionGroups,
+    /// `Some`: it moves along this path (offset from `offset`) with scene
+    /// time — a planet's collider ([`space_sim::StaticCollider::motion`]).
+    pub motion: Option<OrbitPath>,
 }
 
 /// Where the far end of a joint or spring of a [`BodyDef`] is.
@@ -228,6 +235,21 @@ pub enum GravityDef {
         radius: f64,
         /// Centre, metres from the anchor.
         center: [f64; 3],
+    },
+    /// A point mass on a fixed orbit of scene time ([`BodyPlace::Orbit`]).
+    Orbit {
+        /// Its reach, metres (as for [`GravityDef::Body`]).
+        reach: f64,
+        /// Name.
+        name: &'static str,
+        /// `GM`, m³/s².
+        gm: f64,
+        /// Radius, metres.
+        radius: f64,
+        /// The point the path is relative to, metres from the anchor.
+        base: [f64; 3],
+        /// The path.
+        path: OrbitPath,
     },
 }
 
@@ -310,9 +332,12 @@ pub fn catalog() -> Arc<ShapeCatalog> {
 #[must_use]
 pub fn statics(scene: Scene) -> Vec<StaticDef> {
     match scene {
-        Scene::DemoArea => demo::statics(),
+        Scene::DemoArea => {
+            let mut s = demo::statics();
+            s.extend(others::sky_statics());
+            s
+        }
         Scene::Materials => others::materials_statics(),
-        Scene::Solar => others::solar_statics(),
         Scene::Galaxy => others::galaxy_statics(),
     }
 }
@@ -322,7 +347,7 @@ pub fn statics(scene: Scene) -> Vec<StaticDef> {
 pub fn body_defs(scene: Scene) -> Vec<BodyDef> {
     match scene {
         Scene::DemoArea => demo::bodies(),
-        Scene::Materials | Scene::Solar | Scene::Galaxy => Vec::new(),
+        Scene::Materials | Scene::Galaxy => Vec::new(),
     }
 }
 
@@ -330,8 +355,11 @@ pub fn body_defs(scene: Scene) -> Vec<BodyDef> {
 #[must_use]
 pub fn gravity_defs(scene: Scene) -> Vec<GravityDef> {
     match scene {
-        Scene::DemoArea => demo::gravity(),
-        Scene::Solar => others::solar_gravity(),
+        Scene::DemoArea => {
+            let mut g = demo::gravity();
+            g.extend(others::sky_gravity());
+            g
+        }
         Scene::Materials | Scene::Galaxy => Vec::new(),
     }
 }
@@ -358,6 +386,7 @@ pub fn environment(scene: Scene, anchor: WorldPos) -> Environment {
             restitution: s.restitution,
             visual: s.visual,
             groups: s.groups,
+            motion: s.motion,
         })
         .collect();
     let mut gravity = GravityField::none();
@@ -386,6 +415,23 @@ pub fn environment(scene: Scene, anchor: WorldPos) -> Environment {
                 gm,
                 radius,
                 place: BodyPlace::Fixed(WorldPoint::new(anchor, center)),
+                reach,
+            }),
+            GravityDef::Orbit {
+                reach,
+                name,
+                gm,
+                radius,
+                base,
+                path,
+            } => gravity.bodies.push(LargeBody {
+                name: name.into(),
+                gm,
+                radius,
+                place: BodyPlace::Orbit {
+                    base: WorldPoint::new(anchor, base),
+                    path,
+                },
                 reach,
             }),
         }

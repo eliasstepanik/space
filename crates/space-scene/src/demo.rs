@@ -147,6 +147,7 @@ fn drawn(name: &'static str, shape: ShapeRef, at: [f64; 3], rotation: [f32; 4]) 
         restitution: 0.1,
         visual: Visual(visual::NONE),
         groups: CollisionGroups::ALL,
+        motion: None,
     }
 }
 

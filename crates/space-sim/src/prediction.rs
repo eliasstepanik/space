@@ -125,6 +125,7 @@ impl PredictedShip {
             thrust: [0.0; 3],
             torque: [0.0; 3],
             tick,
+            fast: false,
         }
     }
 
@@ -318,6 +319,11 @@ pub struct PredictedPhysics {
     pub authoritative: ShipState,
     /// The tick [`authoritative`](Self::authoritative) describes.
     pub last_tick: SimTick,
+    /// Whether the ship was in fast travel at [`last_tick`](Self::last_tick)
+    /// (the shard's replicated `ShipControls::fast`): every replay starts
+    /// from it, so leaving fast travel is predicted on the tick the shard
+    /// applies it.
+    pub authoritative_fast: bool,
     /// Inputs sent and not yet covered by an authoritative state, oldest first.
     pub pending: VecDeque<PlayerInput>,
     nearby: BTreeMap<EntityGuid, Nearby>,
@@ -347,6 +353,7 @@ impl PredictedPhysics {
             own,
             authoritative: state,
             last_tick,
+            authoritative_fast: false,
             pending: VecDeque::new(),
             nearby: BTreeMap::new(),
         })
@@ -362,6 +369,13 @@ impl PredictedPhysics {
     #[must_use]
     pub fn params(&self) -> ShipParams {
         self.world.params()
+    }
+
+    /// Map ticks to scene time by `clock` (the shard's, see
+    /// [`crate::SimWorld::set_scene_clock`]): orbiting bodies and what they
+    /// carry are predicted where the shard has them.
+    pub fn set_scene_clock(&mut self, clock: space_protocol::SceneClock) {
+        self.world.set_scene_clock(clock);
     }
 
     /// Record an input (same rules as [`PredictedShip::apply_input`]).
@@ -435,6 +449,13 @@ impl PredictedPhysics {
         if let Some(e) = self.world.entity_of(self.own) {
             if let Some(s) = self.world.world_mut().get_mut::<ShipState>(e) {
                 *s = self.authoritative;
+            }
+            if let Some(c) = self
+                .world
+                .world_mut()
+                .get_mut::<crate::components::ShipControls>(e)
+            {
+                c.fast = self.authoritative_fast;
             }
         }
         let last_pending = self.pending.back().copied();
@@ -516,6 +537,7 @@ mod tests {
             thrust,
             torque: [0.0; 3],
             tick,
+            fast: false,
         }
     }
 
@@ -722,6 +744,7 @@ mod tests {
                 thrust: [rng.signed(), rng.signed(), rng.signed()],
                 torque: [rng.signed(), rng.signed(), rng.signed()],
                 tick,
+                fast: false,
             };
             // Zero latency, in order, nothing lost: the client predicts with the
             // input and the server receives it before the step that produces it.
@@ -748,6 +771,7 @@ mod tests {
             thrust: [0.5, -0.25, 0.125],
             torque: [0.0, 0.75, -0.5],
             tick: 1,
+            fast: false,
         };
         one_step.apply_inputs(1, &[first]);
         one_step.step();

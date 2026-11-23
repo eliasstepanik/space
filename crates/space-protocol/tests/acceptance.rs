@@ -12,9 +12,9 @@ use space_protocol::{
     AdminReply, CodecError, Delta, DirectoryQuery, DirectoryReply, EntityGuid, EntitySnapshot,
     GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer, HandoffReason, Hello,
     InputTick, IslandKey, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject,
-    RejectReason, Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId, ShardMap, ShardRegion,
-    ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    RejectReason, Scene, SceneAck, SceneClock, SceneId, SceneState, ShardHello, ShardId, ShardMap,
+    ShardRegion, ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN,
+    MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use space_world::{NodeRef, WorldPos};
 
@@ -115,12 +115,14 @@ fn all_messages() -> Vec<Message> {
                     thrust: [0.0, 1.5, -2.25],
                     torque: [0.0, 0.0, 0.125],
                     tick: 12,
+                    fast: true,
                 },
                 PlayerInput {
                     entity: guid(2, 6),
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0, 0.0, 0.0],
                     tick: 12,
+                    fast: false,
                 },
             ],
             ack_tick: 11,
@@ -249,18 +251,19 @@ fn all_messages() -> Vec<Message> {
             shard_map: sample_map(),
             peer_token: "peer-secret".into(),
         }),
-        Message::SceneSet(SceneState::new(Scene::Solar.id(), 4)),
+        Message::SceneSet(SceneState::new(Scene::Galaxy.id(), 4)),
         Message::SceneAck(SceneAck {
             shard: shard(5),
-            applied: SceneState::new(Scene::Solar.id(), 4),
+            applied: SceneState::new(Scene::Galaxy.id(), 4),
         }),
-        Message::SceneUpdate(last_message_state()),
+        Message::SceneUpdate(SceneState::new(Scene::Materials.id(), 9)),
+        Message::SceneClock(last_message_clock()),
     ]
 }
 
-/// The payload of the last message in tag order (`SceneUpdate`, tag 27).
-fn last_message_state() -> SceneState {
-    SceneState::new(Scene::Galaxy.id(), 9)
+/// The payload of the last message in tag order (`SceneClock`, tag 28).
+fn last_message_clock() -> SceneClock {
+    SceneClock::new(1234, 1_763_900_000_123_456)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +275,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 36);
+    assert_eq!(messages.len(), 37);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -444,13 +447,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 28, so the valid wire tags are `0..=27`.
-    // The boundary that matters is tag 28 — the first tag past the last variant.
+    // `Message::VARIANT_COUNT` is 29, so the valid wire tags are `0..=28`.
+    // The boundary that matters is tag 29 — the first tag past the last variant.
     // (An earlier revision tested the literals 28/29 while the count was 25:
     // unknown only incidentally, and "passing" for ever as variants were
     // appended — which is why the bound below is the count itself.)
-    assert_eq!(Message::VARIANT_COUNT, 28);
-    let first_invalid = Message::VARIANT_COUNT; // 28
+    assert_eq!(Message::VARIANT_COUNT, 29);
+    let first_invalid = Message::VARIANT_COUNT; // 29
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -462,9 +465,9 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (27, `SceneUpdate`) must decode, proving 28 is the
+    // The last valid tag (28, `SceneClock`) must decode, proving 29 is the
     // first rejection and not an off-by-one that also drops the last variant.
-    let last_valid = Message::SceneUpdate(last_message_state());
+    let last_valid = Message::SceneClock(last_message_clock());
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
     assert_eq!(
         decode_frame(&encode_frame(&last_valid)),
@@ -860,7 +863,7 @@ impl Rng {
         ShardMap::new(self.next_u64(), regions)
     }
     fn message(&mut self) -> Message {
-        match self.below(28) {
+        match self.below(29) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -891,6 +894,7 @@ impl Rng {
                         thrust: self.vec3(),
                         torque: self.vec3(),
                         tick: self.next_u64(),
+                        fast: self.below(2) == 1,
                     })
                     .collect(),
                 ack_tick: self.next_u64(),
@@ -1048,7 +1052,8 @@ impl Rng {
                 shard: self.shard(),
                 applied: self.scene_state(),
             }),
-            _ => Message::SceneUpdate(self.scene_state()),
+            27 => Message::SceneUpdate(self.scene_state()),
+            _ => Message::SceneClock(SceneClock::new(self.next_u64(), self.next_u64() as i64)),
         }
     }
     /// A scene state over the **whole** id space, not just the catalogue: an
@@ -1393,7 +1398,8 @@ fn scene_messages_have_a_pinned_wire_layout() {
 /// the revision either.
 #[test]
 fn an_unknown_scene_id_decodes_and_the_receiver_can_fall_back() {
-    for raw in [Scene::ALL.len() as u16, 77, u16::MAX] {
+    // 2 is the retired `solar`: unknown now, like an id from the future.
+    for raw in [2, 4, 77, u16::MAX] {
         for message in [
             Message::SceneUpdate(SceneState::new(SceneId(raw), 12)),
             Message::SceneSet(SceneState::new(SceneId(raw), 12)),

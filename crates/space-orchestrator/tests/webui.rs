@@ -583,8 +583,8 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "action=\"action/scene\"",
         "<button name=\"scene\" value=\"demo-area\" disabled",
         ">demo-area (current)</button>",
-        "<button name=\"scene\" value=\"solar\"",
-        ">Switch all shards to solar</button>",
+        "<button name=\"scene\" value=\"materials\"",
+        ">Switch all shards to materials</button>",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");
     }
@@ -606,35 +606,36 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     let switch_to = |scene: &str| format!("csrf={token}&refresh=3&scene={scene}");
 
     // ---- a change before any shard exists is saved and waits for them.
-    let accepted = post(ui, "/action/scene", &switch_to("solar")).await;
+    let accepted = post(ui, "/action/scene", &switch_to("materials")).await;
     assert_eq!(accepted.status, 303, "{accepted:?}");
     assert_eq!(accepted.header("X-Space-Result"), Some("accepted"));
     assert_eq!(accepted.header("X-Space-Confirmed"), Some("0/0"));
     assert_eq!(
         accepted.body.trim_end(),
-        "accepted: scene demo-area -> solar (revision 2), sent to nobody. No shard is \
-         connected: solar (revision 2) is saved and is handed to each shard when it registers"
+        "accepted: scene demo-area -> materials (revision 2), sent to nobody. No shard is \
+         connected: materials (revision 2) is saved and is handed to each shard when it registers"
     );
     let scene_file = space_orchestrator::scene::scene_path(&cluster.state_path);
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("the scene was saved"),
-        "2 solar\n"
+        "2 materials\n"
     );
 
     // ---- a shard that registers afterwards is handed the current scene with
     // its welcome, and confirms it.
     let root = cluster.root_shard().await;
-    wait_for_scene(&root, at(Scene::Solar, 2), Duration::from_secs(5)).await;
+    wait_for_scene(&root, at(Scene::Materials, 2), Duration::from_secs(5)).await;
     let state = wait_for_state(ui, Duration::from_secs(5), "shard 1 to confirm", |s| {
         s.contains("\"confirmed_by\":[1],\"not_confirmed_by\":[]")
     })
     .await;
     assert!(
-        cluster_scene(&state).starts_with("\"scene\":{\"name\":\"solar\",\"id\":2,\"revision\":2,"),
+        cluster_scene(&state)
+            .starts_with("\"scene\":{\"name\":\"materials\",\"id\":1,\"revision\":2,"),
         "{state}"
     );
     assert!(state.contains(
-        "\"scene\":{\"name\":\"solar\",\"id\":2,\"revision\":2},\"scene_sync\":\"in-sync\""
+        "\"scene\":{\"name\":\"materials\",\"id\":1,\"revision\":2},\"scene_sync\":\"in-sync\""
     ));
 
     // ---- a player on that shard is told the scene behind its welcome.
@@ -647,14 +648,14 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     )
     .await
     .expect("a player joins the root shard");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Solar, 2));
+    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 2));
 
     // ---- refused requests change nothing: an unknown name, another origin,
     // no form token, a GET.
     let unknown = post(ui, "/action/scene", &switch_to("nowhere")).await;
     assert_eq!(unknown.status, 400, "{unknown:?}");
     assert!(
-        unknown.body.contains("demo-area, materials, solar, galaxy"),
+        unknown.body.contains("demo-area, materials, galaxy"),
         "{unknown:?}"
     );
     for headers in [
@@ -671,13 +672,14 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     tokio::time::sleep(Duration::from_millis(200)).await;
     let state = get(ui, "/api/state").await.body;
     assert!(
-        cluster_scene(&state).starts_with("\"scene\":{\"name\":\"solar\",\"id\":2,\"revision\":2,"),
+        cluster_scene(&state)
+            .starts_with("\"scene\":{\"name\":\"materials\",\"id\":1,\"revision\":2,"),
         "a refused request must change nothing: {state}"
     );
-    assert_eq!(scene_of(&root).await, at(Scene::Solar, 2));
+    assert_eq!(scene_of(&root).await, at(Scene::Materials, 2));
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("still there"),
-        "2 solar\n"
+        "2 materials\n"
     );
 
     // ---- the page's own form, with auto-refresh switched off: the answer
@@ -690,7 +692,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     assert_eq!(accepted.header("X-Space-Confirmed"), Some("1/1"));
     assert_eq!(
         accepted.body.trim_end(),
-        "accepted: scene solar -> galaxy (revision 3), sent to shard 1. All 1 connected shard \
+        "accepted: scene materials -> galaxy (revision 3), sent to shard 1. All 1 connected shard \
          switched to galaxy (revision 3)"
     );
     assert_eq!(
@@ -709,7 +711,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "<span class=\"pill info\">galaxy</span>",
         "<button name=\"scene\" value=\"galaxy\" disabled",
         ">galaxy (current)</button>",
-        ">Switch all shards to solar</button>",
+        ">Switch all shards to materials</button>",
         "galaxy, revision 3 <span class=\"pill ok\">current</span>",
         "<span class=\"pill ok\">1 of 1 connected shards</span>",
         "shard 1 confirmed scene galaxy (revision 3)",
@@ -918,13 +920,13 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
 
     let first = cluster.root_shard().await;
     let (id, endpoint) = (first.shard, first.endpoint);
-    let accepted = post(ui, "/action/scene", &switch_to("solar")).await;
+    let accepted = post(ui, "/action/scene", &switch_to("materials")).await;
     assert_eq!(
         accepted.header("X-Space-Confirmed"),
         Some("1/1"),
         "{accepted:?}"
     );
-    assert_eq!(scene_of(&first).await, at(Scene::Solar, 2));
+    assert_eq!(scene_of(&first).await, at(Scene::Materials, 2));
 
     // The shard goes away, and the scene is changed while it is gone.
     first.abort();
@@ -993,8 +995,8 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
     wait_for_scene(&root, at(Scene::DemoArea, 1), Duration::from_secs(5)).await;
 
     // The shard's state as it would be had it outlived that orchestrator:
-    // solar at revision 9, and a player who was told so.
-    assert!(root.state.lock().await.set_scene(at(Scene::Solar, 9)));
+    // materials at revision 9, and a player who was told so.
+    assert!(root.state.lock().await.set_scene(at(Scene::Materials, 9)));
     let endpoint = space_net::client_endpoint_for(root.endpoint).expect("client endpoint");
     let (player, _welcome) = space_net::connect(
         &endpoint,
@@ -1004,7 +1006,7 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
     )
     .await
     .expect("a player joins");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Solar, 9));
+    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 9));
 
     // The operator switches to galaxy. For the orchestrator that is revision
     // 2 — which the shard, at 9, will not adopt.

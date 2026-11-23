@@ -327,6 +327,94 @@ pub fn lift_accel(
     [k * gravity[0], k * gravity[1], k * gravity[2]]
 }
 
+/// The ship's top speed in normal flight, m/s: `thrust / (mass · drag_lin)`
+/// (120 m/s for [`ShipParams::PLACEHOLDER`]).
+#[must_use]
+pub fn top_speed(params: &ShipParams) -> f32 {
+    params.thrust / (params.mass * params.drag_lin)
+}
+
+/// Fast travel: the speed limit is the distance to the nearest surface
+/// covered in this many seconds (so a ship flying at the limit straight at a
+/// surface closes in exponentially and never reaches it faster than it can
+/// stop).
+pub const FAST_ARRIVAL_S: f64 = 1.0;
+
+/// Fast travel: the highest speed at all, m/s (`1e10`: the Sun, 1.5e11 m
+/// away, in about half a minute; Neptune in a few minutes).
+pub const FAST_MAX_SPEED: f64 = 1.0e10;
+
+/// Fast travel: the time constant, seconds, with which the velocity follows
+/// the input towards `input direction × limit` (and comes to rest with the
+/// stick released).
+pub const FAST_RESPONSE_S: f64 = 0.5;
+
+/// Fast travel: a ship **closing in** on the nearest surface has its speed
+/// limit count the distance from this far out, metres. Within it (plus the
+/// normal top speed's second) fast travel is normal flight, and a ship that
+/// arrives there at its top speed of 120 m/s can still brake to a stop
+/// (1.2 km at 6 m/s²) before it reaches the ground. A ship moving away from
+/// it (leaving the demo area, lifting off) needs no such margin.
+pub const FAST_CLEARANCE: f64 = 2_000.0;
+
+/// Fast travel's speed limit at `surface` metres from the nearest surface,
+/// m/s: `(surface − clearance) / FAST_ARRIVAL_S`, at least the normal
+/// [`top_speed`] and at most [`FAST_MAX_SPEED`], where the clearance is
+/// [`FAST_CLEARANCE`] for a ship `closing` in on that surface and 0 for one
+/// moving away from it (or along it). Within 120 m of a surface — and within
+/// 2.12 km of the one being approached — fast travel is normal flight;
+/// further out a ship flying at the limit straight at a surface closes in
+/// exponentially and arrives at the clearance at its normal top speed.
+#[must_use]
+pub fn fast_travel_limit(surface: f64, closing: bool, params: &ShipParams) -> f64 {
+    let top = f64::from(top_speed(params));
+    if surface.is_nan() {
+        return top;
+    }
+    let clearance = if closing { FAST_CLEARANCE } else { 0.0 };
+    ((surface - clearance) / FAST_ARRIVAL_S).clamp(top, FAST_MAX_SPEED)
+}
+
+/// Scale `state.vel` down to at most `limit` m/s.
+pub fn limit_speed(state: &mut ShipState, limit: f64) {
+    let v = state.vel.map(f64::from);
+    let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if speed > limit && speed > 0.0 {
+        let k = limit / speed;
+        state.vel = v.map(|c| (c * k) as f32);
+    }
+}
+
+/// The velocity half of a ship's step in **fast travel** (see
+/// [`fast_travel_limit`]): the velocity follows `input direction × limit`
+/// with the time constant [`FAST_RESPONSE_S`] (with no input it comes to
+/// rest), plus the external acceleration `ext`, then is capped at `limit`.
+/// The angular half is [`ship_velocity_step`]'s.
+pub fn fast_velocity_step(
+    state: &mut ShipState,
+    thrust: [f32; 3],
+    torque: [f32; 3],
+    params: &ShipParams,
+    ext: [f32; 3],
+    limit: f64,
+) {
+    let dt = f64::from(dt());
+    // The angular half (and settling) exactly as in normal flight; its linear
+    // result is thrown away.
+    let before = state.vel;
+    ship_velocity_step(state, [0.0; 3], torque, params, [0.0; 3]);
+    let dir = quat_rotate(state.quat, clamp_unit(thrust));
+    let k = (dt / FAST_RESPONSE_S).min(1.0);
+    for axis in 0..3 {
+        let v = f64::from(before[axis]);
+        let target = f64::from(dir[axis]) * limit;
+        let nv = v + (target - v) * k + f64::from(ext[axis]) * dt;
+        state.vel[axis] = nv as f32;
+    }
+    limit_speed(state, limit);
+    state.vel = settle(state.vel);
+}
+
 /// The pose half of [`step_ship`]: orientation from the (new) angular
 /// velocity, then position from the (new) velocity.
 pub fn ship_pose_step(state: &mut ShipState) {
@@ -400,6 +488,7 @@ mod tests {
             thrust,
             torque,
             tick: 0,
+            fast: false,
         }
     }
 

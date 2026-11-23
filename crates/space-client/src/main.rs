@@ -275,11 +275,13 @@ fn usage() -> String {
         the connect screen: type the server's address (host, host:port or\n\
         [ipv6]:port; the port defaults to {DEFAULT_PORT}) and press Enter. Esc quits\n\
         (the window only: see --headless).\n\
-        The scene that is drawn (demo-area, materials, solar, galaxy) is the\n\
+        The scene that is drawn (demo-area, materials, galaxy) is the\n\
         server's choice, not the client's.\n\
         \n\
         While playing: {KEY_HELP}\n\
-        (C toggles the chase camera and first person. B toggles the brake\n\
+        (C toggles the chase camera and first person. F toggles fast travel:\n\
+        the speed limit grows with the distance to the nearest surface, so the\n\
+        Moon is about half a minute away. B toggles the brake\n\
         assist, which stops the ship when no movement key is held. Esc returns\n\
         to the connect screen.)\n\
         \n\

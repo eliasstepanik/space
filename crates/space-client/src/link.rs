@@ -90,6 +90,16 @@
 //! apart). A body that a neighbouring shard simulates arrives as its
 //! ghost — the same guid, the same components — and is drawn like any other.
 //!
+//! # The scene clock
+//!
+//! Every shard maps its ticks to **scene time** (the time the demo area's
+//! planets move by) and says how in a [`Message::SceneClock`] behind its
+//! `Welcome`, again whenever it re-anchors and every few seconds. The link
+//! keeps the mapping of the shard being played on ([`Replica::scene_clock`]);
+//! during a handoff the accepting shard's is held back and taken at the
+//! switch, together with that shard's ticks — a mapping is only meaningful
+//! with the ticks of the shard that made it.
+//!
 //! # Prediction
 //!
 //! The link remembers every input batch it sends ([`ServerLink::take_sent`])
@@ -113,13 +123,14 @@ use space_ecs::{ComponentDef, ComponentId};
 use space_net::{client_endpoint_for, connect, hello, Conn, NetError};
 use space_protocol::{
     EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    SceneState, ShardId, ShardMap,
+    SceneClock, SceneState, ShardId, ShardMap,
 };
 use space_sim::articulation::{decode_articulation, decode_part_states};
 use space_sim::body::{decode_body, decode_residual, decode_visual};
 use space_sim::spring::decode_springs;
 use space_sim::{
-    Articulation, Body, CollisionGroups, Owner, PartStates, PosResidual, ShipState, Springs, Visual,
+    Articulation, Body, CollisionGroups, Owner, PartStates, PosResidual, ShipControls, ShipState,
+    Springs, Visual,
 };
 use space_world::WorldPos;
 use tokio::task::JoinHandle;
@@ -329,6 +340,9 @@ pub struct Replica {
     /// survives a shard transition; compare it with the value last drawn to
     /// notice a change (see the module docs, "The scene").
     pub scene: SceneState,
+    /// How the shard being played on maps its ticks to scene time (see the
+    /// module docs, "The scene clock"); `None` until it has said.
+    pub scene_clock: Option<SceneClock>,
     /// Every ship the shard being played on has reported and not removed
     /// again, our own included (see [`Replica::others`]).
     ships: ShipView,
@@ -668,6 +682,26 @@ impl Replica {
         })
     }
 
+    /// Whether the own ship is in fast travel, as the shard last said (its
+    /// replicated `ShipControls`).
+    #[must_use]
+    pub fn own_fast(&self) -> bool {
+        let Some(guid) = self.ship else {
+            return false;
+        };
+        self.ships
+            .ships
+            .iter()
+            .find(|t| t.ship.guid == guid)
+            .and_then(|t| {
+                t.components
+                    .iter()
+                    .find(|(id, _)| *id == ShipControls::ID)
+                    .and_then(|(_, b)| space_protocol::codec::decode_raw::<ShipControls>(b).ok())
+            })
+            .is_some_and(|(c, _)| c.fast)
+    }
+
     /// The ship state in `entity`, if it is this session's ship.
     fn own_state(&self, entity: &EntitySnapshot) -> Option<ShipState> {
         if owner_of(entity)? != self.session {
@@ -793,6 +827,8 @@ struct Pending {
     /// The newest scene this shard has announced on this connection, kept for
     /// the moment it becomes the shard being played on.
     scene: Option<SceneState>,
+    /// Its scene clock, kept for the same moment.
+    scene_clock: Option<SceneClock>,
     /// The ships this shard has reported on this connection, kept for the
     /// same moment: its join snapshot arrives long before the switch, and the
     /// deltas after it only name ships that change.
@@ -807,6 +843,8 @@ struct Shared {
     /// Thrust intent, each axis in `-1..=1` (world frame; the ship is never
     /// torqued, so its body frame stays the world frame).
     thrust: [f32; 3],
+    /// Fast travel on, sent with every input.
+    fast: bool,
     /// Input batches sent.
     seq: u64,
     /// The inputs sent since the app last took them ([`ServerLink::take_sent`]),
@@ -867,6 +905,7 @@ impl ServerLink {
             replica: Replica::joined(welcome.session, welcome.shard, &welcome.shard_map),
             tick_seen: Instant::now(),
             thrust: [0.0; 3],
+            fast: false,
             seq: 0,
             sent: VecDeque::new(),
             active: conn.clone(),
@@ -897,6 +936,11 @@ impl ServerLink {
     /// Set the thrust intent sent with every following input batch.
     pub fn set_thrust(&self, thrust: [f32; 3]) {
         lock(&self.shared).thrust = thrust;
+    }
+
+    /// Set fast travel on or off for every following input batch.
+    pub fn set_fast(&self, fast: bool) {
+        lock(&self.shared).fast = fast;
     }
 
     /// The inputs sent since the last call, oldest first, each tagged with
@@ -998,6 +1042,7 @@ async fn send_inputs(shared: SharedRef) {
                 thrust: s.thrust,
                 torque: [0.0; 3],
                 tick,
+                fast: s.fast,
             };
             s.sent.push_back(input);
             while s.sent.len() > SENT_LOG {
@@ -1052,6 +1097,7 @@ async fn read_frames(
                 follow_redirect(&shared, &player_token, generation, redirect);
             }
             Ok(Some(Message::SceneUpdate(update))) => on_scene(&shared, generation, update),
+            Ok(Some(Message::SceneClock(clock))) => on_scene_clock(&shared, generation, clock),
             Ok(Some(message)) => on_frame(&shared, generation, &message),
             // Peer gone.
             Ok(None) => return,
@@ -1084,6 +1130,18 @@ fn on_scene(shared: &SharedRef, generation: u64, update: SceneState) {
     }
     if s.replica.adopt_scene(update, from_active) {
         log_scene(update);
+    }
+}
+
+/// Take a scene clock from the connection with reader `generation`: the
+/// shard being played on's at once, the accepting shard's of a handoff kept
+/// for the switch.
+fn on_scene_clock(shared: &SharedRef, generation: u64, clock: SceneClock) {
+    let mut s = lock(shared);
+    if generation == s.active_generation {
+        s.replica.scene_clock = Some(clock);
+    } else if let Some(pending) = s.pending.as_mut().filter(|p| p.generation == generation) {
+        pending.scene_clock = Some(clock);
     }
 }
 
@@ -1152,6 +1210,10 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
         if s.replica.adopt_scene(theirs, true) {
             log_scene(theirs);
         }
+    }
+    // The new shard's ticks come with its own mapping onto scene time.
+    if pending.scene_clock.is_some() {
+        s.replica.scene_clock = pending.scene_clock;
     }
     log::info!(
         "space-client: now on shard {} (session {}), transition {}",
@@ -1249,6 +1311,7 @@ async fn open_redirect(
             entity: redirect.entity,
             opened: Instant::now(),
             scene: None,
+            scene_clock: None,
             ships: ShipView::default(),
         }) {
             previous.conn.close(0, "superseded");
@@ -1429,19 +1492,19 @@ mod tests {
         // Repeats and late messages change nothing, on either connection.
         for from_active in [true, false] {
             assert!(!r.adopt_scene(scene(Scene::Galaxy, 2), from_active));
-            assert!(!r.adopt_scene(scene(Scene::Solar, 1), from_active));
+            assert!(!r.adopt_scene(scene(Scene::Materials, 1), from_active));
             assert!(!r.adopt_scene(SceneState::UNSET, from_active));
         }
         assert_eq!(r.scene, scene(Scene::Galaxy, 2));
 
         // A newer revision counts wherever it is heard: the scene is the
         // cluster's, and the accepting shard may learn of a change first.
-        assert!(r.adopt_scene(scene(Scene::Solar, 3), false));
-        assert_eq!(r.scene, scene(Scene::Solar, 3));
+        assert!(r.adopt_scene(scene(Scene::Materials, 3), false));
+        assert_eq!(r.scene, scene(Scene::Materials, 3));
 
         // The handoff itself keeps the scene.
         r.switch_to(3, ShardId::new(2), ShipView::default());
-        assert_eq!(r.scene, scene(Scene::Solar, 3));
+        assert_eq!(r.scene, scene(Scene::Materials, 3));
         assert_eq!(r.handoffs, 1);
     }
 
@@ -1453,15 +1516,15 @@ mod tests {
         let mut r = Replica::new(7, ShardId::new(1));
         assert!(r.adopt_scene(scene(Scene::Galaxy, 1), true));
         assert!(
-            !r.adopt_scene(scene(Scene::Solar, 1), false),
+            !r.adopt_scene(scene(Scene::Materials, 1), false),
             "not while it is only the accepting shard of a handoff in flight"
         );
         assert_eq!(r.scene, scene(Scene::Galaxy, 1));
         assert!(
-            r.adopt_scene(scene(Scene::Solar, 1), true),
+            r.adopt_scene(scene(Scene::Materials, 1), true),
             "once it is the shard being played on"
         );
-        assert_eq!(r.scene, scene(Scene::Solar, 1));
+        assert_eq!(r.scene, scene(Scene::Materials, 1));
     }
 
     /// A scene this build does not know is kept as it was sent (the revision
@@ -1477,10 +1540,10 @@ mod tests {
         assert_eq!(r.scene.scene.or_default(), Scene::DEFAULT);
         log_scene(unknown); // says so; must not panic
         assert!(
-            !r.adopt_scene(scene(Scene::Solar, 4), true),
+            !r.adopt_scene(scene(Scene::Materials, 4), true),
             "still ordered"
         );
-        assert!(r.adopt_scene(scene(Scene::Solar, 6), true));
+        assert!(r.adopt_scene(scene(Scene::Materials, 6), true));
     }
 
     fn region(depth: u8, index: [i64; 3], shard: u32) -> space_protocol::ShardRegion {

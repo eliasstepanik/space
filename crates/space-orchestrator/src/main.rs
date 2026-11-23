@@ -13,7 +13,7 @@
 //!   # with the built-in web UI (off unless asked for)
 //!   space-orchestrator --webui 127.0.0.1:7980
 //!   # the scene a fresh cluster shows (default: demo-area)
-//!   space-orchestrator --scene solar
+//!   space-orchestrator --scene galaxy
 //! ```
 //!
 //! There is no argument-parsing dependency (mirrors `space-server`): the grammar
@@ -55,13 +55,15 @@
 //!
 //! | flag | environment fallback | |
 //! |---|---|---|
-//! | `--scene <name>` | `SPACE_ORCHESTRATOR_SCENE` | the **initial** scene: `demo-area` (the default), `materials`, `solar` or `galaxy` |
+//! | `--scene <name>` | `SPACE_ORCHESTRATOR_SCENE` | the **initial** scene: `demo-area` (the default), `materials` or `galaxy` |
 //!
 //! The scene is the cluster's: every shard is told it and tells its clients.
 //! An operator changes it in the web UI; a scene chosen there is saved in
 //! `<state file>.scene` and is what a restarted orchestrator comes back with —
 //! `--scene` only says what to show until then (delete the file to make it
-//! apply again). An unknown name is an error at startup.
+//! apply again). An unknown name is an error at startup, and so is `solar`:
+//! that scene was retired, the solar system is part of `demo-area` now (a
+//! saved `solar` loads as `demo-area`, see [`space_orchestrator::scene`]).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -88,7 +90,7 @@ struct Options {
 const USAGE: &str =
     "usage: space-orchestrator [--bind <addr:port>] [--control-addr <addr:port>] [--cluster <id>] \
                      [--state <path>] [--first-id <n>] [--launcher local|docker] \
-                     [--peer-token <secret>] [--scene demo-area|materials|solar|galaxy] \
+                     [--peer-token <secret>] [--scene demo-area|materials|galaxy] \
                      [--max-regions <n>] \
                      [--webui <addr:port>] [--webui-token <secret> | --webui-token-file <path>] \
                      [--webui-host <name>[:<port>]]... \
@@ -365,6 +367,8 @@ fn scene_line(
             )
         };
         format!("space-orchestrator: scene {current}, restored from {file}{unused}")
+    } else if scene.note().is_some() {
+        format!("space-orchestrator: scene {current}, replacing a retired scene saved in {file}")
     } else {
         format!(
             "space-orchestrator: scene {current}, the initial scene; a change is saved in {file}"
@@ -484,23 +488,22 @@ mod tests {
         }
         // A flag wins over the environment; an empty variable is unset.
         let both = parse_with(
-            &["--scene", "solar"],
+            &["--scene", "materials"],
             &[("SPACE_ORCHESTRATOR_SCENE", "galaxy")],
         )
         .expect("parses");
-        assert_eq!(both.config.initial_scene, Scene::Solar);
+        assert_eq!(both.config.initial_scene, Scene::Materials);
         let empty = parse_with(&[], &[("SPACE_ORCHESTRATOR_SCENE", "  ")]).expect("parses");
         assert_eq!(empty.config.initial_scene, Scene::DemoArea);
-        let padded = parse_with(&[], &[("SPACE_ORCHESTRATOR_SCENE", " solar\n")]).expect("parses");
-        assert_eq!(padded.config.initial_scene, Scene::Solar);
+        let padded = parse_with(&[], &[("SPACE_ORCHESTRATOR_SCENE", " galaxy\n")]).expect("parses");
+        assert_eq!(padded.config.initial_scene, Scene::Galaxy);
 
-        // An unknown name is an error that lists the catalogue, from either source.
-        for bad in ["Solar", "demo", "4"] {
+        // An unknown name is an error that lists the catalogue, from either
+        // source. `solar` was retired (merged into the demo area): it is
+        // refused like any name the catalogue does not have.
+        for bad in ["solar", "Solar", "demo", "4"] {
             let err = parse(&["--scene", bad]).expect_err(bad);
-            assert!(
-                err.contains("demo-area, materials, solar, galaxy"),
-                "{bad}: {err}"
-            );
+            assert!(err.contains("demo-area, materials, galaxy"), "{bad}: {err}");
             let err = parse_with(&[], &[("SPACE_ORCHESTRATOR_SCENE", bad)]).expect_err(bad);
             assert!(err.contains("SPACE_ORCHESTRATOR_SCENE"), "{bad}: {err}");
         }
@@ -533,12 +536,20 @@ mod tests {
                 && line.contains(&file.display().to_string()),
             "{line}"
         );
-        store.set(Scene::Solar).expect("saved");
+        store.set(Scene::Materials).expect("saved");
         let restored = SceneStore::open(&file, config.initial_scene);
         let line = scene_line(&restored, &config);
         assert!(
-            line.contains("scene solar (revision 2), restored from")
+            line.contains("scene materials (revision 2), restored from")
                 && line.contains("wins over the initial scene galaxy"),
+            "{line}"
+        );
+        // A saved scene that was retired: the default, not "the initial scene".
+        std::fs::write(&file, "4 solar\n").expect("write");
+        let replaced = SceneStore::open(&file, config.initial_scene);
+        let line = scene_line(&replaced, &config);
+        assert!(
+            line.contains("scene demo-area (revision 5), replacing a retired scene saved in"),
             "{line}"
         );
         std::fs::remove_file(&file).ok();

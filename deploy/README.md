@@ -59,8 +59,10 @@ several commits pushed together, the head is the one that is built.
 ## Scene and the orchestrator web UI
 
 **The scene is server state.** The orchestrator owns it, every shard runs it and
-tells its clients; a client has no say. Catalogue: `demo-area` (default),
-`materials`, `solar`, `galaxy`. `space-orchestrator --scene NAME` (env
+tells its clients; a client has no say. Catalogue: `demo-area` (default; the
+solar system is part of it), `materials`, `galaxy`. The former `solar` scene was
+retired: a saved `solar` comes back as `demo-area` at the next revision, and
+`--scene solar` is refused. `space-orchestrator --scene NAME` (env
 `SPACE_ORCHESTRATOR_SCENE`, compose variable `SPACE_SCENE`) is only the *initial*
 scene: one chosen at run time is saved next to the id counter
 (`<state file>.scene`) and wins on restart, so keep the state directory on a

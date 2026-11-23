@@ -133,9 +133,9 @@ async fn neighbours() -> (Running, Running) {
 async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
     let (a, b) = neighbours().await;
     // The cluster's scene was just changed and the change has reached B but
-    // not A yet: A still says the galaxy, B already the solar system.
+    // not A yet: A still says the galaxy, B already the material chart.
     assert!(a.shard.lock().await.set_scene(scene(Scene::Galaxy, 2)));
-    assert!(b.shard.lock().await.set_scene(scene(Scene::Solar, 3)));
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Materials, 3)));
 
     let link = ServerLink::connect(a.addr()).await.expect("join shard A");
     let joined = link.replica();
@@ -151,7 +151,7 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
     );
     let first_scene = link.scene();
     assert!(
-        first_scene == scene(Scene::Galaxy, 2) || first_scene == scene(Scene::Solar, 3),
+        first_scene == scene(Scene::Galaxy, 2) || first_scene == scene(Scene::Materials, 3),
         "{first_scene}"
     );
 
@@ -167,9 +167,9 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
     let ship = arrived.ship.expect("the ship came along");
     assert!(!link.is_closed(), "the new connection is the live one");
     // The newer scene won, and the replica and the link agree on it.
-    assert_eq!(arrived.scene, scene(Scene::Solar, 3));
-    assert_eq!(link.scene(), scene(Scene::Solar, 3));
-    assert_eq!(link.scene().scene.or_default(), Scene::Solar);
+    assert_eq!(arrived.scene, scene(Scene::Materials, 3));
+    assert_eq!(link.scene(), scene(Scene::Materials, 3));
+    assert_eq!(link.scene().scene.or_default(), Scene::Materials);
 
     // Seamless: the ship is where it was (it has not been flown yet), not
     // reset to some other spawn point.
@@ -254,7 +254,7 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
 async fn a_handoff_to_a_shard_that_is_behind_does_not_roll_the_scene_back() {
     let (a, b) = neighbours().await;
     assert!(a.shard.lock().await.set_scene(scene(Scene::Materials, 5)));
-    assert!(b.shard.lock().await.set_scene(scene(Scene::Solar, 4)));
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Materials, 4)));
 
     let link = ServerLink::connect(a.addr()).await.expect("join shard A");
     assert!(
@@ -310,7 +310,7 @@ async fn the_client_learns_the_scene_on_join_and_follows_a_change() {
     // What an app does every frame: compare with the scene it last drew.
     let mut drawn = link.scene();
     let mut changes = Vec::new();
-    for next in [scene(Scene::Solar, 2), scene(Scene::DemoArea, 3)] {
+    for next in [scene(Scene::Materials, 2), scene(Scene::DemoArea, 3)] {
         assert!(shard.shard.lock().await.set_scene(next));
         assert!(
             eventually(5, || link.scene() != drawn).await,
@@ -327,7 +327,7 @@ async fn the_client_learns_the_scene_on_join_and_follows_a_change() {
     }
     assert_eq!(
         changes,
-        vec![scene(Scene::Solar, 2), scene(Scene::DemoArea, 3)]
+        vec![scene(Scene::Materials, 2), scene(Scene::DemoArea, 3)]
     );
 
     // A scene a newer server knows and this client does not: kept as sent,

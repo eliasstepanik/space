@@ -67,7 +67,7 @@ pub use messages::{
     Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
-pub use scene::{Scene, SceneAck, SceneId, SceneState, UnknownScene};
+pub use scene::{Scene, SceneAck, SceneClock, SceneId, SceneState, UnknownScene};
 pub use shard::{
     AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
 };

@@ -68,7 +68,15 @@ use crate::messages::Message;
 /// now a per-tick batch of border ghosts between shards; and a handoff's state
 /// may describe an unowned body. None of it is readable by a v4 peer, so the
 /// version bumps and such a peer is refused at the hello.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// **Version 6** (the merged demo area: orbits and fast travel): every shard
+/// sends its clients a [`crate::SceneClock`] (wire tag 28, appended) behind the
+/// `Welcome` and again every few seconds — the mapping from its ticks to the
+/// scene time the planets move by; a [`crate::PlayerInput`] carries the
+/// fast-travel flag (`fast`), and so does the replicated `ShipControls`
+/// component (25 bytes, was 24). A v5 client would fail on the new tag and
+/// misread every input, so the version bumps.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Largest accepted frame payload, in bytes (1 MiB).
 ///

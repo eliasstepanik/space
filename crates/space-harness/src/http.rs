@@ -101,7 +101,9 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        frame, width, height, fps,
                        gravity, landed, bodies (nearest first: guid, visual, visual_id,
                        position, distance, speed, parts, in_view), bodies_in_view,
-                       correction_m, correction_max_m
+                       correction_m, correction_max_m,
+                       fast, nearest, nearest_surface_m, sky (name, position, radius,
+                       surface_m)
 GET  /frame.png        the current picture, lossless PNG
 GET  /frame.jpg        the same as JPEG (?quality=1..100)
                        ?wait=1   block until the next frame

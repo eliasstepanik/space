@@ -18,7 +18,8 @@
 #                     (7777 owns cell 0, 7778 owns cell 1): fly +X (hold D for
 #                     about 15 s, until the HUD's pos passes 512) and the HUD
 #                     changes to "shard 2  handoffs 1".
-#   --scene demo-area|materials|solar|galaxy    (default: demo-area)
+#   --scene demo-area|materials|galaxy    (default: demo-area; the solar
+#       system is part of demo-area)
 #       What the SERVERS show. The orchestrator takes it as its initial scene;
 #       a scene chosen later in the web UI is remembered in
 #       target/dev/orchestrator.id.scene, and giving --scene forgets that.
@@ -128,8 +129,8 @@ case "$topology" in
     *) die "--topology must be orchestrated, single or two-shards (got '$topology')" ;;
 esac
 case "$scene" in
-    demo-area | materials | solar | galaxy) ;;
-    *) die "--scene must be demo-area, materials, solar or galaxy (got '$scene')" ;;
+    demo-area | materials | galaxy) ;;
+    *) die "--scene must be demo-area, materials or galaxy (got '$scene'; the solar system is part of demo-area)" ;;
 esac
 case "$client" in
     window | headless | stream) ;;

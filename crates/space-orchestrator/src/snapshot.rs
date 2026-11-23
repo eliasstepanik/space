@@ -133,8 +133,8 @@ impl SceneProgress {
     }
 
     /// The state in one sentence, for a person and for a script alike:
-    /// `All 2 connected shards switched to solar (revision 4)`,
-    /// `Switching to solar (revision 4): waiting for shard 2 … (1 of 2
+    /// `All 2 connected shards switched to galaxy (revision 4)`,
+    /// `Switching to galaxy (revision 4): waiting for shard 2 … (1 of 2
     /// connected shards confirmed)`, or that no shard is connected.
     #[must_use]
     pub fn sentence(&self) -> String {
@@ -446,30 +446,30 @@ mod tests {
     #[test]
     fn a_confirmed_scene_is_compared_with_the_current_one() {
         let view = SceneView {
-            scene: Scene::Solar,
+            scene: Scene::Materials,
             revision: 4,
             changed_tick: None,
             path: None,
         };
-        assert_eq!(view.current(), SceneState::new(Scene::Solar.id(), 4));
+        assert_eq!(view.current(), SceneState::new(Scene::Materials.id(), 4));
         let at = |scene: Scene, revision| Some(SceneState::new(scene.id(), revision));
         assert_eq!(view.sync_of(None), SceneSync::Unconfirmed);
-        assert_eq!(view.sync_of(at(Scene::Solar, 4)), SceneSync::InSync);
+        assert_eq!(view.sync_of(at(Scene::Materials, 4)), SceneSync::InSync);
         assert_eq!(view.sync_of(at(Scene::DemoArea, 3)), SceneSync::Behind);
-        assert_eq!(view.sync_of(at(Scene::Solar, 1)), SceneSync::Behind);
+        assert_eq!(view.sync_of(at(Scene::Materials, 1)), SceneSync::Behind);
         assert_eq!(
             view.sync_of(at(Scene::Galaxy, 4)),
             SceneSync::Differs,
             "the right revision with the wrong scene is not a confirmation"
         );
-        assert_eq!(view.sync_of(at(Scene::Solar, 9)), SceneSync::Differs);
+        assert_eq!(view.sync_of(at(Scene::Materials, 9)), SceneSync::Differs);
         assert_eq!(SceneSync::Behind.label(), "behind");
     }
 
     #[test]
     fn the_progress_of_a_scene_reads_as_one_sentence() {
         let progress = |confirmed: &[u32], waiting: &[u32]| SceneProgress {
-            scene: Scene::Solar,
+            scene: Scene::Materials,
             revision: 4,
             confirmed: confirmed.iter().copied().map(ShardId::new).collect(),
             waiting: waiting.iter().copied().map(ShardId::new).collect(),
@@ -478,18 +478,18 @@ mod tests {
         assert!(all.settled());
         assert_eq!(
             all.sentence(),
-            "All 2 connected shards switched to solar (revision 4)"
+            "All 2 connected shards switched to materials (revision 4)"
         );
         assert_eq!(
             progress(&[1], &[]).sentence(),
-            "All 1 connected shard switched to solar (revision 4)"
+            "All 1 connected shard switched to materials (revision 4)"
         );
         let pending = progress(&[1], &[2, 3]);
         assert!(!pending.settled());
         assert_eq!(pending.connected(), 3);
         assert_eq!(
             pending.sentence(),
-            "Switching to solar (revision 4): waiting for shard 2, shard 3 … (1 of 3 connected \
+            "Switching to materials (revision 4): waiting for shard 2, shard 3 … (1 of 3 connected \
              shards confirmed)"
         );
         let nobody = progress(&[], &[]);
@@ -497,7 +497,7 @@ mod tests {
         assert!(
             nobody
                 .sentence()
-                .starts_with("No shard is connected: solar (revision 4) is saved"),
+                .starts_with("No shard is connected: materials (revision 4) is saved"),
             "{}",
             nobody.sentence()
         );

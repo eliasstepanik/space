@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use space_client::app::{App, AppConfig, CHASE_DISTANCE, CHASE_HEIGHT};
 use space_client::headless::{run_headless, HeadlessConfig, HeadlessReport};
-use space_client::scenes::{character_mesh, ship_mesh, World};
+use space_client::scenes::{character_mesh, ship_mesh, SkyTime, World};
 use space_harness::{ClientState, Control, Frame, Hub, Key, Screen, ViewerInput};
 use space_protocol::{Scene, SceneId, SceneState, ShardId, ShardMap, ShardRegion};
 use space_render::{ContextOptions, QualityPreset, RenderContext};
@@ -548,7 +548,6 @@ fn the_scene_switches_live_when_the_shards_scene_changes() {
 
     let mut revision = 0;
     for (scene, yaw_deg) in [
-        (Scene::Solar, 0.0),
         (Scene::Galaxy, 180.0),
         (Scene::Materials, 0.0),
         (Scene::DemoArea, 0.0),
@@ -575,9 +574,20 @@ fn the_scene_switches_live_when_the_shards_scene_changes() {
         let expected = world.build(&client.app.scene(640, 360).camera);
         let bodies = client.app.client_state(640, 360).bodies.len();
         let drawn = client.app.scene(640, 360);
-        assert_eq!(drawn.lights.len(), expected.lights.len(), "{scene}");
+        // ...plus the moving sky (the demo area's Sun, planets and Moon, and
+        // the sunlight), which the app adds every frame.
+        let (sky, sun) = world.sky(&drawn.camera, &SkyTime::default());
+        assert_eq!(
+            drawn.lights.len(),
+            expected.lights.len() + usize::from(sun.is_some()),
+            "{scene}"
+        );
         if bodies == 0 {
-            assert_eq!(drawn.instances.len(), expected.instances.len(), "{scene}");
+            assert_eq!(
+                drawn.instances.len(),
+                expected.instances.len() + sky.len(),
+                "{scene}"
+            );
             // ...plus the player's own character (chase camera).
             assert_eq!(drawn.models.len(), expected.models.len() + 1, "{scene}");
         } else {
@@ -621,10 +631,10 @@ fn the_scene_switches_live_when_the_shards_scene_changes() {
     set_scene(
         &rt,
         &shard,
-        SceneState::new(Scene::Solar.id(), revision + 2),
+        SceneState::new(Scene::Materials.id(), revision + 2),
     );
-    client.until("switched to solar", |app| {
-        app.world().scene() == Scene::Solar
+    client.until("switched to the material chart", |app| {
+        app.world().scene() == Scene::Materials
     });
     set_scene(&rt, &shard, SceneState::new(SceneId(4_000), revision + 3));
     client.until("fell back to the default", |app| {
@@ -1558,7 +1568,7 @@ local before = s.scene_revision
 client.log("drawing " .. s.scene .. " at revision " .. before)
 -- The cue for the operator (the test) to switch the scene.
 client.turn(10, 0)
-client.wait_until(function() return client.state().scene == "solar" end, 20)
+client.wait_until(function() return client.state().scene == "galaxy" end, 20)
 s = client.state()
 assert(s.scene_revision > before, "the revision did not go up")
 assert(s.screen == "online" and s.position ~= nil, "the switch dropped the player")
@@ -1577,14 +1587,14 @@ assert(client.state().scene == nil, "a scene after leaving")
         )
     });
     // The client's loop, and the operator: when the script gives its cue (it
-    // has read the first scene), switch to the solar system.
+    // has read the first scene), switch to the galaxy.
     let mut switched = false;
     let deadline = Instant::now() + Duration::from_secs(60);
     while !script.is_finished() {
         client.frame();
         let state = client.app.client_state(640, 360);
         if !switched && state.scene.is_some() && (state.yaw_deg - 10.0).abs() < 0.5 {
-            set_scene(&rt, &shard, SceneState::new(Scene::Solar.id(), 7));
+            set_scene(&rt, &shard, SceneState::new(Scene::Galaxy.id(), 7));
             switched = true;
         }
         assert!(Instant::now() < deadline, "the script never ended");
@@ -1596,7 +1606,7 @@ assert(client.state().scene == nil, "a scene after leaving")
         report.output,
         vec![
             "drawing demo-area at revision 0".to_owned(),
-            "now solar at revision 7".to_owned(),
+            "now galaxy at revision 7".to_owned(),
         ]
     );
     drop(client);

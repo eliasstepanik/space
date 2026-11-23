@@ -10,7 +10,7 @@ use space_ecs::ComponentId;
 
 use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
 use crate::guid::EntityGuid;
-use crate::scene::{SceneAck, SceneState};
+use crate::scene::{SceneAck, SceneClock, SceneState};
 use crate::shard::{
     EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
 };
@@ -30,6 +30,10 @@ pub struct PlayerInput {
     pub torque: [f32; 3],
     /// Tick the input applies to.
     pub tick: u64,
+    /// Fast travel on (protocol 6): the ship's speed limit scales with its
+    /// distance to the nearest surface (see `space_sim::physics`). It stays
+    /// as the last input set it while no input arrives.
+    pub fast: bool,
 }
 
 /// A batch of inputs for one tick.
@@ -555,6 +559,13 @@ pub enum Message {
     /// connection a client opens during a handoff — and again whenever the
     /// shard's scene changes. A client keeps the highest revision it has seen.
     SceneUpdate(SceneState),
+    /// Shard → client: how this shard's ticks map to scene time (protocol 6).
+    ///
+    /// Sent right after the [`Message::SceneUpdate`] on every join, whenever
+    /// the shard re-anchors its clock and again every few seconds. A client
+    /// moves the scene's planets by it (see [`crate::scene`], "The scene
+    /// clock").
+    SceneClock(SceneClock),
 }
 
 impl Message {
@@ -564,7 +575,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 28;
+    pub const VARIANT_COUNT: u32 = 29;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -601,6 +612,7 @@ impl Message {
             Message::SceneSet(_) => 25,
             Message::SceneAck(_) => 26,
             Message::SceneUpdate(_) => 27,
+            Message::SceneClock(_) => 28,
         }
     }
 

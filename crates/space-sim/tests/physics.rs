@@ -76,6 +76,7 @@ fn floor(origin: WorldPos, top: f64, half: f32) -> StaticCollider {
         restitution: 0.0,
         visual: Visual(0),
         groups: space_sim::CollisionGroups::ALL,
+        motion: None,
     }
 }
 
@@ -154,6 +155,7 @@ fn falling_in_a_zone_and_weightless_outside() {
     sim.set_gravity(GravityField {
         zones: vec![zone(at(o, [0.0, 100.0, 0.0]), 100.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     spawn(&mut sim, 1, at(o, [0.0, 150.0, 0.0]), ball(0.5));
     spawn(&mut sim, 2, at(o, [500.0, 150.0, 0.0]), ball(0.5));
@@ -202,6 +204,7 @@ fn orbit_around_a_point_mass_conserves_energy() {
             place: BodyPlace::Fixed(WorldPoint::at(center)),
             reach: f64::INFINITY,
         }],
+        clock: Default::default(),
     });
     let mut s = ShipState::at_rest(at(center, [r, 0.0, 0.0]));
     s.vel = [0.0, 0.0, v as f32];
@@ -283,11 +286,13 @@ fn balls_in_a_concave_bowl_settle_at_the_bottom() {
         restitution: 0.0,
         visual: Visual(0),
         groups: space_sim::CollisionGroups::ALL,
+        motion: None,
     }])
     .unwrap();
     sim.set_gravity(GravityField {
         zones: vec![zone(o, 20.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     for (n, x) in [(1u64, 1.8f64), (2, -1.6), (3, 0.6)] {
         // On the slope: y of the sphere cap at radius x, plus the ball radius.
@@ -327,6 +332,7 @@ fn a_five_crate_stack_stands_for_ten_seconds() {
     sim.set_gravity(GravityField {
         zones: vec![zone(o, 50.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     for i in 0..5u64 {
         spawn(
@@ -373,6 +379,7 @@ fn ccd_stops_a_fast_ball_at_a_thin_wall() {
         restitution: 0.0,
         visual: Visual(0),
         groups: space_sim::CollisionGroups::ALL,
+        motion: None,
     }])
     .unwrap();
     let mut b = ball(0.1);
@@ -416,6 +423,7 @@ fn spring_pendulum_period_and_damping() {
         sim.set_gravity(GravityField {
             zones: vec![zone(o, 100.0)],
             bodies: vec![],
+            clock: Default::default(),
         });
         let mut b = ball(0.2);
         b.mass = space_sim::MassSpec::Mass(10.0);
@@ -547,6 +555,7 @@ fn a_chain_hangs_from_its_anchor() {
     sim.set_gravity(GravityField {
         zones: vec![zone(o, 50.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     let link_len = 0.5f32;
     let link = || {
@@ -655,6 +664,7 @@ fn ship_flight_feel_is_unchanged() {
                 thrust,
                 torque: [0.0; 3],
                 tick: t,
+                fast: false,
             }],
         );
         sim.step();
@@ -749,6 +759,7 @@ fn ships_collide_with_the_world_and_push_bodies() {
                 thrust: [0.0, -1.0, 0.0],
                 torque: [0.0; 3],
                 tick: t,
+                fast: false,
             }],
         );
         sim.step();
@@ -770,6 +781,7 @@ fn ships_collide_with_the_world_and_push_bodies() {
                 thrust: [0.0, 0.0, -1.0],
                 torque: [0.0; 3],
                 tick: t,
+                fast: false,
             }],
         );
         sim.step();
@@ -799,12 +811,14 @@ fn busy_world(order: &[u64]) -> SimWorld {
             restitution: 0.1,
             visual: Visual(0),
             groups: space_sim::CollisionGroups::ALL,
+            motion: None,
         },
     ])
     .unwrap();
     sim.set_gravity(GravityField {
         zones: vec![zone(o, 30.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     for &n in order {
         let x = (n % 4) as f64 * 1.1 - 2.0;
@@ -837,6 +851,7 @@ fn determinism_same_inputs_and_spawn_order() {
             thrust: [((t % 7) as f32 - 3.0) / 3.0, -0.5, 0.2],
             torque: [0.0, 0.1, 0.0],
             tick: t,
+            fast: false,
         };
         for w in [&mut a, &mut b, &mut c] {
             w.apply_inputs(t, &[input]);
@@ -869,6 +884,7 @@ fn a_body_moves_between_worlds_mid_flight() {
         sim.set_gravity(GravityField {
             zones: vec![zone(o, 1000.0)],
             bodies: vec![],
+            clock: Default::default(),
         });
         sim
     };
@@ -1103,12 +1119,14 @@ fn the_same_scene_moves_the_same_anywhere_in_the_world() {
                 restitution: 0.0,
                 visual: Visual(0),
                 groups: space_sim::CollisionGroups::ALL,
+                motion: None,
             },
         ])
         .unwrap();
         sim.set_gravity(GravityField {
             zones: vec![zone(o, 40.0)],
             bodies: vec![],
+            clock: Default::default(),
         });
         // Every position is a short binary fraction, so it is exactly the
         // same offset in every cell placement below.
@@ -1353,6 +1371,7 @@ fn physics_prediction_matches_the_server() {
         sim.set_gravity(GravityField {
             zones: vec![zone(at(o, [0.0, 0.0, 0.0]), 20.0)],
             bodies: vec![],
+            clock: Default::default(),
         });
     };
     let mut server = SimWorld::new(ShardId(1));
@@ -1374,6 +1393,7 @@ fn physics_prediction_matches_the_server() {
             },
             torque: [0.0; 3],
             tick: t,
+            fast: false,
         };
         client.apply_input(input);
         server.apply_inputs(t, &[input]);
@@ -1419,6 +1439,7 @@ fn a_dynamic_concave_body_uses_its_cached_convex_decomposition() {
     sim.set_gravity(GravityField {
         zones: vec![zone(o, 30.0)],
         bodies: vec![],
+        clock: Default::default(),
     });
     let mut bowl = Body::dynamic(ShapeRef::Asset(AssetId(1)));
     bowl.mass = space_sim::MassSpec::Mass(50.0);

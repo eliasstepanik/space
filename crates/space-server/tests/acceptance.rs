@@ -187,6 +187,7 @@ impl Pair {
                 ],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
             ack_tick: 0,
         };
@@ -532,7 +533,7 @@ fn client_gets_a_snapshot_then_deltas_and_its_input_ack_advances() {
 fn a_redirected_clients_second_connection_is_told_the_scene() {
     let mut pair = Pair::new();
     let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
-    let scene = SceneState::new(Scene::Solar.id(), 3);
+    let scene = SceneState::new(Scene::Galaxy.id(), 3);
     assert!(pair.a.set_scene(scene));
     assert!(pair.b.set_scene(scene));
     let (session_a, _guid) = join(&mut pair.a, "player");
@@ -965,6 +966,7 @@ fn an_unanswered_offer_times_out_and_the_world_is_unchanged() {
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -1253,6 +1255,7 @@ async fn a_client_can_connect_to_a_running_shard() {
                 thrust: [1.0, 0.0, 0.0],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
             ack_tick: 0,
         };
@@ -1331,6 +1334,7 @@ fn drive_offer(a: &mut Shard, guid: EntityGuid, session: u64) -> space_protocol:
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -2332,7 +2336,7 @@ fn frames_of(shard: &mut Shard, session: u64) -> Vec<Message> {
         .into_iter()
         .filter(|o| o.dest == Destination::Client(session))
         .map(|o| o.message)
-        .filter(|message| !matches!(message, Message::SceneUpdate(_)))
+        .filter(|message| !matches!(message, Message::SceneUpdate(_) | Message::SceneClock(_)))
         .collect()
 }
 
@@ -2364,6 +2368,7 @@ fn input(ship: EntityGuid, tick: u64, thrust: [f32; 3], ack_tick: u64) -> InputT
             thrust,
             torque: [0.0; 3],
             tick,
+            fast: false,
         }],
         ack_tick,
     }

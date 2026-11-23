@@ -90,6 +90,38 @@ use space_sim::SimTick;
 /// client, stripped before the state is imported.
 pub const TRANSFER_COMPONENT: u16 = u16::MAX - 1;
 
+/// The private component id a handoff state carries the **scene time** it
+/// describes under (`i64` µs, big endian): the sending shard's
+/// `SimWorld::scene_time` when it took the state. The receiving shard's own
+/// scene clock may differ by a few milliseconds (each shard keeps its own
+/// mapping onto the wall clock), which near a moon moving thousands of
+/// kilometres a second is kilometres: the receiver moves the state by what
+/// the orbiting bodies carry it from that time to its own
+/// (`SimWorld::carry`), so it arrives where it was relative to the planet it
+/// is near. Never sent to a client, stripped before the state is imported.
+/// Private ids are [`PRIVATE_COMPONENTS`] and up.
+pub const SCENE_TIME_COMPONENT: u16 = u16::MAX - 2;
+
+/// The lowest private component id of a handoff state.
+pub const PRIVATE_COMPONENTS: u16 = SCENE_TIME_COMPONENT;
+
+/// The [`SCENE_TIME_COMPONENT`] for scene time `us`.
+#[must_use]
+pub fn scene_time_component(us: i64) -> (u16, Vec<u8>) {
+    (SCENE_TIME_COMPONENT, us.to_be_bytes().to_vec())
+}
+
+/// The scene time a handoff state carries, if it carries one.
+#[must_use]
+pub fn scene_time_of(state: &EntitySnapshot) -> Option<i64> {
+    state
+        .components
+        .iter()
+        .find(|(id, _)| *id == SCENE_TIME_COMPONENT)
+        .and_then(|(_, b)| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(i64::from_be_bytes)
+}
+
 /// What a transfer moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
@@ -532,5 +564,29 @@ impl Ledger {
             epoch: offer.epoch,
             activation_tick: offer.activation_tick,
         }
+    }
+}
+
+#[cfg(test)]
+mod scene_time_tests {
+    use super::{scene_time_component, scene_time_of, PRIVATE_COMPONENTS, TRANSFER_COMPONENT};
+    use space_protocol::{EntityGuid, EntitySnapshot, ShardId};
+
+    /// The scene time a handoff state carries comes back exactly, a state
+    /// without one has none, and the id is private (stripped before import).
+    #[test]
+    fn a_handoff_state_carries_its_scene_time() {
+        let guid = EntityGuid::new(ShardId(1), 1);
+        let mut state = EntitySnapshot::new(guid, vec![(0, vec![1, 2, 3])]);
+        assert_eq!(scene_time_of(&state), None);
+        state.components.push(scene_time_component(-42));
+        state
+            .components
+            .push(scene_time_component(1_763_900_000_123_456));
+        assert_eq!(scene_time_of(&state), Some(-42), "the first one counts");
+        let (id, _) = scene_time_component(0);
+        assert!((PRIVATE_COMPONENTS..TRANSFER_COMPONENT).contains(&id));
+        let bad = EntitySnapshot::new(guid, vec![(id, vec![1, 2])]);
+        assert_eq!(scene_time_of(&bad), None, "a malformed one is ignored");
     }
 }

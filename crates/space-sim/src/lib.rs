@@ -84,6 +84,7 @@
 //! * [`spring`] — [`Springs`] (id 6), force-based springs and ropes
 //! * [`articulation`] — [`Articulation`] (id 7) and [`PartStates`] (id 8)
 //! * [`gravity`] — [`gravity::GravityField`]: zones and large bodies
+//! * [`motion`] — [`motion::OrbitPath`]: fixed orbits as a function of scene time
 //! * [`rigid`] — the rigid-body world: physics bubbles, statics, islands
 //! * [`sim_world`] — [`SimWorld`], the ticked simulation world + state hash
 //! * [`orbits`] — [`orbits::rail_pos`], planets on rails (never simulated)
@@ -100,6 +101,7 @@ pub mod body;
 mod codec;
 pub mod components;
 pub mod gravity;
+pub mod motion;
 pub mod orbits;
 pub mod params;
 pub mod physics;

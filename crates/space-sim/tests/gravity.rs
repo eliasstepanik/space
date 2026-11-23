@@ -26,6 +26,7 @@ fn planetoid(center: WorldPos) -> GravityField {
             place: BodyPlace::Fixed(WorldPoint::at(center)),
             reach: REACH,
         }],
+        clock: Default::default(),
     }
 }
 

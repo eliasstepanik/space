@@ -7,7 +7,7 @@
 //! | id | component        | replicated | wire form |
 //! |----|------------------|------------|-----------|
 //! | 0  | [`ShipState`]    | yes        | [`crate::wire`], 76 B |
-//! | 1  | [`ShipControls`] | yes        | bincode, 24 B |
+//! | 1  | [`ShipControls`] | yes        | bincode, 25 B (24 before protocol 6) |
 //! | 2  | [`Owner`]        | yes        | bincode `u64`, 8 B |
 //! | 3  | [`ShardAuthority`]| no        | — |
 //! | 4  | [`crate::Body`]  | yes        | [`crate::body`], versioned |
@@ -93,6 +93,11 @@ pub struct ShipControls {
     pub thrust: [f32; 3],
     /// Torque in entity-local newton-metres, `(x, y, z)`.
     pub torque: [f32; 3],
+    /// Fast travel on ([`crate::physics::fast_travel_limit`]). Unlike thrust
+    /// and torque it is **not** consumed by the step: it stays as the last
+    /// input set it, travels with the ship in a handoff and is replicated, so
+    /// a client's prediction starts from the shard's word on it.
+    pub fast: bool,
 }
 
 /// The player session that drives a ship.

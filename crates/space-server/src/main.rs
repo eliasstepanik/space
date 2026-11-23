@@ -83,7 +83,7 @@ struct Options {
 /// The usage line, printed for `--help` and for any parse error.
 const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
-                     [--scene demo-area|materials|solar|galaxy] \
+                     [--scene demo-area|materials|galaxy] \
                      [--orchestrator <addr:port> [--claim-region <depth:x:y:z>] [--cluster <id>] \
                      [--advertise <addr:port>]]";
 
@@ -357,7 +357,12 @@ async fn run(options: Options) -> Result<(), String> {
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             clock.tick().await;
-            shard.lock().await.tick();
+            {
+                let mut shard = shard.lock().await;
+                shard.tick();
+                // The scene clock follows the wall clock (re-anchored only on drift).
+                shard.sync_scene_clock(space_server::config::wall_clock_us());
+            }
             net.flush(&shard).await;
         }
     });
@@ -558,16 +563,16 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{scene} must parse: {err}"));
             assert_eq!(options.scene, scene);
         }
-        for bad in ["Solar", "demo", "", "3"] {
+        for bad in ["Solar", "solar", "demo", "", "3"] {
             let err = with(&["--scene", bad]).expect_err(bad);
             assert!(
-                err.contains("--scene") && err.contains("demo-area, materials, solar, galaxy"),
+                err.contains("--scene") && err.contains("demo-area, materials, galaxy"),
                 "{bad:?}: {err}"
             );
         }
         assert!(with(&["--scene"]).is_err(), "the flag needs a value");
 
-        let err = parse(&["--orchestrator", "127.0.0.1:7900", "--scene", "solar"])
+        let err = parse(&["--orchestrator", "127.0.0.1:7900", "--scene", "galaxy"])
             .expect_err("an orchestrated shard is told its scene");
         assert!(err.contains("standalone"), "{err}");
         // Without the flag an orchestrated shard parses as before.

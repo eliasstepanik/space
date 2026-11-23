@@ -79,6 +79,7 @@ fn input_tick(tick: u64) -> Message {
             thrust: [0.0, 0.0, 1_000.0],
             torque: [0.0; 3],
             tick,
+            fast: false,
         }],
         ack_tick: 0,
     })

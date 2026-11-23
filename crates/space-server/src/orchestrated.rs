@@ -152,7 +152,12 @@ pub async fn start_orchestrated(
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             clock.tick().await;
-            shard.lock().await.tick();
+            {
+                let mut shard = shard.lock().await;
+                shard.tick();
+                // The scene clock follows the wall clock (re-anchored only on drift).
+                shard.sync_scene_clock(crate::config::wall_clock_us());
+            }
             net.flush(&shard).await;
         }
     });

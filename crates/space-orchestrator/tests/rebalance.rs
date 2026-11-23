@@ -595,6 +595,7 @@ impl Cluster {
                 thrust,
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
             ack_tick: 0,
         };

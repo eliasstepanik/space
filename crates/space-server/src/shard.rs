@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use space_protocol::{
     EntityGuid, HandoffReason, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    RejectReason, SceneAck, SceneState, ShardId, ShardMap, ShardRegion, StaleEpoch, Welcome,
+    RejectReason, SceneAck, SceneClock, SceneState, ShardId, ShardMap, ShardRegion, StaleEpoch,
+    Welcome,
 };
 use space_sim::{ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
@@ -155,6 +156,9 @@ struct PendingCommit {
     components: Components,
     /// The shard that committed it (and now holds a ghost of it).
     from: ShardId,
+    /// The sender's scene time of the state
+    /// ([`crate::handoff::SCENE_TIME_COMPONENT`]).
+    scene_time: Option<i64>,
 }
 
 /// One shard: its region, its simulation, its clients and its handoff ledger.
@@ -213,6 +217,8 @@ pub struct Shard {
     /// The scene clients are told to draw, and the revision it was set at (see
     /// [`Shard::set_scene`]).
     scene: SceneState,
+    /// Whether the scene clock was set ([`Shard::sync_scene_clock`]).
+    scene_clock_set: bool,
     stats: ShardStats,
 }
 
@@ -251,8 +257,42 @@ impl Shard {
             shard_map: map,
             epoch_participant: EpochParticipant::new(),
             scene: SceneState::UNSET,
+            scene_clock_set: false,
             stats: ShardStats::default(),
         }
+    }
+
+    /// The mapping from this shard's ticks to scene time (see
+    /// [`space_protocol::SceneClock`]).
+    #[must_use]
+    pub fn scene_clock(&self) -> SceneClock {
+        self.sim.scene_clock()
+    }
+
+    /// Use `clock` from now on and tell every client (tests, and
+    /// [`Shard::sync_scene_clock`]).
+    pub fn set_scene_clock(&mut self, clock: SceneClock) {
+        self.sim.set_scene_clock(clock);
+        self.scene_clock_set = true;
+        self.send_to_all(Message::SceneClock(clock));
+    }
+
+    /// Keep the scene clock on the wall clock: `now_us` is the wall clock's
+    /// time (µs since the Unix epoch, [`crate::config::wall_clock_us`]) of the
+    /// tick just produced. The first call anchors the clock there; later
+    /// calls re-anchor it only when it has drifted more than
+    /// [`crate::config::SCENE_CLOCK_TOLERANCE_US`] from the wall clock (a
+    /// skipped tick), and tell every client. Returns whether it re-anchored.
+    /// The run loops call it after every tick; a shard nobody calls it on
+    /// counts scene time from 0 at tick 0 (deterministic, for tests).
+    pub fn sync_scene_clock(&mut self, now_us: i64) -> bool {
+        let tick = self.sim.tick();
+        let drift = now_us - self.sim.scene_clock().time_us_at(tick);
+        if self.scene_clock_set && drift.abs() <= crate::config::SCENE_CLOCK_TOLERANCE_US {
+            return false;
+        }
+        self.set_scene_clock(SceneClock::new(tick, now_us));
+        true
     }
 
     /// This shard's id.
@@ -588,6 +628,11 @@ impl Shard {
         self.send_to(
             Destination::Client(session),
             Message::SceneUpdate(self.scene),
+        );
+        // And the clock the scene's planets move by.
+        self.send_to(
+            Destination::Client(session),
+            Message::SceneClock(self.sim.scene_clock()),
         );
         Ok(Welcome {
             session,
@@ -1119,6 +1164,8 @@ impl Shard {
             kind: staged.kind,
             components,
             from: staged.from,
+            scene_time: crate::handoff::scene_time_of(&commit.state)
+                .or_else(|| crate::handoff::scene_time_of(&staged.state)),
         });
     }
 
@@ -1242,6 +1289,7 @@ impl Shard {
         // message to a client is still its frame.
         if tick.is_multiple_of(SCENE_REANNOUNCE_TICKS) {
             self.send_to_all(Message::SceneUpdate(self.scene));
+            self.send_to_all(Message::SceneClock(self.sim.scene_clock()));
         }
 
         // 6. Replication.
@@ -1312,6 +1360,15 @@ impl Shard {
                 continue;
             }
             self.remove_ghost(pending.guid);
+            // Where it was relative to the planet it is near, by our clock.
+            let mut state = pending.state;
+            if let Some(sent) = pending.scene_time {
+                let c = self.sim.carry(state.pos, sent, self.sim.scene_time());
+                if c != [0.0; 3] {
+                    state.pos = space_world::WorldPos::from_f64_metres_around(state.pos, c);
+                }
+            }
+            let pending = PendingCommit { state, ..pending };
             let entity = self
                 .sim
                 .spawn_ship(pending.guid, pending.session, pending.state);
@@ -1437,6 +1494,9 @@ impl Shard {
             // (see [`OWNER_TOKEN_COMPONENT`]).
             let mut state = with_owner_token(state, &self.owner_token_of(guid));
             state.components.push(TransferKind::Ship.component(lead));
+            state
+                .components
+                .push(crate::handoff::scene_time_component(self.sim.scene_time()));
             let offer = Ledger::offer_with_lead(
                 guid,
                 self.config.shard,
@@ -1819,6 +1879,7 @@ mod tests {
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick: 1,
+                    fast: false,
                 };
                 23_000
             ],
@@ -1922,6 +1983,46 @@ mod tests {
 
     use space_protocol::Scene;
 
+    /// Two shards that booted at different times (different ticks) agree on
+    /// the scene time once both follow the wall clock; a shard re-anchors
+    /// only when it has drifted past the tolerance, and tells its clients.
+    #[test]
+    fn shards_agree_on_the_scene_clock_and_re_anchor_only_on_drift() {
+        let (mut a, mut b) = (shard(), shard());
+        a.tick_n(7);
+        b.tick_n(300);
+        let now = 1_763_900_000_000_000;
+        assert!(
+            a.sync_scene_clock(now) && b.sync_scene_clock(now),
+            "the first sync anchors"
+        );
+        assert_eq!(a.scene_clock().time_us_at(7), now);
+        assert_eq!(b.scene_clock().time_us_at(300), now);
+        // A second later both are a second on, on their own ticks.
+        a.tick_n(30);
+        b.tick_n(30);
+        let later = now + 1_000_000;
+        assert!(!a.sync_scene_clock(later) && !b.sync_scene_clock(later + 20_000));
+        assert_eq!(a.sim().scene_time(), later);
+        assert_eq!(b.sim().scene_time(), later);
+        // A stall: shard b skipped three ticks (100 ms). It re-anchors, and
+        // tells its client.
+        let session = join(&mut b, "p");
+        let _ = b.take_outbox();
+        b.tick();
+        assert!(b.sync_scene_clock(later + 33_333 + 100_000));
+        assert_eq!(b.scene_clock().time_us_at(b.sim().tick()), later + 133_333);
+        let told: Vec<SceneClock> = b
+            .take_outbox()
+            .into_iter()
+            .filter_map(|o| match (o.dest, o.message) {
+                (Destination::Client(s), Message::SceneClock(c)) if s == session => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, vec![b.scene_clock()]);
+    }
+
     fn shard() -> Shard {
         Shard::new(ShardConfig::new(
             ShardId::new(1),
@@ -1967,7 +2068,7 @@ mod tests {
     fn a_joining_client_is_told_the_scene_before_its_first_frame() {
         let mut shard = shard();
         assert_eq!(shard.scene(), SceneState::UNSET, "nobody has set one yet");
-        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        assert!(shard.set_scene(state(Scene::Galaxy, 4)));
         assert!(shard.take_outbox().is_empty(), "nobody to tell yet");
 
         let session = join(&mut shard, "player");
@@ -1980,11 +2081,16 @@ mod tests {
             .collect();
         assert_eq!(
             mine.first(),
-            Some(&&Message::SceneUpdate(state(Scene::Solar, 4))),
+            Some(&&Message::SceneUpdate(state(Scene::Galaxy, 4))),
             "the scene comes first"
         );
+        assert_eq!(
+            mine.get(1),
+            Some(&&Message::SceneClock(shard.scene_clock())),
+            "then the scene clock"
+        );
         assert!(
-            matches!(mine.get(1), Some(Message::Snapshot(_))),
+            matches!(mine.get(2), Some(Message::Snapshot(_))),
             "then the first frame: {mine:?}"
         );
         assert_eq!(
@@ -2013,13 +2119,14 @@ mod tests {
     #[test]
     fn a_client_that_missed_the_scene_is_told_again_without_a_change() {
         let mut shard = shard();
-        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        assert!(shard.set_scene(state(Scene::Galaxy, 4)));
         let (a, b) = (join(&mut shard, "a"), join(&mut shard, "b"));
         // Both announcements are lost on the way to the clients.
         let lost = scene_updates(&mut shard);
         assert_eq!(lost.len(), 2, "precondition: the join announced the scene");
 
         let mut told: Vec<(SimTick, u64, SceneState)> = Vec::new();
+        let mut clocks = 0;
         for _ in 0..(2 * SCENE_REANNOUNCE_TICKS) {
             let tick = shard.tick();
             let mut frames = 0;
@@ -2028,6 +2135,12 @@ mod tests {
                     (Destination::Client(session), Message::SceneUpdate(scene)) => {
                         assert_eq!(frames, 0, "the announcement comes before the frames");
                         told.push((tick, session, scene));
+                    }
+                    (Destination::Client(_), Message::SceneClock(clock)) => {
+                        assert_eq!(frames, 0, "the clock comes before the frames");
+                        assert_eq!(tick % SCENE_REANNOUNCE_TICKS, 0, "with the scene");
+                        assert_eq!(clock, shard.scene_clock());
+                        clocks += 1;
                     }
                     (Destination::Client(_), Message::Snapshot(_) | Message::Delta(_)) => {
                         frames += 1;
@@ -2038,7 +2151,7 @@ mod tests {
             assert_eq!(frames, 2, "tick {tick}: one frame per client, as ever");
         }
         told.sort_unstable_by_key(|(tick, session, _)| (*tick, *session));
-        let solar = state(Scene::Solar, 4);
+        let solar = state(Scene::Galaxy, 4);
         assert_eq!(
             told,
             vec![
@@ -2050,6 +2163,7 @@ mod tests {
             "the current scene, to every client, once per interval and on no other tick"
         );
         assert_eq!(shard.scene(), solar, "no change of scene was needed");
+        assert_eq!(clocks, 4, "the clock is said again with the scene");
 
         // A shard with nobody connected says nothing to nobody.
         let mut empty = self::shard();
@@ -2078,8 +2192,8 @@ mod tests {
         );
 
         for stale in [
-            state(Scene::Solar, 2),
-            state(Scene::Solar, 1),
+            state(Scene::Galaxy, 2),
+            state(Scene::Galaxy, 1),
             state(Scene::Galaxy, 2),
             SceneState::UNSET,
         ] {
@@ -2129,31 +2243,31 @@ mod tests {
             (acks, updates)
         };
 
-        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 4)));
         let (confirmed, relayed) = drain(&mut shard);
         assert_eq!(
             confirmed,
             vec![SceneAck {
                 shard: ShardId::new(1),
-                applied: state(Scene::Solar, 4)
+                applied: state(Scene::Galaxy, 4)
             }]
         );
-        assert_eq!(relayed, vec![(session, state(Scene::Solar, 4))]);
+        assert_eq!(relayed, vec![(session, state(Scene::Galaxy, 4))]);
 
         // The same message again (the orchestrator re-sends until it hears an
         // ack): confirmed again, relayed to nobody.
-        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 4)));
         let (confirmed, relayed) = drain(&mut shard);
         assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert_eq!(confirmed[0].applied, state(Scene::Galaxy, 4));
         assert!(relayed.is_empty());
 
         // A late, older one: the answer names the newer scene the shard runs.
         shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 3)));
         let (confirmed, relayed) = drain(&mut shard);
-        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert_eq!(confirmed[0].applied, state(Scene::Galaxy, 4));
         assert!(relayed.is_empty());
-        assert_eq!(shard.scene(), state(Scene::Solar, 4));
+        assert_eq!(shard.scene(), state(Scene::Galaxy, 4));
 
         assert_eq!(shard.epoch(), epoch, "a scene is not an epoch");
         assert_eq!(shard.shard_map(), &map);

@@ -95,11 +95,16 @@ use crate::input::{CameraMode, Controls, Request, ScreenKind, KEY_HELP};
 use crate::kestrel::Detail;
 use crate::link::{OtherShip, Replica, ServerLink};
 use crate::predict::{Clock, OwnShip, Shown};
-use crate::scenes::{character_mesh, metres, relative, ship_mesh, Prop, World, EYE_HEIGHT};
+use crate::scenes::{
+    character_mesh, metres, relative, ship_mesh, Prop, SkyTime, World, EYE_HEIGHT,
+};
 use crate::ui::{self, ConnectView, HudView, Status};
 
 /// The most bodies [`ClientState::bodies`] lists (the nearest ones).
 pub const MAX_LISTED_BODIES: usize = 64;
+
+/// The renderer draws at most this many point lights.
+const MAX_LIGHTS: usize = 8;
 
 /// The longest a connection attempt may take, name lookup included, before
 /// the connect screen is back with an error.
@@ -292,6 +297,18 @@ impl Session {
     fn ship(&self) -> Option<space_sim::ShipState> {
         self.shown.map(|s| s.state).or(self.replica.state)
     }
+
+    /// The moment the sky is drawn at: the shard's scene clock, at the tick
+    /// the own ship is drawn at (so a ship on the Moon is drawn on the Moon).
+    fn sky_time(&self) -> SkyTime {
+        let clock = self.replica.scene_clock.unwrap_or_default();
+        let tick = self
+            .shown
+            .map(|s| s.tick)
+            .or_else(|| self.clock.now())
+            .unwrap_or(self.replica.tick as f64);
+        SkyTime::new(clock, tick)
+    }
 }
 
 enum Net {
@@ -316,6 +333,7 @@ struct Base {
     /// rest are this frame's players and are replaced every frame).
     instances: usize,
     models: usize,
+    lights: usize,
 }
 
 /// Frames per second over the last half second.
@@ -746,6 +764,7 @@ impl App {
                 session.advance(self.world.scene(), Instant::now());
                 let velocity = session.ship().map(|ship| ship.vel);
                 session.link.set_thrust(self.controls.thrust(velocity));
+                session.link.set_fast(self.controls.fast);
                 Event::Scene(session.replica.scene)
             }
         };
@@ -918,6 +937,7 @@ impl App {
             Some(base) => {
                 self.scene.instances.truncate(base.instances);
                 self.scene.models.truncate(base.models);
+                self.scene.lights.truncate(base.lights);
             }
             None => {
                 self.scene = self.world.build(&camera);
@@ -929,7 +949,18 @@ impl App {
                     key,
                     instances: self.scene.instances.len(),
                     models: self.scene.models.len(),
+                    lights: self.scene.lights.len(),
                 });
+            }
+        }
+        // The sky moves: the Sun, the planets and the Moon where they are at
+        // this frame's scene time, and the sunlight from the Sun (the
+        // renderer's eighth light, unless the cabin lamp has it).
+        let (sky, sun) = self.world.sky(&camera, &session.sky_time());
+        self.scene.instances.extend(sky);
+        if let Some(sun) = sun {
+            if self.scene.lights.len() < MAX_LIGHTS {
+                self.scene.lights.push(sun);
             }
         }
 
@@ -949,6 +980,24 @@ impl App {
         // (interpolated between the shard's ticks).
         let (spawn, anchor) = (self.world.spawn(), replica.anchor());
         let behind = session.clock.now().map(|t| t - INTERPOLATION_DELAY);
+        // Everybody else is drawn a moment behind the own ship and the sky:
+        // whatever an orbiting planet carries (a player standing on the
+        // Moon) is moved on by what the planet carries it in that moment.
+        let sky_time = session.sky_time();
+        let field = session.own.as_ref().map(OwnShip::gravity_field);
+        let carry = |t: f64| {
+            let (from, _) = sky_time.clock.time_at(t);
+            let to = sky_time.time_us();
+            move |p: WorldPos| {
+                field.map_or([0.0; 3], |f| {
+                    if from == to || !f.has_orbits() {
+                        [0.0; 3]
+                    } else {
+                        f.carry(p, [0.0; 3], 0, from, to)
+                    }
+                })
+            }
+        };
         let mut headings = std::mem::take(&mut self.headings);
         let mut seen: Vec<EntityGuid> = Vec::new();
         for tracked in replica.other_ships() {
@@ -956,6 +1005,8 @@ impl App {
             let pos = behind
                 .and_then(|t| pose_at(&tracked.history, t))
                 .map_or(other.state.pos, |poses| poses[0].pos);
+            let c = behind.map_or([0.0; 3], |t| carry(t)(pos));
+            let pos = WorldPos::from_f64_metres_around(pos, c);
             let place = scene_place(spawn, anchor, pos);
             seen.push(other.guid);
             // A player (here or, as a ghost, on a neighbouring shard) is a
@@ -980,9 +1031,14 @@ impl App {
         self.headings = headings;
         // The physics bodies, at the same moment.
         let t = behind.unwrap_or(replica.tick as f64);
-        self.drawn_bodies = self
-            .bodies
-            .draw(replica, t, spawn, Instant::now(), &mut self.scene);
+        self.drawn_bodies = self.bodies.draw(
+            replica,
+            t,
+            spawn,
+            Instant::now(),
+            &mut self.scene,
+            &carry(t),
+        );
     }
 
     fn hud_lines(&self) -> Vec<String> {
@@ -1033,8 +1089,11 @@ impl App {
             ));
         }
         let eye = self.eye(session);
-        if let Some(place) = self.world.whereabouts(eye) {
+        if let Some(place) = self.world.whereabouts(eye, &session.sky_time()) {
             lines.push(place);
+        }
+        if self.controls.fast {
+            lines.push("fast travel on".to_owned());
         }
         lines
     }
@@ -1114,6 +1173,23 @@ impl App {
                     state.correction_max_m = f64::from(own.corrections().0);
                 }
                 state.bodies = self.body_states(session);
+                state.fast = self.controls.fast;
+                let bodies = self.world.sky_bodies(&session.sky_time());
+                let eye = self.eye(session);
+                if let Some((body, surface)) = crate::scenes::nearest(&bodies, eye) {
+                    state.nearest = Some(body.name.to_owned());
+                    state.nearest_surface_m = Some(surface);
+                }
+                let spawn = self.world.spawn();
+                state.sky = bodies
+                    .iter()
+                    .map(|b| space_harness::SkyBodyState {
+                        name: b.name.to_owned(),
+                        position: WorldPos::delta(spawn, b.position),
+                        radius: f64::from(b.radius),
+                        surface_m: WorldPos::distance(eye, b.position) - f64::from(b.radius),
+                    })
+                    .collect();
                 state.bodies_in_view =
                     u32::try_from(self.drawn_bodies.iter().filter(|b| b.in_view).count())
                         .unwrap_or(u32::MAX);
@@ -1164,7 +1240,7 @@ impl App {
                 };
                 let place = self
                     .world
-                    .whereabouts(self.eye(session))
+                    .whereabouts(self.eye(session), &session.sky_time())
                     .map_or_else(String::new, |place| format!(" - {place}"));
                 format!(
                     "{} on {}, shard {shard}{handoffs}{place}",
@@ -1228,7 +1304,13 @@ async fn join(address: &ServerAddress) -> Result<ServerLink, String> {
 fn hud_motion(speed: f32, from_anchor: [f64; 3]) -> String {
     // (A value that rounds to zero is shown as 0.0, not -0.0.)
     let [x, y, z] = from_anchor.map(|v| if v.abs() < 0.05 { 0.0 } else { v });
-    format!("speed {speed:.1} m/s  pos {x:.1} {y:.1} {z:.1}")
+    // Fast travel: thousands of kilometres a second read as such.
+    let speed = if speed < 1.0e4 {
+        format!("{speed:.1} m/s")
+    } else {
+        format!("{:.0} km/s", speed / 1.0e3)
+    };
+    format!("speed {speed}  pos {x:.1} {y:.1} {z:.1}")
 }
 
 /// The HUD's line on the gravity at the ship and whether it stands on
