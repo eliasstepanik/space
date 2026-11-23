@@ -1977,11 +1977,16 @@ fn the_harness_refuses_a_public_address_without_a_token() {
     assert_eq!(unbindable.code, Some(2), "{}", unbindable.stderr);
     assert!(unbindable.stderr.contains("--harness not-an-address"));
     // An old scene flag is ignored with a pointer to where its job went (a
-    // deployment that still passes one must not lose its client), ...
-    let ignored = run_client(&["--headless", "--galaxy", "--frames", "1"], &[]);
-    assert_eq!(ignored.code, Some(0), "{}", ignored.stderr);
+    // deployment that still passes one must not lose its client): parsing
+    // goes on past it, which the unknown argument after it shows. Checked on
+    // the command line only, so this needs no Vulkan device - the CI runners
+    // have none, and a client that had to start would exit 1 there. ...
+    let ignored = run_client(&["--galaxy", "--no-such-flag"], &[]);
+    assert_eq!(ignored.code, Some(2), "{}", ignored.stderr);
     assert!(
-        ignored.stderr.contains("--galaxy is ignored") && ignored.stderr.contains("--scene"),
+        ignored.stderr.contains("--galaxy is ignored")
+            && ignored.stderr.contains("--scene")
+            && ignored.stderr.contains("--no-such-flag"),
         "{}",
         ignored.stderr
     );

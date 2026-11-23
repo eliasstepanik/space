@@ -466,6 +466,17 @@ fn interest_cap() {
 // 7. benchmarks (debug budget; release numbers in `space_world::interest`)
 // ---------------------------------------------------------------------------
 
+/// Wall-clock budget for one benchmark workload in a debug build.
+///
+/// These run in CI, on a shared runner that builds the release binaries and
+/// three images while the tests run, so a wall-clock limit is a guard against
+/// an *algorithmic* regression (a probe of every cell, a quadratic sort), not a
+/// micro-benchmark. On an idle machine the insert workload takes about 0.5 s
+/// and the query workload about 1 s; on a heavily loaded one they were
+/// measured at up to 2.4 s and 7.1 s, which the old 2 s budget turned into
+/// random red builds. Anything slower than 10 s is a real regression.
+const BENCH_BUDGET_S: f64 = 10.0;
+
 /// Spread `n` entities over a 100 km cube (about 1000 per 1 km cell).
 fn populate(n: u64) -> InterestGrid {
     let mut grid = InterestGrid::new();
@@ -494,7 +505,10 @@ fn bench_interest_insert() {
         elapsed,
         grid.len()
     );
-    assert!(elapsed.as_secs_f64() < 2.0, "insert took {elapsed:?}");
+    assert!(
+        elapsed.as_secs_f64() < BENCH_BUDGET_S,
+        "insert took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -519,5 +533,8 @@ fn bench_interest_query() {
         "bench_interest_query: 1000 query_sphere(r=10km, cap=1000) in {elapsed:?} \
          ({total} hits total)"
     );
-    assert!(elapsed.as_secs_f64() < 2.0, "queries took {elapsed:?}");
+    assert!(
+        elapsed.as_secs_f64() < BENCH_BUDGET_S,
+        "queries took {elapsed:?}"
+    );
 }

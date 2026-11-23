@@ -692,6 +692,15 @@ impl Cluster {
     }
 }
 
+/// The tick stamped on a frame; `None` for anything that is not a frame.
+fn frame_tick(message: &Message) -> Option<u64> {
+    match message {
+        Message::Snapshot(f) => Some(f.tick),
+        Message::Delta(f) => Some(f.tick),
+        _ => None,
+    }
+}
+
 /// The component id of `ShipState` on the wire (`space_sim`'s registry: id 0).
 const SHIP_STATE_COMPONENT: u16 = 0;
 
@@ -797,6 +806,26 @@ impl Cluster {
         client.shard = redirect.new_shard;
     }
 
+    /// Do what a client does with a *repeated* `Redirect` to the shard it is
+    /// already connected to: the shards re-offered (the first attempt timed out
+    /// or was refused), so report in again on the open connection
+    /// (`space_client::link::follow_redirect` does the same). Without this the
+    /// re-offer waits on a confirmation that never comes, times out, and is
+    /// offered again, forever.
+    async fn report_in(&mut self, idx: usize, redirect: &Redirect) {
+        let client = &self.clients[idx];
+        let Some(next) = client.next.as_ref() else {
+            return;
+        };
+        next.send_control(&Message::NeighbourStatus(NeighbourStatus {
+            entity: client.guid,
+            shard: redirect.new_shard,
+            connected: true,
+        }))
+        .await
+        .expect("report the connection again");
+    }
+
     /// The handoff completed: send inputs to the new shard and drop the old link.
     fn switch_input_path(&mut self, idx: usize) {
         let client = &mut self.clients[idx];
@@ -812,25 +841,58 @@ impl Cluster {
     ///
     /// Returns every message the client received, in arrival order. Every other
     /// client is left alone but keeps being ticked.
+    ///
+    /// **The beats are paced like a running shard's ticks** (one per
+    /// `1 / TICK_HZ` of wall-clock time) for as long as the flight lasts.
+    /// Everything a handoff waits on is bounded in *ticks* (offer, commit and
+    /// adoption: two seconds at 30 Hz), while what it waits for travels over
+    /// real QUIC connections. Beating as fast as the loop can run (about every
+    /// 5 ms) squeezed those bounds to a fraction of a second of wall-clock
+    /// time, so on a busy host (tests in parallel, a CI runner building three
+    /// images at once) an offer or a commit was still in flight when the bound
+    /// fired: the ship went missing from the client's frames for the length of
+    /// a delivery delay, or the handoff timed out. At the real tick rate the
+    /// bounds mean what they mean in production.
+    ///
+    /// Frames stamped with a tick from before the flight are left out of what
+    /// is returned. They are the setup's, still in flight when it emptied the
+    /// inbox: the setup beats flat out, and a frame its client's reader could
+    /// not take in time is retransmitted and lands in the middle of the flight
+    /// (a frame of tick 31 next to tick 96), where it read as a 64-tick gap
+    /// in a transition that had none.
     async fn fly_into_child(&mut self, idx: usize, child: ShardId, after: u64) -> Vec<Message> {
+        let tick = std::time::Duration::from_secs(1) / space_sim::TICK_HZ;
+        let started_after = self.beats;
         let mut inbox: Vec<Message> = Vec::new();
         let mut redirected = false;
         let mut done_at: Option<u64> = None;
+        let mut next_beat = tokio::time::Instant::now();
         for _ in 0..1500 {
             self.thrust_xyz(idx, [-1.0, -1.0, -1.0]).await;
             self.step().await;
             self.settle().await;
             let got = self.clients[idx].drain();
-            if !redirected {
-                if let Some(Message::Redirect(r)) =
-                    got.iter().find(|m| matches!(m, Message::Redirect(_)))
-                {
-                    let r = r.clone();
-                    self.follow(idx, &r).await;
-                    redirected = true;
+            if done_at.is_none() {
+                let redirects: Vec<Redirect> = got
+                    .iter()
+                    .filter_map(|m| match m {
+                        Message::Redirect(r) => Some(r.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for r in &redirects {
+                    if !redirected {
+                        self.follow(idx, r).await;
+                        redirected = true;
+                    } else if r.new_shard == self.clients[idx].shard {
+                        self.report_in(idx, r).await;
+                    }
                 }
             }
-            inbox.extend(got);
+            inbox.extend(
+                got.into_iter()
+                    .filter(|m| frame_tick(m).is_none_or(|t| t > started_after)),
+            );
             if redirected && done_at.is_none() && self.simulates(idx).await == Some(child) {
                 self.switch_input_path(idx);
                 done_at = Some(self.beats);
@@ -838,6 +900,8 @@ impl Cluster {
             if done_at.is_some_and(|at| self.beats >= at + after) {
                 return inbox;
             }
+            next_beat += tick;
+            tokio::time::sleep_until(next_beat).await;
         }
         panic!("the ship never completed a handoff into the child (redirected: {redirected})");
     }

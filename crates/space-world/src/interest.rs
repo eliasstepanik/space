@@ -12,8 +12,9 @@
 //! Measured on the development machine (`x86_64`, `--release`, `lto = "thin"`):
 //! 1 000 000 [`InterestGrid::insert`] calls in ~0.74 s and 1 000
 //! [`InterestGrid::query_sphere`] calls (radius 10 km, cap 1000, ~1000 entities
-//! per cell) in ~1.38 s. The debug-mode benchmark test in
-//! `tests/acceptance.rs` asserts a 2 s budget for the same workload.
+//! per cell) in ~1.38 s. The debug-mode benchmark tests in
+//! `tests/acceptance.rs` run the same workloads with a 10 s budget each: a
+//! guard against algorithmic regressions that survives a busy CI runner.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
