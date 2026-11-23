@@ -224,6 +224,50 @@ impl Autoscaler {
     pub fn tracks(&self, shard: ShardId) -> bool {
         self.states.contains_key(&shard)
     }
+
+    /// Tick until which no action fires at all (the one-action-in-flight
+    /// damper). Read-only: an operator view shows it, nothing decides on it.
+    #[must_use]
+    pub fn busy_until(&self) -> u64 {
+        self.busy_until
+    }
+
+    /// What is remembered about `shard`: its dwell timers and its cooldown.
+    /// Read-only, for an operator view.
+    #[must_use]
+    pub fn state_of(&self, shard: ShardId) -> Option<ShardScaleState> {
+        self.states.get(&shard).map(|state| ShardScaleState {
+            hot_since: state.hot_since,
+            cold_since: state.cold_since,
+            immune_until: state.immune_until,
+        })
+    }
+
+    /// Clear every dwell timer; cooldowns are kept.
+    ///
+    /// Called when an operator pauses (or resumes) the autoscaler. While it is
+    /// paused no report is fed, so a timer left standing would go on "counting"
+    /// the pause: a shard that was hot for one tick before a ten-minute pause
+    /// would be split the instant the autoscaler resumed. After this every
+    /// shard needs a fresh, full dwell of reports before anything fires.
+    pub fn reset_dwell(&mut self) {
+        for state in self.states.values_mut() {
+            state.hot_since = None;
+            state.cold_since = None;
+        }
+    }
+}
+
+/// What the autoscaler remembers about one shard, as plain data
+/// ([`Autoscaler::state_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardScaleState {
+    /// Tick since which the load has stayed at/above [`SPLIT_THRESHOLD`].
+    pub hot_since: Option<u64>,
+    /// Tick since which the load has stayed at/below [`MERGE_THRESHOLD`].
+    pub cold_since: Option<u64>,
+    /// Tick until which the shard is immune to any action (cooldown).
+    pub immune_until: u64,
 }
 
 #[cfg(test)]

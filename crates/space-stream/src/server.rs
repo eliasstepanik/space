@@ -25,6 +25,12 @@
 //!   is added to the queued one, and a `Key` supersedes the queued event for
 //!   the same key, so the state after draining is the same as if nothing had
 //!   been merged.
+//! * **Typed text is input, not state.** A `Text` character cannot be merged, so
+//!   past the limit it is dropped and counted ([`StreamClient::dropped_text`])
+//!   rather than queued without bound. Text-entry keys (Enter, Backspace, ...)
+//!   are strokes, sent as a down directly followed by an up: they go through
+//!   the same per-viewer bookkeeping as movement keys, and the native side
+//!   acts on the down.
 
 use std::collections::VecDeque;
 use std::io;
@@ -65,16 +71,25 @@ struct InputQueue {
     events: VecDeque<ViewerInput>,
     /// Number of connected viewers holding each key (index: [`Key::index`]).
     holders: [u32; Key::COUNT],
+    /// Typed characters dropped because the queue was full.
+    dropped_text: u64,
 }
 
 impl InputQueue {
     /// Queue `event`. Below [`INPUT_QUEUE`] it is appended as is; above it the
     /// event is merged into the newest queued event of the same kind, so the
     /// queue stays bounded (at most one extra `Pointer`, one extra `Turn` and
-    /// one extra event per key) without losing state.
+    /// one extra event per key) without losing state. A `Text` has nothing to
+    /// merge into and is dropped (and counted) instead.
     fn push(&mut self, event: ViewerInput) {
         if self.events.len() < INPUT_QUEUE {
             self.events.push_back(event);
+            return;
+        }
+        if let ViewerInput::Text(_) = event {
+            // Appending it anyway would let a viewer that types (or pastes)
+            // at a native side that is not polling grow the queue for ever.
+            self.dropped_text += 1;
             return;
         }
         // The newest queued event the new one can be merged into: any pointer,
@@ -206,6 +221,12 @@ impl StreamClient {
     /// Malformed viewer messages dropped so far.
     pub fn rejected_input(&self) -> u64 {
         self.shared.rejected_input.load(Ordering::Relaxed)
+    }
+
+    /// Typed characters dropped so far because the input queue was full (the
+    /// native side had not polled for over a thousand events).
+    pub fn dropped_text(&self) -> u64 {
+        self.shared.input().dropped_text
     }
 }
 
@@ -535,6 +556,41 @@ mod tests {
         assert_eq!(client.rejected_input(), 1);
     }
 
+    /// Typing an address and pressing Enter in the viewer arrives as exactly
+    /// that: the characters in order, then one Enter stroke (down, up). A
+    /// control character sent as text is rejected at the door.
+    #[tokio::test]
+    async fn typed_text_and_text_entry_keys_reach_the_client_in_order() {
+        let (server, client) = StreamServer::bind("127.0.0.1:0").await.unwrap();
+        let mut ws = connect(server.local_addr()).await;
+        let mut sent: Vec<ViewerInput> = "[::1]:7777 ö€".chars().map(ViewerInput::Text).collect();
+        sent.extend([
+            key(Key::Backspace, true),
+            key(Key::Backspace, false),
+            // An auto-repeat is one more down/up pair, so it is one more stroke.
+            key(Key::Backspace, true),
+            key(Key::Backspace, false),
+            key(Key::CaretLeft, true),
+            key(Key::CaretLeft, false),
+            ViewerInput::Text('x'),
+            key(Key::Enter, true),
+            key(Key::Enter, false),
+        ]);
+        for input in &sent {
+            send_input(&mut ws, *input).await;
+        }
+        // A newline as text (tag 4, U+000A) and a lone surrogate.
+        for bad in [[4u8, 0, 0, 0, 0x0a], [4, 0, 0, 0xd8, 0]] {
+            ws.send(Message::Binary(bad.to_vec().into())).await.unwrap();
+        }
+        send_input(&mut ws, ViewerInput::Text('!')).await;
+        sent.push(ViewerInput::Text('!'));
+
+        expect_input(&client, &sent).await;
+        assert_eq!(client.rejected_input(), 2);
+        assert_eq!(client.dropped_text(), 0);
+    }
+
     /// A viewer that connects after a frame was pushed still gets it, and a burst
     /// of pushes collapses to the newest (latest-frame-wins).
     #[tokio::test]
@@ -834,6 +890,8 @@ mod tests {
         turned: (f64, f64),
         /// The last pointer `(x, y, buttons)`.
         pointer: Option<(f32, f32, u8)>,
+        /// Every typed character, in order.
+        typed: String,
     }
 
     /// Replay `events` the way the native side does.
@@ -847,6 +905,7 @@ mod tests {
                     state.turned.1 += f64::from(dpitch);
                 }
                 ViewerInput::Pointer { x, y, buttons } => state.pointer = Some((x, y, buttons)),
+                ViewerInput::Text(c) => state.typed.push(c),
             }
         }
         state
@@ -941,5 +1000,55 @@ mod tests {
         for event in queue.drain() {
             assert_eq!(ViewerInput::decode(&event.encode()), Ok(event));
         }
+    }
+
+    /// Below the limit typed text is queued verbatim and in order. Past it
+    /// (the native side is not polling) text is dropped and counted: it has no
+    /// state to merge into, and appending it anyway would let one viewer grow
+    /// the queue without bound.
+    ///
+    /// Mutation this catches: treating `Text` like a key that has nothing
+    /// queued to merge into (which appends it).
+    #[test]
+    fn typed_text_cannot_grow_a_full_queue() {
+        let mut queue = InputQueue::default();
+        let mut held = [false; Key::COUNT];
+        for c in "hello".chars() {
+            queue.push(ViewerInput::Text(c));
+        }
+        queue.key(&mut held, Key::Enter, true);
+        queue.key(&mut held, Key::Enter, false);
+        let typed = final_state(&queue.drain());
+        assert_eq!(typed.typed, "hello");
+        assert_eq!(queue.dropped_text, 0);
+
+        for _ in 0..INPUT_QUEUE {
+            queue.push(ViewerInput::Text('a'));
+        }
+        assert_eq!(queue.events.len(), INPUT_QUEUE);
+        for _ in 0..100_000 {
+            queue.push(ViewerInput::Text('b'));
+        }
+        assert_eq!(queue.events.len(), INPUT_QUEUE, "the queue did not grow");
+        assert_eq!(queue.dropped_text, 100_000);
+        // Keys still get through a queue that is full of text: a held movement
+        // key is state and must not be lost, and a stroke is at worst merged.
+        queue.key(&mut held, Key::Forward, true);
+        queue.key(&mut held, Key::Enter, true);
+        queue.key(&mut held, Key::Enter, false);
+        queue.key(&mut held, Key::Enter, true);
+        queue.key(&mut held, Key::Enter, false);
+        assert!(
+            queue.events.len() <= INPUT_QUEUE + 2,
+            "{}",
+            queue.events.len()
+        );
+        let state = final_state(&queue.drain());
+        assert_eq!(state.typed, "a".repeat(INPUT_QUEUE));
+        assert!(state.keys_down[Key::Forward.index()]);
+        assert!(!state.keys_down[Key::Enter.index()]);
+        // Once drained, text flows again.
+        queue.push(ViewerInput::Text('c'));
+        assert_eq!(queue.drain(), [ViewerInput::Text('c')]);
     }
 }

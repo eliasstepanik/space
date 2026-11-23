@@ -126,6 +126,23 @@ impl EpochPublisher {
         &self.phase
     }
 
+    /// The tick the last commit landed at, if any since this publisher was
+    /// built. Read-only, for an operator view.
+    #[must_use]
+    pub fn last_commit_tick(&self) -> Option<u64> {
+        self.last_commit_tick
+    }
+
+    /// The ownership changes of the prepare currently outstanding (empty when
+    /// nothing is in flight). Read-only, for an operator view.
+    #[must_use]
+    pub fn outstanding_changes(&self) -> &[EpochChange] {
+        match &self.outstanding {
+            Some(Message::EpochPrepare(prepare)) => &prepare.changes,
+            _ => &[],
+        }
+    }
+
     /// Whether a new change may be proposed right now (H12/H14 serialisation).
     #[must_use]
     pub fn can_propose(&self, tick: u64, min_interval: u64) -> bool {

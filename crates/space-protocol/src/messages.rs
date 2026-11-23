@@ -10,6 +10,7 @@ use space_ecs::ComponentId;
 
 use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
 use crate::guid::EntityGuid;
+use crate::scene::{SceneAck, SceneState};
 use crate::shard::{
     EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
 };
@@ -498,6 +499,22 @@ pub enum Message {
     ShardHello(ShardHello),
     /// Orchestrator → shard: here are your id, region, map and peer token.
     ShardWelcome(ShardWelcome),
+    /// Orchestrator → shard: the cluster's scene, at its revision.
+    ///
+    /// Sent right behind the [`ShardWelcome`] on every (re-)registration and
+    /// again on every change. The shard adopts it when it
+    /// [supersedes](SceneState::supersedes) what it holds and answers with a
+    /// [`Message::SceneAck`] either way. Not part of the epoch protocol: the
+    /// map does not change with the scene (see [`crate::scene`]).
+    SceneSet(SceneState),
+    /// Shard → orchestrator: the scene and revision this shard runs now.
+    SceneAck(SceneAck),
+    /// Shard → client: the scene to draw around the ships, at its revision.
+    ///
+    /// Sent right after the [`Welcome`] on every join — including the second
+    /// connection a client opens during a handoff — and again whenever the
+    /// shard's scene changes. A client keeps the highest revision it has seen.
+    SceneUpdate(SceneState),
 }
 
 impl Message {
@@ -507,7 +524,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 25;
+    pub const VARIANT_COUNT: u32 = 28;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -541,6 +558,9 @@ impl Message {
             Message::NeighbourStatus(_) => 22,
             Message::ShardHello(_) => 23,
             Message::ShardWelcome(_) => 24,
+            Message::SceneSet(_) => 25,
+            Message::SceneAck(_) => 26,
+            Message::SceneUpdate(_) => 27,
         }
     }
 

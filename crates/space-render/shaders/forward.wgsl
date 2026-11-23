@@ -3,7 +3,9 @@
 // analytic point lights, 1-bounce probe GI as indirect diffuse, HDR output.
 // Depth test is provided by the render pass depth attachment.
 //
-// Outputs (opaque pass, `fs_main`): location 0 = HDR colour (alpha 1),
+// Outputs (opaque pass, `fs_main`): location 0 = HDR colour, with alpha 1 —
+// the target is cleared to alpha 0, so alpha says whether any opaque surface
+// was drawn at a pixel (`post.wgsl` asks) —
 // location 1 = material buffer `rgba16float` (r = metallic, g = roughness,
 // ba = the shading normal, octahedral-encoded) read by `post.wgsl`. With
 // FEATURE_REFRACT, transmissive instances (transmission > 0) are skipped here
@@ -11,6 +13,21 @@
 // attachment (rgb = lit colour, a = transmission), so the opaque scene behind
 // the glass survives in the HDR target for refraction, and their own material
 // and normal over the opaque ones in the material buffer.
+//
+// build.rs compiles this file in several variants. Lines between `//#if NAME`
+// and `//#endif` (with an optional `//#else`) exist only in the variants that
+// define NAME:
+//   MESH     the mesh-model entry points `vs_mesh` / `fs_mesh` (vertex buffers,
+//            a base-colour texture in descriptor set 1);
+//   SHADOWS  ray-traced shadows: one ray query towards each light against the
+//            scene's acceleration structure (binding 5);
+//   SKY      the background entry points `vs_sky` / `fs_sky`: the scene's
+//            environment drawn where nothing else was.
+// The variants without SHADOWS contain no ray-query code at all, so a frame
+// that casts no shadows runs exactly the shaders it always did.
+//#if SHADOWS
+enable wgpu_ray_query;
+//#endif
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -40,26 +57,26 @@ struct Params {
     _pad2: u32,
     _pad3: u32,
     _pad4: u32,
+    environment: Environment, // the scene's surroundings (all zero: none)
 }
 
 const FEATURE_FOG: u32 = 1u;
 const FEATURE_REFRACT: u32 = 4u;
 
-// One drawn part of a mesh model (`vs_mesh`): where it is and what it is made
-// of. Mirrored by `MeshInstanceGpu` in src/params.rs.
-struct MeshInstance {
-    model_x: vec4<f32>,  // rows of the 3x4 model -> camera-relative world matrix
-    model_y: vec4<f32>,
-    model_z: vec4<f32>,
-    albedo: vec4<f32>,   // rgb + metallic in .w
-    emissive: vec4<f32>, // rgb radiance + roughness in .w
-}
-
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
 @group(0) @binding(2) var gi_tex: texture_2d<f32>;
 @group(0) @binding(3) var gi_sampler: sampler;
+//#if MESH
 @group(0) @binding(4) var<storage, read> mesh_instances: array<MeshInstance>;
+// The part's base-colour texture (sRGB, mip-mapped; 1x1 white for an
+// untextured part) and its trilinear, repeating sampler.
+@group(1) @binding(0) var base_color_tex: texture_2d<f32>;
+@group(1) @binding(1) var base_color_sampler: sampler;
+//#endif
+//#if SHADOWS
+@group(0) @binding(5) var scene_as: acceleration_structure;
+//#endif
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -247,30 +264,43 @@ fn vs_glass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     return vertex_body(vi, ii, true);
 }
 
-// Mesh models: real vertex buffers (position + normal) instead of the
-// procedural shapes above. One indexed draw per material part, with
-// `instance_index` selecting the part's `MeshInstance` record. The rotation in
-// the model matrix is orthonormal with a uniform scale, so it transforms
-// normals as well.
+//#if MESH
+// Mesh models: real vertex buffers (position, normal, texture coordinate)
+// instead of the procedural shapes above. One indexed draw per material part,
+// with `instance_index` selecting the part's `MeshInstance` record. The
+// rotation in the model matrix is orthonormal with a uniform scale, so it
+// transforms normals as well.
+struct MeshVsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) albedo: vec3<f32>,   // the base-colour *factor*
+    @location(3) material: vec2<f32>, // x = metallic, y = roughness
+    @location(4) emissive: vec3<f32>,
+    @location(5) uv: vec2<f32>,
+}
+
 @vertex
 fn vs_mesh(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
     @builtin(instance_index) ii: u32,
-) -> VsOut {
+) -> MeshVsOut {
     let m = mesh_instances[ii];
     let p = vec4(position, 1.0);
     let world = vec3(dot(m.model_x, p), dot(m.model_y, p), dot(m.model_z, p));
-    var out: VsOut;
+    var out: MeshVsOut;
     out.world = world;
     out.normal = vec3(dot(m.model_x.xyz, normal), dot(m.model_y.xyz, normal), dot(m.model_z.xyz, normal));
     out.albedo = m.albedo.rgb;
     out.material = vec2(m.albedo.w, m.emissive.w);
     out.emissive = m.emissive.rgb;
-    out.transmission = 0.0;
+    out.uv = uv;
     out.pos = params.camera.view_proj * vec4(world, 1.0);
     return out;
 }
+//#endif
 
 const PI: f32 = 3.14159265359;
 
@@ -340,6 +370,67 @@ fn probe_radiance(world: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
 }
 
+// Scale and bias of the specular reflection of a uniform environment (the
+// "environment BRDF" of the split-sum approximation, as fitted by Karis for
+// mobile): how much of what a surface of `roughness` reflects reaches a viewer
+// at cosine `nov` from its normal. Rises to 1 at grazing angles (Fresnel).
+fn env_brdf(f0: vec3<f32>, roughness: f32, nov: f32) -> vec3<f32> {
+    let c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * nov)) * r.x + r.y;
+    let ab = vec2(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + vec3(ab.y);
+}
+
+//#if SHADOWS
+// Shadow rays. Instance mask bit 0 marks a shadow caster (glass and a body
+// with a light inside it are not). Every solid in the acceleration structure
+// is single-sided for these rays: the faces a ray would *leave* a closed shape
+// through are culled, so a surface point that sits a little inside its own
+// ray-traced shape (the rasterised sphere is finer or coarser than the traced
+// one; a smooth-shaded mesh near its terminator) is not shadowed by it, while
+// anything between the point and the light is still entered from outside.
+// Open meshes are flagged two-sided on their instance instead.
+const SHADOW_MASK: u32 = 1u;
+// Metres the ray starts off the surface (and stops short of the light), per
+// metre of distance from the camera plus one: float precision scales with it.
+const SHADOW_BIAS: f32 = 5e-4;
+
+// Is the light at `light_pos` unoccluded as seen from the surface point
+// `world`? `n` is the unit shading normal, on the light's side.
+fn light_visible(world: vec3<f32>, n: vec3<f32>, light_pos: vec3<f32>) -> bool {
+    let bias = SHADOW_BIAS * (1.0 + length(world - params.camera.position.xyz));
+    let origin = world + n * bias;
+    let to_light = light_pos - origin;
+    let dist = length(to_light);
+    if dist <= 2.0 * bias {
+        return true;
+    }
+    var rq: ray_query;
+    rayQueryInitialize(
+        &rq,
+        scene_as,
+        RayDesc(
+            RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT | RAY_FLAG_CULL_BACK_FACING,
+            SHADOW_MASK,
+            0.0,
+            dist - bias,
+            origin,
+            to_light / dist,
+        ),
+    );
+    // Everything is opaque for this ray and the first hit ends it, so there
+    // are no candidates to confirm: proceed until the traversal is done.
+    loop {
+        if !rayQueryProceed(&rq) {
+            break;
+        }
+    }
+    return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
+}
+//#endif
+
 // Lit (and fogged) colour of one surface point.
 fn shade(in: VsOut) -> vec3<f32> {
     let n = normalize(in.normal);
@@ -349,13 +440,38 @@ fn shade(in: VsOut) -> vec3<f32> {
 
     var color = in.emissive;
     for (var i: u32 = 0u; i < params.light_count; i = i + 1u) {
+//#if SHADOWS
+        // The ray is only cast where the light would contribute at all (it is
+        // on the surface's side), and the BRDF only counts where it arrives.
+        let lit = light_radiance(params.lights[i], in.world, n, v, in.albedo, metallic, roughness);
+        if dot(lit, vec3(1.0)) > 0.0 && light_visible(in.world, n, params.lights[i].position.xyz) {
+            color = color + lit;
+        }
+//#else
         color = color + light_radiance(params.lights[i], in.world, n, v, in.albedo, metallic, roughness);
+//#endif
     }
     if params.gi_enabled == 1u {
         // Indirect diffuse: probe radiance along the surface normal's dominant
         // axis, Lambertian albedo, dielectric only (metallic is specular-only).
         let gi = probe_radiance(in.world, n);
         color = color + gi * in.albedo * (1.0 - metallic) / PI;
+    }
+    if params.environment.zenith.w > 0.0 {
+        // The environment (a scene without one stops at the test above): its
+        // light from the hemisphere the surface faces, on the diffuse colour,
+        // and its reflection along the mirror direction, blurred by roughness
+        // and weighted by Fresnel. Shadows do not touch either — this is the
+        // light that is left where no lamp reaches — and where the post pass
+        // finds a screen-space reflection it blends that over this one.
+        // (Nothing is culled: for a surface seen from behind, the side that
+        // is visible is the one that counts.)
+        let side = select(n, -n, dot(n, v) < 0.0);
+        let f0 = mix(vec3(0.04), in.albedo, metallic);
+        let reflected = env_reflection(params.environment, reflect(-v, side), roughness);
+        color = color
+            + env_ambient(params.environment, side) * in.albedo * (1.0 - metallic)
+            + reflected * env_brdf(f0, roughness, clamp(dot(side, v), 0.0, 1.0));
     }
     if (params.features & FEATURE_FOG) != 0u {
         // Exponential-squared fog on camera distance, after lighting and
@@ -382,3 +498,58 @@ fn fs_glass(in: VsOut) -> FsOut {
     out.material = material_out(in);
     return out;
 }
+
+//#if SKY
+// The background: the scene's environment wherever no geometry was drawn. One
+// triangle over the whole frame at the far end of the (reversed) depth range,
+// drawn after the opaque geometry with the depth test "equal": it only passes
+// where the depth buffer still holds its clear value.
+struct SkyOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+}
+
+@vertex
+fn vs_sky(@builtin(vertex_index) vi: u32) -> SkyOut {
+    // (-1, -1), (3, -1), (-1, 3): a triangle that covers the clip square.
+    let xy = vec2(f32((vi << 1u) & 2u), f32(vi & 2u)) * 2.0 - vec2(1.0);
+    var out: SkyOut;
+    out.pos = vec4(xy, 0.0, 1.0);
+    out.ndc = xy;
+    return out;
+}
+
+@fragment
+fn fs_sky(in: SkyOut) -> FsOut {
+    // The view ray through this pixel: unproject any point on it.
+    let h = params.camera.inv_view_proj * vec4(in.ndc, 0.5, 1.0);
+    let dir = normalize(h.xyz / h.w - params.camera.position.xyz);
+    var out: FsOut;
+    // Alpha 0, like the clear colour: there is still no surface here.
+    out.color = vec4(env_radiance(params.environment, dir), 0.0);
+    out.material = vec4(0.0);
+    return out;
+}
+//#endif
+
+//#if MESH
+// A mesh fragment is shaded exactly like a procedural one, with the
+// base-colour factor multiplied by the part's texture.
+@fragment
+fn fs_mesh(in: MeshVsOut) -> FsOut {
+    // Sampled unconditionally: implicit derivatives need uniform control flow.
+    let texel = textureSample(base_color_tex, base_color_sampler, in.uv);
+    var surface: VsOut;
+    surface.pos = in.pos;
+    surface.world = in.world;
+    surface.normal = in.normal;
+    surface.albedo = in.albedo * texel.rgb;
+    surface.material = in.material;
+    surface.emissive = in.emissive;
+    surface.transmission = 0.0;
+    var out: FsOut;
+    out.color = vec4(shade(surface), 1.0);
+    out.material = material_out(surface);
+    return out;
+}
+//#endif

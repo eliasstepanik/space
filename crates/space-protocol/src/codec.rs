@@ -42,7 +42,22 @@ use crate::messages::Message;
 /// (wire tags 23/24) — the shard↔orchestrator "give me an id and my map"
 /// exchange. It is a *new required* exchange for an orchestrated shard, so the
 /// version bumps rather than smuggling the claim through `Hello.player_token`.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// **Version 4** (server-owned scene): `SceneSet`/`SceneAck`/`SceneUpdate` were
+/// appended (wire tags 25/26/27, see [`crate::scene`]). No existing layout
+/// changed — by the append-only rule alone the version could have stayed — but
+/// the new messages are sent *unasked* to every peer: the orchestrator sends a
+/// `SceneSet` to every shard right behind its `ShardWelcome`, and every shard
+/// sends a `SceneUpdate` to every client right behind its `Welcome`. A
+/// version-3 peer can decode neither tag and would find that out in the middle
+/// of an established session: a shard's control-link reader ends on the first
+/// frame it cannot decode, so the shard would silently stop following epoch
+/// changes; a client would report an unknown tag for every update and never
+/// learn the scene. So the version bumps, exactly as it did for
+/// `ShardHello`/`ShardWelcome`, and such a peer is turned away at the hello
+/// instead, with the reason, before any session exists (`space-net` answers a
+/// hello framed at another version with a `Reject` naming both).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Largest accepted frame payload, in bytes (1 MiB).
 ///

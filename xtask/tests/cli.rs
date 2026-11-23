@@ -230,6 +230,133 @@ fn gpu_setup_flags_are_accepted() {
 }
 
 #[test]
+fn viewer_is_listed_and_documents_its_flags() {
+    let output = xtask().arg("--help").output().expect("spawn xtask");
+    assert!(output.status.success());
+    let commands = String::from_utf8_lossy(&output.stdout);
+    let listed = commands
+        .lines()
+        .any(|line| line.trim_start().starts_with("viewer ") && line.contains("browser viewer"));
+    assert!(listed, "`xtask --help` should list viewer:\n{commands}");
+
+    let output = xtask()
+        .args(["viewer", "--help"])
+        .output()
+        .expect("spawn xtask");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "--port <N>",
+        "--bind <ADDR>",
+        "--allow-remote",
+        "--ws <URL>",
+        "--no-build",
+        "--install-bindgen",
+        "--site-only",
+        "[default: 8097]",
+        "[default: 127.0.0.1]",
+        "viewer-site",
+        "space-client --stream",
+    ] {
+        assert!(
+            help.contains(text),
+            "`viewer --help` should have {text}:\n{help}"
+        );
+    }
+}
+
+/// The viewer server is a development tool. An address other machines can
+/// reach is refused, before anything is built, unless `--allow-remote` is
+/// given as well; so are arguments that cannot be meant.
+#[test]
+fn viewer_refuses_a_non_loopback_bind_and_bad_arguments() {
+    for bind in ["0.0.0.0", "192.168.1.20", "::"] {
+        let output = xtask()
+            .args(["viewer", "--no-build", "--site-only", "--bind", bind])
+            .current_dir(workspace_root())
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(output.status.code(), Some(2), "--bind {bind}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a loopback address") && stderr.contains("--allow-remote"),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    for bad in [
+        &["--bind", "localhost"][..],
+        &["--port", "65536"],
+        &["--port", "http"],
+        &["--ws", "127.0.0.1:8099"],
+        &["--ws", "http://127.0.0.1:8099"],
+        &["--frobnicate"],
+    ] {
+        let output = xtask()
+            .args(["viewer", "--no-build", "--site-only"])
+            .args(bad)
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(output.status.code(), Some(2), "{bad:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{bad:?}: {output:?}");
+    }
+}
+
+/// Without the `wasm-bindgen` CLI the command stops with status 2 and the one
+/// line that installs the version the lockfile asks for. It does not build or
+/// write anything first, and it downloads nothing.
+#[test]
+fn viewer_names_the_install_command_when_wasm_bindgen_is_missing() {
+    let root = workspace_root();
+    let lockfile = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+    let mut lines = lockfile.lines().map(str::trim);
+    lines
+        .find(|line| *line == "name = \"wasm-bindgen\"")
+        .expect("wasm-bindgen is in Cargo.lock");
+    let version = lines
+        .next()
+        .and_then(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a version line after the name");
+
+    // A machine with nothing installed: an empty PATH, home and cargo home.
+    let empty = std::env::temp_dir().join(format!("xtask viewer empty {}", std::process::id()));
+    let target = empty.join("target");
+    std::fs::create_dir_all(&empty).expect("temp dir");
+    let output = xtask()
+        .args(["viewer", "--no-build", "--site-only"])
+        .current_dir(root.join("xtask"))
+        .env("PATH", &empty)
+        .env("CARGO_HOME", &empty)
+        .env("HOME", &empty)
+        .env("USERPROFILE", &empty)
+        .env("CARGO_TARGET_DIR", &target)
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_INSTALL_ROOT")
+        .output()
+        .expect("spawn xtask");
+    let wrote = target.exists();
+    let _ = std::fs::remove_dir_all(&empty);
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().last(),
+        Some(&*format!(
+            "cargo install --locked wasm-bindgen-cli --version {version}"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("not found") && stderr.contains("--install-bindgen"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("xtask: running"), "{stdout}");
+    assert!(!wrote, "the target directory was created before stopping");
+}
+
+#[test]
 fn lint_subcommand_is_accepted() {
     // `xtask lint` shells out to cargo, so only check that the subcommand parses.
     let output = xtask()

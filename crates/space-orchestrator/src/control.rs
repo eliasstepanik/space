@@ -27,13 +27,14 @@ use std::time::Duration;
 
 use space_protocol::control::{AdminCommand, AdminReply, LoadReport};
 use space_protocol::shard::{EpochAck, ShardId, ShardMap, ShardRegion};
-use space_protocol::{Message, ShardHello, ShardWelcome};
+use space_protocol::{Message, SceneAck, ShardHello, ShardWelcome};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::autoscale::Autoscaler;
 use crate::config::OrchestratorConfig;
 use crate::epoch::EpochPublisher;
 use crate::ids::PersistentShardIdAllocator;
+use crate::scene::SceneStore;
 
 /// The orchestrator's mutable control state that the handlers touch.
 #[derive(Debug)]
@@ -48,6 +49,12 @@ pub struct ControlPlane {
     pub autoscaler: Autoscaler,
     /// The shared peer secret handed to every shard on welcome.
     pub peer_token: String,
+    /// The cluster's scene, its revision and where it is persisted. Not part
+    /// of the map and not published through the epoch protocol
+    /// ([`crate::scene`]). [`Self::new`] starts it in memory at the configured
+    /// initial scene; [`crate::boot::boot`] replaces it with the file-backed
+    /// store.
+    pub scene: SceneStore,
     /// The root owner the orchestrator reserved at startup that no live shard
     /// has claimed yet. The first root (or region-less) hello adopts it.
     unclaimed_root_owner: Option<ShardId>,
@@ -63,6 +70,7 @@ impl ControlPlane {
         peer_token: String,
     ) -> Self {
         Self {
+            scene: SceneStore::in_memory(config.initial_scene),
             config,
             ids,
             publisher,
@@ -332,6 +340,8 @@ pub enum Inbound {
     Report(LoadReport),
     /// A shard acknowledged a prepared epoch.
     Ack(EpochAck),
+    /// A shard said which scene it runs (its answer to a `SceneSet`).
+    SceneAck(SceneAck),
 }
 
 /// The orchestrator's QUIC front end.
@@ -339,8 +349,9 @@ pub enum Inbound {
 /// Binds one endpoint and speaks the shard↔orchestrator protocol: a shard
 /// connects (the ordinary [`space_net`] hello handshake), sends a [`ShardHello`],
 /// and receives a [`ShardWelcome`] carrying its id, region, map and peer token.
-/// Thereafter the shard sends [`LoadReport`]s and [`EpochAck`]s and receives
-/// epoch messages. The front end **only moves frames**: every decision is a call
+/// Thereafter the shard sends [`LoadReport`]s, [`EpochAck`]s and [`SceneAck`]s
+/// and receives epoch messages and the cluster's scene. The front end **only
+/// moves frames**: every decision is a call
 /// into [`ControlPlane`] on the run loop. It mirrors `space_server::net::ShardNet`
 /// (one task per connection, a FIFO sender per shard) so reviewers see one idiom.
 #[derive(Debug)]
@@ -456,6 +467,24 @@ impl ControlServer {
         self.registry.lock().await.remove(&shard);
     }
 
+    /// The registered shards whose control connection is still open.
+    ///
+    /// A shard's sender closes when its connection task ends (the peer closed,
+    /// the transport timed out, or the writer failed), so "registered and not
+    /// closed" is what the front end knows about liveness. It is an
+    /// observation for the operator view and the event log; no control
+    /// decision is taken on it. Like [`Self::send_to`] this never waits on a
+    /// peer: the registry lock is only ever held for a map operation.
+    pub async fn connected(&self) -> Vec<ShardId> {
+        self.registry
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, sender)| !sender.is_closed())
+            .map(|(shard, _)| *shard)
+            .collect()
+    }
+
     /// Stop accepting.
     pub fn close(&self) {
         self.endpoint
@@ -531,6 +560,11 @@ impl ControlServer {
                 }
                 Ok(Some(Message::EpochAck(ack))) => {
                     if self.tx.send(Inbound::Ack(ack)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(Message::SceneAck(ack))) => {
+                    if self.tx.send(Inbound::SceneAck(ack)).await.is_err() {
                         break;
                     }
                 }

@@ -9,7 +9,9 @@
 
 use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 
+use crate::environment::Environment;
 use crate::mesh::ModelInstance;
+use crate::overlay::Overlay;
 use crate::params::GpuInstance;
 
 /// Shape selector for an LOD depth: coarse nodes render as boxes, fine nodes
@@ -155,21 +157,27 @@ pub fn mat4_inverse(m: &Mat4) -> Option<Mat4> {
             + a[2][1] * a[3][2] * a[0][3]
             + a[3][1] * a[0][2] * a[2][3]
             - a[3][1] * a[2][2] * a[0][3]);
+    // (These three cofactors once took their column-2 and column-3 terms from
+    // the wrong row — `a[..][1]`-style copies of the row above. Every such
+    // term is multiplied by `a[2][0]` or `a[3][0]`, which are zero for a
+    // camera that looks straight down -Z, so nothing noticed until a camera
+    // turned: then the post pass rebuilt positions from a wrong inverse and
+    // reflections and refraction looked in the wrong place.)
     inv[1][1] =
-        a[0][0] * a[2][2] * a[3][3] - a[0][0] * a[3][2] * a[2][3] - a[2][0] * a[1][2] * a[3][3]
-            + a[2][0] * a[3][2] * a[1][3]
-            + a[3][0] * a[1][2] * a[2][3]
-            - a[3][0] * a[2][2] * a[1][3];
+        a[0][0] * a[2][2] * a[3][3] - a[0][0] * a[3][2] * a[2][3] - a[2][0] * a[0][2] * a[3][3]
+            + a[2][0] * a[3][2] * a[0][3]
+            + a[3][0] * a[0][2] * a[2][3]
+            - a[3][0] * a[2][2] * a[0][3];
     inv[2][1] =
-        -(a[0][0] * a[2][1] * a[3][3] - a[0][0] * a[3][1] * a[2][3] - a[2][0] * a[1][1] * a[3][3]
-            + a[2][0] * a[3][1] * a[1][3]
-            + a[3][0] * a[1][1] * a[2][3]
-            - a[3][0] * a[2][1] * a[1][3]);
+        -(a[0][0] * a[2][1] * a[3][3] - a[0][0] * a[3][1] * a[2][3] - a[2][0] * a[0][1] * a[3][3]
+            + a[2][0] * a[3][1] * a[0][3]
+            + a[3][0] * a[0][1] * a[2][3]
+            - a[3][0] * a[2][1] * a[0][3]);
     inv[3][1] =
-        a[0][0] * a[2][1] * a[3][2] - a[0][0] * a[3][1] * a[2][2] - a[2][0] * a[1][1] * a[3][2]
-            + a[2][0] * a[3][1] * a[1][2]
-            + a[3][0] * a[1][1] * a[2][2]
-            - a[3][0] * a[2][1] * a[1][2];
+        a[0][0] * a[2][1] * a[3][2] - a[0][0] * a[3][1] * a[2][2] - a[2][0] * a[0][1] * a[3][2]
+            + a[2][0] * a[3][1] * a[0][2]
+            + a[3][0] * a[0][1] * a[2][2]
+            - a[3][0] * a[2][1] * a[0][2];
     inv[0][2] =
         a[0][1] * a[1][2] * a[3][3] - a[0][1] * a[3][2] * a[1][3] - a[1][1] * a[0][2] * a[3][3]
             + a[1][1] * a[3][2] * a[0][3]
@@ -263,12 +271,20 @@ pub struct Scene {
     /// The camera pose the scene was built for.
     pub camera: CameraPose,
     /// Mesh models (camera-relative), drawn with the same shading as the
-    /// instances. They are rasterised only: ray-traced GI does not see them.
+    /// instances and, like them, part of the ray-traced scene: they cast and
+    /// receive shadows and the GI probes see them.
     pub models: Vec<ModelInstance>,
     /// Analytic point lights (world-space positions).
     pub lights: Vec<SceneLight>,
     /// The LOD-selected nodes behind `instances` (for tests/diagnostics).
     pub selected: Vec<NodeRef>,
+    /// 2D rectangles and text drawn over the finished frame (empty by
+    /// default, and then free).
+    pub overlay: Overlay,
+    /// The surroundings: ambient light, something for reflections and glass
+    /// to show where the scene has nothing, optionally a painted background.
+    /// None by default, and then the frame is exactly what it is without.
+    pub environment: Environment,
 }
 
 /// Placeholder radius of a star instance, in metres (stars are drawn far
@@ -356,6 +372,8 @@ impl Scene {
             camera: *camera,
             lights: Vec::new(),
             selected: used,
+            overlay: Overlay::new(),
+            environment: Environment::NONE,
         }
     }
 }
@@ -531,6 +549,8 @@ impl Scene {
             camera,
             lights: Vec::new(),
             selected: Vec::new(),
+            overlay: Overlay::new(),
+            environment: Environment::NONE,
         }
     }
 
@@ -553,6 +573,13 @@ impl Scene {
     #[must_use]
     pub fn with_lights(mut self, lights: Vec<SceneLight>) -> Self {
         self.lights = lights;
+        self
+    }
+
+    /// Set the surroundings (see [`Environment`]).
+    #[must_use]
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -702,6 +729,83 @@ mod tests {
         assert!(mat4_inverse(&proj).is_some());
     }
 
+    /// `mat4_inverse` really inverts — in particular the view-projection of a
+    /// camera that is *not* looking down -Z, whose matrix has no convenient
+    /// zeros to hide a wrong cofactor behind. (Three cofactors were wrong for
+    /// exactly those cameras: the post pass put reflections and refraction in
+    /// the wrong place as soon as the player turned.)
+    #[test]
+    fn the_inverse_of_a_turned_cameras_view_projection_is_its_inverse() {
+        let identity_error = |m: &Mat4| {
+            let inverse = mat4_inverse(m).expect("invertible");
+            let (left, right) = (mat4_mul(&inverse, m), mat4_mul(m, &inverse));
+            let mut worst = 0.0f32;
+            for c in 0..4 {
+                for r in 0..4 {
+                    let expected = if c == r { 1.0 } else { 0.0 };
+                    worst = worst
+                        .max((left[c][r] - expected).abs())
+                        .max((right[c][r] - expected).abs());
+                }
+            }
+            worst
+        };
+        // A matrix with no zeros at all.
+        let dense: Mat4 = [
+            [2.0, -1.0, 0.5, 3.0],
+            [0.25, 4.0, -2.0, 1.0],
+            [1.5, 0.75, 3.0, -0.5],
+            [-1.0, 2.0, 0.125, 5.0],
+        ];
+        assert!(identity_error(&dense) < 1e-5, "{}", identity_error(&dense));
+        // Cameras turned every which way, near planes from 5 cm to 1 m.
+        for (yaw, pitch, near) in [
+            (0.0f32, 0.0f32, 0.05f32),
+            (38.0, -3.0, 0.05),
+            (-120.0, 25.0, 0.05),
+            (90.0, 0.0, 1.0),
+            (200.0, -60.0, 0.1),
+            (5.0, 80.0, 0.05),
+        ] {
+            let (yaw, pitch) = (yaw.to_radians(), pitch.to_radians());
+            let forward = [
+                -yaw.sin() * pitch.cos(),
+                pitch.sin(),
+                -yaw.cos() * pitch.cos(),
+            ];
+            let scene = Scene::from_instances(
+                CameraPose {
+                    forward,
+                    aspect: 16.0 / 9.0,
+                    near,
+                    ..CameraPose::default()
+                },
+                Vec::new(),
+            );
+            let view_proj = scene.view_proj();
+            let error = identity_error(&view_proj);
+            assert!(error < 1e-4, "yaw {yaw} pitch {pitch}: off by {error}");
+            // And what the post pass does with it: a point projected to the
+            // screen and unprojected again is the same point.
+            let inverse = scene.inv_view_proj().expect("invertible");
+            let apply = |m: &Mat4, p: [f32; 4]| -> [f32; 4] {
+                [0, 1, 2, 3].map(|r| (0..4).map(|c| m[c][r] * p[c]).sum())
+            };
+            let point = [0, 1, 2].map(|k| forward[k] * 4.7 + [0.3, -0.2, 0.1][k]);
+            let clip = apply(&view_proj, [point[0], point[1], point[2], 1.0]);
+            let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3], 1.0];
+            let back = apply(&inverse, ndc);
+            for k in 0..3 {
+                assert!(
+                    (back[k] / back[3] - point[k]).abs() < 1e-3,
+                    "yaw {yaw} pitch {pitch}: {point:?} came back as {back:?}"
+                );
+            }
+        }
+        // A singular matrix has no inverse.
+        assert!(mat4_inverse(&[[1.0, 2.0, 3.0, 4.0]; 4]).is_none());
+    }
+
     /// The cube is closed too: 12 triangles over 8 corners, each of the 12
     /// cube edges and 6 face diagonals shared by exactly two triangles.
     #[test]
@@ -714,6 +818,30 @@ mod tests {
         let uses = edge_uses(&mesh);
         assert_eq!(uses.len(), 18);
         assert!(uses.values().all(|&n| n == 2));
+    }
+
+    /// Which way round the two shapes are wound, by the sign of the volume
+    /// their triangles enclose: the sphere counter-clockwise seen from outside
+    /// (positive), the cube clockwise (negative). The rasteriser does not care
+    /// (nothing is culled), but shadow rays do: `passes.rs` tells the
+    /// acceleration structure which of the two each instance is
+    /// (`ShapeBlas::flags_for`), and would shadow every box from the inside
+    /// out if this changed without it.
+    #[test]
+    fn the_sphere_is_wound_counter_clockwise_and_the_cube_clockwise() {
+        let volume = |mesh: &[[f32; 3]]| -> f32 {
+            mesh.as_chunks::<3>()
+                .0
+                .iter()
+                .map(|[a, b, c]| dot(*a, cross(*b, *c)) / 6.0)
+                .sum()
+        };
+        // A unit sphere holds 4.19, the level-1 polyhedron a little less; the
+        // cube of half-extent 1 holds 8.
+        let sphere = volume(&sphere_mesh(1));
+        assert!((3.9..4.19).contains(&sphere), "sphere volume {sphere}");
+        assert!((volume(&icosphere_mesh()) - 2.536).abs() < 0.01);
+        assert!((volume(&cube_mesh()) + 8.0).abs() < 1e-4);
     }
 
     /// The vertex shader generates the sphere from its own copy of the face

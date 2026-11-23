@@ -1,28 +1,26 @@
 name: Release images
 
-# Build the three server images and PUSH them to ghcr.io on every merge to main.
+# Build the three server images and PUSH them to ghcr.io on EVERY push to main.
 # (ci.yml's `docker` job only proves the Dockerfiles build; it never pushes.)
-# Tags: `latest` and `sha-<7-char commit>`.
 #
-# After the FIRST push the repo owner must set each package to Public
-# (GitHub > Packages > space-shard / space-orchestrator / space-client >
+# No path filter: whatever a commit touched, `sha-<commit>` exists for every
+# pushed head. No `concurrency` group either: a group cancels the build of an
+# older push, or drops it from the queue, when a newer one arrives.
+#
+# Tags: `sha-<7-char commit>` always. `latest` is moved to the new image after
+# the build, and only while that commit is still the head of main, so the slow
+# build of an older push can never put `latest` back behind a newer one.
+# (GitHub starts one run per push: of several commits pushed together, the
+# head is the one that is built.)
+#
+# After the FIRST push of an image the repo owner must set its package to
+# Public (GitHub > Packages > space-shard / space-orchestrator / space-client >
 # Package settings > Change visibility) so the proxy host can pull anonymously.
 
 on:
   push:
     branches: [main]
-    paths:
-      - "crates/**"
-      - "deploy/**"
-      - "Dockerfile"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/release-images.yml"
   workflow_dispatch:
-
-concurrency:
-  group: release-images-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   push:
@@ -43,6 +41,8 @@ jobs:
             file: deploy/Dockerfile.orchestrator
           - image: space-client
             file: deploy/Dockerfile.client
+    env:
+      IMAGE: ghcr.io/eliasstepanik/${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
       - name: Short SHA
@@ -54,14 +54,30 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
+      - name: Build and push :sha-${{ steps.vars.outputs.short }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.file }}
           push: true
-          tags: |
-            ghcr.io/eliasstepanik/${{ matrix.image }}:latest
-            ghcr.io/eliasstepanik/${{ matrix.image }}:sha-${{ steps.vars.outputs.short }}
+          tags: ${{ env.IMAGE }}:sha-${{ steps.vars.outputs.short }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      # Asked after the build, not before it: the build is the slow part, and
+      # main may have moved on meanwhile.
+      - name: Is this commit still the head of main?
+        id: head
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: 'main' });
+            const head = main.commit.sha === context.sha;
+            if (!head) {
+              core.notice(`main is at ${main.commit.sha.slice(0, 7)}: that push's run moves :latest`);
+            }
+            core.setOutput('head', String(head));
+      # A registry-side retag of the image pushed above: nothing is rebuilt, so
+      # `latest` and `sha-<commit>` are the same digest.
+      - name: Move :latest to this image
+        if: steps.head.outputs.head == 'true'
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:sha-${{ steps.vars.outputs.short }}"

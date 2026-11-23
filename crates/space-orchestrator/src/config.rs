@@ -92,6 +92,21 @@ pub struct OrchestratorConfig {
     pub host_port_range: (u16, u16),
     /// Which launcher impl the binary picks.
     pub launcher: LauncherKind,
+    /// The most regions the map may hold. A split that would add one more is
+    /// refused, whoever asks for it — the autoscaler, an operator or the admin
+    /// verb (`--max-regions`, default [`Self::DEFAULT_MAX_REGIONS`]).
+    ///
+    /// Every region is a shard to launch, a control link to serve and a row
+    /// the control loop walks for each snapshot it publishes, so the map must
+    /// not be able to grow without bound: an operator (or a looping script)
+    /// asking for split after split would otherwise slow the very loop that
+    /// answers hellos and meets epoch deadlines.
+    pub max_regions: usize,
+    /// The scene the cluster shows until an operator chooses another one
+    /// (`--scene`). Only used when no scene has been persisted yet: a scene
+    /// chosen at run time is saved next to the id counter and wins on restart
+    /// (see [`crate::scene`]).
+    pub initial_scene: space_protocol::Scene,
 }
 
 impl Default for OrchestratorConfig {
@@ -106,6 +121,8 @@ impl Default for OrchestratorConfig {
             first_shard_id: 1,
             host_port_range: (7_870, 7_899),
             launcher: LauncherKind::default(),
+            max_regions: Self::DEFAULT_MAX_REGIONS,
+            initial_scene: space_protocol::Scene::DEFAULT,
         }
     }
 }
@@ -114,6 +131,11 @@ impl OrchestratorConfig {
     /// Default root depth: enough headroom above the split floor that the root
     /// can be split many times (see [`Self::root_depth`]).
     pub const DEFAULT_ROOT_DEPTH: u8 = 40;
+
+    /// Default for [`Self::max_regions`]: far more shards than one host runs
+    /// (the default host port range holds 30), and few enough that everything
+    /// the control loop does per region stays negligible.
+    pub const DEFAULT_MAX_REGIONS: usize = 64;
 
     /// The address launched shards dial: `control_addr` if set, else `bind`.
     #[must_use]

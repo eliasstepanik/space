@@ -12,14 +12,14 @@ use std::collections::{HashMap, HashSet};
 
 use space_protocol::{
     EntityGuid, HandoffReason, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    RejectReason, ShardId, ShardMap, ShardRegion, StaleEpoch, Welcome,
+    RejectReason, SceneAck, SceneState, ShardId, ShardMap, ShardRegion, StaleEpoch, Welcome,
 };
 use space_sim::{ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
 
 use crate::config::{
     ShardConfig, ADOPT_TIMEOUT_TICKS, MAX_PENDING_INPUTS, REDIRECT_TIMEOUT_TICKS,
-    REOFFER_BACKOFF_TICKS,
+    REOFFER_BACKOFF_TICKS, SCENE_REANNOUNCE_TICKS,
 };
 use crate::epoch::EpochParticipant;
 use crate::handoff::{Ledger, HANDOFF_TIMEOUT_TICKS};
@@ -36,11 +36,15 @@ pub const MAX_PLAYERS_PER_SHARD: usize = 100;
 /// handoff messages). The bound is for a caller that steps the shard *without*
 /// draining it — [`Shard::tick_n`] from a tool or a test. Every client is sent a
 /// frame every tick, so an undrained outbox would otherwise grow by one message
-/// per client per tick for as long as nobody collects it. Only [`Message::Delta`]
-/// frames for clients are discarded, oldest first: a newer delta supersedes an
-/// older one, and what a discarded one carried is re-sent once the client's
-/// acknowledgements show it never arrived (see [`crate::replicate`]). Snapshots,
-/// redirects and everything addressed to a shard or the orchestrator are kept.
+/// per client per tick for as long as nobody collects it. Only what a later
+/// message makes redundant is discarded, oldest first: a client's
+/// [`Message::Delta`] frames (a newer delta supersedes an older one, and what a
+/// discarded one carried is re-sent once the client's acknowledgements show it
+/// never arrived — see [`crate::replicate`]) and its [`Message::SceneUpdate`]s
+/// (the scene is announced again every
+/// [`SCENE_REANNOUNCE_TICKS`](crate::config::SCENE_REANNOUNCE_TICKS)).
+/// Snapshots, redirects and everything addressed to a shard or the orchestrator
+/// are kept.
 pub const MAX_OUTBOX: usize = 4096;
 
 /// One message routed to a peer: a client session or another shard.
@@ -161,6 +165,9 @@ pub struct Shard {
     /// The shard's epoch-protocol participation (Phase 3): the staged prepare,
     /// if one is outstanding.
     epoch_participant: EpochParticipant,
+    /// The scene clients are told to draw, and the revision it was set at (see
+    /// [`Shard::set_scene`]).
+    scene: SceneState,
     stats: ShardStats,
 }
 
@@ -188,6 +195,7 @@ impl Shard {
             departing: Vec::new(),
             shard_map: map,
             epoch_participant: EpochParticipant::new(),
+            scene: SceneState::UNSET,
             stats: ShardStats::default(),
         }
     }
@@ -274,6 +282,32 @@ impl Shard {
         &self.epoch_participant
     }
 
+    /// The scene this shard tells its clients to draw, and its revision.
+    ///
+    /// [`SceneState::UNSET`] (the default scene, revision 0) until somebody
+    /// sets one: the command line of a standalone shard, or the orchestrator.
+    #[must_use]
+    pub const fn scene(&self) -> SceneState {
+        self.scene
+    }
+
+    /// Make `state` this shard's scene and tell every connected client — if it
+    /// [supersedes](SceneState::supersedes) the scene held. Returns whether it
+    /// did.
+    ///
+    /// The scene is what clients draw around the ships; nothing in the
+    /// simulation reads it, so no tick, handoff or epoch is affected. Only a
+    /// strictly newer revision is adopted, which is what makes a late or
+    /// repeated message harmless: it changes nothing and is relayed to nobody.
+    pub fn set_scene(&mut self, state: SceneState) -> bool {
+        if !state.supersedes(&self.scene) {
+            return false;
+        }
+        self.scene = state;
+        self.send_to_all(Message::SceneUpdate(state));
+        true
+    }
+
     /// Install a committed shard map and immediately abort any in-flight
     /// transfer whose epoch no longer matches.
     ///
@@ -320,6 +354,12 @@ impl Shard {
     /// * [`Message::DirectoryReply`] — the orchestrator's authoritative map push,
     ///   which fills in the endpoints a commit cannot carry.
     ///
+    /// One more message arrives on the same link and is **not** part of that
+    /// protocol: [`Message::SceneSet`], the cluster's scene. It is adopted
+    /// through [`Shard::set_scene`] and always answered with a
+    /// [`Message::SceneAck`] naming the scene the shard runs afterwards. It
+    /// neither reads nor touches the map, the staged prepare or any transfer.
+    ///
     /// A prepare for an epoch that is not exactly one above the current one, or a
     /// second prepare while one is staged, is ignored (the participant rejects
     /// it), matching the publisher's "one change at a time" rule.
@@ -359,6 +399,19 @@ impl Shard {
                 } else if map.epoch == self.epoch() {
                     self.set_shard_map(map);
                 }
+            }
+            Message::SceneSet(state) => {
+                // Adopted only if newer (a repeat or a late message is a no-op),
+                // and confirmed either way with what this shard runs *now*: the
+                // orchestrator learns the truth, not an echo of what it sent.
+                let _ = self.set_scene(state);
+                self.send_to(
+                    Destination::Orchestrator,
+                    Message::SceneAck(SceneAck {
+                        shard: self.config.shard,
+                        applied: self.scene,
+                    }),
+                );
             }
             other => {
                 debug_assert!(false, "unexpected orchestrator message: {other:?}");
@@ -415,6 +468,10 @@ impl Shard {
     /// gets its ship by adopting the staged entity in [`Shard::client_status`]; if
     /// adoption never comes it is spawned a ship like any newcomer after
     /// [`crate::config::ADOPT_TIMEOUT_TICKS`].
+    ///
+    /// Every client that is admitted — a newcomer and a redirected player's
+    /// second connection alike — is queued a [`Message::SceneUpdate`] with the
+    /// shard's current scene, so it is the first thing behind the [`Welcome`].
     pub fn join(&mut self, hello: &Hello) -> Result<Welcome, RejectReason> {
         if self.clients.len() >= MAX_PLAYERS_PER_SHARD {
             return Err(RejectReason::Full);
@@ -453,6 +510,13 @@ impl Shard {
                 redirect_deadline: None,
                 adopt_deadline,
             },
+        );
+        // The scene to draw, right behind the welcome. Queued here rather than
+        // sent by the front end so it is in the outbox before this session's
+        // first frame, whatever tick the join lands on.
+        self.send_to(
+            Destination::Client(session),
+            Message::SceneUpdate(self.scene),
         );
         Ok(Welcome {
             session,
@@ -981,6 +1045,13 @@ impl Shard {
         // 5. Handoffs: start, commit, time out.
         self.handoff_pass(tick);
 
+        // 5.5 The scene, again, for whoever missed it (see
+        // [`SCENE_REANNOUNCE_TICKS`]). Before the frames, so a tick's last
+        // message to a client is still its frame.
+        if tick.is_multiple_of(SCENE_REANNOUNCE_TICKS) {
+            self.send_to_all(Message::SceneUpdate(self.scene));
+        }
+
         // 6. Replication.
         self.replicate_pass();
 
@@ -1293,8 +1364,9 @@ impl Shard {
     }
 
     /// Keep an outbox nobody is draining from growing without bound (see
-    /// [`MAX_OUTBOX`]): once it is over the limit, the oldest client deltas are
-    /// discarded until it is half full again. A no-op in a running shard.
+    /// [`MAX_OUTBOX`]): once it is over the limit, the oldest client deltas and
+    /// scene announcements are discarded until it is half full again. A no-op
+    /// in a running shard.
     fn trim_outbox(&mut self) {
         if self.outbox.len() <= MAX_OUTBOX {
             return;
@@ -1303,7 +1375,7 @@ impl Shard {
         self.outbox.retain(|out| {
             let stale = to_drop > 0
                 && matches!(out.dest, Destination::Client(_))
-                && matches!(out.message, Message::Delta(_));
+                && matches!(out.message, Message::Delta(_) | Message::SceneUpdate(_));
             if stale {
                 to_drop -= 1;
             }
@@ -1561,5 +1633,261 @@ mod tests {
             matches!(&newest.message, Message::Delta(d) if d.tick == last),
             "the newest frame is kept: {newest:?}"
         );
+        // The periodic scene announcements are shed with the deltas (a later
+        // one says the same): they do not pile up either. Over this many ticks
+        // there were dozens; what is left is what fits the kept window.
+        let announced = (last / SCENE_REANNOUNCE_TICKS) as usize;
+        let kept = shard
+            .outbox
+            .iter()
+            .filter(|o| matches!(o.message, Message::SceneUpdate(_)))
+            .count();
+        assert!(announced > 50, "precondition: {announced} announcements");
+        assert!(
+            kept <= MAX_OUTBOX / SCENE_REANNOUNCE_TICKS as usize + 2,
+            "{kept} of {announced} scene announcements are still queued"
+        );
+    }
+
+    // ------------------------------------------------------------- the scene
+
+    use space_protocol::Scene;
+
+    fn shard() -> Shard {
+        Shard::new(ShardConfig::new(
+            ShardId::new(1),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            NodeRef::new(64, [0, 0, 0]),
+        ))
+    }
+
+    fn join(shard: &mut Shard, token: &str) -> u64 {
+        shard
+            .join(&Hello {
+                protocol: space_protocol::PROTOCOL_VERSION,
+                player_token: token.into(),
+            })
+            .expect("join")
+            .session
+    }
+
+    /// The `(session, state)` of every scene update in the outbox, draining it.
+    fn scene_updates(shard: &mut Shard) -> Vec<(u64, SceneState)> {
+        shard
+            .take_outbox()
+            .into_iter()
+            .filter_map(|out| match (out.dest, out.message) {
+                (Destination::Client(session), Message::SceneUpdate(state)) => {
+                    Some((session, state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn state(scene: Scene, revision: u64) -> SceneState {
+        SceneState::new(scene.id(), revision)
+    }
+
+    /// A client is told the scene as the first thing behind its welcome: the
+    /// update is queued by the join itself, ahead of the session's first frame.
+    ///
+    /// Mutation this catches: announcing the scene only on a change — a client
+    /// that joins a shard whose scene was set earlier would never learn it.
+    #[test]
+    fn a_joining_client_is_told_the_scene_before_its_first_frame() {
+        let mut shard = shard();
+        assert_eq!(shard.scene(), SceneState::UNSET, "nobody has set one yet");
+        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        assert!(shard.take_outbox().is_empty(), "nobody to tell yet");
+
+        let session = join(&mut shard, "player");
+        shard.tick();
+        let outbox = shard.take_outbox();
+        let mine: Vec<&Message> = outbox
+            .iter()
+            .filter(|out| out.dest == Destination::Client(session))
+            .map(|out| &out.message)
+            .collect();
+        assert_eq!(
+            mine.first(),
+            Some(&&Message::SceneUpdate(state(Scene::Solar, 4))),
+            "the scene comes first"
+        );
+        assert!(
+            matches!(mine.get(1), Some(Message::Snapshot(_))),
+            "then the first frame: {mine:?}"
+        );
+        assert_eq!(
+            mine.iter()
+                .filter(|m| matches!(m, Message::SceneUpdate(_)))
+                .count(),
+            1,
+            "it is said once, not every tick"
+        );
+        // A shard nobody configured still says what applies: the default.
+        let mut bare = self::shard();
+        let session = join(&mut bare, "player");
+        assert_eq!(scene_updates(&mut bare), vec![(session, SceneState::UNSET)]);
+        assert_eq!(SceneState::UNSET.scene.known(), Some(Scene::DEFAULT));
+    }
+
+    /// A client whose scene announcement never arrived — the front end drops
+    /// what it offers to a full write queue — is told again within
+    /// `SCENE_REANNOUNCE_TICKS`, without any change of scene, and the repeat
+    /// costs the other ticks nothing: every tick still carries exactly one
+    /// frame per client and nothing else.
+    ///
+    /// Mutation this catches: announcing the scene on join and on change only
+    /// (the client that lost its announcement draws the old scene until the
+    /// next change), or re-announcing on every tick.
+    #[test]
+    fn a_client_that_missed_the_scene_is_told_again_without_a_change() {
+        let mut shard = shard();
+        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        let (a, b) = (join(&mut shard, "a"), join(&mut shard, "b"));
+        // Both announcements are lost on the way to the clients.
+        let lost = scene_updates(&mut shard);
+        assert_eq!(lost.len(), 2, "precondition: the join announced the scene");
+
+        let mut told: Vec<(SimTick, u64, SceneState)> = Vec::new();
+        for _ in 0..(2 * SCENE_REANNOUNCE_TICKS) {
+            let tick = shard.tick();
+            let mut frames = 0;
+            for out in shard.take_outbox() {
+                match (out.dest, out.message) {
+                    (Destination::Client(session), Message::SceneUpdate(scene)) => {
+                        assert_eq!(frames, 0, "the announcement comes before the frames");
+                        told.push((tick, session, scene));
+                    }
+                    (Destination::Client(_), Message::Snapshot(_) | Message::Delta(_)) => {
+                        frames += 1;
+                    }
+                    other => panic!("tick {tick}: unexpected {other:?}"),
+                }
+            }
+            assert_eq!(frames, 2, "tick {tick}: one frame per client, as ever");
+        }
+        told.sort_unstable_by_key(|(tick, session, _)| (*tick, *session));
+        let solar = state(Scene::Solar, 4);
+        assert_eq!(
+            told,
+            vec![
+                (SCENE_REANNOUNCE_TICKS, a, solar),
+                (SCENE_REANNOUNCE_TICKS, b, solar),
+                (2 * SCENE_REANNOUNCE_TICKS, a, solar),
+                (2 * SCENE_REANNOUNCE_TICKS, b, solar),
+            ],
+            "the current scene, to every client, once per interval and on no other tick"
+        );
+        assert_eq!(shard.scene(), solar, "no change of scene was needed");
+
+        // A shard with nobody connected says nothing to nobody.
+        let mut empty = self::shard();
+        empty.tick_n(2 * SCENE_REANNOUNCE_TICKS);
+        assert!(empty.take_outbox().is_empty());
+    }
+
+    /// A change reaches every connected client, once; a stale or repeated
+    /// revision reaches nobody and changes nothing.
+    ///
+    /// Mutation this catches: `>=` instead of `>` in the revision test (a
+    /// repeat would be re-broadcast), or adopting whatever arrives last (a
+    /// late message rolls the scene back).
+    #[test]
+    fn a_scene_change_reaches_every_client_and_a_stale_one_is_ignored() {
+        let mut shard = shard();
+        let (a, b) = (join(&mut shard, "a"), join(&mut shard, "b"));
+        let _ = shard.take_outbox();
+
+        assert!(shard.set_scene(state(Scene::Galaxy, 2)));
+        let mut told = scene_updates(&mut shard);
+        told.sort_unstable_by_key(|(session, _)| *session);
+        assert_eq!(
+            told,
+            vec![(a, state(Scene::Galaxy, 2)), (b, state(Scene::Galaxy, 2))]
+        );
+
+        for stale in [
+            state(Scene::Solar, 2),
+            state(Scene::Solar, 1),
+            state(Scene::Galaxy, 2),
+            SceneState::UNSET,
+        ] {
+            assert!(!shard.set_scene(stale), "{stale} is not newer");
+            assert_eq!(shard.scene(), state(Scene::Galaxy, 2));
+            assert!(
+                shard.take_outbox().is_empty(),
+                "{stale} is relayed to nobody"
+            );
+        }
+
+        // A scene this build has never heard of is still relayed: the shard
+        // only passes the id on, and the client decides what to draw.
+        let unknown = SceneState::new(space_protocol::SceneId(4_000), 3);
+        assert!(shard.set_scene(unknown));
+        assert_eq!(scene_updates(&mut shard).len(), 2);
+        assert_eq!(shard.scene(), unknown);
+    }
+
+    /// The orchestrator's scene is adopted, relayed to the clients and
+    /// confirmed; a stale one is confirmed with what the shard really runs.
+    /// Nothing about the map or the epoch protocol moves.
+    ///
+    /// Mutation this catches: acking the revision that was *sent* (the
+    /// orchestrator would believe a shard confirmed a scene it refused), or no
+    /// ack for a no-op (a shard that already had the scene would show as
+    /// behind for ever).
+    #[test]
+    fn the_orchestrators_scene_is_adopted_relayed_and_confirmed() {
+        let mut shard = shard();
+        let session = join(&mut shard, "player");
+        let _ = shard.take_outbox();
+        let (epoch, map) = (shard.epoch(), shard.shard_map().clone());
+
+        let drain = |shard: &mut Shard| -> (Vec<SceneAck>, Vec<(u64, SceneState)>) {
+            let mut acks = Vec::new();
+            let mut updates = Vec::new();
+            for out in shard.take_outbox() {
+                match (out.dest, out.message) {
+                    (Destination::Orchestrator, Message::SceneAck(ack)) => acks.push(ack),
+                    (Destination::Client(s), Message::SceneUpdate(state)) => {
+                        updates.push((s, state));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            (acks, updates)
+        };
+
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        let (confirmed, relayed) = drain(&mut shard);
+        assert_eq!(
+            confirmed,
+            vec![SceneAck {
+                shard: ShardId::new(1),
+                applied: state(Scene::Solar, 4)
+            }]
+        );
+        assert_eq!(relayed, vec![(session, state(Scene::Solar, 4))]);
+
+        // The same message again (the orchestrator re-sends until it hears an
+        // ack): confirmed again, relayed to nobody.
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        let (confirmed, relayed) = drain(&mut shard);
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert!(relayed.is_empty());
+
+        // A late, older one: the answer names the newer scene the shard runs.
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 3)));
+        let (confirmed, relayed) = drain(&mut shard);
+        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert!(relayed.is_empty());
+        assert_eq!(shard.scene(), state(Scene::Solar, 4));
+
+        assert_eq!(shard.epoch(), epoch, "a scene is not an epoch");
+        assert_eq!(shard.shard_map(), &map);
+        assert!(!shard.epoch_participant().has_staged());
     }
 }

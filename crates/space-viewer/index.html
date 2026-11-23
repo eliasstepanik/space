@@ -1,5 +1,8 @@
 <!doctype html>
 <meta charset="utf-8">
+<!-- A phone lays the page out at its own width; without this it would use a
+     980 px wide page shrunk to fit, and zoom in when the keyboard comes up. -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>space viewer</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #eee; font: 14px monospace }
@@ -14,7 +17,12 @@
 <!-- Build: see README.md. Serve this directory over http and open index.html.
      The stream address defaults to ws://<the host this page came from>:8099
      (the `space-client --stream` port); override it with
-     index.html?ws=ws://HOST:PORT. -->
+     index.html?ws=ws://HOST:PORT.
+     The viewer adds one more element itself: an invisible, always focused
+     <textarea id="space-viewer-input">. Everything typed goes through it, so
+     that text arrives the same way from a keyboard, an input method, a
+     phone's keyboard, a paste, or a tool that inserts text without pressing
+     keys. -->
 <canvas id="c" width="640" height="480"></canvas>
 <div id="status">loading the viewer ...</div>
 <script type="module">

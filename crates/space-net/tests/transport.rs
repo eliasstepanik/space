@@ -9,6 +9,8 @@
 //! |------|--------|
 //! | [`hello_handshake_round_trip`] | client `connect` + server `accept_connection` → `Welcome` with the session id and shard map, `Hello` seen server-side |
 //! | [`version_mismatch_is_rejected`] | a `Hello` with a wrong `protocol` → client gets `NetError::VersionMismatch`, server gets `NetError::VersionMismatch` |
+//! | [`a_peer_built_for_another_protocol_version_is_refused_at_the_hello`] | a hello whose **frame header** names another version (what a build at another version really sends) → the server answers a `Reject` naming both versions and reports `VersionMismatch` |
+//! | [`a_server_speaking_another_version_is_a_version_mismatch_to_the_client`] | a reply whose frame header names another version → `connect` returns `VersionMismatch`, not a transport error |
 //! | [`first_frame_must_be_hello`] | a non-`Hello` first frame → `NetError::Protocol` |
 //! | [`datagram_message_round_trips`] | an `InputTick` rides a datagram and decodes identically |
 //! | [`oversized_delta_promoted_to_stream`] | a `Delta` past the datagram budget is sent on a stream and still arrives |
@@ -155,6 +157,139 @@ async fn version_mismatch_is_rejected() {
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
+    server_task.await.expect("server task");
+}
+
+/// `frame` with the protocol version in its header replaced by `version`: what
+/// a build at that version puts on the wire.
+fn frame_at_version(message: &Message, version: u32) -> Vec<u8> {
+    let mut frame = encode_frame(message);
+    frame[4..8].copy_from_slice(&version.to_be_bytes());
+    frame
+}
+
+/// A peer built for another protocol version is turned away **at the hello**,
+/// with the reason — not dropped, and not let into a session it would fail in.
+///
+/// [`version_mismatch_is_rejected`] sends a hello that only *claims* another
+/// version inside a current-version frame. A real older build differs in the
+/// frame header too, and that is checked first: nothing it sends decodes. This
+/// is that case.
+///
+/// Mutation this catches: treating the undecodable hello like any other
+/// transport error (the connection is dropped and the peer sees "connection
+/// lost" — indistinguishable from a crashed server).
+#[tokio::test]
+async fn a_peer_built_for_another_protocol_version_is_refused_at_the_hello() {
+    let theirs = PROTOCOL_VERSION - 1;
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let err = accept_connection(server.accept())
+            .await
+            .expect_err("another protocol version must be refused");
+        assert_eq!(
+            err,
+            NetError::VersionMismatch {
+                seen: theirs,
+                expected: PROTOCOL_VERSION
+            }
+        );
+    });
+
+    // A raw client: QUIC and TLS as usual, then a hello as that build frames it.
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("connect")
+        .await
+        .expect("handshake");
+    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+    let hello = Message::Hello(Hello {
+        protocol: theirs,
+        player_token: "old-build".into(),
+    });
+    send.write_all(&frame_at_version(&hello, theirs))
+        .await
+        .expect("write hello");
+
+    // The answer arrives before the connection closes: a reject naming both
+    // versions, in a frame whose header says which version the server speaks.
+    let mut header = [0u8; 8];
+    recv.read_exact(&mut header)
+        .await
+        .expect("the server answers instead of hanging up");
+    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    assert_eq!(
+        u32::from_be_bytes([header[4], header[5], header[6], header[7]]),
+        PROTOCOL_VERSION,
+        "even a peer that cannot decode the payload reads the version here"
+    );
+    let mut frame = header.to_vec();
+    frame.resize(8 + length, 0);
+    recv.read_exact(&mut frame[8..]).await.expect("the payload");
+    assert_eq!(
+        space_protocol::decode_frame(&frame),
+        Ok(Message::Reject(space_protocol::Reject {
+            reason: RejectReason::VersionMismatch {
+                seen: theirs,
+                expected: PROTOCOL_VERSION
+            }
+        }))
+    );
+    conn.close(0u32.into(), b"read it");
+    server_task.await.expect("server task");
+}
+
+/// The other end of the same situation: this build dials a server that speaks
+/// another version. The server's answer cannot be decoded, but its frame
+/// header says why — and `connect` reports exactly that.
+///
+/// Mutation this catches: surfacing the undecodable reply as a transport
+/// error, so a client pointed at a not-yet-updated server reports an I/O
+/// failure instead of "version mismatch".
+#[tokio::test]
+async fn a_server_speaking_another_version_is_a_version_mismatch_to_the_client() {
+    let theirs = PROTOCOL_VERSION + 1;
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        // A raw server at another version: it reads whatever the client sent
+        // and answers in its own framing.
+        let conn = server
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("handshake");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("the control stream");
+        let mut header = [0u8; 8];
+        recv.read_exact(&mut header)
+            .await
+            .expect("the hello's header");
+        let reject = Message::Reject(space_protocol::Reject {
+            reason: RejectReason::VersionMismatch {
+                seen: PROTOCOL_VERSION,
+                expected: theirs,
+            },
+        });
+        send.write_all(&frame_at_version(&reject, theirs))
+            .await
+            .expect("write the answer");
+        let _ = send.finish();
+        // Stay until the client has read it.
+        conn.closed().await;
+    });
+
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let err = connect(&client, bound, "space.local", &space_net::hello("player-1"))
+        .await
+        .expect_err("another protocol version cannot be joined");
+    assert_eq!(
+        err,
+        NetError::VersionMismatch {
+            seen: PROTOCOL_VERSION,
+            expected: theirs
+        }
+    );
     server_task.await.expect("server task");
 }
 

@@ -6,13 +6,13 @@
 # Build from the REPOSITORY ROOT (the workspace is the build context):
 #   docker build -f deploy/Dockerfile.client -t space/client .
 #
-# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
-# inspection only (deploy/README.md says what is and is not verified).
+# Built and run locally (Docker 28 on Windows, through docker-compose.yaml):
+# see "What is and is not verified" in deploy/README.md.
 #
 # The wasm viewer (crates/space-viewer) is NOT served by this image: the client's
-# `--stream` port speaks WebSocket only and has no `--http-static` mode. Serve
-# crates/space-viewer/{index.html,pkg/} from any static file server and point the
-# page at this container with `index.html?ws=ws://<host>:<published-port>`.
+# `--stream` port speaks WebSocket only. The viewer page is a local development
+# tool: `cargo run -p xtask -- viewer` serves it, and `?ws=ws://<host>:<port>`
+# points it at this container.
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1.100-bookworm AS build
@@ -41,10 +41,13 @@ COPY --from=build /src/target/release/space-client /usr/local/bin/space-client
 USER client
 
 # STREAM_BIND  wildcard ws:// listen address inside the container (viewers dial it).
-# SPACE_SERVER optional `host:port` of the shard to play on (`--server`; resolved,
-#              but compose uses the fixed shard IP). Unset = offline, no server.
-# CLIENT_ARGS  optional extra flags, word-split, e.g. "--galaxy --size 1280x720
-#              --quality medium".
+# SPACE_SERVER `host:port` of the shard to play on (`--server`; resolved, but
+#              compose uses the fixed shard IP). When set, the client keeps
+#              retrying until the shard answers, and again after every loss, and
+#              logs each attempt to stderr. The client is online only: unset, it
+#              sits on its connect screen until a viewer types an address.
+# CLIENT_ARGS  optional extra flags, word-split, e.g. "--size 1280x720 --quality
+#              medium". The scene is not a client flag: the shard announces it.
 # No TLS: ws:// only (wss:// is deferred, see docs/security-notes.md).
 ENV STREAM_BIND=0.0.0.0:8099
 EXPOSE 8099/tcp

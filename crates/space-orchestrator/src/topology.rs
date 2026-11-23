@@ -146,6 +146,56 @@ pub fn centre_octant(node: NodeRef) -> usize {
         .unwrap_or(0)
 }
 
+/// The octants of `shard`'s region that can still be carved out for a new
+/// shard (0..=7; bit 0 = +x, bit 1 = +y, bit 2 = +z), in order — **without
+/// planning anything**.
+///
+/// An octant is free exactly when its node is not already a region of the
+/// map: for a region that passes [`can_split`] in a valid map, a duplicate node
+/// is the only thing [`split_plan`]'s validation can find. So this answers
+/// "which octants could be split off?" by looking, where trying each
+/// [`split_plan`] clones and re-validates the whole map eight times. It is what
+/// the operator view and the pre-check of an operator's request use (they run
+/// on the control loop for every region, several times a second);
+/// [`split_plan`] remains the authority when a split is actually planned.
+///
+/// # Errors
+///
+/// [`TopologyError::UnknownShard`] or [`TopologyError::TooSmallToSplit`].
+pub fn free_octants(map: &ShardMap, shard: ShardId) -> Result<Vec<u8>, TopologyError> {
+    let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
+    let children = octree::children(region.node)
+        .filter(|_| can_split(region.node))
+        .ok_or(TopologyError::TooSmallToSplit(region.node))?;
+    Ok((0..8u8)
+        .filter(|octant| {
+            let child = children[usize::from(*octant)];
+            !map.regions.iter().any(|r| r.node == child)
+        })
+        .collect())
+}
+
+/// The shard `shard`'s region would be merged into — the owner of the region
+/// around it — **without planning the merge**.
+///
+/// The same rule as [`merge_plan`] (which uses this), minus building and
+/// validating the resulting map.
+///
+/// # Errors
+///
+/// [`TopologyError::UnknownShard`], or [`TopologyError::NoMergeTarget`] if the
+/// parent node is not a region of the map or is owned by the shard itself.
+pub fn merge_target(map: &ShardMap, shard: ShardId) -> Result<ShardId, TopologyError> {
+    let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
+    let parent = octree::parent(region.node).ok_or(TopologyError::NoMergeTarget(region.node))?;
+    map.regions
+        .iter()
+        .find(|r| r.node == parent)
+        .map(|r| r.shard)
+        .filter(|owner| *owner != shard)
+        .ok_or(TopologyError::NoMergeTarget(region.node))
+}
+
 /// Which octant of `shard`'s region to carve: the first one, starting at
 /// `first` and going round (`first`, `first + 1`, … modulo 8), whose
 /// [`split_plan`] validates.
@@ -239,14 +289,7 @@ pub fn split_plan(
 /// [`TopologyError::Invalid`].
 pub fn merge_plan(map: &ShardMap, shard: ShardId) -> Result<Merge, TopologyError> {
     let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
-    let parent = octree::parent(region.node).ok_or(TopologyError::NoMergeTarget(region.node))?;
-    let parent_owner = map
-        .regions
-        .iter()
-        .find(|r| r.node == parent)
-        .map(|r| r.shard)
-        .filter(|owner| *owner != shard)
-        .ok_or(TopologyError::NoMergeTarget(region.node))?;
+    let parent_owner = merge_target(map, shard)?;
     let mut new_map = map.clone();
     new_map.epoch += 1;
     new_map
@@ -269,7 +312,13 @@ pub fn merge_plan(map: &ShardMap, shard: ShardId) -> Result<Merge, TopologyError
 /// * no region is deeper than [`SPLIT_MAX_DEPTH`] (the split ceiling).
 ///
 /// `Ok(())` otherwise `Err(reason)`.
+///
+/// The pairwise check makes this quadratic in the number of regions, which is
+/// fine for the one or two calls a split or merge makes and is why nothing
+/// that runs per region per snapshot may call it (see [`free_octants`]).
 pub fn validate(map: &ShardMap) -> Result<(), String> {
+    #[cfg(test)]
+    VALIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
     for region in &map.regions {
         validate_node(region.node.depth, region.node.index)?;
         if region.node.depth > SPLIT_MAX_DEPTH {
@@ -296,10 +345,85 @@ pub fn validate(map: &ShardMap) -> Result<(), String> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How often [`validate`] ran on this thread: lets a test prove that a
+    /// code path (building a snapshot) does not validate at all.
+    pub(crate) static VALIDATE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use space_world::WorldPos;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// The cheap answers are the planners' answers: an octant is listed as
+    /// free exactly when its split plan validates, and a merge has a target
+    /// exactly when its plan does — the same target.
+    ///
+    /// Mutation this catches: a `free_octants` that forgets a rule the planner
+    /// has (the page would offer a button the orchestrator then refuses) or
+    /// adds one it does not have.
+    #[test]
+    fn the_cheap_view_checks_agree_with_the_planners() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let kids = octree::children(root).expect("splits");
+        let grandkids = octree::children(kids[3]).expect("splits");
+        let floor = NodeRef::new(55, [0, 0, 0]); // below the split floor
+        let maps = [
+            root_map(),
+            ShardMap::new(
+                4,
+                vec![
+                    ShardRegion::new(root, shard(1), addr(1)),
+                    ShardRegion::new(kids[0], shard(2), addr(2)),
+                    ShardRegion::new(kids[3], shard(3), addr(3)),
+                    ShardRegion::new(kids[7], shard(4), addr(4)),
+                    ShardRegion::new(grandkids[5], shard(5), addr(5)),
+                ],
+            ),
+            // Every octant of the root is taken.
+            ShardMap::new(
+                9,
+                std::iter::once(ShardRegion::new(root, shard(1), addr(1)))
+                    .chain(
+                        kids.iter()
+                            .enumerate()
+                            .map(|(i, kid)| ShardRegion::new(*kid, shard(10 + i as u32), addr(9))),
+                    )
+                    .collect(),
+            ),
+            ShardMap::new(1, vec![ShardRegion::new(floor, shard(1), addr(1))]),
+        ];
+        for map in &maps {
+            validate(map).expect("a valid map to start from");
+            let mut owners: Vec<ShardId> = map.regions.iter().map(|r| r.shard).collect();
+            owners.push(shard(99)); // and somebody the map does not know
+            for owner in owners {
+                let planned: Vec<u8> = (0..8u8)
+                    .filter(|o| split_plan(map, owner, usize::from(*o), ShardId::NONE).is_ok())
+                    .collect();
+                assert_eq!(
+                    free_octants(map, owner).unwrap_or_default(),
+                    planned,
+                    "{owner} in a map of {} region(s)",
+                    map.regions.len()
+                );
+                assert_eq!(
+                    free_octants(map, owner).err(),
+                    split_plan(map, owner, 0, ShardId::NONE)
+                        .err()
+                        .filter(|err| !matches!(err, TopologyError::Invalid(_))),
+                    "{owner}: the same refusal"
+                );
+                assert_eq!(
+                    merge_target(map, owner),
+                    merge_plan(map, owner).map(|plan| plan.into),
+                    "{owner}"
+                );
+            }
+        }
+    }
 
     fn addr(n: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), n)

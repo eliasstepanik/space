@@ -24,18 +24,31 @@ addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
 
 ## Publishing pipeline
 
-- **Images**: every push to `main` touching `crates/**`, `deploy/**`,
-  `Dockerfile` or `Cargo.*` runs `.github/workflows/release-images.yml`, which
-  builds and pushes `ghcr.io/eliasstepanik/space-shard`, `space-orchestrator`
-  and `space-client` as `:latest` and `:sha-<shortsha>` (the `space/*:dev` names
-  above are local compose builds only). The repo owner must make the packages
-  public after the first push. `ci.yml`'s `docker` job still only builds.
-- **Release**: pushing a `v*` tag runs `.github/workflows/release.yml`: builds
-  `space-client` (`--release --locked`) on Linux and Windows plus the wasm viewer,
-  and attaches `space-client`, `space-client.exe` and `space-viewer.zip`
-  (`index.html` + `pkg/`) to a GitHub Release with generated notes.
+Both pipelines run on **every push to `main`**, whatever the commit touched, so
+a push to `main` is a release and a deploy. GitHub starts one run per push: of
+several commits pushed together, the head is the one that is built.
+
+- **Images**: `.github/workflows/release-images.yml` builds and pushes
+  `ghcr.io/eliasstepanik/space-shard`, `space-orchestrator` and `space-client`
+  as `:sha-<shortsha>`, then moves `:latest` to that image (the `space/*:dev`
+  names above are local compose builds only). `:latest` only moves while the
+  commit is still the head of `main`, so a slow build of an older push cannot
+  put it back. The repo owner must make a package public after its first push.
+  `ci.yml`'s `docker` job still only builds.
+- **Release**: `.github/workflows/release.yml` takes the next patch version
+  after the highest `vX.Y.Z` tag, tags the pushed commit with it, builds
+  `space-client` (`--release --locked`) on Linux and Windows plus the wasm
+  viewer, and attaches `space-client`, `space-client.exe` and `space-viewer.zip`
+  (`index.html` + `pkg/`) to a GitHub Release with generated notes. Nothing is
+  tagged by hand; the newest Windows client is always
+  `https://github.com/eliasstepanik/space/releases/latest/download/space-client.exe`.
+  Pushing a `v*` tag yourself still releases that tag, and is how the minor or
+  major version moves (`git tag v0.2.0 && git push origin v0.2.0`; the next push
+  to `main` is then `v0.2.1`). A commit that already carries a `v*` tag is not
+  numbered again. The numbering lives in `.github/scripts/release_version.js`.
 - **Proxy**: `deploy/proxy/` is the production bundle (compose pulling the ghcr
-  images, `.env.example`, `redeploy.sh`). Watchtower on the host (label opt-in,
+  images, `.env.example`, `redeploy.sh`). It does not serve the browser viewer:
+  that page is a local development and agent-testing tool (`AGENTS.md`). Watchtower on the host (label opt-in,
   60s poll) redeploys on new images; `.github/workflows/deploy.yml` is the manual
   SSH path (secrets `DEPLOY_SSH_HOST/USER/KEY`, not yet created). See
   `deploy/proxy/README.md`.
@@ -43,11 +56,47 @@ addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
   (`.github/scripts/check_yaml.py`), because GitHub silently drops a workflow
   with invalid YAML.
 
+## Scene and the orchestrator web UI
+
+**The scene is server state.** The orchestrator owns it, every shard runs it and
+tells its clients; a client has no say. Catalogue: `demo-area` (default),
+`materials`, `solar`, `galaxy`. `space-orchestrator --scene NAME` (env
+`SPACE_ORCHESTRATOR_SCENE`, compose variable `SPACE_SCENE`) is only the *initial*
+scene: one chosen at run time is saved next to the id counter
+(`<state file>.scene`) and wins on restart, so keep the state directory on a
+volume and delete that file to make `--scene` apply again. A shard run without
+an orchestrator takes `space-server --scene NAME`; give hand-wired `--peer`
+shards the same one. Client, shard and orchestrator must come from the same
+build (wire protocol 4) - the pipelines above build them from one commit.
+
+**The web UI** is part of the `space-orchestrator` binary (server-rendered HTML,
+no JavaScript): cluster, map, shards, autoscaler, id allocator, recent events,
+and the actions split / merge / pause autoscaler / re-send map / **switch the
+scene on all shards**. The same state is JSON at `/api/state`.
+
+- Off unless `--webui ADDR` (env `SPACE_ORCHESTRATOR_WEBUI`). Suggested port 7980.
+- A loopback bind needs no credentials - and then serves only loopback `Host`s
+  and refuses anything that arrived through a proxy. **Never put a proxy in
+  front of a tokenless UI.**
+- Any other bind (a container needs `0.0.0.0:7980`) refuses to start without
+  `--webui-token` / `SPACE_ORCHESTRATOR_WEBUI_TOKEN` / `..._TOKEN_FILE` of at
+  least 16 characters. Log in with any user name and the token as the password.
+- Plain HTTP with Basic auth: publish it on loopback and tunnel
+  (`ssh -L 7980:127.0.0.1:7980 host`), or put a TLS proxy in front and name the
+  public host with `--webui-host name[:port]` (needs a token).
+- `--max-regions N` (default 64) caps how far splits can grow the map.
+- This compose file switches it on for local use at `http://127.0.0.1:7980/`
+  (password `space-local-dev-token` unless `SPACE_WEBUI_TOKEN` is set);
+  `proxy/` leaves it off until `.env` sets a bind and a token.
+
+Details and known gaps: `docs/security-notes.md`.
+
 ## Streaming client and the wasm viewer
 
 `Dockerfile.client` starts `space-client --stream $STREAM_BIND [--server
 $SPACE_SERVER] $CLIENT_ARGS`. Compose sets `SPACE_SERVER=172.31.0.11:7870`
-(shard-a) and `CLIENT_ARGS=--galaxy`. It renders on lavapipe (software Vulkan);
+(shard-a); `CLIENT_ARGS` is for extra flags such as `--size` (the scene is not a
+client flag any more: the shard announces it). It renders on lavapipe (software Vulkan);
 bookworm's Mesa 22.3 lavapipe lacks `VK_KHR_ray_query`, so GI is off in that
 image (the renderer logs it and carries on). Pass `/dev/dri` through or use
 Mesa >= 25 for the ray-query path.
@@ -65,19 +114,31 @@ line and reconnects on its own when the stream goes away.
 
 ## What is and is not verified
 
-Verified (run in the authoring sandbox): the binaries' flags match the
-Dockerfiles' entrypoints (read from the `--help`/parser sources), the workspace
-builds with `--locked`, `space-viewer` builds for `wasm32-unknown-unknown`, and
-the full `cargo run -p xtask -- ci` passes.
+State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
+4080 SUPER and Docker 28, and on Ubuntu 24.04 in WSL (Mesa 25 lavapipe):
 
-**Not verified: every Dockerfile and the compose file.** The sandbox has no
-Docker daemon, so nothing here has been built or run (see
-`docs/security-notes.md`). Correct by inspection only; in particular the
-`rust:1.100-bookworm` tag, the `apt` package names in `Dockerfile.client`, and
-the compose profile have never been exercised. CI's `docker` job
-(`.github/workflows/ci.yml`) builds each Dockerfile (no push, no run) and is the
-first real check. Container runtime behaviour (client reaching the shard over the
-bridge, viewer connecting) has no automated test.
+**Run and passing**
+- `cargo run -p xtask -- ci` with `SPACE_REQUIRE_GPU=1`: fmt, clippy `-D warnings`
+  and every test - **950 passed, 0 failed, 3 ignored**. The GPU-using suites
+  also pass under `SPACE_RENDER_VALIDATION=1` with zero validation messages.
+- `Dockerfile.orchestrator`, `Dockerfile.shard`, `Dockerfile.client` and
+  `docker-compose.yaml` **built and run**, including the `stream` profile: the
+  shard registers; the web UI answers 401 without the token and 200 with it; a
+  scene switch in the web UI reaches the shard and the client container, and
+  survives an orchestrator restart; the client container renders on lavapipe
+  (`ray_query=true`), connects over the bridge and its stream was watched in a
+  browser through `cargo run -p xtask -- viewer`.
+- The same stack without containers through `scripts/dev.ps1` (Windows) and
+  `scripts/dev.sh` (Linux/WSL, software Vulkan): connect screen, demo area,
+  scene switching, a second client, the Lua smoke script, the harness API.
 
-The CI GPU step is `continue-on-error: true` for the same reason: it has not run
-on a hosted runner.
+**Not run**
+- `proxy/docker-compose.yaml` on the host (checked with `docker compose config`
+  against `.env.example` only) and `redeploy.sh`; the web UI behind a real TLS
+  proxy; the root `Dockerfile` (CI's `docker` job builds it).
+- GPU tests on the hosted CI runner: its Mesa is too old for the renderer, so
+  that step is `continue-on-error: true` and fails visibly rather than
+  reporting tests that rendered nothing.
+- Cross-shard visibility: players on different shards do not see each other
+  (the server does not replicate across a border); only the handoff itself is
+  seamless.

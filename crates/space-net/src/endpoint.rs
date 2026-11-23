@@ -32,7 +32,10 @@ use space_protocol::{
 use tokio::sync::Mutex;
 
 use crate::crypto::make_client_config;
-use crate::framed::{read_frame, recv_datagram, recv_stream_message, send_message, send_on_stream};
+use crate::framed::{
+    frame_version_mismatch, read_frame, recv_datagram, recv_stream_message, send_message,
+    send_on_stream,
+};
 
 /// Application close code used when a [`Hello`] is refused.
 pub const REJECT_CLOSE_CODE: u32 = 0x20;
@@ -425,9 +428,26 @@ async fn connect_unbounded(
     send.write_all(&frame)
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
-    let reply = read_frame(&mut recv)
-        .await?
-        .ok_or_else(|| NetError::Protocol("the server closed the control stream".into()))?;
+    let reply = match read_frame(&mut recv).await {
+        Ok(reply) => reply
+            .ok_or_else(|| NetError::Protocol("the server closed the control stream".into()))?,
+        Err(err) => {
+            // The server answered in another protocol version. Whatever it
+            // said (most likely a reject of our hello) cannot be decoded here,
+            // but its frame header has told us all there is to know.
+            if let Some((theirs, ours)) = frame_version_mismatch(&err) {
+                conn.close(
+                    VarInt::from_u32(REJECT_CLOSE_CODE),
+                    b"protocol version mismatch",
+                );
+                return Err(NetError::VersionMismatch {
+                    seen: ours,
+                    expected: theirs,
+                });
+            }
+            return Err(err.into());
+        }
+    };
     match reply {
         Message::Welcome(welcome) => Ok((
             Conn {
@@ -493,13 +513,30 @@ async fn accept_first_frame(
     // The control stream is the bi stream the client opened: the server reads the
     // hello from its receive half and answers on its send half, so both sides
     // share one reliable, ordered control channel.
-    let (send, mut recv) = conn
+    let (mut send, mut recv) = conn
         .accept_bi()
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
-    let first = read_frame(&mut recv)
-        .await?
-        .ok_or_else(|| NetError::Protocol("the client sent no hello".into()))?;
+    let first = match read_frame(&mut recv).await {
+        Ok(first) => first.ok_or_else(|| NetError::Protocol("the client sent no hello".into()))?,
+        Err(err) => {
+            // A peer built for another protocol version: the version is in
+            // every frame's header, so its hello cannot even be decoded and
+            // `check_hello` is never reached. Answer it the same way that
+            // check would — a `Reject` naming both versions, then a close that
+            // waits for it to be read — instead of just dropping the
+            // connection, which the peer could not tell from a crash. (A peer
+            // old enough not to decode the reject either still reads the
+            // version off its frame header.)
+            if let Some((seen, expected)) = frame_version_mismatch(&err) {
+                let reason = RejectReason::VersionMismatch { seen, expected };
+                send_reject(&mut send, &reason).await;
+                drain_then_close(&conn, b"protocol version mismatch").await;
+                return Err(reject_to_err(reason));
+            }
+            return Err(err.into());
+        }
+    };
     Ok((conn, send, recv, first))
 }
 

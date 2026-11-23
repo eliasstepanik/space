@@ -3,8 +3,8 @@
 # Build from the REPOSITORY ROOT (the workspace is the build context):
 #   docker build -f deploy/Dockerfile.orchestrator -t space/orchestrator .
 #
-# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
-# inspection only (docs/plan-phase3.md P3.0).
+# Built and run locally (Docker 28 on Windows, through docker-compose.yaml):
+# see "What is and is not verified" in deploy/README.md.
 #
 # The `--launcher docker` mode is DEFERRED (bollard is not in the offline cargo
 # cache; see launcher/docker.rs), so this image runs `--launcher local`: shards
@@ -26,11 +26,27 @@ USER orchestrator
 
 # The control port is QUIC (UDP). It binds the wildcard inside the container;
 # ORCHESTRATOR_CONTROL_ADDR is the `ip:port` shards dial (not resolved as a name).
-# The shard-id counter lives on a volume so a restart resumes above the last id (H9).
+# The shard-id counter lives on a volume so a restart resumes above the last id
+# (H9); the scene an operator chose is kept next to it (`orchestrator.id.scene`).
+#
+# Read by the binary itself (no flag in the entrypoint below):
+#   SPACE_ORCHESTRATOR_SCENE         initial scene (demo-area, materials, solar,
+#                                    galaxy); a saved choice on the volume wins
+#   SPACE_ORCHESTRATOR_WEBUI         `ip:port` of the operator web UI; unset or
+#                                    empty = off. In a container it must be the
+#                                    wildcard (0.0.0.0:7980), and then
+#   SPACE_ORCHESTRATOR_WEBUI_TOKEN   (or ..._TOKEN_FILE) is REQUIRED, at least 16
+#                                    characters: the orchestrator refuses to
+#                                    start with a non-loopback bind and no token.
+#   SPACE_ORCHESTRATOR_WEBUI_HOSTS   extra Host names (`name[:port]`, comma
+#                                    separated) when a TLS proxy is in front.
+# Plain HTTP, HTTP Basic auth (any user name, the token as password): publish the
+# port on loopback or to a TLS proxy only. See docs/security-notes.md.
 ENV ORCHESTRATOR_BIND=0.0.0.0:7900 \
     SPACE_CLUSTER=space-local
 VOLUME /var/lib/space
 EXPOSE 7900/udp
+EXPOSE 7980/tcp
 
 ENTRYPOINT ["/bin/sh", "-c", "exec space-orchestrator \
   --bind \"$ORCHESTRATOR_BIND\" \

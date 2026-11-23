@@ -7,18 +7,29 @@
 //!
 //! ## Feature matrix
 //!
-//! | preset | fog | fog density (1/m) | SSR | SSR steps | SSR max roughness | refraction |
-//! |--------|-----|-------------------|-----|-----------|-------------------|------------|
-//! | High   | on  | 2.0e-3            | on  | 32        | 0.5               | on         |
-//! | Medium | on  | 1.0e-3            | on  | 16        | 0.3               | on         |
-//! | Low    | off | —                 | off | —         | —                 | off        |
-//! | Ci     | off | —                 | off | —         | —                 | off        |
+//! | preset | fog | fog density (1/m) | SSR | SSR steps | SSR max roughness | refraction | shadows |
+//! |--------|-----|-------------------|-----|-----------|-------------------|------------|---------|
+//! | High   | on  | 2.0e-3            | on  | 32        | 0.5               | on         | on      |
+//! | Medium | on  | 1.0e-3            | on  | 16        | 0.3               | on         | on      |
+//! | Low    | off | —                 | off | —         | —                 | off        | off     |
+//! | Ci     | off | —                 | off | —         | —                 | off        | off     |
 //!
 //! `Ci` is the deterministic, cheapest tier: every optional feature is off so
 //! golden-pixel tests are independent of feature work. `Low` also has all
 //! optional features off. Fog is exponential-squared on distance from the
 //! camera and applies to shaded surfaces (after lighting, before tone map);
 //! the empty background is not fogged.
+//!
+//! Shadows are ray traced: the forward pass's fragment shaders cast one ray
+//! per light against the scene's acceleration structure (the same one probe
+//! GI uses), so spheres, boxes and mesh models all cast and receive hard
+//! shadows from every point light. They need a device with ray query and a
+//! scene with at least one light (`RenderContext::shadows_active`); a frame
+//! without either runs the plain forward shaders, with no ray-query code in
+//! them at all. Two things cast no shadow: transmissive instances (glass),
+//! and a sphere or box instance that *contains* a light — it is that light's
+//! lamp, like the Sun around the solar scene's point light. Mesh models
+//! always cast shadows, so keep lights outside closed meshes.
 //!
 //! SSR (screen-space reflections) and refraction are done by the `post.wgsl`
 //! compute pass, which runs between the forward pass(es) and the tone map and
@@ -52,6 +63,11 @@ pub const FEATURE_SSR: u32 = 1 << 1;
 /// through transmissive instances (glass draw + post pass).
 pub const FEATURE_REFRACT: u32 = 1 << 2;
 
+/// Bit in [`RenderFeatures::flags`]: ray-traced shadows from the point lights.
+/// (No shader reads it: a frame with shadows is drawn with the shadowed
+/// forward pipelines, a frame without them with the plain ones.)
+pub const FEATURE_SHADOWS: u32 = 1 << 3;
+
 /// Mask of the features that need the post pass.
 pub const POST_FEATURES: u32 = FEATURE_SSR | FEATURE_REFRACT;
 
@@ -84,6 +100,7 @@ impl QualityPreset {
                 ssr_steps: 32,
                 ssr_max_roughness: 0.5,
                 refraction: true,
+                shadows: true,
             },
             Self::Medium => RenderFeatures {
                 fog: true,
@@ -92,6 +109,7 @@ impl QualityPreset {
                 ssr_steps: 16,
                 ssr_max_roughness: 0.3,
                 refraction: true,
+                shadows: true,
             },
             Self::Low | Self::Ci => RenderFeatures {
                 fog: false,
@@ -100,6 +118,7 @@ impl QualityPreset {
                 ssr_steps: 0,
                 ssr_max_roughness: 0.0,
                 refraction: false,
+                shadows: false,
             },
         }
     }
@@ -168,6 +187,9 @@ pub struct RenderFeatures {
     pub ssr_max_roughness: f32,
     /// Refraction through transmissive instances (glass draw + post pass).
     pub refraction: bool,
+    /// Ray-traced hard shadows from the point lights (needs ray query; see
+    /// the module docs).
+    pub shadows: bool,
 }
 
 impl RenderFeatures {
@@ -183,6 +205,9 @@ impl RenderFeatures {
         }
         if self.refraction {
             f |= FEATURE_REFRACT;
+        }
+        if self.shadows {
+            f |= FEATURE_SHADOWS;
         }
         f
     }
@@ -229,11 +254,11 @@ mod tests {
         assert_eq!(QualityPreset::Low.features().flags(), 0);
         assert_eq!(
             QualityPreset::High.features().flags(),
-            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT
+            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT | FEATURE_SHADOWS
         );
         assert_eq!(
             QualityPreset::Medium.features().flags(),
-            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT
+            FEATURE_FOG | FEATURE_SSR | FEATURE_REFRACT | FEATURE_SHADOWS
         );
         // Presets with fog off must not leak a density to the shader.
         assert_eq!(QualityPreset::Ci.features().fog_density, 0.0);
@@ -248,8 +273,12 @@ mod tests {
         assert_eq!((high.ssr_steps, medium.ssr_steps), (32, 16));
         assert_eq!(high.ssr_max_roughness, 0.5);
         assert_eq!(medium.ssr_max_roughness, 0.3);
+        // Shadows: High and Medium on, Low and Ci off; they need no post pass.
+        assert!(high.shadows && medium.shadows);
+        assert_eq!(FEATURE_SHADOWS & POST_FEATURES, 0);
         for p in [QualityPreset::Low, QualityPreset::Ci] {
             let f = p.features();
+            assert!(!f.shadows, "{p}");
             assert!(!f.ssr && !f.refraction && !f.needs_post(), "{p}");
             assert_eq!((f.ssr_steps, f.ssr_max_roughness), (0, 0.0), "{p}");
             assert_eq!(f.flags() & POST_FEATURES, 0, "{p}");

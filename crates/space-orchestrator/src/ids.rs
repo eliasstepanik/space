@@ -222,33 +222,51 @@ impl FileCounterSink {
 
 impl CounterSink for FileCounterSink {
     fn persist(&mut self, next: u64) -> io::Result<()> {
-        use std::io::Write as _;
-
-        // Write to a sibling temp file, then rename it directly over the
-        // target. The rename is atomic and replaces the destination, so a crash
-        // leaves either the old or the new counter file present, never neither.
-        // The target is deliberately not removed first.
-        //
-        // The temp file is synced **before** the rename: without that, a power
-        // loss shortly after can leave the renamed file empty (the rename was
-        // journalled, the data was not), and an empty counter refuses the next
-        // boot — or, worse, the old contents come back and an id is reused.
-        let tmp = Self::tmp_path(&self.path);
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(format!("{next}\n").as_bytes())?;
-            file.sync_all()?;
-        }
-        Self::rename_over(&tmp, &self.path)?;
-        if let Ok(dir) = std::fs::File::open(Self::dir_of(&self.path)) {
-            // Best-effort durability of the rename itself; a failure here is
-            // not worth failing the allocation over, since the rename already
-            // committed the value. (A directory cannot be opened this way on
-            // Windows, where the rename is durable through the journal.)
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        replace_file(
+            &self.path,
+            &Self::tmp_path(&self.path),
+            format!("{next}\n").as_bytes(),
+        )
     }
+}
+
+/// Replace the file at `path` with `contents`, atomically and durably, going
+/// through the sibling file `tmp`.
+///
+/// This is the one way this crate writes state it must find again after a
+/// crash (the id counter here, the scene in [`crate::scene`]):
+///
+/// * the contents are written to `tmp`, which is then renamed directly over
+///   `path`. The rename is atomic and replaces the destination, so a crash
+///   leaves either the old or the new file present, never neither. The target
+///   is deliberately not removed first.
+/// * `tmp` is synced **before** the rename: without that, a power loss shortly
+///   after can leave the renamed file empty (the rename was journalled, the
+///   data was not).
+/// * the directory is synced afterwards where the platform allows it.
+///
+/// # Errors
+///
+/// Any error from creating, writing or syncing `tmp`, or from the rename (a
+/// Windows sharing violation is retried briefly first). `path` is then
+/// untouched.
+pub(crate) fn replace_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
+    {
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    FileCounterSink::rename_over(tmp, path)?;
+    if let Ok(dir) = std::fs::File::open(FileCounterSink::dir_of(path)) {
+        // Best-effort durability of the rename itself; a failure here is not
+        // worth failing the write over, since the rename already committed the
+        // value. (A directory cannot be opened this way on Windows, where the
+        // rename is durable through the journal.)
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// A sink that only records what it was asked to persist (tests, dry runs).

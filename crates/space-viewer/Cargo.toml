@@ -18,6 +18,10 @@ web-sys = { version = "0.3", features = [
     "Window", "Document", "Element", "HtmlCanvasElement", "CanvasRenderingContext2d",
     "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event",
     "KeyboardEvent", "MouseEvent", "DomRect", "Blob", "BlobPropertyBag", "ImageBitmap", "console",
+    # Pasting text (the connect prompt's server address).
+    "ClipboardEvent", "DataTransfer",
+    # The invisible text field all typed text comes from.
+    "HtmlElement", "HtmlTextAreaElement", "InputEvent", "FocusOptions", "Node", "EventTarget",
 ] }
 
 [lints]

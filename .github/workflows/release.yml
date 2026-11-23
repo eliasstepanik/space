@@ -1,12 +1,26 @@
 name: Release
 
-# On a `v*` tag: build the native client for Linux and Windows and the wasm
-# viewer bundle, then attach them to a GitHub Release with generated notes.
+# Every push to `main` is a release. The run takes the next patch version after
+# the highest `vX.Y.Z` tag, tags the pushed commit with it, builds the native
+# client for Linux and Windows and the wasm viewer bundle, and attaches them to
+# a GitHub Release with generated notes. Nothing is tagged by hand.
 #
-#   git tag v0.2.0 && git push origin v0.2.0
+# Pushing a `v*` tag yourself still releases that tag, and is how the minor or
+# major version moves; the automatic numbering carries on from the highest tag:
+#
+#   git tag v0.2.0 && git push origin v0.2.0      # the next push to main is v0.2.1
+#
+# GitHub starts one run per push, not per commit: of several commits pushed
+# together, the head is the one that is built and released.
+#
+# No `concurrency` group on purpose. A group either cancels the run of an older
+# push or drops it from the queue when a newer one arrives, and then not every
+# push would get its release. Runs build in parallel instead; the `version` job
+# hands the numbers out in push order (see .github/scripts/release_version.js).
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 env:
@@ -16,6 +30,29 @@ jobs:
   # Linux jobs run BARE on the self-hosted `space-ci` runner (proxy host) and
   # install Rust via rustup (job containers do not work with its dind sidecar);
   # the Windows job stays on GitHub-hosted `windows-latest`.
+
+  # First and fast, so that numbers follow push order. A build that fails
+  # afterwards leaves its tag without a release; re-running the failed jobs
+  # publishes to that same tag.
+  version:
+    name: Version
+    runs-on: [self-hosted, linux, x64, space-ci]
+    permissions:
+      contents: write
+    outputs:
+      # Empty when the commit already carries a hand-pushed `v*` tag: that
+      # tag's own run publishes it, this one only builds.
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick the release tag
+        id: pick
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { pickTag } = require('./.github/scripts/release_version.js');
+            await pickTag({ github, context, core });
+
   client-linux:
     name: Client (linux)
     runs-on: [self-hosted, linux, x64, space-ci]
@@ -69,10 +106,17 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Build space-viewer for wasm32-unknown-unknown
         run: cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer
-      # Must match the wasm-bindgen version in Cargo.lock (see crates/space-viewer/README.md).
-      # Slow from source, but the bare container has no prebuilt binary.
-      - name: Install wasm-bindgen-cli
-        run: cargo install --locked wasm-bindgen-cli --version 0.2.130
+      # The CLI must be the exact version of the `wasm-bindgen` crate in
+      # Cargo.lock, so read it from there: this runs on every push, and a
+      # hard-coded number would fail every release after a dependency update.
+      # A no-op when that version is already installed on the runner; slow
+      # from source otherwise (the bare runner has no prebuilt binary).
+      - name: Install wasm-bindgen-cli (the version in Cargo.lock)
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '$1 == "name = " && $2 == "wasm-bindgen" { getline; print $2; exit }' Cargo.lock)"
+          test -n "$version"
+          cargo install --locked wasm-bindgen-cli --version "$version"
       - name: Generate JS glue
         run: |
           wasm-bindgen --target web --out-dir space-viewer/pkg \
@@ -91,19 +135,35 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [client-linux, client-windows, viewer]
+    needs: [version, client-linux, client-windows, viewer]
+    if: needs.version.outputs.tag != ''
     runs-on: [self-hosted, linux, x64, space-ci]
     permissions:
       contents: write
     steps:
+      # For .github/scripts; before the download, because it cleans the workspace.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: List release files
         run: ls -l dist
+      # Runs for different pushes may finish out of order: only the highest
+      # published version is marked "Latest".
+      - name: Is this the newest release?
+        id: latest
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        with:
+          script: |
+            const { makeLatest } = require('./.github/scripts/release_version.js');
+            await makeLatest({ github, context, core }, process.env.RELEASE_TAG);
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
           generate_release_notes: true
           files: |
             dist/space-client

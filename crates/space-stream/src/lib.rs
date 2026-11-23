@@ -10,9 +10,12 @@
 //! * server → viewer: one binary WebSocket message per frame,
 //!   `[seq: u64 BE][flags: u8][JPEG bytes…]`.
 //! * viewer → server: one small binary message per input event
-//!   ([`protocol::ViewerInput`]): pointer position, key transitions and
-//!   *relative* view rotation (`Turn`). The proxy owns the absolute view
-//!   direction; a viewer never sends one.
+//!   ([`protocol::ViewerInput`]): pointer position, key transitions,
+//!   *relative* view rotation (`Turn`) and typed characters (`Text`, plus the
+//!   text-entry keys such as Enter and Backspace). The proxy owns the absolute
+//!   view direction; a viewer never sends one. It also owns the meaning of a
+//!   key press: the viewer cannot see whether the proxy shows a text field, so
+//!   it sends a printable key both as a movement key and as text.
 //!
 //! # Multiplayer seam
 //!
@@ -35,17 +38,18 @@
 //!
 //! The [`protocol`] module has no dependencies; everything else is behind the
 //! default `net` feature so the wasm viewer can share the wire format without
-//! pulling in tokio.
+//! pulling in tokio. The JPEG encoder alone (no tokio, no WebSocket) is the
+//! `jpeg` feature, which `net` includes.
 #![forbid(unsafe_code)]
 
 pub mod protocol;
 
-#[cfg(feature = "net")]
+#[cfg(feature = "jpeg")]
 pub mod jpeg;
 #[cfg(feature = "net")]
 pub mod server;
 
-#[cfg(feature = "net")]
+#[cfg(feature = "jpeg")]
 pub use jpeg::{jpeg_dimensions, EncodeScratch, EncodedJpeg, JpegEncoder, JpegError};
 pub use protocol::{FrameHeader, Key, ProtocolError, ViewerInput};
 #[cfg(feature = "net")]

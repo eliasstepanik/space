@@ -621,8 +621,9 @@ pub fn peer_hello(shard: ShardId) -> space_protocol::Hello {
 
 /// The shard's persistent control connection to the orchestrator (Phase 3).
 ///
-/// One connection, one FIFO sender (epoch acks and load reports go out in order)
-/// and one reader task (epoch prepare/commit/abort come in and are fed to
+/// One connection, one FIFO sender (epoch acks, scene acks and load reports go
+/// out in order) and one reader task (epoch prepare/commit/abort, map pushes
+/// and the cluster's scene come in and are fed to
 /// [`Shard::orchestrator_message`]). It reuses `run_peer_sender`'s shape because
 /// order matters for epoch messages for the same reason it matters for handoff
 /// messages.
@@ -753,6 +754,20 @@ impl OrchestratorLink {
                             | Message::DirectoryReply(_) => {
                                 shard.lock().await.orchestrator_message(message);
                             }
+                            Message::SceneSet(_) => {
+                                // The cluster's scene. The shard adopts it if it
+                                // is newer, relays it to its clients and queues
+                                // the ack; the switch is worth a line in the log.
+                                let (id, before, after) = {
+                                    let mut s = shard.lock().await;
+                                    let before = s.scene();
+                                    s.orchestrator_message(message);
+                                    (s.shard(), before, s.scene())
+                                };
+                                if after != before {
+                                    println!("{}", scene_switch_line(id, before, after));
+                                }
+                            }
                             _ => {}
                         },
                         Ok(None) => {
@@ -776,6 +791,19 @@ impl OrchestratorLink {
     pub fn close(self) {
         self.reader.abort();
         self.sender.abort();
+    }
+}
+
+/// The log line for a shard whose scene the orchestrator just changed.
+fn scene_switch_line(
+    shard: ShardId,
+    before: space_protocol::SceneState,
+    after: space_protocol::SceneState,
+) -> String {
+    if before.is_set() {
+        format!("space-server: {shard} switched scene: {before} -> {after}")
+    } else {
+        format!("space-server: {shard} runs scene {after}, as told by the orchestrator")
     }
 }
 
@@ -880,6 +908,18 @@ mod tests {
         assert!(net.writers.lock().await.contains_key(&welcome.session));
         shard.lock().await.tick();
         net.flush(&shard).await;
+        // The scene announcement the join queued comes first (it is not a
+        // frame of the world); the snapshot is right behind it.
+        let announced = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
+            .await
+            .expect("the scene must arrive")
+            .expect("recv")
+            .expect("a message");
+        assert_eq!(
+            announced,
+            Message::SceneUpdate(space_protocol::SceneState::UNSET),
+            "the first thing behind the welcome is the scene"
+        );
         let frame = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
             .await
             .expect("the first snapshot must arrive")
@@ -899,6 +939,141 @@ mod tests {
         );
         serve.abort();
         net.close();
+    }
+
+    /// Over the real transport: a client is told the scene behind its welcome,
+    /// a change made while it is connected reaches it, and a stale revision
+    /// reaches nobody.
+    ///
+    /// Mutation this catches: a scene update that never leaves the outbox (a
+    /// destination the flush does not deliver), or one sent on a path the
+    /// client does not read.
+    #[tokio::test]
+    async fn a_connected_client_is_told_the_scene_and_follows_a_change() {
+        use space_protocol::{Scene, SceneState};
+        let (net, shard, serve) = served_shard().await;
+        let bound = net.local_addr().expect("addr");
+        let solar = SceneState::new(Scene::Solar.id(), 1);
+        let galaxy = SceneState::new(Scene::Galaxy.id(), 2);
+        assert!(shard.lock().await.set_scene(solar));
+
+        let endpoint = client_endpoint_for(bound).expect("client endpoint");
+        let (conn, _welcome) = connect(&endpoint, bound, SERVER_NAME, &hello("player"))
+            .await
+            .expect("connect");
+        // The next scene update on the reliable path (frames of the world are
+        // skipped: each message rides its own stream).
+        let next_scene = |conn: Conn| async move {
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
+                    .await
+                    .expect("a scene update must arrive")
+                    .expect("recv")
+                    .expect("the connection is open");
+                if let Message::SceneUpdate(state) = message {
+                    return state;
+                }
+            }
+        };
+
+        shard.lock().await.tick();
+        net.flush(&shard).await;
+        assert_eq!(next_scene(conn.clone()).await, solar, "told on join");
+
+        // A late message for an older revision changes nothing and is not
+        // relayed; the change behind it is.
+        assert!(!shard
+            .lock()
+            .await
+            .set_scene(SceneState::new(Scene::Materials.id(), 1)));
+        assert!(shard.lock().await.set_scene(galaxy));
+        shard.lock().await.tick();
+        net.flush(&shard).await;
+        assert_eq!(
+            next_scene(conn.clone()).await,
+            galaxy,
+            "the change, and only the change, reaches the client"
+        );
+        serve.abort();
+        net.close();
+    }
+
+    /// Over the real transport: the announcement queued by the join never
+    /// reaches the client (it is taken out of the outbox before any flush —
+    /// what a full write queue does to it), the scene does not change again,
+    /// and the client is told it all the same within the re-announce interval.
+    ///
+    /// Mutation this catches: no periodic re-announcement — the client then
+    /// waits for a scene that is never sent, and the read below times out.
+    #[tokio::test]
+    async fn a_client_whose_scene_announcement_was_dropped_still_learns_the_scene() {
+        use space_protocol::{Scene, SceneState};
+        let (net, shard, serve) = served_shard().await;
+        let bound = net.local_addr().expect("addr");
+        let solar = SceneState::new(Scene::Solar.id(), 3);
+        assert!(shard.lock().await.set_scene(solar));
+
+        let endpoint = client_endpoint_for(bound).expect("client endpoint");
+        let (conn, _welcome) = connect(&endpoint, bound, SERVER_NAME, &hello("player"))
+            .await
+            .expect("connect");
+        // The join's announcement is dropped before it is ever offered.
+        let dropped = shard.lock().await.take_outbox();
+        assert!(
+            dropped
+                .iter()
+                .any(|out| out.message == Message::SceneUpdate(solar)),
+            "precondition: the join queued the announcement: {dropped:?}"
+        );
+
+        // The client reads what arrives on the reliable path while the shard
+        // ticks through one re-announce interval; nothing changes the scene.
+        let reader = tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                loop {
+                    match conn.recv_stream().await {
+                        Ok(Some(Message::SceneUpdate(state))) => return Some(state),
+                        Ok(Some(_)) => {}
+                        _ => return None,
+                    }
+                }
+            }
+        });
+        for _ in 0..crate::config::SCENE_REANNOUNCE_TICKS {
+            shard.lock().await.tick();
+            net.flush(&shard).await;
+        }
+        let learned = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the scene is announced again within the interval")
+            .expect("the reader task");
+        assert_eq!(learned, Some(solar));
+        assert_eq!(
+            shard.lock().await.scene(),
+            solar,
+            "without a further change"
+        );
+        serve.abort();
+        net.close();
+    }
+
+    #[test]
+    fn a_scene_switch_reads_as_what_happened() {
+        use space_protocol::{Scene, SceneState};
+        let solar = SceneState::new(Scene::Solar.id(), 2);
+        assert_eq!(
+            scene_switch_line(ShardId::new(3), SceneState::UNSET, solar),
+            "space-server: shard 3 runs scene solar (revision 2), as told by the orchestrator"
+        );
+        assert_eq!(
+            scene_switch_line(
+                ShardId::new(3),
+                SceneState::new(Scene::DemoArea.id(), 1),
+                solar
+            ),
+            "space-server: shard 3 switched scene: demo-area (revision 1) -> solar (revision 2)"
+        );
     }
 
     /// A shard at the player cap tells the client so.

@@ -12,8 +12,9 @@ use space_protocol::{
     AdminReply, CodecError, Delta, DirectoryQuery, DirectoryReply, EntityGuid, EntitySnapshot,
     GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer, HandoffReason, Hello,
     InputTick, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject, RejectReason,
-    ShardHello, ShardId, ShardMap, ShardRegion, ShardWelcome, Snapshot, SnapshotBuilder,
-    StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId, ShardMap, ShardRegion, ShardWelcome,
+    Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE,
+    PROTOCOL_VERSION,
 };
 use space_world::{NodeRef, WorldPos};
 
@@ -240,7 +241,18 @@ fn all_messages() -> Vec<Message> {
             shard_map: sample_map(),
             peer_token: "peer-secret".into(),
         }),
+        Message::SceneSet(SceneState::new(Scene::Solar.id(), 4)),
+        Message::SceneAck(SceneAck {
+            shard: shard(5),
+            applied: SceneState::new(Scene::Solar.id(), 4),
+        }),
+        Message::SceneUpdate(last_message_state()),
     ]
+}
+
+/// The payload of the last message in tag order (`SceneUpdate`, tag 27).
+fn last_message_state() -> SceneState {
+    SceneState::new(Scene::Galaxy.id(), 9)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +264,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 33);
+    assert_eq!(messages.len(), 36);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -420,12 +432,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 25, so the valid wire tags are `0..=24`.
-    // The boundary that matters is tag 25 — the first tag past the last variant.
-    // (An earlier revision tested 28/29, which are unknown only incidentally and
-    // would keep "passing" if a variant were appended and VARIANT_COUNT grew.)
-    assert_eq!(Message::VARIANT_COUNT, 25);
-    let first_invalid = Message::VARIANT_COUNT; // 25
+    // `Message::VARIANT_COUNT` is 28, so the valid wire tags are `0..=27`.
+    // The boundary that matters is tag 28 — the first tag past the last variant.
+    // (An earlier revision tested the literals 28/29 while the count was 25:
+    // unknown only incidentally, and "passing" for ever as variants were
+    // appended — which is why the bound below is the count itself.)
+    assert_eq!(Message::VARIANT_COUNT, 28);
+    let first_invalid = Message::VARIANT_COUNT; // 28
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -437,14 +450,9 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (24, `ShardWelcome`) must decode, proving 25 is the
+    // The last valid tag (27, `SceneUpdate`) must decode, proving 28 is the
     // first rejection and not an off-by-one that also drops the last variant.
-    let last_valid = Message::ShardWelcome(ShardWelcome {
-        shard: shard(5),
-        region: region(40, [0, 0, 0], 5),
-        shard_map: sample_map(),
-        peer_token: "peer-secret".into(),
-    });
+    let last_valid = Message::SceneUpdate(last_message_state());
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
     assert_eq!(
         decode_frame(&encode_frame(&last_valid)),
@@ -840,7 +848,7 @@ impl Rng {
         ShardMap::new(self.next_u64(), regions)
     }
     fn message(&mut self) -> Message {
-        match self.below(25) {
+        match self.below(28) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -1009,13 +1017,24 @@ impl Rng {
                     Some(ShardRegion::new(self.node(), self.shard(), self.addr()))
                 },
             }),
-            _ => Message::ShardWelcome(ShardWelcome {
+            24 => Message::ShardWelcome(ShardWelcome {
                 shard: self.shard(),
                 region: ShardRegion::new(self.node(), self.shard(), self.addr()),
                 shard_map: self.map(),
                 peer_token: self.string(),
             }),
+            25 => Message::SceneSet(self.scene_state()),
+            26 => Message::SceneAck(SceneAck {
+                shard: self.shard(),
+                applied: self.scene_state(),
+            }),
+            _ => Message::SceneUpdate(self.scene_state()),
         }
+    }
+    /// A scene state over the **whole** id space, not just the catalogue: an
+    /// id this build does not know has to cross the wire like any other.
+    fn scene_state(&mut self) -> SceneState {
+        SceneState::new(SceneId(self.next_u64() as u16), self.next_u64())
     }
 }
 
@@ -1304,6 +1323,83 @@ fn builder_overhead_is_max_of_snapshot_and_delta() {
         delta_len <= BUDGET,
         "delta after set_tick is {delta_len} B, budget {BUDGET}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scene messages
+// ---------------------------------------------------------------------------
+
+/// The three scene messages keep their tags and their byte layout: tag (u32),
+/// then for an ack the shard (u32), then the scene id (u16) and the revision
+/// (u64), all big endian.
+///
+/// Mutation this catches: inserting a variant before them, reordering the
+/// fields of `SceneState`, or widening the id — each is a silent wire break
+/// between an orchestrator, a shard and a client built at different commits.
+#[test]
+fn scene_messages_have_a_pinned_wire_layout() {
+    let state = SceneState::new(SceneId(0x0102), 0x0A0B_0C0D_0E0F_1011);
+    let state_bytes = [0x01, 0x02, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11];
+    let cases: [(Message, u32, Vec<u8>); 3] = [
+        (Message::SceneSet(state), 25, state_bytes.to_vec()),
+        (
+            Message::SceneAck(SceneAck {
+                shard: shard(7),
+                applied: state,
+            }),
+            26,
+            [&[0, 0, 0, 7][..], &state_bytes[..]].concat(),
+        ),
+        (Message::SceneUpdate(state), 27, state_bytes.to_vec()),
+    ];
+    for (message, tag, body) in cases {
+        assert_eq!(message.wire_tag(), tag, "{message:?}");
+        assert_eq!(message.epoch(), None, "a scene message carries no epoch");
+        let frame = encode_frame(&message);
+        let mut expected = tag.to_be_bytes().to_vec();
+        expected.extend_from_slice(&body);
+        assert_eq!(payload_of(&frame), &expected[..], "{message:?}");
+        assert_eq!(decode_frame(&frame), Ok(message));
+    }
+}
+
+/// A scene id this build does not know is **not** a decode error: the frame
+/// decodes, the id is reported as unknown, and the receiver's fallback is the
+/// default scene. (The catalogue grows; an older client must survive a newer
+/// scene, not drop the frame.)
+///
+/// Mutation this catches: putting the `Scene` enum itself on the wire — an
+/// unknown variant index is then a decode error and the receiver never learns
+/// the revision either.
+#[test]
+fn an_unknown_scene_id_decodes_and_the_receiver_can_fall_back() {
+    for raw in [Scene::ALL.len() as u16, 77, u16::MAX] {
+        for message in [
+            Message::SceneUpdate(SceneState::new(SceneId(raw), 12)),
+            Message::SceneSet(SceneState::new(SceneId(raw), 12)),
+        ] {
+            let decoded = decode_frame(&encode_frame(&message)).expect("an unknown id decodes");
+            assert_eq!(decoded, message);
+            let (Message::SceneUpdate(state) | Message::SceneSet(state)) = decoded else {
+                panic!("a scene message");
+            };
+            assert_eq!(state.revision, 12, "the revision is still readable");
+            assert_eq!(
+                state.scene.known(),
+                None,
+                "id {raw} is not in this catalogue"
+            );
+            assert_eq!(state.scene.or_default(), Scene::DEFAULT);
+        }
+    }
+    // Every catalogue scene, by contrast, comes back as itself.
+    for scene in Scene::ALL {
+        let message = Message::SceneUpdate(SceneState::new(scene.id(), 1));
+        let Ok(Message::SceneUpdate(state)) = decode_frame(&encode_frame(&message)) else {
+            panic!("{scene} must round-trip");
+        };
+        assert_eq!(state.scene.known(), Some(scene));
+    }
 }
 
 // ---------------------------------------------------------------------------

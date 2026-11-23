@@ -41,8 +41,40 @@
 //! * [`autoscale`] — the load metric and the split/merge decision
 //! * [`launcher`] — the [`launcher::Launcher`] seam and [`launcher::local::LocalLauncher`]
 //!   (the in-process impl; `launcher::docker` is a later slice)
+//! * [`scene`] — the cluster's scene, its revision and its persistence (not an
+//!   epoch: see below)
 //! * [`control`] — the control-plane message handlers (QUIC front end later)
 //! * [`orchestrator`] — [`orchestrator::Orchestrator`], the tie-in point
+//! * [`events`] — the bounded recent-events log (pure)
+//! * [`snapshot`] — [`snapshot::Snapshot`], everything the orchestrator knows
+//!   as plain data (pure)
+//! * [`ops`] — the operator's way into the run loop: read a snapshot, offer a
+//!   command
+//! * [`webui`] — the built-in web UI: an HTTP/1.1 server on tokio that renders
+//!   the snapshot as HTML and JSON and turns form posts into operator commands
+//!
+//! # The operator view and H9–H15
+//!
+//! The web UI is a *reader* of [`snapshot::Snapshot`]s and a *sender* of
+//! [`ops::OperatorCommand`]s; it holds no reference to the orchestrator. A
+//! split or merge asked for by an operator is carried out by
+//! [`orchestrator::Orchestrator::handle_operator`] on the run loop, through the
+//! same planning, epoch proposal and launcher steps as an autoscaler decision,
+//! so H9–H13 and H15 hold for it unchanged. The one new input to H14 is the
+//! operator's pause switch: the autoscaler is still a pure function of its
+//! reports — while paused it is simply not fed, and its dwell timers are
+//! cleared so nothing fires on resume without a fresh dwell.
+//!
+//! # The scene and H9–H15
+//!
+//! The scene (which world clients draw around the ships) is cluster state the
+//! orchestrator owns and an operator can change at run time. It is **not** part
+//! of the map and does not travel through the epoch protocol: a change is
+//! persisted, told to every connected shard at once (`SceneSet`), confirmed by
+//! each (`SceneAck`) and re-offered once a second to a shard that has not
+//! confirmed. It neither waits for an epoch in flight nor delays one, and it
+//! touches no id, no region and no publisher state — so H9–H15 are exactly
+//! what they were. See [`scene`] and [`space_protocol::scene`].
 //!
 //! # What this crate is not yet
 //!
@@ -60,10 +92,15 @@ pub mod boot;
 pub mod config;
 pub mod control;
 pub mod epoch;
+pub mod events;
 pub mod ids;
 pub mod launcher;
+pub mod ops;
 pub mod orchestrator;
+pub mod scene;
+pub mod snapshot;
 pub mod topology;
+pub mod webui;
 
 pub use autoscale::{load_metric, Autoscaler, ScaleAction};
 pub use config::OrchestratorConfig;

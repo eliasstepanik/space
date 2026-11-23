@@ -2,9 +2,10 @@
 //!
 //! It plays the part of a player: it connects to an authoritative shard through
 //! the ordinary `space-net` client path ([`space_client::link::ServerLink`]),
-//! sends thrust input, and can render the scene from the replicated ship's point
-//! of view offscreen (via `space-render`, so it works on lavapipe) and hand the
-//! frame back as a JPEG.
+//! sends thrust input, and can render the scene the shard shows
+//! ([`space_client::scenes::World`]: the demo area unless the server says
+//! otherwise) from the replicated ship's point of view offscreen (via
+//! `space-render`, so it works on lavapipe) and hand the frame back as a JPEG.
 //!
 //! # Tools
 //!
@@ -12,7 +13,7 @@
 //! |-----------------|---------------------------------------------------------------|
 //! | `connect`       | join the shard at `addr` (host:port, QUIC) as a player        |
 //! | `disconnect`    | leave the shard                                               |
-//! | `client_status` | session, tick, ship guid, replicated offset/velocity          |
+//! | `client_status` | session, tick, ship guid, replicated offset/velocity, scene   |
 //! | `send_input`    | set thrust `[x,y,z]` (optionally for `duration_ms`, then 0)   |
 //! | `capture_frame` | render one frame offscreen, return it as base64 JPEG / a file |
 
@@ -24,12 +25,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use space_client::input::InputState;
 use space_client::link::ServerLink;
+use space_client::scenes::{SceneKind, World};
 use space_mcp::tool::{arg_str, arg_u64_opt};
 use space_mcp::{base64, McpServer, Tool, ToolRegistry};
-use space_render::{
-    demo_scene, ContextOptions, Quality, QualityPreset, RenderContext, RenderOptions, Scene,
-};
+use space_render::{ContextOptions, QualityPreset, RenderContext, RenderOptions, Scene};
 use space_stream::JpegEncoder;
 use space_world::WorldPos;
 use tokio::sync::Mutex;
@@ -78,18 +79,22 @@ fn pretty(value: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| e.to_string())
 }
 
-/// The demo scene seen from a camera displaced by `offset` metres (the same
-/// re-basing the pixel-stream proxy does for its replicated camera).
-fn scene_at(offset: [f64; 3], width: u32, height: u32) -> Scene {
-    let mut scene = demo_scene(width, height);
-    scene.camera.position = WorldPos::from_f64_metres_around(scene.camera.position, offset);
-    let off = offset.map(|v| v as f32);
-    for inst in &mut scene.instances {
-        for (c, o) in inst.center.iter_mut().zip(off) {
-            *c -= o;
-        }
-    }
-    scene
+/// `scene` as a ship sees it that has flown `offset` metres from where it
+/// first appeared: a first-person camera that far from the scene's spawn
+/// point, looking the way a newcomer looks (the mapping the client itself
+/// uses), and the render options that scene is drawn with.
+fn scene_at(scene: SceneKind, offset: [f64; 3], width: u32, height: u32) -> (Scene, RenderOptions) {
+    let world = World::new(scene);
+    let (yaw, pitch) = world.initial_view();
+    let camera = world.camera(
+        WorldPos::from_f64_metres_around(world.spawn(), offset),
+        InputState::looking(yaw, pitch).forward(),
+        width as f32 / height as f32,
+    );
+    (
+        world.build(&camera),
+        world.options(QualityPreset::default()),
+    )
 }
 
 /// A captured, JPEG-encoded frame.
@@ -105,14 +110,15 @@ pub struct Capture {
     pub device: String,
 }
 
-/// Render the scene (camera displaced by `offset` metres) and JPEG-encode it.
-/// Blocking (GPU work).
+/// Render `scene` (camera displaced by `offset` metres from its spawn point)
+/// and JPEG-encode it. Blocking (GPU work).
 ///
 /// # Errors
 ///
 /// `Err` when no Vulkan device is usable or rendering/encoding fails.
 pub fn render_jpeg(
     render: &StdMutex<Option<RenderContext>>,
+    scene: SceneKind,
     offset: [f64; 3],
     width: u32,
     height: u32,
@@ -125,14 +131,9 @@ pub fn render_jpeg(
         );
     }
     let ctx = slot.as_ref().ok_or("render context missing")?;
-    let options = RenderOptions {
-        gi_enabled: false,
-        quality: Quality::CI,
-        preset: QualityPreset::default(),
-        ..Default::default()
-    };
+    let (scene, options) = scene_at(scene, offset, width, height);
     let frame = ctx
-        .render_offscreen(&scene_at(offset, width, height), width, height, &options)
+        .render_offscreen(&scene, width, height, &options)
         .map_err(|e| format!("render failed: {}", e.message))?;
     let jpeg = JpegEncoder::new(JPEG_QUALITY, 1)
         .encode(&frame.pixels, frame.width, frame.height)
@@ -212,7 +213,7 @@ pub fn registry(state: &Arc<ClientState>) -> ToolRegistry {
     let s = Arc::clone(state);
     r.register(tool(
         "client_status",
-        "Connection state and the client's replicated view: session id, last tick, frames received, own ship guid, offset from where it first appeared (m) and velocity.",
+        "Connection state and the client's replicated view: session id, last tick, frames received, own ship guid, offset from where it first appeared (m), velocity and the scene the shard shows.",
         empty,
         move |_| {
             let s = Arc::clone(&s);
@@ -241,7 +242,7 @@ pub fn registry(state: &Arc<ClientState>) -> ToolRegistry {
     let s = Arc::clone(state);
     r.register(tool(
         "capture_frame",
-        "Render one frame offscreen (software Vulkan is fine) and return it as a JPEG: JSON with width/height/bytes/device and `base64` (unless inline=false). If connected the camera follows the replicated ship. `name` (plain file name) also saves it to the server's output directory and returns the path.",
+        "Render one frame offscreen (software Vulkan is fine) and return it as a JPEG: JSON with width/height/bytes/device/scene and `base64` (unless inline=false). If connected the picture is the scene the shard shows, seen from the replicated ship (first person); otherwise the default scene from its spawn point. `name` (plain file name) also saves it to the server's output directory and returns the path.",
         json!({
             "type": "object",
             "properties": {
@@ -314,6 +315,7 @@ async fn client_status(state: &ClientState) -> Result<String, String> {
         "ship": replica.ship.map(|g| format!("{}:{}", g.shard.0, g.serial)),
         "offset_m": link.offset(),
         "velocity_mps": replica.state.map(|s| s.vel),
+        "scene": replica.scene.scene.or_default().name(),
     }))
 }
 
@@ -373,9 +375,9 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
             )
         }
     };
-    let (offset, connected) = match state.link.lock().await.as_ref() {
-        Some(link) => (link.offset(), true),
-        None => ([0.0; 3], false),
+    let (scene, offset, connected) = match state.link.lock().await.as_ref() {
+        Some(link) => (link.scene().scene.or_default(), link.offset(), true),
+        None => (SceneKind::DEFAULT, [0.0; 3], false),
     };
     let render = Arc::clone(&state.render);
     // Rendering, encoding **and** writing the file all block, so they all run
@@ -383,7 +385,7 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
     let save_to = name.as_ref().map(|name| state.out_dir.join(name));
     let saving = save_to.clone();
     let capture = tokio::task::spawn_blocking(move || {
-        let capture = render_jpeg(&render, offset, width, height)?;
+        let capture = render_jpeg(&render, scene, offset, width, height)?;
         if let Some(path) = saving {
             save_capture(&path, &capture.jpeg)?;
         }
@@ -398,6 +400,7 @@ async fn capture_frame(state: &ClientState, args: &Value) -> Result<String, Stri
         "bytes": capture.jpeg.len(),
         "device": capture.device,
         "connected": connected,
+        "scene": scene.name(),
         "camera_offset_m": offset,
     });
     if let Some(path) = save_to {

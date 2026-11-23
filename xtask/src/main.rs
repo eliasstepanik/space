@@ -4,6 +4,8 @@ use std::process::{exit, Command, Stdio};
 
 use clap::{Parser, Subcommand};
 
+mod viewer;
+
 #[derive(Parser)]
 #[command(
     name = "xtask",
@@ -54,6 +56,9 @@ enum Task {
         #[arg(long)]
         print_env: bool,
     },
+    /// Build the browser viewer (wasm + JS glue) and serve it on http://127.0.0.1:8097/
+    #[command(after_help = viewer::AFTER_HELP)]
+    Viewer(viewer::ViewerArgs),
 }
 
 fn main() {
@@ -83,6 +88,7 @@ fn main() {
             }
             gpu_setup(&prefix, force, print_env)
         }
+        Task::Viewer(args) => viewer::run(args, &invoked_from),
         Task::E2e | Task::Load | Task::Parity | Task::WebSmoke | Task::Accept => stub(),
     }
 }
@@ -104,27 +110,33 @@ fn workspace_root(from: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Where the test build goes: `xtask-test` inside the target directory.
-///
-/// A *separate* directory so a running `xtask.exe` is never relinked while it
-/// is still executing (Windows file locking), but inside whatever target
-/// directory is configured: with `CARGO_TARGET_DIR` (or `build.target-dir` via
-/// `CARGO_BUILD_TARGET_DIR`) pointing out of the checkout, a hard-coded
-/// `target/xtask-test` would still put a full build tree back into it. A
-/// relative value means what it means to cargo: relative to where the command
-/// was run (`invoked_from`). With neither set it is `target/xtask-test` under
-/// the workspace root. `env` is the environment lookup.
-fn test_target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) -> PathBuf {
+/// The target directory: what `CARGO_TARGET_DIR` (or `build.target-dir` via
+/// `CARGO_BUILD_TARGET_DIR`) names, else `target` under the workspace root
+/// (relative: xtask runs there). A relative value means what it means to
+/// cargo: relative to where the command was run (`invoked_from`). `env` is the
+/// environment lookup.
+fn target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) -> PathBuf {
     let configured = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
         .into_iter()
         .filter_map(env)
         .find(|dir| !dir.is_empty());
-    let target = match configured {
+    match configured {
         // `join` keeps an absolute path as it is.
         Some(dir) => invoked_from.join(dir),
         None => PathBuf::from("target"),
-    };
-    target.join("xtask-test")
+    }
+}
+
+/// Where the test build goes: `xtask-test` inside the target directory.
+///
+/// A *separate* directory so a running `xtask.exe` is never relinked while it
+/// is still executing (Windows file locking), but inside whatever target
+/// directory is configured ([`target_dir`]): with `CARGO_TARGET_DIR` pointing
+/// out of the checkout, a hard-coded `target/xtask-test` would still put a
+/// full build tree back into it. With nothing configured it is
+/// `target/xtask-test` under the workspace root.
+fn test_target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) -> PathBuf {
+    target_dir(env, invoked_from).join("xtask-test")
 }
 
 /// Packages whose tests create a Vulkan device when one is usable. GPU tests

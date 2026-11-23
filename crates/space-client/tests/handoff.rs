@@ -13,13 +13,18 @@
 //! * the ship keeps its guid and its place: nothing jumps at the switch;
 //! * the player stays in control: thrust sent after the switch moves the ship
 //!   on B, and on B only — A no longer simulates it.
+//!
+//! The scene rides along: the link learns it from the shard it joins, takes a
+//! newer one from the accepting shard while the handoff is still in flight,
+//! never falls back to an older one, and follows a change on whichever shard
+//! it is playing on.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use space_client::link::ServerLink;
-use space_protocol::{ShardId, ShardMap, ShardRegion};
+use space_protocol::{Scene, SceneId, SceneState, ShardId, ShardMap, ShardRegion};
 use space_server::net::ShardNet;
 use space_server::{Shard, ShardConfig};
 use space_world::NodeRef;
@@ -92,10 +97,14 @@ async fn eventually(seconds: u64, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
-    // A owns a two-cell-wide node; B owns the far octant carved out of it,
-    // which is where A's region centre (the spawn point) lies.
+fn scene(scene: Scene, revision: u64) -> SceneState {
+    SceneState::new(scene.id(), revision)
+}
+
+/// Two neighbouring shards as a split leaves them: A owns a two-cell-wide
+/// node; B owns the far octant carved out of it, which is where A's region
+/// centre (the spawn point) lies — so a player joining A is handed to B.
+async fn neighbours() -> (Running, Running) {
     let region_a = NodeRef::new(63, [0, 0, 0]);
     let region_b = NodeRef::new(64, [1, 1, 1]);
     let a = start(1, region_a);
@@ -117,11 +126,34 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
     );
     a.shard.lock().await.set_shard_map(map.clone());
     b.shard.lock().await.set_shard_map(map);
+    (a, b)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
+    let (a, b) = neighbours().await;
+    // The cluster's scene was just changed and the change has reached B but
+    // not A yet: A still says the galaxy, B already the solar system.
+    assert!(a.shard.lock().await.set_scene(scene(Scene::Galaxy, 2)));
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Solar, 3)));
 
     let link = ServerLink::connect(a.addr()).await.expect("join shard A");
     let joined = link.replica();
     assert_eq!(joined.shard, Some(ShardId::new(1)));
     let first_session = joined.session;
+    // The scene arrives behind the welcome. It is A's, or already B's newer
+    // one (heard on the handoff's second connection) — never nothing, and
+    // never B's followed by A's.
+    assert!(
+        eventually(5, || link.scene().is_set()).await,
+        "the link was never told a scene: {:?}",
+        link.replica()
+    );
+    let first_scene = link.scene();
+    assert!(
+        first_scene == scene(Scene::Galaxy, 2) || first_scene == scene(Scene::Solar, 3),
+        "{first_scene}"
+    );
 
     // The handoff: A redirects, the link connects to B and reports in, the
     // shards commit, and the first frame from B showing our ship is the switch.
@@ -134,6 +166,10 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
     assert_eq!(arrived.shard, Some(ShardId::new(2)), "{arrived:?}");
     let ship = arrived.ship.expect("the ship came along");
     assert!(!link.is_closed(), "the new connection is the live one");
+    // The newer scene won, and the replica and the link agree on it.
+    assert_eq!(arrived.scene, scene(Scene::Solar, 3));
+    assert_eq!(link.scene(), scene(Scene::Solar, 3));
+    assert_eq!(link.scene().scene.or_default(), Scene::Solar);
 
     // Seamless: the ship is where it was (it has not been flown yet), not
     // reset to some other spawn point.
@@ -186,7 +222,124 @@ async fn the_client_follows_its_ship_to_the_neighbouring_shard() {
         "B applied the thrust: {server_side:?}"
     );
 
+    // The scene changes again: the shard the client is on now tells it. The
+    // old shard catching up afterwards reaches nobody (it has no client), and
+    // an older revision is not a change at all.
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Materials, 4)));
+    assert!(
+        eventually(5, || link.scene() == scene(Scene::Materials, 4)).await,
+        "the change on the new shard never reached the client: {}",
+        link.scene()
+    );
+    assert!(a.shard.lock().await.set_scene(scene(Scene::Materials, 4)));
+    assert!(!b.shard.lock().await.set_scene(scene(Scene::Galaxy, 4)));
+    assert!(!b.shard.lock().await.set_scene(scene(Scene::Galaxy, 3)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(link.scene(), scene(Scene::Materials, 4));
+    assert_eq!(link.replica().handoffs, 1);
+
     link.close();
     a.stop();
     b.stop();
+}
+
+/// The other order: the scene change has reached the shard the client joins
+/// but not yet the one it is handed to. Arriving there must not roll the scene
+/// back, and the accepting shard catching up is not a change.
+///
+/// Mutation this catches: taking the accepting shard's announcement at the
+/// switch whatever its revision — the client would briefly draw the old scene
+/// again after every handoff that races a scene change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handoff_to_a_shard_that_is_behind_does_not_roll_the_scene_back() {
+    let (a, b) = neighbours().await;
+    assert!(a.shard.lock().await.set_scene(scene(Scene::Materials, 5)));
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Solar, 4)));
+
+    let link = ServerLink::connect(a.addr()).await.expect("join shard A");
+    assert!(
+        eventually(5, || link.scene() == scene(Scene::Materials, 5)).await,
+        "the link never learned the scene of the shard it joined: {}",
+        link.scene()
+    );
+    assert!(
+        eventually(20, || link.replica().handoffs == 1).await,
+        "the client never arrived on shard B: {:?}",
+        link.replica()
+    );
+    assert_eq!(link.replica().shard, Some(ShardId::new(2)));
+    assert_eq!(
+        link.scene(),
+        scene(Scene::Materials, 5),
+        "the shard that is behind must not win"
+    );
+
+    // B catches up: the same revision, so nothing changes for the client...
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Materials, 5)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(link.scene(), scene(Scene::Materials, 5));
+    // ...and the next change is followed.
+    assert!(b.shard.lock().await.set_scene(scene(Scene::Galaxy, 6)));
+    assert!(
+        eventually(5, || link.scene() == scene(Scene::Galaxy, 6)).await,
+        "{}",
+        link.scene()
+    );
+
+    link.close();
+    a.stop();
+    b.stop();
+}
+
+/// One shard, no handoff: the link learns the scene on join, follows every
+/// change, ignores a stale one, and keeps an id it does not know (drawing the
+/// default for it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_learns_the_scene_on_join_and_follows_a_change() {
+    let shard = start(1, NodeRef::new(64, [0, 0, 0]));
+    assert!(shard.shard.lock().await.set_scene(scene(Scene::Galaxy, 1)));
+
+    let link = ServerLink::connect(shard.addr()).await.expect("join");
+    assert!(
+        eventually(5, || link.scene() == scene(Scene::Galaxy, 1)).await,
+        "not told on join: {}",
+        link.scene()
+    );
+    assert_eq!(link.replica().scene, link.scene());
+
+    // What an app does every frame: compare with the scene it last drew.
+    let mut drawn = link.scene();
+    let mut changes = Vec::new();
+    for next in [scene(Scene::Solar, 2), scene(Scene::DemoArea, 3)] {
+        assert!(shard.shard.lock().await.set_scene(next));
+        assert!(
+            eventually(5, || link.scene() != drawn).await,
+            "the change to {next} never arrived"
+        );
+        drawn = link.scene();
+        changes.push(drawn);
+        // A late message for an older revision is not relayed, so nothing moves.
+        assert!(!shard
+            .shard
+            .lock()
+            .await
+            .set_scene(scene(Scene::Materials, 1)));
+    }
+    assert_eq!(
+        changes,
+        vec![scene(Scene::Solar, 2), scene(Scene::DemoArea, 3)]
+    );
+
+    // A scene a newer server knows and this client does not: kept as sent,
+    // drawn as the default.
+    let unknown = SceneState::new(SceneId(4_000), 4);
+    assert!(shard.shard.lock().await.set_scene(unknown));
+    assert!(eventually(5, || link.scene() == unknown).await);
+    assert_eq!(link.scene().scene.known(), None);
+    assert_eq!(link.scene().scene.or_default(), Scene::DEFAULT);
+    assert_eq!(link.replica().handoffs, 0);
+    assert!(!link.is_closed());
+
+    link.close();
+    shard.stop();
 }

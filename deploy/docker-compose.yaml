@@ -2,8 +2,8 @@
 #
 #   docker compose -f deploy/docker-compose.yaml up --build
 #
-# NOT EXECUTED: the authoring sandbox has no Docker daemon, so this file is
-# correct by inspection only (docs/plan-phase3.md P3.0 is the real verification).
+# Run locally with Docker 28, including the `stream` profile: see "What is and
+# is not verified" in deploy/README.md.
 #
 # The cluster starts with ONE shard. The orchestrator pre-allocates the root
 # region's owner and the first region-less hello (shard-a, no --shard, no region
@@ -18,6 +18,10 @@
 # IPv4 on the bridge subnet below.
 #
 #   orchestrator  172.31.0.10:7900   binds 0.0.0.0:7900, shards dial 172.31.0.10:7900
+#                 172.31.0.10:7980   operator web UI (HTTP), on the host at
+#                                    http://127.0.0.1:7980/ (any user name,
+#                                    password = SPACE_WEBUI_TOKEN, by default
+#                                    `space-local-dev-token`)
 #   shard-a       172.31.0.11:7870   binds 0.0.0.0:7870, advertises 172.31.0.11:7870
 #   client        172.31.0.12:8099   (profile "stream" only) ws:// pixel stream,
 #                                    plays on shard-a at 172.31.0.11:7870
@@ -63,10 +67,20 @@ services:
       ORCHESTRATOR_BIND: 0.0.0.0:7900
       # What shards dial; distinct from the wildcard bind above.
       ORCHESTRATOR_CONTROL_ADDR: 172.31.0.10:7900
+      # The scene every shard runs until an operator picks another one in the
+      # web UI (that choice is kept on the state volume and wins on restart).
+      SPACE_ORCHESTRATOR_SCENE: ${SPACE_SCENE:-demo-area}
+      # Operator web UI. In a container it has to bind the wildcard, and a
+      # non-loopback bind refuses to start without a token. The default token is
+      # for THIS LOCAL STACK ONLY: the port below is published on the host's
+      # loopback interface. Set SPACE_WEBUI_TOKEN before publishing it anywhere.
+      SPACE_ORCHESTRATOR_WEBUI: 0.0.0.0:7980
+      SPACE_ORCHESTRATOR_WEBUI_TOKEN: ${SPACE_WEBUI_TOKEN:-space-local-dev-token}
     volumes:
       - orchestrator-state:/var/lib/space
     ports:
       - "7900:7900/udp"
+      - "127.0.0.1:7980:7980/tcp"
     networks:
       space:
         ipv4_address: 172.31.0.10
@@ -99,7 +113,9 @@ services:
       STREAM_BIND: 0.0.0.0:8099
       # The shard's in-network address (an `ip:port`, like the other fixed IPs).
       SPACE_SERVER: 172.31.0.11:7870
-      CLIENT_ARGS: "--galaxy"
+      # Extra space-client flags (e.g. "--size 1280x720 --quality medium").
+      # The scene is not one of them: the orchestrator decides it.
+      CLIENT_ARGS: ""
     ports:
       - "8099:8099/tcp"
     networks:

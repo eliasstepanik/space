@@ -4,9 +4,8 @@
 # Build from the REPOSITORY ROOT (the workspace is the build context):
 #   docker build -f deploy/Dockerfile.shard -t space/shard .
 #
-# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
-# inspection only; the first real build is the Docker-equipped-runner entry
-# criterion (docs/plan-phase3.md P3.0).
+# Built and run locally (Docker 28 on Windows, through docker-compose.yaml):
+# see "What is and is not verified" in deploy/README.md.
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1.100-bookworm AS build

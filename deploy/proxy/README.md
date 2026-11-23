@@ -24,10 +24,9 @@ cd /home/proxy/stacks/space && docker compose up -d
 
 ## How updates reach the host
 
-1. A merge to `main` touching `crates/`, `deploy/`, `Dockerfile` or `Cargo.*`
-   runs `.github/workflows/release-images.yml`, which pushes
-   `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` tagged `latest` and
-   `sha-<shortsha>`.
+1. Every push to `main` runs `.github/workflows/release-images.yml`, which
+   pushes `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` tagged
+   `sha-<shortsha>` and then moves `latest` to that image.
 2. **Primary path (Watchtower):** the Watchtower container already running on
    the host polls every 60s. It only touches containers that opt in with the
    label `com.centurylinklabs.watchtower.enable: "true"` (set on `orchestrator`,
@@ -42,19 +41,69 @@ Watchtower only follows the tag the container runs. Rollback: set
 `SPACE_TAG=sha-<shortsha>` in `.env` and run `docker compose up -d`; set it back
 to `latest` to resume auto-updates.
 
+## Scene and the operator web UI
+
+`SPACE_SCENE` in `.env` is the scene the cluster starts with (`demo-area`,
+`materials`, `solar`, `galaxy`). Once an operator switches it in the web UI the
+choice is saved in `./state/orchestrator.id.scene` and wins over `.env` on every
+restart; delete that file to go back to `SPACE_SCENE`.
+
+The web UI (status, split / merge, autoscaler pause, scene switch) is **off**
+until `.env` sets both `SPACE_WEBUI_BIND=0.0.0.0:7980` and a `SPACE_WEBUI_TOKEN`
+of at least 16 random characters (a bind without a token makes the orchestrator
+refuse to start, which takes the cluster down - set both or neither). It is
+plain HTTP with Basic auth, so the port is published on the host's loopback
+only:
+
+```sh
+ssh -L 7980:127.0.0.1:7980 <host>      # then open http://127.0.0.1:7980/
+```
+
+Log in with any user name and the token as the password. To serve it under a
+public name instead, put a TLS-terminating proxy in front and add
+`SPACE_ORCHESTRATOR_WEBUI_HOSTS=<name[:port]>` to the orchestrator's
+environment. `docs/security-notes.md` lists what the UI does and does not
+protect against.
+
+## No browser viewer on this host
+
+The stack used to include a `viewer` service (stock `nginx:alpine` serving a
+hand-copied wasm bundle from `./viewer/space-viewer` on port 8098). It is gone:
+the browser viewer is a local development and agent-testing tool (`AGENTS.md`,
+`crates/space-viewer/README.md`), not part of the deployment.
+
+On a host that still runs the older compose file: copy this directory's
+`docker-compose.yaml` to `/home/proxy/stacks/space/`, run
+`docker compose up -d --remove-orphans` there (that stops and removes the
+`space-viewer` container), then delete `./viewer/` and the `VIEWER_PORT` line
+in `.env`.
+
+## Updating a host that runs the older compose file
+
+Images built from the online-only rework still start under the older compose
+file: the client ignores the removed scene flag in `CLIENT_ARGS=--galaxy` (with
+a warning in its log) and reconnects on its own, and orchestrator, shard and
+client all speak wire protocol 4 once Watchtower has pulled the three of them.
+Then, at your convenience, copy this directory's `docker-compose.yaml` and the
+new entries of `.env.example` to the host and run
+`docker compose up -d --remove-orphans`: that drops `--galaxy`, removes the old
+`viewer` container, and makes the scene and the web UI configurable.
+
 ## Client configuration
 
 The client image's ENTRYPOINT is a shell wrapper that runs
 `space-client --stream "$STREAM_BIND" [--server "$SPACE_SERVER"] $CLIENT_ARGS`,
 so the compose file sets those env vars (`STREAM_BIND=0.0.0.0:8099`,
-`SPACE_SERVER=172.29.0.11:7870`, `CLIENT_ARGS=--galaxy`) instead of a
+`SPACE_SERVER=172.29.0.11:7870`, `CLIENT_ARGS=` for extra flags) instead of a
 `command:` (which the wrapper would ignore).
 
-Note: the `client` service requires a GPU with `VK_KHR_acceleration_structure`
-(ray tracing). On hosts without one (e.g. software Vulkan such as lavapipe) it
-exits, and it is set to `restart: "no"` so it is not restarted (a crash loop
-would churn a new backend session each time). `orchestrator` and `shard-a` stay
-at `restart: unless-stopped`.
+Note: the `client` image renders on software Vulkan (lavapipe from Mesa 25,
+which has `VK_KHR_acceleration_structure`), so it needs no GPU. Should no usable
+Vulkan device be found it exits 1, and it is set to `restart: "no"` so that it is
+not restarted in a loop (each start would open a new backend session). While
+running it reconnects on its own when the shard restarts, and nothing a viewer
+sends can make it quit. `orchestrator` and `shard-a` stay at
+`restart: unless-stopped`.
 
 ## Network subnet
 
@@ -82,6 +131,8 @@ Actions:
 
 ## Verification status
 
-Compose and workflows are validated as YAML only; scripts are checked with
-`bash -n`. Nothing here has been run in the authoring sandbox (no Docker daemon,
-no access to the host).
+This compose file is checked with `docker compose config` against
+`.env.example`; scripts are checked with `bash -n`. It has not been run from the
+repository (it pulls the published images and belongs on the host). The images
+themselves, and the same topology in `../docker-compose.yaml`, have been built
+and run locally: see "What is and is not verified" in `../README.md`.

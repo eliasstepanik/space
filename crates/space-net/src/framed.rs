@@ -236,9 +236,29 @@ pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Message>, io::
         }
         filled += n;
     }
+    // The codec error is kept as the error's source (its text is unchanged),
+    // so the handshake can tell "this peer speaks another protocol version"
+    // from every other undecodable frame ([`frame_version_mismatch`]).
     space_protocol::decode_frame(&frame)
         .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// If `err` is [`read_frame`] refusing a frame because its **header** names
+/// another protocol version, the two versions: `(the frame's, ours)`.
+///
+/// Every frame carries the version in its header, so a peer built for another
+/// version cannot get a single frame through — not even the hello, and not
+/// even the `Reject` that would tell it why. The handshake uses this to turn
+/// that into what it is: a version mismatch, on both ends.
+pub(crate) fn frame_version_mismatch(err: &io::Error) -> Option<(u32, u32)> {
+    match err
+        .get_ref()?
+        .downcast_ref::<space_protocol::CodecError>()?
+    {
+        space_protocol::CodecError::VersionMismatch { seen, expected } => Some((*seen, *expected)),
+        _ => None,
+    }
 }
 
 /// `read_exact` that reports a clean end-of-stream *at a boundary* as `false`

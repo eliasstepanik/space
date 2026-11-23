@@ -4,7 +4,9 @@
 //
 // Inputs (all read with textureLoad, no samplers):
 //   scene_tex    rgba16f  opaque HDR scene (already fogged by the forward pass,
-//                          so reflected/refracted samples carry fog with them)
+//                          so reflected/refracted samples carry fog with them);
+//                          alpha 1 where an opaque surface was drawn, 0 where
+//                          there is none (empty, or only the painted background)
 //   depth_tex    d32f     depth: nearest surface, glass included. Reversed
 //                          (1 at the near plane, towards 0 with distance,
 //                          exactly 0 = nothing drawn), the same view_proj as
@@ -37,6 +39,7 @@ struct PostParams {
     refract_distance: f32, // metres the refracted ray travels behind the surface
     refract_eta: f32,      // IOR ratio entering the medium (air -> glass = 1 / 1.5)
     _pad0: f32,
+    environment: Environment, // the scene's surroundings (all zero: none)
 }
 
 const FEATURE_SSR: u32 = 2u;
@@ -51,6 +54,9 @@ const FEATURE_REFRACT: u32 = 4u;
 
 const METALLIC_MIN: f32 = 0.5;
 const REFINE_STEPS: u32 = 6u;
+// Refraction: a lookup closer to the frame's edge than this fraction of the
+// frame eases back to the unrefracted view (it is about to run out of picture).
+const REFRACT_EDGE_FADE: f32 = 0.05;
 
 fn size_i() -> vec2<i32> {
     return vec2<i32>(post.image_size);
@@ -217,11 +223,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is_glass = true;
                 // Refraction: continue the refracted ray `refract_distance`
                 // behind the surface and look the scene up where it lands.
+                // If the frame has nothing to show for that place — it is off
+                // screen, behind the camera, nearer than the glass, or no
+                // surface was drawn there — the glass shows what is straight
+                // behind it instead (always on screen): the view through it
+                // loses its bend there, never its content.
                 let n = surface_normal(p, view);
                 let t = refract(view, n, post.refract_eta);
                 let q = pos + t * post.refract_distance;
                 let hq = post.camera.view_proj * vec4(q, 1.0);
-                var bg = color; // fall back to the undistorted background
+                let straight = textureLoad(scene_tex, p, 0);
+                var seen = straight;
                 if hq.w > post.camera.forward.w {
                     let uvq = (hq.xy / hq.w) * 0.5 + vec2(0.5);
                     if all(uvq >= vec2(0.0)) && all(uvq < vec2(1.0)) {
@@ -232,9 +244,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         // (Reversed depth: farther means a smaller value.)
                         let behind = textureLoad(glass_tex, pq, 0).a > 0.0 || load_depth(pq) <= d;
                         if behind {
-                            bg = textureLoad(scene_tex, pq, 0).rgb;
+                            let found = textureLoad(scene_tex, pq, 0);
+                            // How far to trust it: not at all where no surface
+                            // was drawn (alpha 0), and less and less towards
+                            // the frame's edge, so that the view eases back to
+                            // the straight one instead of cutting to it.
+                            let edge = min(min(uvq.x, 1.0 - uvq.x), min(uvq.y, 1.0 - uvq.y));
+                            let trust = found.a * min(edge / REFRACT_EDGE_FADE, 1.0);
+                            if trust >= 1.0 {
+                                seen = found;
+                            } else {
+                                seen = mix(straight, found, trust);
+                            }
                         }
                     }
+                }
+                var bg = seen.rgb;
+                if post.environment.zenith.w > 0.0 {
+                    // Still alpha 0: there is no surface straight behind the
+                    // glass either. The ray leaves the scene into its
+                    // surroundings, which an environment gives a colour along
+                    // the refracted direction. (Without one, this is whatever
+                    // the frame's empty pixels hold: black.)
+                    bg = mix(env_radiance(post.environment, t), seen.rgb, seen.a);
                 }
                 let f = fresnel(0.04, dot(-view, n));
                 color = mix(bg, glass.rgb, clamp(f + (1.0 - glass.a), 0.0, 1.0));

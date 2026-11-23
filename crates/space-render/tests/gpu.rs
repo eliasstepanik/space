@@ -286,6 +286,7 @@ fn a_mesh_cube_renders_like_the_procedural_box() {
         metallic: 0.0,
         roughness: 0.45,
         emissive: [0.02, 0.03, 0.05],
+        base_color_texture: None,
     };
     let light = space_render::SceneLight {
         position: WorldPos::from_f64_metres_around(WorldPos::ZERO, [3.0, 4.0, 1.0]),
@@ -324,6 +325,7 @@ fn a_mesh_cube_renders_like_the_procedural_box() {
         .map(|(i, &position)| MeshVertex {
             position,
             normal: normals[i / 6],
+            uv: [0.0; 2],
         })
         .collect();
     let cube = MeshData {
@@ -334,6 +336,7 @@ fn a_mesh_cube_renders_like_the_procedural_box() {
             index_count: 36,
             material,
         }],
+        textures: Vec::new(),
         bounds_min: [-1.0; 3],
         bounds_max: [1.0; 3],
     };
@@ -1503,5 +1506,1903 @@ fn swapchain_without_surface_extension_is_a_clean_error() {
     match Swapchain::new(&ctx, handles, 64, 64) {
         Err(e) => assert!(e.to_string().contains("window_display"), "{e}"),
         Ok(_) => panic!("swapchain must not be created without surface extensions"),
+    }
+}
+
+// ---- textures, models in the ray-traced scene, shadows, the overlay ------------
+
+use std::sync::Arc;
+
+use space_render::{
+    MeshData, MeshMaterial, MeshPart, MeshVertex, ModelInstance, Overlay, SceneLight, Texture,
+    IDENTITY_ROTATION,
+};
+
+/// A rough, non-metallic material of `color`: lit by diffuse light alone, and
+/// never picked up by screen-space reflections.
+fn matte(color: [f32; 3]) -> MeshMaterial {
+    MeshMaterial {
+        base_color: color,
+        metallic: 0.0,
+        roughness: 1.0,
+        emissive: [0.0; 3],
+        base_color_texture: None,
+    }
+}
+
+/// A material that only glows.
+fn glowing(radiance: [f32; 3]) -> MeshMaterial {
+    MeshMaterial {
+        base_color: [0.0; 3],
+        metallic: 0.0,
+        roughness: 0.5,
+        emissive: radiance,
+        base_color_texture: None,
+    }
+}
+
+fn placed(mesh: &Arc<MeshData>, position: [f32; 3]) -> ModelInstance {
+    ModelInstance {
+        mesh: Arc::clone(mesh),
+        position,
+        rotation: IDENTITY_ROTATION,
+        scale: 1.0,
+    }
+}
+
+fn light_at(position: [f64; 3], intensity: f32) -> SceneLight {
+    SceneLight {
+        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, position),
+        color: [1.0, 1.0, 1.0],
+        intensity,
+    }
+}
+
+/// A matte grey floor: a huge box instance whose top face is the plane y = `y`.
+fn matte_floor(y: f32) -> GpuInstance {
+    GpuInstance {
+        center: [0.0, y - 100.0, 0.0, 100.0],
+        albedo: [0.8, 0.8, 0.8, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape: space_render::SHAPE_BOX,
+        transmission: 0.0,
+        _pad1: 0.0,
+    }
+}
+
+/// Render `scene` at `size` x `size` with `preset` and **no fog** (GI off), so
+/// that High and Medium differ from Low and Ci by reflections, refraction and
+/// shadows only. Asserts zero validation messages.
+fn render_clear(
+    ctx: &mut RenderContext,
+    scene: &Scene,
+    size: u32,
+    preset: QualityPreset,
+) -> space_render::FrameOutput {
+    let opts = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset,
+        fog_scale: 0.0,
+        ..Default::default()
+    };
+    let out = ctx.render_frame(scene, size, size, &opts).expect("render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    out
+}
+
+fn rgb(out: &space_render::FrameOutput, x: u32, y: u32) -> [u16; 3] {
+    let p = pixel(out, x, y);
+    [p[0], p[1], p[2]]
+}
+
+fn is_blue(p: [u16; 3]) -> bool {
+    p[2] > 60 && p[2] > 3 * p[0].max(p[1]).max(1)
+}
+
+fn is_dark(p: [u16; 3]) -> bool {
+    p.iter().all(|&c| c < 10)
+}
+
+fn is_bright(p: [u16; 3]) -> bool {
+    p.iter().all(|&c| c > 100)
+}
+
+/// A square facing the camera (+Z), `half` units from its centre to its
+/// edges, with its texture upright: UV (0, 0) is the corner that is top-left
+/// on screen, and the texture repeats `repeat` times across.
+fn facing_quad(half: f32, repeat: f32, material: MeshMaterial) -> MeshData {
+    let vertex = |x: f32, y: f32| MeshVertex {
+        position: [x * half, y * half, 0.0],
+        normal: [0.0, 0.0, 1.0],
+        uv: [(x + 1.0) * 0.5 * repeat, (1.0 - y) * 0.5 * repeat],
+    };
+    MeshData {
+        // Top-left, top-right, bottom-right, bottom-left.
+        vertices: vec![
+            vertex(-1.0, 1.0),
+            vertex(1.0, 1.0),
+            vertex(1.0, -1.0),
+            vertex(-1.0, -1.0),
+        ],
+        indices: vec![0, 3, 2, 0, 2, 1],
+        parts: vec![MeshPart {
+            first_index: 0,
+            index_count: 6,
+            material,
+        }],
+        textures: Vec::new(),
+        bounds_min: [-half, -half, 0.0],
+        bounds_max: [half, half, 0.0],
+    }
+}
+
+/// Base-colour textures: a quad facing the camera shows its texture upright
+/// and where its texture coordinates put it — the four differently coloured
+/// texels of a 2x2 image in the four quadrants, a 4x4 checker cell by cell,
+/// twice as many cells when the coordinates run 0..2 (the sampler repeats) —
+/// multiplied with the material's base-colour factor; the image survives a GLB
+/// round trip pixel for pixel; and a fine pattern seen from far away averages
+/// out through the mip chain, in linear light, instead of aliasing.
+/// Mutation: the same quad without the texture is a flat colour.
+#[test]
+fn a_textured_quad_shows_its_texture_where_the_uvs_put_it() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128u32;
+    let camera = post_camera();
+    // The quad: 3 m across, 4 m away. On a 128-pixel frame with a 60 degree
+    // field of view it spans 1.5 / (4 tan 30) = 0.65 of the half-frame:
+    // pixels 22.4 .. 105.6 in x and y.
+    let (left, span) = (22.43f32, 83.14f32);
+    let cell_centre = |i: u32, cells: u32| (left + (i as f32 + 0.5) * span / cells as f32) as u32;
+    let scene_with = |mesh: MeshData, distance: f32, intensity: f32| {
+        // The light is at the camera, so the whole quad is evenly lit.
+        let mut scene = Scene::from_instances(camera, Vec::new())
+            .with_lights(vec![light_at([0.0, 0.0, 0.0], intensity)]);
+        scene
+            .models
+            .push(placed(&Arc::new(mesh), [0.0, 0.0, -distance]));
+        scene
+    };
+    let textured = |texture: Texture, repeat: f32, factor: [f32; 3]| {
+        let mut quad = facing_quad(1.5, repeat, matte(factor));
+        quad.parts[0].material.base_color_texture = Some(quad.add_texture(texture));
+        quad
+    };
+    let mut render = |mesh: MeshData| {
+        let out = ctx
+            .render_frame(&scene_with(mesh, 4.0, 40.0), size, size, &ci_options())
+            .expect("textured render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        out
+    };
+
+    // Orientation: four texels, four colours. Row 0 of the image is the top.
+    let corners = Texture::from_rgba8(
+        2,
+        2,
+        vec![
+            255, 0, 0, 255, /* */ 0, 255, 0, 255, //
+            0, 0, 255, 255, /* */ 255, 255, 255, 255,
+        ],
+    )
+    .expect("a 2x2 texture");
+    let out = render(textured(corners, 1.0, [1.0; 3]));
+    let (near, far) = (cell_centre(0, 2), cell_centre(1, 2));
+    let (top_left, top_right) = (rgb(&out, near, near), rgb(&out, far, near));
+    let (bottom_left, bottom_right) = (rgb(&out, near, far), rgb(&out, far, far));
+    eprintln!("2x2: {top_left:?} {top_right:?} / {bottom_left:?} {bottom_right:?}");
+    assert!(is_red(top_left), "top-left texel is red: {top_left:?}");
+    assert!(is_green(top_right), "top-right is green: {top_right:?}");
+    assert!(is_blue(bottom_left), "bottom-left is blue: {bottom_left:?}");
+    assert!(
+        is_bright(bottom_right),
+        "bottom-right is white: {bottom_right:?}"
+    );
+    // Outside the quad nothing is drawn.
+    assert_eq!(rgb(&out, 10, 64), [0, 0, 0]);
+
+    // A 4x4 checker, cell by cell; the cell at the UV origin is the first colour.
+    let (red, blue) = ([255, 0, 0], [0, 0, 255]);
+    let checker = || Texture::checkerboard(64, 4, red, blue);
+    let check_cells = |out: &space_render::FrameOutput, cells: u32, what: &str| {
+        for j in 0..cells {
+            for i in 0..cells {
+                let p = rgb(out, cell_centre(i, cells), cell_centre(j, cells));
+                let ok = if (i + j) % 2 == 0 {
+                    is_red(p)
+                } else {
+                    is_blue(p)
+                };
+                assert!(ok, "{what}: cell ({i}, {j}) is {p:?}");
+            }
+        }
+    };
+    let once = render(textured(checker(), 1.0, [1.0; 3]));
+    check_cells(&once, 4, "checker");
+    // Coordinates 0..2: the texture repeats, 8x8 cells.
+    let twice = render(textured(checker(), 2.0, [1.0; 3]));
+    check_cells(&twice, 8, "repeated checker");
+    assert!(once.pixels != twice.pixels);
+
+    // The base-colour factor multiplies the texture: no red factor, no red cells.
+    let tinted = render(textured(checker(), 1.0, [0.0, 1.0, 1.0]));
+    let (was_red, still_blue) = (
+        rgb(&tinted, cell_centre(0, 4), cell_centre(0, 4)),
+        rgb(&tinted, cell_centre(1, 4), cell_centre(0, 4)),
+    );
+    // (All that is left of a red texel under a cyan factor is the faint
+    // white specular term.)
+    assert!(
+        was_red.iter().all(|&c| c < 30),
+        "red texel x cyan factor has no colour left: {was_red:?}"
+    );
+    assert!(is_blue(still_blue), "{still_blue:?}");
+
+    // Through a GLB file and back: the same picture, pixel for pixel.
+    let reloaded = MeshData::from_glb(&textured(checker(), 1.0, [1.0; 3]).to_glb())
+        .expect("the textured quad round-trips");
+    assert_eq!(reloaded.textures.len(), 1);
+    assert!(
+        render(reloaded).pixels == once.pixels,
+        "GLB round trip changed the image"
+    );
+
+    // MUTATION CHECK: without the texture the quad is one flat colour, so the
+    // pattern above can only come from the sampled image.
+    let plain = render(facing_quad(1.5, 1.0, matte([1.0; 3])));
+    let (a, b) = (
+        rgb(&plain, cell_centre(0, 4), cell_centre(0, 4)),
+        rgb(&plain, cell_centre(1, 4), cell_centre(0, 4)),
+    );
+    assert!(
+        is_bright(a) && (0..3).all(|c| a[c].abs_diff(b[c]) <= 6),
+        "{a:?} vs {b:?}"
+    );
+
+    // Mip-mapping: the quad 40 m away is 8 pixels across, so a checker of
+    // 2-texel cells (64 texels across) is far below the pixel grid. Sampled
+    // from the mip chain it is a flat grey — the same grey as a texture of
+    // the checker's average *in linear light* (sRGB 188, not 128) — rather
+    // than a moire of black and white pixels.
+    let mut far_render = |texture: Texture| {
+        let out = ctx
+            .render_frame(
+                &scene_with(textured(texture, 1.0, [1.0; 3]), 40.0, 4000.0),
+                size,
+                size,
+                &ci_options(),
+            )
+            .expect("far render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        out
+    };
+    let fine = far_render(Texture::checkerboard(64, 32, [255; 3], [0; 3]));
+    let grey = far_render(Texture::solid([188; 3]));
+    let mut seen = 0;
+    for y in 62..66 {
+        for x in 62..66 {
+            let (p, q) = (rgb(&fine, x, y), rgb(&grey, x, y));
+            assert!(
+                q[0] > 60 && q[0] < 250,
+                "the grey reference is mid-range: {q:?}"
+            );
+            assert!(
+                (0..3).all(|c| p[c].abs_diff(q[c]) <= 4),
+                "minified checker at ({x}, {y}) is {p:?}, the linear-light average is {q:?}"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 16);
+}
+
+/// The shadow test scene: a matte floor at y = -4 and a point light 7 m above
+/// it at (0, 3, -8), with whatever `models` and extra `instances` are given.
+///
+/// Seen by `post_camera` on a 128-pixel frame, the floor point straight below
+/// the light is at pixel row ~119 behind anything standing there, and the
+/// floor in front of it, at z = -7.33, is row 124.
+fn shadow_scene(models: Vec<ModelInstance>, extra: Vec<GpuInstance>) -> Scene {
+    let mut instances = vec![matte_floor(-4.0)];
+    instances.extend(extra);
+    let mut scene = Scene::from_instances(post_camera(), instances)
+        .with_lights(vec![light_at([0.0, 3.0, -8.0], 400.0)]);
+    scene.models = models;
+    scene
+}
+
+/// Ray-traced shadows with a mesh model in the scene. A 2 m cube (a *mesh*)
+/// stands under the light, its top 4.5 m below it and the floor 7 m below, so
+/// its shadow on the floor is a square reaching 7 / 4.5 = 1.56 m from the
+/// centre:
+///
+/// * the floor in front of the cube, inside that square, is black with
+///   shadows on (High, Medium) and lit with them off (Low, Ci);
+/// * the shadow ends where the geometry says it does;
+/// * floor outside the shadow, and the cube's lit top, look the same with and
+///   without shadows (no self-shadowing, no darkening);
+/// * the model *receives* shadows too: a sphere between the light and the
+///   cube darkens the cube's top.
+///
+/// Mutation: without the cube (same preset) the floor is lit there, so the
+/// shadow comes from the model's acceleration structure and nothing else.
+#[test]
+fn a_model_casts_a_shadow_on_the_floor_and_receives_one() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let cube = Arc::new(MeshData::cuboid([1.0; 3], 1.0, matte([0.8; 3])));
+    let cube_at = || vec![placed(&cube, [0.0, -2.5, -8.0])];
+    let scene = shadow_scene(cube_at(), Vec::new());
+    assert!(ctx.shadows_active(
+        &scene,
+        &RenderOptions {
+            preset: QualityPreset::High,
+            ..ci_options()
+        }
+    ));
+    assert!(!ctx.shadows_active(&scene, &ci_options()));
+
+    // Row 124 is the floor 7.33 m ahead; the shadow there is 1.56 m to either
+    // side of the centre line, i.e. 23.5 pixels: columns 40.5 .. 87.5.
+    let (in_shadow, lit_floor, cube_top) = ((64, 124), (16, 124), (64, 85));
+    let shadow_edge = [
+        ((45, 124), true),
+        ((36, 124), false),
+        ((83, 124), true),
+        ((92, 124), false),
+    ];
+
+    let unshadowed = render_clear(&mut ctx, &scene, size, QualityPreset::Low);
+    for (x, y) in [in_shadow, lit_floor, cube_top] {
+        let p = rgb(&unshadowed, x, y);
+        assert!(is_bright(p), "without shadows ({x}, {y}) is lit: {p:?}");
+    }
+    assert!(
+        render_clear(&mut ctx, &scene, size, QualityPreset::Ci).pixels == unshadowed.pixels,
+        "Low and Ci both have shadows off"
+    );
+
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_clear(&mut ctx, &scene, size, preset);
+        let shadow = rgb(&out, in_shadow.0, in_shadow.1);
+        assert!(
+            is_dark(shadow),
+            "{preset}: the floor under the cube is {shadow:?}"
+        );
+        for ((x, y), dark) in shadow_edge {
+            let p = rgb(&out, x, y);
+            assert_eq!(is_dark(p), dark, "{preset}: floor at ({x}, {y}) is {p:?}");
+            assert!(dark || is_bright(p), "{preset}: ({x}, {y}) is {p:?}");
+        }
+        // Lit surfaces are exactly as bright as without shadows.
+        for (x, y) in [lit_floor, cube_top] {
+            let (a, b) = (rgb(&out, x, y), rgb(&unshadowed, x, y));
+            assert!(
+                (0..3).all(|c| a[c].abs_diff(b[c]) <= 2),
+                "{preset}: lit pixel ({x}, {y}) changed: {a:?} vs {b:?}"
+            );
+        }
+        // How much of the frame went dark: only a shadow-sized part of it.
+        let darkened = (0..size)
+            .flat_map(|y| (0..size).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_bright(rgb(&unshadowed, x, y)) && is_dark(rgb(&out, x, y)))
+            .count();
+        eprintln!("{preset}: {darkened} pixels in the cube's shadow");
+        assert!((150..1200).contains(&darkened), "{preset}: {darkened} px");
+    }
+
+    // MUTATION CHECK: no cube, no shadow.
+    let bare = render_clear(
+        &mut ctx,
+        &shadow_scene(Vec::new(), Vec::new()),
+        size,
+        QualityPreset::High,
+    );
+    let p = rgb(&bare, in_shadow.0, in_shadow.1);
+    assert!(is_bright(p), "without the model the floor is lit: {p:?}");
+
+    // The model receives a shadow: a sphere 2.5 m under the light.
+    let occluder = GpuInstance {
+        center: [0.0, 0.5, -8.0, 0.6],
+        albedo: [0.8, 0.8, 0.8, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    let shaded = shadow_scene(cube_at(), vec![occluder]);
+    let high = render_clear(&mut ctx, &shaded, size, QualityPreset::High);
+    let low = render_clear(&mut ctx, &shaded, size, QualityPreset::Low);
+    let (dark, lit) = (
+        rgb(&high, cube_top.0, cube_top.1),
+        rgb(&low, cube_top.0, cube_top.1),
+    );
+    assert!(
+        is_dark(dark),
+        "the sphere's shadow falls on the cube's top: {dark:?}"
+    );
+    assert!(
+        is_bright(lit),
+        "shadows off: the cube's top is lit: {lit:?}"
+    );
+
+    // Glass casts no shadow: the same sphere, transmissive.
+    let glass = GpuInstance {
+        transmission: 1.0,
+        ..occluder
+    };
+    let through = render_clear(
+        &mut ctx,
+        &shadow_scene(cube_at(), vec![glass]),
+        size,
+        QualityPreset::High,
+    );
+    let p = rgb(&through, cube_top.0, cube_top.1);
+    assert!(
+        is_bright(p),
+        "a glass sphere leaves the cube's top lit: {p:?}"
+    );
+}
+
+/// An open mesh — a single-sided plane with no thickness — blocks light from
+/// both of its sides (its top-level instance is flagged two-sided), and the
+/// start offset of the shadow rays keeps it from shadowing itself.
+#[test]
+fn an_open_mesh_casts_shadows_from_both_sides() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let plane = Arc::new(MeshData::plane([1.0, 1.0], [1.0, 1.0], matte([0.8; 3])));
+    assert!(!plane.is_closed());
+    // 5 m under the light and 2 m over the floor: the shadow reaches 1.4 m.
+    let facing_up = placed(&plane, [0.0, -2.0, -8.0]);
+    let facing_down = ModelInstance {
+        // Half a turn about X.
+        rotation: [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
+        ..facing_up.clone()
+    };
+    let (in_shadow, lit_floor, on_plane) = ((64, 124), (16, 124), (64, 92));
+    for (name, model) in [
+        ("facing the light", facing_up),
+        ("facing away", facing_down),
+    ] {
+        let scene = shadow_scene(vec![model], Vec::new());
+        let high = render_clear(&mut ctx, &scene, size, QualityPreset::High);
+        let low = render_clear(&mut ctx, &scene, size, QualityPreset::Low);
+        let (shadow, was) = (
+            rgb(&high, in_shadow.0, in_shadow.1),
+            rgb(&low, in_shadow.0, in_shadow.1),
+        );
+        assert!(
+            is_dark(shadow) && is_bright(was),
+            "{name}: {shadow:?} (unshadowed {was:?})"
+        );
+        let p = rgb(&high, lit_floor.0, lit_floor.1);
+        assert!(is_bright(p), "{name}: floor beside the shadow is {p:?}");
+        // The plane itself, where it faces the light, is lit: not shadowed
+        // by its own triangles.
+        if name == "facing the light" {
+            let (a, b) = (
+                rgb(&high, on_plane.0, on_plane.1),
+                rgb(&low, on_plane.0, on_plane.1),
+            );
+            assert!(is_bright(a), "{name}: the plane's lit side is {a:?}");
+            assert!((0..3).all(|c| a[c].abs_diff(b[c]) <= 2), "{a:?} vs {b:?}");
+        }
+    }
+}
+
+/// Shadow rays treat every closed solid as single-sided: a ray is stopped by
+/// a face it *enters* a solid through, never by one it leaves through. Two
+/// consequences, both of which fail with the facing rule the wrong way round
+/// (or with no culling at all):
+///
+/// * a light outside an enclosing box still lights what is inside the box
+///   (the ray from the surface to the light only ever leaves the box);
+/// * a sphere a few pixels across is not shadowed by itself, although it is
+///   rasterised as a bare icosahedron whose faces lie *inside* the finer
+///   sphere that is ray traced.
+#[test]
+fn shadow_rays_ignore_the_faces_they_leave_a_solid_through() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let ball = |center: [f32; 3], radius: f32| GpuInstance {
+        center: [center[0], center[1], center[2], radius],
+        albedo: [0.8, 0.8, 0.8, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+
+    // The camera and a ball inside a 20 m box; the light 30 m behind the
+    // camera, outside it.
+    let room = GpuInstance {
+        center: [0.0, 0.0, 0.0, 10.0],
+        shape: space_render::SHAPE_BOX,
+        ..ball([0.0; 3], 0.0)
+    };
+    let inside = Scene::from_instances(post_camera(), vec![room, ball([0.0, 0.0, -4.0], 1.0)])
+        .with_lights(vec![light_at([0.0, 0.0, 30.0], 4000.0)]);
+    let high = render_clear(&mut ctx, &inside, size, QualityPreset::High);
+    let low = render_clear(&mut ctx, &inside, size, QualityPreset::Low);
+    let (a, b) = (rgb(&high, 64, 64), rgb(&low, 64, 64));
+    eprintln!("ball inside the box: shadows on {a:?}, off {b:?}");
+    assert!(b[0] > 80, "the ball is lit without shadows: {b:?}");
+    assert!(
+        (0..3).all(|c| a[c].abs_diff(b[c]) <= 2),
+        "the box's far wall must not shadow its inside: {a:?} vs {b:?}"
+    );
+
+    // A ball 22 m away is about 5 pixels in radius: drawn as an icosahedron.
+    let small = Scene::from_instances(post_camera(), vec![ball([0.0, 0.0, -22.0], 1.0)])
+        .with_lights(vec![light_at([6.0, 6.0, 0.0], 3000.0)]);
+    let high = render_clear(&mut ctx, &small, size, QualityPreset::High);
+    let low = render_clear(&mut ctx, &small, size, QualityPreset::Low);
+    let (with, without) = (brightness_sum(&high), brightness_sum(&low));
+    eprintln!("small ball: brightness {with} with shadows, {without} without");
+    assert!(without > 5_000, "the small ball is visible: {without}");
+    assert!(
+        with.abs_diff(without) * 50 <= without,
+        "a small sphere must not shadow itself: {with} vs {without}"
+    );
+}
+
+/// A sphere or box instance that contains a light casts no shadow from it —
+/// it is the lamp around the bulb (the Sun around the solar system's point
+/// light) — while the same body with the light outside it does.
+#[test]
+fn a_body_around_a_light_does_not_block_it() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let lamp = |center: [f32; 3]| GpuInstance {
+        center: [center[0], center[1], center[2], 0.5],
+        albedo: [1.0, 1.0, 1.0, 0.0],
+        emissive: [3.0, 3.0, 3.0, 1.0],
+        roughness: 0.5,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    };
+    // Around the light: the floor below is lit as if the lamp were not there.
+    let around = shadow_scene(Vec::new(), vec![lamp([0.0, 3.0, -8.0])]);
+    let p = rgb(
+        &render_clear(&mut ctx, &around, size, QualityPreset::High),
+        64,
+        124,
+    );
+    assert!(
+        is_bright(p),
+        "the lamp around the light lets it through: {p:?}"
+    );
+    // A metre below the light: an ordinary occluder, with a shadow under it.
+    let below = shadow_scene(Vec::new(), vec![lamp([0.0, 2.0, -8.0])]);
+    let p = rgb(
+        &render_clear(&mut ctx, &below, size, QualityPreset::High),
+        64,
+        124,
+    );
+    assert!(
+        is_dark(p),
+        "the same sphere below the light casts a shadow: {p:?}"
+    );
+}
+
+/// A mesh model shows up in screen-space reflections like any other surface:
+/// a glowing red cube (a mesh) hovering over the mirror floor of
+/// `mirror_scene` is reflected where mirror geometry predicts.
+/// Mutation: no model, or the post pass off (`Ci`), and the floor is black.
+#[test]
+fn a_model_is_visible_in_a_mirror_reflection() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    // The floor of `mirror_scene` (y = -1), without its sphere.
+    let mut scene = mirror_scene(0.1);
+    scene.instances.truncate(1);
+    let empty = Scene::from_instances(scene.camera, scene.instances.clone());
+    // A 0.8 m cube from y = -0.8 to 0: its mirror image spans y = -2 .. -1.2,
+    // centred on (0, -1.6, -6): row ~93.6 of 128, column 64, like the sphere's.
+    let cube = Arc::new(MeshData::cuboid([0.4; 3], 1.0, glowing([6.0, 0.0, 0.0])));
+    scene.models.push(placed(&cube, [0.0, -0.4, -6.0]));
+
+    let reflection_rows = 84..size;
+    let ci = render_preset(&mut ctx, &scene, size, QualityPreset::Ci);
+    let direct = centroid(&ci, 0..82, is_red).expect("the cube itself is visible");
+    assert!(
+        (direct.1 - 64.0).abs() < 1.0,
+        "direct cube centroid {direct:?}"
+    );
+    assert!(
+        centroid(&ci, reflection_rows.clone(), is_red).is_none(),
+        "no post pass, no reflection"
+    );
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_preset(&mut ctx, &scene, size, preset);
+        let (n, cx, cy) = centroid(&out, reflection_rows.clone(), is_red)
+            .unwrap_or_else(|| panic!("{preset}: the model is not reflected"));
+        eprintln!("{preset}: model reflection n={n} centroid=({cx:.1},{cy:.1})");
+        assert!(n >= 60, "{preset}: reflection too small ({n} px)");
+        assert!(
+            (cx - 64.0).abs() <= 2.5 && (86.0..100.0).contains(&cy),
+            "{preset}: reflection centroid ({cx:.1},{cy:.1}) vs mirror prediction (64, ~93)"
+        );
+        // MUTATION CHECK: no model, nothing to reflect.
+        let bare = render_preset(&mut ctx, &empty, size, preset);
+        assert!(centroid(&bare, 0..size, is_red).is_none(), "{preset}");
+    }
+}
+
+/// A mesh model is seen through glass: the green marker of
+/// `refraction_scene`, as a mesh cube, hidden behind the lens with refraction
+/// off and visible through it — displaced outwards, as a convex lens does —
+/// with refraction on.
+#[test]
+fn a_model_is_seen_through_glass() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let marker = Arc::new(MeshData::cuboid([0.5; 3], 1.0, glowing([0.0, 6.0, 0.0])));
+    let scene_with = |with_glass: bool| {
+        // `refraction_scene` lists its marker sphere first: replace it.
+        let mut scene = refraction_scene(with_glass);
+        scene.instances.remove(0);
+        scene.models.push(placed(&marker, [1.6, 0.0, -9.0]));
+        scene
+    };
+    let (glass, bare) = (scene_with(true), scene_with(false));
+    assert_eq!((glass.instances.len(), bare.instances.len()), (1, 0));
+
+    let reference = render_preset(&mut ctx, &bare, size, QualityPreset::High);
+    let (ref_n, ref_x, ref_y) =
+        centroid(&reference, 0..size, is_green).expect("marker visible without glass");
+    for preset in [QualityPreset::Ci, QualityPreset::Low] {
+        let off = render_preset(&mut ctx, &glass, size, preset);
+        assert!(
+            centroid(&off, 0..size, is_green).is_none(),
+            "{preset}: the opaque lens hides the model"
+        );
+    }
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let out = render_preset(&mut ctx, &glass, size, preset);
+        let (n, x, y) = centroid(&out, 0..size, is_green)
+            .unwrap_or_else(|| panic!("{preset}: the model is not visible through the glass"));
+        eprintln!(
+            "{preset}: model through glass n={n} centroid=({x:.2},{y:.2}); \
+             reference n={ref_n} ({ref_x:.2},{ref_y:.2})"
+        );
+        assert!(n >= 100, "{preset}: only {n} px of the model show through");
+        assert!(
+            x > ref_x + 1.0,
+            "{preset}: the lens should displace the model outwards: {x:.2} vs {ref_x:.2}"
+        );
+        assert!((y - ref_y).abs() < 1.5, "{preset}: {y:.2} vs {ref_y:.2}");
+    }
+}
+
+/// A model is in the ray-traced scene exactly where it is drawn: the
+/// character — turned, scaled and moved off-axis — has the same outline in
+/// the forward pass (vertex buffers, model matrix) and in the raw ray probe
+/// (its bottom-level structure, one geometry per part, and its top-level
+/// instance transform). A wrong index offset, part range or matrix moves one
+/// outline but not the other.
+/// Mutation: without the model the ray probe hits nothing.
+#[test]
+fn a_model_has_the_same_outline_rasterised_and_ray_traced() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 160u32;
+    // Every part glowing, so the rasterised silhouette is simply "not black".
+    let mut glowing_character = space_render::sample_character();
+    for part in &mut glowing_character.parts {
+        part.material = glowing([4.0; 3]);
+    }
+    let character = Arc::new(glowing_character);
+    let ship = Arc::new({
+        let mut ship = space_render::sample_ship();
+        for part in &mut ship.parts {
+            part.material = glowing([4.0; 3]);
+        }
+        ship
+    });
+    let probe = RenderOptions {
+        ray_probe: true,
+        ..ci_options()
+    };
+    for (name, model) in [
+        (
+            "character",
+            ModelInstance {
+                mesh: Arc::clone(&character),
+                position: [0.4, -1.3, -3.2],
+                rotation: space_render::rotation_y(0.7),
+                scale: 1.3,
+            },
+        ),
+        (
+            "ship",
+            ModelInstance {
+                mesh: Arc::clone(&ship),
+                position: [-0.5, 0.3, -6.0],
+                rotation: space_render::rotation_y(-1.1),
+                scale: 0.8,
+            },
+        ),
+    ] {
+        let mut scene = Scene::from_instances(post_camera(), Vec::new());
+        scene.models.push(model);
+        let raster = ctx
+            .render_frame(&scene, size, size, &ci_options())
+            .expect("forward render");
+        let traced = ctx
+            .render_frame(&scene, size, size, &probe)
+            .expect("ray-probe render");
+        assert_eq!(raster.validation_messages, 0, "{name}: forward");
+        assert_eq!(traced.validation_messages, 0, "{name}: ray probe");
+        let lit: Vec<bool> = raster
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[0] > 8)
+            .collect();
+        let hit: Vec<bool> = traced
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[0] > 128)
+            .collect();
+        let covered = lit.iter().filter(|&&l| l).count();
+        let differing = lit.iter().zip(&hit).filter(|(l, h)| l != h).count();
+        eprintln!("{name}: {covered} lit pixels, {differing} differ from the ray-traced outline");
+        assert!(covered > 1000, "{name}: too small to compare ({covered})");
+        // Only outline pixels may differ (an edge crossing a pixel resolves
+        // differently when rasterised and when ray cast).
+        assert!(
+            differing * 25 < covered,
+            "{name}: outlines differ in {differing} of {covered} pixels"
+        );
+    }
+    // MUTATION CHECK: no model, no hits.
+    let empty = Scene::from_instances(post_camera(), Vec::new());
+    let traced = ctx
+        .render_frame(&empty, size, size, &probe)
+        .expect("empty ray-probe render");
+    assert!(traced.pixels.as_chunks::<4>().0.iter().all(|p| p[0] < 40));
+}
+
+/// Probe GI sees mesh models: an emissive model lights the receiver of
+/// `gi_scene` like the emissive sphere does, by the radiance of the *part*
+/// the rays hit; a non-emissive model emits nothing; and a model between the
+/// probes and an emitter blocks its light.
+#[test]
+fn probe_gi_sees_mesh_models() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 64;
+    let options = RenderOptions {
+        gi_enabled: true,
+        quality: gi_quality(),
+        ..Default::default()
+    };
+    let mut centre = |scene: &Scene| {
+        let out = ctx
+            .render_frame(scene, size, size, &options)
+            .expect("GI render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        rgb(&out, size / 2, size / 2)
+    };
+    // The receiver box of `gi_scene`, without its emissive sphere.
+    let receiver_only = || {
+        let mut scene = gi_scene(size, size);
+        scene.instances.truncate(1);
+        scene
+    };
+    // A slab behind the camera, where the sphere was: two parts, the first
+    // dark, the second — the one facing the probes — glowing green. A ray
+    // that looked its part up wrongly would find black.
+    let slab = |front: MeshMaterial| {
+        let mut back = MeshData::cuboid([6.0, 6.0, 0.5], 1.0, matte([0.5; 3]));
+        // The cuboid's faces come in the order -x, +x, -y, +y, -z, +z, six
+        // indices each: the -z face (towards the probes) is the fifth.
+        back.parts = vec![
+            MeshPart {
+                first_index: 0,
+                index_count: 24,
+                material: matte([0.5; 3]),
+            },
+            MeshPart {
+                first_index: 24,
+                index_count: 6,
+                material: front,
+            },
+            MeshPart {
+                first_index: 30,
+                index_count: 6,
+                material: matte([0.5; 3]),
+            },
+        ];
+        Arc::new(back)
+    };
+    let mut emitter = receiver_only();
+    emitter
+        .models
+        .push(placed(&slab(glowing([0.0, 10.0, 0.0])), [0.0, 0.0, 8.0]));
+    let lit = centre(&emitter);
+    assert!(
+        lit[1] > 60 && lit[1] > 3 * lit[0].max(lit[2]).max(1),
+        "the model's glowing part lights the receiver green: {lit:?}"
+    );
+
+    // MUTATION CHECK: the same slab without the glow lights nothing.
+    let mut dull = receiver_only();
+    dull.models
+        .push(placed(&slab(matte([0.5; 3])), [0.0, 0.0, 8.0]));
+    let dark = centre(&dull);
+    assert!(
+        is_dark(dark),
+        "a non-emissive model emits nothing: {dark:?}"
+    );
+
+    // Occlusion: the full `gi_scene` (emissive sphere behind the camera) with
+    // a thin wall, a mesh, between the probes (z <= 3.5) and the sphere
+    // (z >= 4).
+    let open = gi_scene(size, size);
+    let unblocked = centre(&open);
+    assert!(
+        unblocked[0] > 60,
+        "the sphere lights the receiver: {unblocked:?}"
+    );
+    let mut walled = gi_scene(size, size);
+    let wall = Arc::new(MeshData::cuboid([30.0, 30.0, 0.05], 1.0, matte([0.5; 3])));
+    walled.models.push(placed(&wall, [0.0, 0.0, 3.8]));
+    let blocked = centre(&walled);
+    assert!(is_dark(blocked), "the wall blocks the emitter: {blocked:?}");
+}
+
+/// A model's GPU resources are created once: its buffers and textures when a
+/// frame first draws it, its acceleration structure when a frame that traces
+/// rays first draws it — and never again while consecutive frames keep
+/// drawing it, whatever the preset. Two placements of one mesh share them.
+#[test]
+fn a_model_is_uploaded_once_and_its_blas_built_once() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 64;
+    let character = Arc::new(space_render::sample_character());
+    let ship = Arc::new(space_render::sample_ship());
+    let mut scene = shadow_scene(
+        vec![
+            placed(&character, [-1.0, -4.0, -8.0]),
+            placed(&character, [1.0, -4.0, -8.0]),
+            placed(&ship, [0.0, -1.0, -9.0]),
+        ],
+        Vec::new(),
+    );
+    let stats = |ctx: &RenderContext| {
+        let s = ctx.model_cache_stats();
+        (s.cached, s.uploads, s.blas_builds)
+    };
+    assert_eq!(stats(&ctx), (0, 0, 0));
+    // No rays (Ci, GI off): uploaded, but no acceleration structure yet.
+    for _ in 0..3 {
+        render_clear(&mut ctx, &scene, size, QualityPreset::Ci);
+    }
+    assert_eq!(stats(&ctx), (2, 2, 0));
+    // Shadows, GI, the ray probe, more frames, other presets: two BLASes,
+    // built once.
+    for _ in 0..3 {
+        render_clear(&mut ctx, &scene, size, QualityPreset::High);
+    }
+    assert_eq!(stats(&ctx), (2, 2, 2));
+    let gi = RenderOptions {
+        gi_enabled: true,
+        quality: gi_quality(),
+        ..Default::default()
+    };
+    for options in [
+        gi,
+        RenderOptions {
+            ray_probe: true,
+            ..ci_options()
+        },
+        ci_options(),
+    ] {
+        let out = ctx
+            .render_frame(&scene, size, size, &options)
+            .expect("render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        render_clear(&mut ctx, &scene, size, QualityPreset::Medium);
+    }
+    assert_eq!(stats(&ctx), (2, 2, 2));
+    // A model the scene no longer draws is dropped; coming back, it is
+    // uploaded (and its BLAS built) again.
+    scene.models.pop();
+    render_clear(&mut ctx, &scene, size, QualityPreset::High);
+    assert_eq!(stats(&ctx), (1, 2, 2));
+    scene.models.push(placed(&ship, [0.0, -1.0, -9.0]));
+    render_clear(&mut ctx, &scene, size, QualityPreset::High);
+    assert_eq!(stats(&ctx), (2, 3, 3));
+}
+
+/// The overlay: rectangles and text in the built-in font land on exactly the
+/// pixels they name, on top of the finished frame — opaque ones replace it,
+/// translucent ones blend with it, later ones cover earlier ones, anything
+/// off-frame is clipped — untouched by exposure, identical in the ray-probe
+/// path, right again after the frame size changes, and gone (the frame bit
+/// for bit what it was) when the overlay is empty.
+#[test]
+fn the_overlay_draws_text_and_rectangles_over_the_finished_frame() {
+    use space_render::overlay::{glyph_pixel, GLYPH_ADVANCE, LINE_ADVANCE};
+
+    let Some(mut ctx) = context() else { return };
+    let (yellow, red_half, blue_quarter, green) = (
+        [1.0, 1.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 0.5],
+        [0.0, 0.0, 1.0, 0.25],
+        [0.0, 1.0, 0.0, 1.0],
+    );
+    let text = "Ab1.:\n7_";
+    let (text_x, text_y, scale) = (4u32, 3u32, 2u32);
+    let draw = |overlay: &mut Overlay| {
+        overlay.text(text_x as f32, text_y as f32, scale, yellow, text);
+        // Over the bright sphere, over the black background, and half
+        // off the frame's bottom-left corner.
+        overlay.rect(40.0, 26.0, 16.0, 12.0, red_half);
+        overlay.rect(70.0, 50.0, 10.0, 10.0, blue_quarter);
+        overlay.rect(-5.0, 40.0, 10.0, 100.0, green);
+        // Later rectangles cover earlier ones.
+        overlay.rect(50.0, 30.0, 4.0, 4.0, green);
+    };
+    // What the overlay should do to pixel (x, y) of a frame: the colours to
+    // blend over it, in order.
+    let layers_at = |x: u32, y: u32| -> Vec<[f32; 4]> {
+        let mut layers = Vec::new();
+        let inside = |rx: i64, ry: i64, w: i64, h: i64| {
+            let (x, y) = (i64::from(x), i64::from(y));
+            x >= rx && x < rx + w && y >= ry && y < ry + h
+        };
+        for (line, row_text) in text.split('\n').enumerate() {
+            for (column, ch) in row_text.chars().enumerate() {
+                let gx0 = text_x + column as u32 * GLYPH_ADVANCE * scale;
+                let gy0 = text_y + line as u32 * LINE_ADVANCE * scale;
+                if x >= gx0 && y >= gy0 && glyph_pixel(ch, (x - gx0) / scale, (y - gy0) / scale) {
+                    layers.push(yellow);
+                }
+            }
+        }
+        if inside(40, 26, 16, 12) {
+            layers.push(red_half);
+        }
+        if inside(70, 50, 10, 10) {
+            layers.push(blue_quarter);
+        }
+        if inside(-5, 40, 10, 100) {
+            layers.push(green);
+        }
+        if inside(50, 30, 4, 4) {
+            layers.push(green);
+        }
+        layers
+    };
+    let check = |out: &space_render::FrameOutput, base: &space_render::FrameOutput, what: &str| {
+        let (mut touched, mut text_pixels) = (0, 0);
+        for y in 0..out.height {
+            for x in 0..out.width {
+                let layers = layers_at(x, y);
+                let (got, under) = (pixel(out, x, y), pixel(base, x, y));
+                let mut expected = [
+                    f32::from(under[0]),
+                    f32::from(under[1]),
+                    f32::from(under[2]),
+                ];
+                for layer in &layers {
+                    for c in 0..3 {
+                        expected[c] = layer[c] * 255.0 * layer[3] + expected[c] * (1.0 - layer[3]);
+                    }
+                }
+                // Opaque and untouched pixels are exact; a blend may round
+                // either way.
+                let slack = if layers.iter().any(|l| l[3] < 1.0) {
+                    1.0
+                } else {
+                    0.0
+                };
+                for c in 0..3 {
+                    assert!(
+                        (f32::from(got[c]) - expected[c]).abs() <= slack + 0.01,
+                        "{what}: pixel ({x}, {y}) is {got:?}, expected {expected:?} over {under:?}"
+                    );
+                }
+                assert_eq!(got[3], under[3], "{what}: alpha of ({x}, {y}) changed");
+                touched += usize::from(!layers.is_empty());
+                text_pixels += usize::from(layers.first() == Some(&yellow));
+            }
+        }
+        (touched, text_pixels)
+    };
+
+    // A frame with something under the overlay: a bright sphere mid-frame.
+    let (width, height) = (96u32, 64u32);
+    let camera = space_render::CameraPose {
+        aspect: width as f32 / height as f32,
+        ..post_camera()
+    };
+    let background = || {
+        Scene::from_instances(
+            camera,
+            vec![emissive_sphere([0.0, 0.0, -3.0], 1.0, [4.0; 3])],
+        )
+    };
+    let mut overlaid = background();
+    draw(&mut overlaid.overlay);
+    assert!(background().overlay.is_empty() && !overlaid.overlay.is_empty());
+
+    let base = ctx
+        .render_frame(&background(), width, height, &ci_options())
+        .expect("base render");
+    let out = ctx
+        .render_frame(&overlaid, width, height, &ci_options())
+        .expect("overlay render");
+    assert_eq!(base.validation_messages, 0, "validation messages seen");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    let sphere = pixel(&base, 48, 32);
+    assert!(
+        sphere[0] > 240 && sphere[3] == 255,
+        "the sphere is under the overlay: {sphere:?}"
+    );
+    let (touched, text_pixels) = check(&out, &base, "overlay");
+    eprintln!("overlay: {touched} pixels touched, {text_pixels} of them text");
+    // "Ab1.:" and "7_" at scale 2: every lit dot is 4 pixels.
+    let dots: usize = text
+        .chars()
+        .filter(|c| *c != '\n')
+        .map(|c| {
+            (0..7)
+                .flat_map(|y| (0..5).map(move |x| (x, y)))
+                .filter(|&(x, y)| glyph_pixel(c, x, y))
+                .count()
+        })
+        .sum();
+    assert_eq!(text_pixels, dots * 4);
+    assert!(touched > text_pixels + 16 * 12 + 100);
+    // Spot checks, in plain numbers: the top-left dot of 'A' is unlit, the
+    // dot right of it lit; the red rectangle over the white sphere is pink;
+    // the green one on top of it is green; blue over black is a quarter blue.
+    assert_eq!(pixel(&out, 4, 3), pixel(&base, 4, 3));
+    assert_eq!(pixel(&out, 6, 3), [255, 255, 0, 255]);
+    let pink = pixel(&out, 45, 28);
+    assert!(
+        pink[0] > 250 && pink[1].abs_diff(sphere[1] / 2) <= 1 && pink[2] == pink[1],
+        "{pink:?}"
+    );
+    assert_eq!(pixel(&out, 51, 31), [0, 255, 0, 255]);
+    let blue = pixel(&out, 75, 55);
+    assert!(
+        blue[0] == 0 && blue[1] == 0 && blue[2].abs_diff(64) <= 1,
+        "{blue:?}"
+    );
+    assert_eq!(
+        pixel(&out, 2, 60),
+        [0, 255, 0, 255],
+        "clipped at the frame edge"
+    );
+
+    // Not tone mapped: a darker exposure dims the sphere, not the overlay.
+    let dim_options = RenderOptions {
+        exposure: 0.05,
+        ..ci_options()
+    };
+    let dim_base = ctx
+        .render_frame(&background(), width, height, &dim_options)
+        .expect("dim base render");
+    let dim = ctx
+        .render_frame(&overlaid, width, height, &dim_options)
+        .expect("dim overlay render");
+    assert!(
+        pixel(&dim_base, 48, 32)[0] < 200,
+        "exposure dims the sphere"
+    );
+    check(&dim, &dim_base, "dim exposure");
+    assert_eq!(pixel(&dim, 6, 3), [255, 255, 0, 255]);
+
+    // With the post pass, and in the raw ray-probe path.
+    for (what, options) in [
+        (
+            "high preset",
+            RenderOptions {
+                preset: QualityPreset::High,
+                ..ci_options()
+            },
+        ),
+        (
+            "ray probe",
+            RenderOptions {
+                ray_probe: true,
+                ..ci_options()
+            },
+        ),
+    ] {
+        if options.ray_probe && !ctx.ray_query_support().complete() {
+            continue;
+        }
+        let under = ctx
+            .render_frame(&background(), width, height, &options)
+            .expect("base render");
+        let over = ctx
+            .render_frame(&overlaid, width, height, &options)
+            .expect("overlay render");
+        assert_eq!(over.validation_messages, 0, "{what}");
+        check(&over, &under, what);
+    }
+
+    // Another frame size (as after a window resize): positions are pixels of
+    // the new frame, not fractions of the old one.
+    for (w, h) in [(64u32, 48u32), (150, 70)] {
+        let resized_camera = space_render::CameraPose {
+            aspect: w as f32 / h as f32,
+            ..post_camera()
+        };
+        let mut scene = Scene::from_instances(resized_camera, Vec::new());
+        let under = ctx
+            .render_frame(&scene, w, h, &ci_options())
+            .expect("resized base render");
+        draw(&mut scene.overlay);
+        let over = ctx
+            .render_frame(&scene, w, h, &ci_options())
+            .expect("resized overlay render");
+        assert_eq!(over.validation_messages, 0, "{w}x{h}");
+        check(&over, &under, "resized");
+    }
+
+    // An empty (or cleared) overlay leaves no trace.
+    overlaid.overlay.clear();
+    let cleared = ctx
+        .render_frame(&overlaid, width, height, &ci_options())
+        .expect("cleared render");
+    assert!(
+        cleared.pixels == base.pixels,
+        "an empty overlay changed the frame"
+    );
+}
+
+// ---- cameras that are not looking down -Z, glass up close, the environment -----
+
+use space_render::Environment;
+
+/// A camera looking along `yaw` / `pitch` (degrees): yaw 0 is -Z and a
+/// positive yaw turns left, towards -X; a positive pitch looks up.
+fn camera_looking(yaw: f32, pitch: f32) -> space_render::CameraPose {
+    let (yaw, pitch) = (yaw.to_radians(), pitch.to_radians());
+    space_render::CameraPose {
+        forward: [
+            -yaw.sin() * pitch.cos(),
+            pitch.sin(),
+            -yaw.cos() * pitch.cos(),
+        ],
+        ..post_camera()
+    }
+}
+
+/// `scene` turned by `yaw` degrees about the vertical axis through the camera:
+/// the view direction and the place of every instance and light with it, so
+/// the camera sees the same picture. (Box instances stay axis-aligned: only
+/// for scenes whose boxes look the same from every side, like a floor.)
+fn turned(scene: &Scene, yaw: f32) -> Scene {
+    let (sin, cos) = yaw.to_radians().sin_cos();
+    // The rotation of `rotation_y`: +Z turns towards +X.
+    let turn = |p: [f32; 3]| [cos * p[0] + sin * p[2], p[1], cos * p[2] - sin * p[0]];
+    let mut out = Scene::from_instances(scene.camera, scene.instances.clone());
+    out.camera.forward = turn(scene.camera.forward);
+    for instance in &mut out.instances {
+        let [x, y, z, radius] = instance.center;
+        let [x, y, z] = turn([x, y, z]);
+        instance.center = [x, y, z, radius];
+    }
+    out.lights = scene
+        .lights
+        .iter()
+        .map(|light| {
+            let d = WorldPos::delta(scene.camera.position, light.position);
+            let [x, y, z] = turn([d[0] as f32, d[1] as f32, d[2] as f32]);
+            SceneLight {
+                position: WorldPos::from_f64_metres_around(
+                    scene.camera.position,
+                    [f64::from(x), f64::from(y), f64::from(z)],
+                ),
+                ..*light
+            }
+        })
+        .collect();
+    out.environment = scene.environment;
+    out
+}
+
+/// Screen-space reflections and refraction rebuild world positions from the
+/// depth buffer with the inverse view-projection matrix. Three cofactors of
+/// that inverse were wrong for any camera with a yaw — every test above looks
+/// straight down -Z, where the wrong terms are multiplied by zero — so a
+/// turned camera put reflections in the wrong place and made glass look up
+/// empty parts of the frame (black) instead of what is behind it.
+///
+/// Here the mirror floor with its red sphere and the lens with its green
+/// marker are turned about the camera together with the camera: the picture
+/// must stay the same picture.
+#[test]
+fn reflections_and_refraction_follow_the_camera_when_it_turns() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    type Wanted = fn([u16; 3]) -> bool;
+    let cases: [(&str, Scene, Wanted, std::ops::Range<u32>); 2] = [
+        // The reflection only: rows below the sphere itself.
+        ("mirror", mirror_scene(0.1), is_red, 83..size),
+        ("lens", refraction_scene(true), is_green, 0..size),
+    ];
+    for (name, scene, wanted, rows) in cases {
+        for preset in [QualityPreset::Medium, QualityPreset::High] {
+            let reference = render_preset(&mut ctx, &scene, size, preset);
+            let (n0, x0, y0) = centroid(&reference, rows.clone(), wanted)
+                .unwrap_or_else(|| panic!("{name}: nothing to compare at {preset}"));
+            for yaw in [38.0f32, -115.0, 77.0, 180.0, 263.0] {
+                let out = render_preset(&mut ctx, &turned(&scene, yaw), size, preset);
+                let (n, x, y) = centroid(&out, rows.clone(), wanted).unwrap_or_else(|| {
+                    panic!("{name}, {preset}, yaw {yaw}: the reflection / refraction is gone")
+                });
+                eprintln!(
+                    "{name} {preset} yaw {yaw}: n={n} ({x:.2},{y:.2}); straight n={n0} ({x0:.2},{y0:.2})"
+                );
+                assert!(
+                    n.abs_diff(n0) * 12 <= n0,
+                    "{name}, {preset}, yaw {yaw}: {n} pixels instead of {n0}"
+                );
+                assert!(
+                    (x - x0).abs() < 1.0 && (y - y0).abs() < 1.0,
+                    "{name}, {preset}, yaw {yaw}: at ({x:.2},{y:.2}) instead of ({x0:.2},{y0:.2})"
+                );
+            }
+        }
+    }
+}
+
+/// A corner for looking at glass, in otherwise empty black space, laid out
+/// like the glass corner of the client's demo area (where the bug below was
+/// found): two bright checkered panels 3.2 m square (the back one at
+/// z = -7.9, the side one at x = -8.08, both from y = -1.7 to 1.5), three
+/// lights, and in the corner, at eye height, a glass cube (1 m, centred on
+/// (-5.8, -0.2, -6.6)) and a glass sphere (1.1 m, centred on
+/// (-7, -0.15, -5.2)). There is no floor: all that is bright is the panels,
+/// so a lookup that goes astray finds darkness.
+struct GlassRoom {
+    back: Arc<MeshData>,
+    side: Arc<MeshData>,
+}
+
+/// What stands in the middle of a [`GlassRoom`].
+#[derive(Clone, Copy, PartialEq)]
+enum Middle {
+    Nothing,
+    Glass,
+    /// The same two shapes, opaque and glowing magenta: their outline.
+    Outline,
+}
+
+impl GlassRoom {
+    fn new() -> Self {
+        let wall = |half: [f32; 3]| {
+            let mut mesh = MeshData::cuboid(half, 1.0, matte([1.0; 3]));
+            let slot = mesh.add_texture(Texture::checkerboard(64, 2, [245; 3], [250, 190, 40]));
+            mesh.parts[0].material.base_color_texture = Some(slot);
+            Arc::new(mesh)
+        };
+        Self {
+            back: wall([1.6, 1.6, 0.08]),
+            side: wall([0.08, 1.6, 1.6]),
+        }
+    }
+
+    /// The room seen from `eye` (room coordinates) along `yaw` / `pitch`
+    /// degrees, for a frame 16 wide and 9 high.
+    fn scene(&self, eye: [f32; 3], yaw: f32, pitch: f32, middle: Middle) -> Scene {
+        let at = |p: [f32; 3]| [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+        let mut instances = Vec::new();
+        if middle != Middle::Nothing {
+            let shape = |center: [f32; 3], radius: f32, shape: u32| {
+                let [x, y, z] = at(center);
+                let outline = middle == Middle::Outline;
+                GpuInstance {
+                    center: [x, y, z, radius],
+                    // Black: the glass has no colour of its own for the
+                    // lights to bring out (only their mirror images in its
+                    // surface), so it is exactly as bright as what is seen
+                    // through it. And the outline is its glow alone.
+                    albedo: [0.0; 4],
+                    emissive: if outline {
+                        [6.0, 0.0, 6.0, 1.0]
+                    } else {
+                        [0.0; 4]
+                    },
+                    roughness: 0.05,
+                    shape,
+                    transmission: if outline { 0.0 } else { 1.0 },
+                    _pad1: 0.0,
+                }
+            };
+            instances.push(shape([-5.8, -0.2, -6.6], 0.5, space_render::SHAPE_BOX));
+            instances.push(shape([-7.0, -0.15, -5.2], 0.55, space_render::SHAPE_SPHERE));
+        }
+        let camera = space_render::CameraPose {
+            aspect: 16.0 / 9.0,
+            ..camera_looking(yaw, pitch)
+        };
+        let mut scene = Scene::from_instances(camera, instances);
+        scene.lights = [
+            ([-5.0, 2.2, -4.5], 140.0),
+            ([-6.8, 1.0, -3.5], 70.0),
+            ([-4.0, 1.0, -6.5], 70.0),
+        ]
+        .into_iter()
+        .map(|(p, intensity): ([f32; 3], f32)| {
+            let [x, y, z] = at(p);
+            light_at([f64::from(x), f64::from(y), f64::from(z)], intensity)
+        })
+        .collect();
+        scene.models = vec![
+            placed(&self.back, at([-6.4, -0.1, -7.9])),
+            placed(&self.side, at([-8.08, -0.1, -6.3])),
+        ];
+        scene
+    }
+}
+
+fn luma(p: [u16; 3]) -> u32 {
+    (u32::from(p[0]) * 2 + u32::from(p[1]) * 5 + u32::from(p[2])) / 8
+}
+
+/// Is `channel` of `p` bright and well above the other two? (Looser than
+/// `is_red` and friends: the tone map lifts the dim channels of a saturated
+/// colour a long way.)
+fn dominant(p: [u16; 3], channel: usize) -> bool {
+    p[channel] > 150 && (0..3).all(|c| c == channel || p[c] + 60 < p[channel])
+}
+
+/// Glass seen from a few metres, from close range, at a grazing angle and
+/// from above, by cameras turned towards the corner, with bright checkered
+/// panels behind it: the glass must show those panels, not darkness.
+///
+/// It used to show black for whole faces of a cube and half a sphere, for two
+/// reasons. The refracted lookups went to the wrong places (the test above
+/// has the cause), and a lookup that found a part of the frame where nothing
+/// was drawn showed that nothing. Now the glass falls back to what is
+/// straight behind it. The view from above is the one that needs the fallback
+/// even with the lookups in the right place: bent downwards, the ray ends
+/// below the panels, in empty space.
+///
+/// For every glass pixel with a lit panel straight behind it — the glass
+/// pixels are those of the same shapes drawn opaque and glowing — the frame
+/// must be about as bright as the same frame without the glass, and next to
+/// none of it dark.
+///
+/// Mutations: without the fallback for a lookup that finds nothing
+/// (`found.a` in `post.wgsl`), a third of the glass seen from above is dark.
+/// With the code as it was (the wrong inverse, no fallback, no easing at the
+/// frame's edge), so is a third of the glass seen from a few metres, and
+/// parts of it close up. The wrong inverse alone does not fail here — the
+/// fallback covers for it — but it fails the test above.
+#[test]
+fn glass_seen_from_close_up_and_at_a_grazing_angle_is_not_dark() {
+    let Some(mut ctx) = context() else { return };
+    let (width, height) = (320u32, 180u32);
+    let room = GlassRoom::new();
+    let mut render = |scene: &Scene, preset: QualityPreset| {
+        let opts = RenderOptions {
+            preset,
+            fog_scale: 0.0,
+            ..ci_options()
+        };
+        let out = ctx
+            .render_frame(scene, width, height, &opts)
+            .expect("render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        out
+    };
+    let views: [(&str, [f32; 3], f32, f32); 5] = [
+        // Where the bug was first seen: 4.5 to 5 m away, turned 38 degrees.
+        ("from a few metres", [-3.8, 0.0, -2.1], 38.0, -3.0),
+        // 1.3 m from the cube's nearest edge.
+        ("close to the cube", [-4.7, 0.0, -5.0], 34.5, -5.9),
+        // Along the cube's +Z face, about 10 degrees off its plane.
+        ("grazing the cube", [-3.9, -0.1, -5.75], 79.6, -3.0),
+        // 1.3 m from the sphere's surface.
+        ("close to the sphere", [-6.0, 0.1, -3.7], 33.7, -7.9),
+        // Looking steeply down onto the cube from above and beside it.
+        ("down onto the cube", [-5.0, 1.3, -5.6], 38.7, -49.5),
+    ];
+    let mut problems = Vec::new();
+    for (name, eye, yaw, pitch) in views {
+        let outline = render(
+            &room.scene(eye, yaw, pitch, Middle::Outline),
+            QualityPreset::Ci,
+        );
+        let glass_pixels: Vec<(u32, u32)> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = rgb(&outline, x, y);
+                p[0] > 200 && p[2] > 200 && p[1] < 80
+            })
+            .collect();
+        assert!(
+            glass_pixels.len() > 800,
+            "{name}: the glass covers only {} pixels",
+            glass_pixels.len()
+        );
+        for preset in [QualityPreset::Medium, QualityPreset::High] {
+            let with = render(&room.scene(eye, yaw, pitch, Middle::Glass), preset);
+            let without = render(&room.scene(eye, yaw, pitch, Middle::Nothing), preset);
+            // The glass pixels with a lit panel straight behind them.
+            let lit: Vec<(u32, u32)> = glass_pixels
+                .iter()
+                .copied()
+                .filter(|&(x, y)| luma(rgb(&without, x, y)) > 150)
+                .collect();
+            assert!(
+                lit.len() > 800,
+                "{name}: only {} glass pixels have a panel behind them",
+                lit.len()
+            );
+            let (mut dark, mut through, mut behind) = (0usize, 0u64, 0u64);
+            for &(x, y) in &lit {
+                let p = rgb(&with, x, y);
+                dark += usize::from(luma(p) < 40);
+                through += u64::from(luma(p));
+                behind += u64::from(luma(rgb(&without, x, y)));
+            }
+            let n = lit.len() as u64;
+            eprintln!(
+                "{name}, {preset}: {} glass pixels, {n} of them over a lit panel: {dark} dark, \
+                 mean brightness {} through the glass, {} without it",
+                glass_pixels.len(),
+                through / n,
+                behind / n
+            );
+            assert!(
+                behind / n > 150,
+                "{name}: what is behind the glass is bright"
+            );
+            if dark * 100 > lit.len() {
+                problems.push(format!(
+                    "{name}, {preset}: {dark} of {n} glass pixels are dark"
+                ));
+            }
+            if through * 10 < behind * 9 {
+                problems.push(format!(
+                    "{name}, {preset}: the glass is darker ({}) than what is behind it ({})",
+                    through / n,
+                    behind / n
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "{}",
+        problems.join(
+            "
+"
+        )
+    );
+}
+
+/// What the tone map makes of a linear radiance: ACES, then gamma 2.2, in
+/// 8 bits (`shaders/tonemap.wgsl`, exposure 1).
+fn tone_mapped(radiance: [f32; 3]) -> [u16; 3] {
+    radiance.map(|x| {
+        let aces = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+        (aces.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u16
+    })
+}
+
+/// An environment whose three colours are easy to tell apart: blue above,
+/// green at the horizon, red below.
+fn rgb_sky() -> Environment {
+    Environment::gradient([0.05, 0.1, 1.0], [0.1, 1.0, 0.1], [1.0, 0.1, 0.05])
+}
+
+fn metal_ball(center: [f32; 3], radius: f32, roughness: f32) -> GpuInstance {
+    GpuInstance {
+        center: [center[0], center[1], center[2], radius],
+        albedo: [0.95, 0.95, 0.95, 1.0],
+        emissive: [0.0; 4],
+        roughness,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 0.0,
+        _pad1: 0.0,
+    }
+}
+
+/// The environment gives a reflection something to show: a smooth metal
+/// sphere alone in an empty, unlit scene is black without one, and with one
+/// mirrors the gradient — the zenith's colour where it reflects upwards, the
+/// horizon's in the middle, the ground's below — in every preset and whichever
+/// way the camera looks. The background stays black unless the environment
+/// asks to be drawn there; then the empty pixels show exactly the gradient
+/// along their view rays, and the sphere's pixels do not change.
+#[test]
+fn a_smooth_metal_sphere_mirrors_the_environment() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let ball = Scene::from_instances(post_camera(), vec![metal_ball([0.0, 0.0, -4.0], 1.2, 0.1)]);
+
+    // Without an environment: nothing. This is today's picture.
+    for preset in QualityPreset::ALL {
+        let black = render_clear(&mut ctx, &ball, size, preset);
+        assert_eq!(
+            brightness_sum(&black),
+            0,
+            "{preset}: no light, no environment"
+        );
+    }
+
+    // Where the surface normal tips 45 degrees up the mirror direction is
+    // straight up; that point of the sphere is 30 pixels above the centre.
+    let (above, middle, below) = ((64, 34), (64, 64), (64, 94));
+    for preset in QualityPreset::ALL {
+        for yaw in [0.0f32, 140.0] {
+            let scene = turned(&ball.clone_with(rgb_sky()), yaw);
+            let out = render_clear(&mut ctx, &scene, size, preset);
+            let (top, centre, bottom) = (
+                rgb(&out, above.0, above.1),
+                rgb(&out, middle.0, middle.1),
+                rgb(&out, below.0, below.1),
+            );
+            eprintln!("{preset}, yaw {yaw}: sphere {top:?} / {centre:?} / {bottom:?}");
+            assert!(
+                dominant(top, 2),
+                "{preset}: the top mirrors the zenith: {top:?}"
+            );
+            assert!(
+                dominant(centre, 1),
+                "{preset}: the middle the horizon: {centre:?}"
+            );
+            assert!(
+                dominant(bottom, 0),
+                "{preset}: the underside the ground: {bottom:?}"
+            );
+            // The background is not painted unless asked for.
+            assert_eq!(rgb(&out, 3, 3), [0, 0, 0], "{preset}");
+            assert_eq!(rgb(&out, 124, 124), [0, 0, 0], "{preset}");
+
+            // Asked for: every empty pixel is the gradient along its view ray,
+            // and the sphere's pixels are what they were.
+            let painted = render_clear(
+                &mut ctx,
+                &turned(&ball.clone_with(rgb_sky().with_background(true)), yaw),
+                size,
+                preset,
+            );
+            let tan = (std::f32::consts::FRAC_PI_3 * 0.5).tan();
+            for (x, y) in [
+                (3u32, 3u32),
+                (64, 2),
+                (2, 64),
+                (125, 64),
+                (64, 125),
+                (100, 120),
+            ] {
+                let ndc = |i: u32| (i as f32 + 0.5) / (size as f32 * 0.5) - 1.0;
+                // (The camera's yaw turns the ray about the vertical: its
+                // elevation, all the gradient looks at, stays the same.)
+                let ray = [ndc(x) * tan, -ndc(y) * tan, -1.0];
+                let expected = tone_mapped(rgb_sky().radiance(ray));
+                let got = rgb(&painted, x, y);
+                assert!(
+                    (0..3).all(|c| got[c].abs_diff(expected[c]) <= 3),
+                    "{preset}, yaw {yaw}: background at ({x}, {y}) is {got:?}, the gradient \
+                     says {expected:?}"
+                );
+            }
+            for y in 0..size {
+                for x in 0..size {
+                    let lit = rgb(&out, x, y);
+                    if lit != [0, 0, 0] {
+                        assert_eq!(
+                            rgb(&painted, x, y),
+                            lit,
+                            "{preset}: sphere pixel ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Roughness blurs the reflection towards the average of what the surface
+    // faces: the top of a rough ball is no longer pure zenith blue.
+    let rough = Scene::from_instances(post_camera(), vec![metal_ball([0.0, 0.0, -4.0], 1.2, 0.9)])
+        .with_environment(rgb_sky());
+    let out = render_clear(&mut ctx, &rough, size, QualityPreset::High);
+    let top = rgb(&out, above.0, above.1);
+    assert!(
+        top[2] > 60 && top[1] > 40 && !dominant(top, 2),
+        "rough top: {top:?}"
+    );
+}
+
+/// The environment is the light that is left where no lamp reaches: the floor
+/// in the cube's shadow (black without an environment, see the shadow test)
+/// is lit by it, and still clearly darker than the floor the lamp does reach.
+/// It lights models as well as spheres and boxes, by the direction each face
+/// looks: the cube's side in the lamp's shadow is brighter than black and
+/// darker than its lit top.
+#[test]
+fn the_environment_lights_what_is_in_shadow() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let cube = Arc::new(MeshData::cuboid([1.0; 3], 1.0, matte([0.8; 3])));
+    let scene = shadow_scene(vec![placed(&cube, [0.0, -2.5, -8.0])], Vec::new());
+    // Pixels as in `a_model_casts_a_shadow_on_the_floor_and_receives_one`,
+    // plus the cube's front face, which the lamp above it does not reach.
+    let (in_shadow, lit_floor, cube_top, cube_front) = ((64, 124), (16, 124), (64, 85), (64, 100));
+    let studio = Environment::studio().with_intensity(0.35);
+
+    let bare = render_clear(&mut ctx, &scene, size, QualityPreset::High);
+    for (x, y) in [in_shadow, cube_front] {
+        let p = rgb(&bare, x, y);
+        assert!(is_dark(p), "no environment: ({x}, {y}) is unlit: {p:?}");
+    }
+    let out = render_clear(
+        &mut ctx,
+        &scene.clone_with(studio),
+        size,
+        QualityPreset::High,
+    );
+    let at = |p: (u32, u32)| luma(rgb(&out, p.0, p.1));
+    eprintln!(
+        "ambient: shadow {} / lit floor {} / cube top {} / cube front {}",
+        at(in_shadow),
+        at(lit_floor),
+        at(cube_top),
+        at(cube_front)
+    );
+    assert!(at(in_shadow) > 60, "the shadow is lit by the environment");
+    assert!(
+        at(in_shadow) + 40 < at(lit_floor),
+        "and still darker than the lit floor beside it"
+    );
+    assert!(at(cube_front) > 50 && at(cube_front) + 40 < at(cube_top));
+    // A floor faces the zenith, a wall the horizon: more light from above.
+    assert!(
+        at(in_shadow) > at(cube_front),
+        "up-facing gets more than side-facing"
+    );
+    // The lit pixels gained the same ambient term: brighter than before, or
+    // already at the top of the range.
+    for p in [lit_floor, cube_top] {
+        assert!(at(p) >= luma(rgb(&bare, p.0, p.1)));
+    }
+    // A brighter environment, a brighter shadow.
+    let brighter = render_clear(
+        &mut ctx,
+        &scene.clone_with(studio.with_intensity(0.7)),
+        size,
+        QualityPreset::High,
+    );
+    assert!(luma(rgb(&brighter, in_shadow.0, in_shadow.1)) > at(in_shadow) + 20);
+
+    // Metals have no diffuse colour and take no ambient light, only the
+    // reflection: a rough metal floor under the same environment is darker
+    // than the matte one.
+    let mut metal = scene.clone_with(studio);
+    metal.instances[0].albedo[3] = 1.0;
+    let metal = render_clear(&mut ctx, &metal, size, QualityPreset::High);
+    assert!(luma(rgb(&metal, in_shadow.0, in_shadow.1)) < at(in_shadow));
+}
+
+/// A mirror that reflects something that is not on screen shows the
+/// environment there instead of black: the mirror floor of `mirror_scene`,
+/// which looks up past the top of the frame. With the red sphere standing on
+/// it, the sphere's screen-space reflection is still where it was, on top of
+/// the environment's.
+#[test]
+fn a_mirror_shows_the_environment_where_the_screen_has_nothing() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let with_sphere = mirror_scene(0.1);
+    let mut floor_only = mirror_scene(0.1);
+    floor_only.instances.truncate(1);
+
+    for preset in QualityPreset::ALL {
+        // No environment: the floor mirrors nothing, as before.
+        let black = render_clear(&mut ctx, &floor_only, size, preset);
+        assert_eq!(brightness_sum(&black), 0, "{preset}");
+
+        // The floor at the bottom of the frame mirrors a steep upward
+        // direction, the floor near the horizon a shallow one: from the
+        // zenith's blue towards the horizon's green.
+        let out = render_clear(&mut ctx, &floor_only.clone_with(rgb_sky()), size, preset);
+        let (near, far) = (rgb(&out, 64, 122), rgb(&out, 64, 76));
+        eprintln!("{preset}: mirror floor near {near:?}, far {far:?}");
+        assert!(
+            near[2] > 100 && near[2] > near[0] + 60,
+            "{preset}: sky in the mirror: {near:?}"
+        );
+        assert!(
+            far[1] > 100 && far[1] > far[0] + 60,
+            "{preset}: horizon in the mirror: {far:?}"
+        );
+        assert!(
+            near[2] > far[2] && far[1] > near[1],
+            "{preset}: {near:?} vs {far:?}"
+        );
+        // The floor mirrors only what is above it: none of the ground's red
+        // (what red there is, is the little in the other two colours).
+        assert!(near[0] + 60 < near[1].min(near[2]) && far[0] < far[2]);
+    }
+
+    // With the sphere: its reflection (rows 83..) is found on screen and wins
+    // over the environment's.
+    let reflection_rows = 83..size;
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let before = render_preset(&mut ctx, &with_sphere, size, preset);
+        let after = render_preset(&mut ctx, &with_sphere.clone_with(rgb_sky()), size, preset);
+        let (n0, x0, y0) = centroid(&before, reflection_rows.clone(), is_red).expect("reflection");
+        let (n, x, y) = centroid(&after, reflection_rows.clone(), is_red)
+            .unwrap_or_else(|| panic!("{preset}: the sphere's reflection is gone"));
+        eprintln!("{preset}: reflection n={n} ({x:.1},{y:.1}); without environment n={n0}");
+        assert!(n * 10 >= n0 * 6, "{preset}: {n} vs {n0} red pixels");
+        assert!((x - x0).abs() < 1.5 && (y - y0).abs() < 3.0);
+    }
+}
+
+/// Glass in front of nothing shows the environment along its refracted view,
+/// not black; glass in front of a painted background likewise; and without an
+/// environment it is as black as the empty frame around it.
+#[test]
+fn glass_in_front_of_nothing_shows_the_environment() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let lens = GpuInstance {
+        center: [0.0, 0.0, -4.0, 1.5],
+        albedo: [0.0; 4],
+        emissive: [0.0; 4],
+        roughness: 0.5,
+        shape: space_render::SHAPE_SPHERE,
+        transmission: 1.0,
+        _pad1: 0.0,
+    };
+    let scene = Scene::from_instances(post_camera(), vec![lens]);
+    for preset in [QualityPreset::Medium, QualityPreset::High] {
+        let black = render_clear(&mut ctx, &scene, size, preset);
+        assert_eq!(
+            brightness_sum(&black),
+            0,
+            "{preset}: nothing to see through the glass"
+        );
+        for background in [false, true] {
+            for yaw in [0.0f32, 70.0] {
+                let environment = rgb_sky().with_background(background);
+                let out = render_clear(
+                    &mut ctx,
+                    &turned(&scene.clone_with(environment), yaw),
+                    size,
+                    preset,
+                );
+                // Straight through the middle: the horizon. Through the upper
+                // part the view is bent downwards, towards the ground's red;
+                // through the lower part upwards, towards the zenith's blue.
+                let (centre, upper, lower) =
+                    (rgb(&out, 64, 64), rgb(&out, 64, 34), rgb(&out, 64, 94));
+                eprintln!(
+                    "{preset}, background {background}, yaw {yaw}: glass {upper:?} / {centre:?} / {lower:?}"
+                );
+                assert!(dominant(centre, 1), "{centre:?}");
+                assert!(
+                    upper[0] > lower[0] && lower[2] > upper[2],
+                    "the upper part is bent towards the red ground, the lower part towards \
+                     the blue zenith: {upper:?} / {lower:?}"
+                );
+                // Beside the glass: black, or the painted background.
+                let corner = rgb(&out, 3, 64);
+                assert_eq!(corner != [0, 0, 0], background, "{corner:?}");
+            }
+        }
+    }
+}
+
+/// A scene without an environment is not touched by any of this: "none" spelt
+/// three different ways renders the same frame, pixel for pixel, as the
+/// default — in the presets with and without the post pass, with models,
+/// glass, mirrors and shadows in the frame. (That the default itself still
+/// renders what it always did is what every other test in this file checks.)
+#[test]
+fn no_environment_changes_nothing() {
+    let Some(mut ctx) = context() else { return };
+    let size = 96;
+    let room = GlassRoom::new();
+    let mut scenes = vec![
+        ("mirror", mirror_scene(0.1)),
+        ("lens", refraction_scene(true)),
+        (
+            "room",
+            room.scene([-4.7, 0.0, -5.0], 34.5, -5.9, Middle::Glass),
+        ),
+    ];
+    let character = Arc::new(space_render::sample_character());
+    scenes.push((
+        "shadows",
+        shadow_scene(vec![placed(&character, [0.0, -4.0, -7.0])], Vec::new()),
+    ));
+    let nones = [
+        Environment::NONE,
+        Environment::sky().with_intensity(0.0).with_background(true),
+        Environment::gradient([0.0; 3], [0.0; 3], [0.0; 3]).with_background(true),
+        Environment::studio().with_intensity(f32::NAN),
+    ];
+    for (name, scene) in &scenes {
+        for preset in [QualityPreset::Ci, QualityPreset::High] {
+            let reference = render_clear(&mut ctx, scene, size, preset);
+            for none in nones {
+                assert!(none.is_none());
+                let out = render_clear(&mut ctx, &scene.clone_with(none), size, preset);
+                assert!(
+                    out.pixels == reference.pixels,
+                    "{name}, {preset}: {none:?} changed the frame"
+                );
+            }
+            // And an environment does change it.
+            let lit = render_clear(
+                &mut ctx,
+                &scene.clone_with(Environment::sky()),
+                size,
+                preset,
+            );
+            assert!(lit.pixels != reference.pixels, "{name}, {preset}");
+        }
+    }
+}
+
+/// `clone_with` for the tests above: the same scene with `environment`.
+trait WithEnvironment {
+    fn clone_with(&self, environment: Environment) -> Scene;
+}
+
+impl WithEnvironment for Scene {
+    fn clone_with(&self, environment: Environment) -> Scene {
+        let mut scene = Scene::from_instances(self.camera, self.instances.clone())
+            .with_lights(self.lights.clone())
+            .with_environment(environment);
+        scene.models = self.models.clone();
+        scene.overlay = self.overlay.clone();
+        scene
     }
 }

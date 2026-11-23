@@ -1,190 +1,156 @@
 //! `space-client` — the native client binary.
 //!
-//! What it does with a frame is one of three things:
+//! The client is always online: it plays on an authoritative shard, and until
+//! it does it shows the connect screen, where the server address is typed.
+//! Given its server on the command line (`--server ADDR`) it also keeps the
+//! connection by itself: a failed or lost one is retried after a short,
+//! growing pause until somebody takes the controls.
 //!
-//! * **window** (the default; also `--window`, or `--server` without
-//!   `--stream`): open a winit window and present through the swapchain, with
-//!   keyboard/mouse input (see [`window`]). `--galaxy` picks the galaxy scene
-//!   instead of the demo scene; `--server ADDR` joins the authoritative shard
-//!   as a player.
-//! * **offline render** (`--demo` / `--galaxy` on their own): render one frame
-//!   headlessly with `space-render`, write it to a PPM file and exit. No window
-//!   system is required, so this runs in a headless CI sandbox and exercises
-//!   the exact pixels the GPU tests assert on.
-//! * **streaming** (`--stream ADDR`): render headlessly in a loop, JPEG each
-//!   frame and serve it to browser viewers over `ws://` (see [`stream`]). With
-//!   `--server ADDR` the process is also a normal `space-net` player on the
-//!   shard; viewer input becomes the player's input and the replicated state
-//!   drives the camera (see [`space_client::link`]).
+//! Only the window can be ended from its keyboard (Esc on the connect
+//! screen). A headless or streaming client is a server-side process whose
+//! keys come from whoever can reach it, so no input ends it: it runs until
+//! the harness asks it to quit, `--frames` are rendered, its `--script` has
+//! ended, or a signal arrives.
+//! There is one application core ([`space_client::app::App`]) and three front
+//! ends over it:
+//!
+//! * **window** (the default): a winit window presenting through the
+//!   swapchain, with keyboard and mouse ([`window`]);
+//! * **headless** (`--headless`): no window — an offscreen render loop at a
+//!   capped rate, to be driven through the harness;
+//! * **stream** (`--stream ADDR`): headless, and every frame is also served as
+//!   JPEG over `ws://` to browser viewers, whose input drives the client.
+//!
+//! In every front end the harness can be attached: `--harness ADDR` serves the
+//! control API over HTTP (state, frames, input, scripts) and `--script FILE`
+//! runs a Lua script against the client and makes its outcome the exit code.
 
-mod scenes;
-mod stream;
 mod window;
 
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-
+use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use space_render::{
-    demo_scene, rotation_y, CameraPose, ContextOptions, MeshData, ModelInstance, Quality,
-    QualityPreset, RenderContext, RenderError, RenderOptions, Scene, SceneLight,
-    MAX_FRAME_DIMENSION,
-};
-use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
+use space_client::address::{ServerAddress, DEFAULT_PORT};
+use space_client::app::{App, AppConfig, TestModel};
+use space_client::headless::{run_headless, HeadlessConfig, DEFAULT_FPS};
+use space_client::input::KEY_HELP;
+use space_harness::http::{self, HttpConfig};
+use space_harness::script::{run_script, ScriptConfig, StopHandle};
+use space_harness::{Control, Hub, ScriptReport};
+use space_render::{ContextOptions, QualityPreset, RenderContext, MAX_FRAME_DIMENSION};
+use space_stream::StreamServer;
 
-/// Which scene is rendered, and — for the two explicit scenes — that a bare
-/// invocation renders it once, offline.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
-    /// The deterministic demo scene (shared with the GPU tests).
-    Demo,
-    /// The deterministic galaxy through the LOD selector.
-    Galaxy,
-    /// The PBR material chart ([`scenes::materials_scene`]).
-    Materials,
-    /// The real-size solar system ([`scenes::solar_scene`]).
-    Solar,
-    /// No scene was named: a live winit window presenting the demo scene.
+/// The environment variable the harness API's bearer token is read from (it
+/// is never taken from the command line, where other users could read it).
+const TOKEN_ENV: &str = "SPACE_HARNESS_TOKEN";
+
+/// How long a script is given to end by itself once the client is closing
+/// (it may be on its last statement) before it is stopped.
+const SCRIPT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a script or an API caller waits for a frame before concluding
+/// that the client has stopped rendering. Generous on purpose: on software
+/// Vulkan (lavapipe) the first frame - shader compilation, mesh upload,
+/// acceleration structures - takes many seconds on a slow or busy machine,
+/// which is exactly where a headless client is run. The harness's own
+/// default (5 s) failed scripts there with "the client rendered no frame".
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How the frames leave the process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrontEnd {
+    /// A window (the default).
     Window,
+    /// No window: an offscreen loop.
+    Headless,
+    /// Headless, plus the `ws://` pixel stream on this address.
+    Stream(String),
 }
 
-impl Mode {
-    /// Short name for logs and the title bar.
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Demo | Self::Window => "demo",
-            Self::Galaxy => "galaxy",
-            Self::Materials => "materials",
-            Self::Solar => "solar",
-        }
+impl FrontEnd {
+    /// Whether the person at this front end's keys may end the client with
+    /// them (Esc on the connect screen): at the window, yes — it is their
+    /// client. The input of a client without a window comes from whoever can
+    /// reach its stream port or its harness, and must not be able to take
+    /// somebody else's process down.
+    fn user_may_quit(&self) -> bool {
+        matches!(self, Self::Window)
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct Config {
-    mode: Mode,
-    width: u32,
-    height: u32,
-    out: Option<PathBuf>,
+    front_end: FrontEnd,
+    /// `--server ADDR`: connect at start instead of showing the connect screen.
+    server: Option<String>,
+    /// `--size WxH` (default: [`Config::size`]).
+    size: Option<(u32, u32)>,
     quality: QualityPreset,
-    /// `--stream ADDR`: serve rendered frames to viewers on this `ws://` address.
-    stream: Option<String>,
-    /// `--server ADDR`: play on this authoritative shard (window or stream).
-    server: Option<SocketAddr>,
-    /// `--frames N`: stop after N frames (default: run until closed/killed).
-    frames: Option<u64>,
-    /// `--window`: present in a window even though a scene was named.
-    window: bool,
     /// Windowed presentation waits for the vertical blank (`--no-vsync` clears it).
     vsync: bool,
-    /// `--glb FILE`: a model to show in front of the spawn point.
+    /// `--frames N`: stop after N frames.
+    frames: Option<u64>,
+    /// `--fps N`: the headless/stream frame rate cap.
+    fps: u32,
+    /// `--glb FILE`: a client-side test model near the spawn point.
     glb: Option<PathBuf>,
     /// `--glb-scale S`: metres per model unit (default: fit to ~3 m across).
     glb_scale: Option<f32>,
-    /// The loaded `--glb` model, placed in the world (set by `main`).
-    model: Option<PlacedModel>,
-}
-
-/// A mesh model at a fixed place in the world.
-#[derive(Clone)]
-struct PlacedModel {
-    mesh: Arc<MeshData>,
-    /// Where the centre of the model's bounding box sits.
-    position: WorldPos,
-    /// Metres per model unit.
-    scale: f32,
-    rotation: [[f32; 3]; 3],
-}
-
-/// The radius a `--glb` model is scaled to when no `--glb-scale` is given, and
-/// how many radii in front of the spawn camera it is placed.
-const MODEL_FIT_RADIUS_M: f32 = 1.5;
-const MODEL_DISTANCE_RADII: f32 = 4.0;
-
-impl PlacedModel {
-    /// Load `path` and place it in front of `mode`'s spawn camera, turned a
-    /// little so it is not seen dead-on.
-    fn load(path: &std::path::Path, scale: Option<f32>, mode: Mode) -> Result<Self, RenderError> {
-        let mesh = MeshData::load(path).map_err(|e| RenderError::new(format!("--glb {e}")))?;
-        let radius = mesh.radius().max(1e-6);
-        let scale = scale.unwrap_or(MODEL_FIT_RADIUS_M / radius);
-        let camera = spawn_camera(mode, 1, 1);
-        let distance = f64::from(MODEL_DISTANCE_RADII * radius * scale);
-        let position = WorldPos::from_f64_metres_around(
-            camera.position,
-            camera.forward.map(|c| f64::from(c) * distance),
-        );
-        eprintln!(
-            "space-client: model {}: {} triangles, {} parts, {:.2} m across at scale {scale}",
-            path.display(),
-            mesh.triangle_count(),
-            mesh.parts.len(),
-            2.0 * radius * scale
-        );
-        Ok(Self {
-            mesh: Arc::new(mesh),
-            position,
-            scale,
-            rotation: rotation_y(0.6),
-        })
-    }
-
-    /// Add the model to `scene`, relative to the scene's camera.
-    fn add_to(&self, scene: &mut Scene) {
-        // The instance's position is where the model's *origin* goes: the
-        // bounding-box centre, rotated and scaled, is subtracted so the centre
-        // lands on `self.position`.
-        let centre = self.mesh.center();
-        let d = WorldPos::delta(scene.camera.position, self.position);
-        let position = [0, 1, 2].map(|r| {
-            let rotated: f32 = (0..3).map(|c| self.rotation[r][c] * centre[c]).sum();
-            d[r] as f32 - rotated * self.scale
-        });
-        scene.models.push(ModelInstance {
-            mesh: Arc::clone(&self.mesh),
-            position,
-            rotation: self.rotation,
-            scale: self.scale,
-        });
-    }
-}
-
-/// The camera a scene starts with (what an offline render uses).
-fn spawn_camera(mode: Mode, width: u32, height: u32) -> CameraPose {
-    match mode {
-        Mode::Galaxy => galaxy_camera(width, height),
-        Mode::Materials => scenes::materials_camera(width, height),
-        Mode::Solar => scenes::solar_camera(width, height),
-        Mode::Demo | Mode::Window => demo_scene(width, height).camera,
-    }
+    /// `--harness ADDR`: serve the control API over HTTP there.
+    harness: Option<String>,
+    /// `--script FILE`: run this Lua script; its outcome is the exit code.
+    script: Option<PathBuf>,
+    /// `--script-timeout SECONDS`.
+    script_timeout: Option<Duration>,
+    /// `--out-dir DIR`: where scripts write screenshots.
+    out_dir: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mode: Mode::Window,
-            width: 640,
-            height: 480,
-            out: None,
-            quality: QualityPreset::default(),
-            stream: None,
+            front_end: FrontEnd::Window,
             server: None,
-            frames: None,
-            window: false,
+            size: None,
+            quality: QualityPreset::default(),
             vsync: true,
+            frames: None,
+            fps: DEFAULT_FPS,
             glb: None,
             glb_scale: None,
-            model: None,
+            harness: None,
+            script: None,
+            script_timeout: None,
+            out_dir: PathBuf::from("harness-out"),
         }
     }
 }
 
 impl Config {
-    /// Whether this invocation opens a window: asked for explicitly, implied
-    /// by joining a server without streaming, or simply no scene named.
-    fn windowed(&self) -> bool {
-        self.stream.is_none() && (self.window || self.server.is_some() || self.mode == Mode::Window)
+    /// The frame size: what `--size` said, or 1280x720 for a window and
+    /// 640x480 without one.
+    fn size(&self) -> (u32, u32) {
+        self.size.unwrap_or(match self.front_end {
+            FrontEnd::Window => (1280, 720),
+            FrontEnd::Headless | FrontEnd::Stream(_) => (640, 480),
+        })
     }
+
+    /// Whether anything but a browser viewer can be watching: the harness
+    /// API or a script.
+    fn harnessed(&self) -> bool {
+        self.harness.is_some() || self.script.is_some()
+    }
+}
+
+/// What the command line asked for.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    Run(Box<Config>),
+    Help,
 }
 
 /// Parse a `WxH` frame size; both sides must be in `1..=MAX_FRAME_DIMENSION`.
@@ -195,347 +161,482 @@ fn parse_size(text: &str) -> Option<(u32, u32)> {
     (valid.contains(&w) && valid.contains(&h)).then_some((w, h))
 }
 
-fn parse_args() -> Config {
+/// Parse the arguments (without the program name).
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut config = Config::default();
-    let mut args = std::env::args().skip(1);
+    let mut headless = false;
+    let mut stream = None;
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        let mut value = |what: &str| args.next().ok_or(format!("{arg} needs {what}"));
         match arg.as_str() {
-            "--demo" => {
-                config.mode = Mode::Demo;
+            "-h" | "--help" => return Ok(Command::Help),
+            "--headless" => headless = true,
+            "--stream" => stream = Some(value("an address, e.g. 127.0.0.1:8099")?),
+            "--server" => {
+                let address = value("a server address, e.g. 127.0.0.1:7777")?;
+                // Only the shape is checked here; whether it answers shows on
+                // the connect screen.
+                ServerAddress::parse(&address).map_err(|e| format!("--server: {e}"))?;
+                config.server = Some(address);
             }
-            "--galaxy" => {
-                config.mode = Mode::Galaxy;
-            }
-            "--materials" => {
-                config.mode = Mode::Materials;
-            }
-            "--solar" => {
-                config.mode = Mode::Solar;
-            }
-            "--window" => {
-                config.window = true;
-            }
-            "--no-vsync" => {
-                config.vsync = false;
-            }
-            "--glb" => match args.next() {
-                Some(path) => config.glb = Some(PathBuf::from(path)),
-                None => {
-                    eprintln!("space-client: --glb needs a .glb file");
-                    std::process::exit(2);
-                }
-            },
-            "--glb-scale" => match args.next().and_then(|s| s.parse::<f32>().ok()) {
-                Some(scale) if scale.is_finite() && scale > 0.0 => config.glb_scale = Some(scale),
-                _ => {
-                    eprintln!("space-client: --glb-scale needs a positive number");
-                    std::process::exit(2);
-                }
-            },
-            "--size" => match args.next().as_deref().and_then(parse_size) {
-                Some((w, h)) => {
-                    config.width = w;
-                    config.height = h;
-                }
-                None => {
-                    eprintln!(
-                        "space-client: --size needs WxH with both sides in \
-                         1..={MAX_FRAME_DIMENSION}, e.g. 1280x720"
-                    );
-                    std::process::exit(2);
-                }
-            },
-            "--out" => {
-                config.out = args.next().map(PathBuf::from);
+            "--size" => {
+                config.size = Some(parse_size(&value("WxH")?).ok_or(format!(
+                    "--size needs WxH with both sides in 1..={MAX_FRAME_DIMENSION}, \
+                     e.g. 1280x720"
+                ))?);
             }
             "--quality" => {
-                let value = args.next().unwrap_or_default();
-                match value.parse() {
-                    Ok(preset) => config.quality = preset,
-                    Err(e) => {
-                        eprintln!("space-client: {e}");
-                        std::process::exit(2);
-                    }
-                }
+                config.quality = value("high, medium, low or ci")?
+                    .parse()
+                    .map_err(|e| format!("--quality: {e}"))?;
             }
-            "--stream" => match args.next() {
-                Some(addr) => config.stream = Some(addr),
-                None => {
-                    eprintln!("space-client: --stream needs an address, e.g. 127.0.0.1:8099");
-                    std::process::exit(2);
-                }
-            },
-            "--server" => {
-                let addr = args.next().and_then(|a| a.to_socket_addrs().ok()?.next());
-                match addr {
-                    Some(addr) => config.server = Some(addr),
-                    None => {
-                        eprintln!("space-client: --server needs a host:port, e.g. 127.0.0.1:7000");
-                        std::process::exit(2);
-                    }
-                }
+            "--no-vsync" => config.vsync = false,
+            "--frames" => {
+                config.frames = Some(
+                    value("a number")?
+                        .parse()
+                        .map_err(|_| "--frames needs a number".to_owned())?,
+                );
             }
-            "--frames" => match args.next().and_then(|n| n.parse().ok()) {
-                Some(n) => config.frames = Some(n),
-                None => {
-                    eprintln!("space-client: --frames needs a number");
-                    std::process::exit(2);
-                }
-            },
-            "-h" | "--help" => {
-                print_usage();
-                std::process::exit(0);
+            "--fps" => {
+                config.fps = value("a number")?
+                    .parse()
+                    .ok()
+                    .filter(|fps| (1..=1000).contains(fps))
+                    .ok_or("--fps needs a number from 1 to 1000")?;
             }
-            other => {
-                eprintln!("space-client: unknown argument {other:?}");
-                print_usage();
-                std::process::exit(2);
+            "--glb" => config.glb = Some(PathBuf::from(value("a .glb file")?)),
+            "--glb-scale" => {
+                config.glb_scale = Some(
+                    value("a positive number")?
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|scale| scale.is_finite() && *scale > 0.0)
+                        .ok_or("--glb-scale needs a positive number")?,
+                );
             }
+            "--harness" => config.harness = Some(value("an address, e.g. 127.0.0.1:8098")?),
+            "--script" => config.script = Some(PathBuf::from(value("a Lua file")?)),
+            "--script-timeout" => {
+                let seconds: f64 = value("a number of seconds")?
+                    .parse()
+                    .map_err(|_| "--script-timeout needs a number of seconds".to_owned())?;
+                config.script_timeout = Some(
+                    Duration::try_from_secs_f64(seconds)
+                        .ok()
+                        .filter(|timeout| !timeout.is_zero())
+                        .ok_or("--script-timeout needs a positive number of seconds")?,
+                );
+            }
+            "--out-dir" => config.out_dir = PathBuf::from(value("a directory")?),
+            // The scene flags of the offline client. Ignored with a warning,
+            // not refused: a deployment that still passes one (the proxy
+            // compose did, as `CLIENT_ARGS=--galaxy`) must not lose its client
+            // to an image update. The scene is the server's choice now.
+            "--demo" | "--galaxy" | "--materials" | "--solar" => {
+                eprintln!(
+                    "space-client: {arg} is ignored: the scene is chosen on the server \
+                     (space-server --scene NAME, or the orchestrator), not by the client"
+                );
+            }
+            "--window" | "--out" => {
+                return Err(format!(
+                    "{arg} is gone: the client always plays on a shard, in a window unless \
+                     --headless or --stream is given"
+                ));
+            }
+            other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    if config.window && config.stream.is_some() {
-        eprintln!("space-client: --window and --stream are mutually exclusive");
-        std::process::exit(2);
-    }
-    config
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage: space-client [--demo | --galaxy | --materials | --solar] [--window]\n\
-        \x20                   [--server ADDR] [--size WxH] [--quality high|medium|low|ci]\n\
-        \x20                   [--no-vsync] [--frames N] [--out FILE.ppm] [--stream ADDR]\n\
-        \n\
-        With no arguments a window opens on the demo scene: W/A/S/D or the arrow\n\
-        keys move, Space/Shift go up/down, dragging with the left mouse button\n\
-        looks around, the mouse wheel changes the flying speed, Esc quits.\n\
-        \n\
-        A scene flag on its own renders one frame headlessly to a PPM file and\n\
-        exits; add --window to fly around it instead (e.g. --window --solar).\n\
-        \x20 --demo      the deterministic demo scene (a sphere and a cube)\n\
-        \x20 --galaxy    the deterministic galaxy through the LOD selector\n\
-        \x20 --materials a PBR material chart: gold, plastic and steel spheres from\n\
-        \x20             mirror-smooth to rough, a mirror floor, glass and a lamp\n\
-        \x20 --solar     the solar system at real size: the Sun, the planets and\n\
-        \x20             the Moon as coloured spheres; you start just off Earth\n\
-        \x20 --window   show the chosen scene in a window instead\n\
-        \x20 --glb FILE  also show a .glb model (binary glTF: geometry and material\n\
-        \x20             factors, no textures) in front of the spawn point\n\
-        \x20 --glb-scale S  metres per model unit (default: fit to about 3 m)\n\
-        \x20 --server ADDR  join the authoritative shard at ADDR (host:port) as a\n\
-        \x20            player: input drives the ship, replication drives the\n\
-        \x20            camera. Opens a window unless --stream is given\n\
-        \x20 --size WxH frame/window size in pixels (default 640x480)\n\
-        \x20 --quality P quality preset: high (default), medium, low or ci\n\
-        \x20            (fog, screen-space reflections, refraction)\n\
-        \x20 --no-vsync window: present as fast as frames render (benchmarking)\n\
-        \x20 --frames N window/stream: exit after N frames\n\
-        \x20 --out FILE offline render: write the frame to FILE (PPM);\n\
-        \x20            default demo.ppm / galaxy.ppm\n\
-        \x20 --stream ADDR  serve frames as JPEG over ws://ADDR (plain ws://, no\n\
-        \x20            TLS) to the space-viewer wasm page; viewer input drives\n\
-        \x20            the camera"
-    );
-}
-
-/// The deterministic galaxy scene, built through `space-world`'s LOD selector.
-fn galaxy_scene(width: u32, height: u32) -> Scene {
-    galaxy_scene_at(&galaxy_camera(width, height))
-}
-
-/// Where the player spawns in the galaxy scene (the base camera's position).
-const GALAXY_SPAWN_M: [f64; 3] = [0.0, 0.0, -5.0e4];
-/// The spawn view direction (the stream starts turned to face the galaxy, +Z).
-const GALAXY_SPAWN_FORWARD: [f32; 3] = [0.0, 0.0, 1.0];
-/// The spawn cube sits this far in front of the spawn point, metres.
-const SPAWN_CUBE_DISTANCE_M: f64 = 12.0;
-/// Distance from the spawn cube's centre to each face, metres.
-const SPAWN_CUBE_HALF_M: f32 = 2.0;
-/// The spawn cube's colour (linear rgb): magenta, absent from the star field.
-const SPAWN_CUBE_COLOR: [f32; 3] = [1.0, 0.05, 0.8];
-
-/// The galaxy scene's base camera.
-fn galaxy_camera(width: u32, height: u32) -> CameraPose {
-    // Same camera as the `lod_galaxy_renders` GPU test: pulled back along -Z and
-    // looking back (+Z) at the galaxy's centre at the origin, so the LOD selector
-    // refines a dense band of the octree around the camera.
-    CameraPose {
-        position: WorldPos::from_f64_metres_around(WorldPos::ZERO, GALAXY_SPAWN_M),
-        forward: GALAXY_SPAWN_FORWARD,
-        up: [0.0, 1.0, 0.0],
-        fov_y: std::f32::consts::FRAC_PI_3,
-        aspect: width as f32 / height as f32,
-        near: 1.0,
-        far: 5.0e6,
-    }
-}
-
-/// The galaxy through the LOD selector, seen from `camera`.
-fn galaxy_scene_at(camera: &CameraPose) -> Scene {
-    let started = std::time::Instant::now();
-    let galaxy = Galaxy::new(0x5eed);
-    let mut lod = LodSelector::new(30, 63, 8.0);
-    // Cull against the frustum that is actually on screen (the selector's
-    // default is 16:9, which would clip the sides of a wider window).
-    if camera.aspect.is_finite() && camera.aspect > 0.0 {
-        lod.aspect = camera.aspect;
-    }
-    // `Scene::build` traverses only the one depth-30 node containing the camera.
-    // The galaxy is centred on the cell origin and the camera sits on its x=0/y=0
-    // boundary, so that node covers a single octant and the galaxy would fill one
-    // frame quadrant. Traverse the 8 nodes of that depth meeting at the origin.
-    //
-    // This runs every frame the camera moves, so it selects in one pass per
-    // root and looks each node's distance up once: every selected node that
-    // holds a star, with its distance from the camera.
-    let mut stars: Vec<(f64, NodeRef)> = Vec::new();
-    for octant in 0..8i64 {
-        let index = [-(octant & 1), -((octant >> 1) & 1), -((octant >> 2) & 1)];
-        let root = NodeRef::new(lod.min_depth, index);
-        for node in lod.select_from(root, camera.position, camera.forward, camera.fov_y) {
-            if galaxy.star_at(node).is_some() {
-                stars.push((lod.distance_to(node, camera.position), node));
-            }
-        }
-    }
-    // Nearest to the camera first, so the instance budget goes to the stars
-    // around the viewer rather than to one side (stable: ties keep root order).
-    stars.sort_by(|a, b| a.0.total_cmp(&b.0));
-    // Leave room for the spawn cube.
-    stars.truncate(MAX_SELECTED - 1);
-    let selected: Vec<NodeRef> = stars.into_iter().map(|(_, node)| node).collect();
-    let mut scene = Scene::from_selection(&galaxy, camera, &selected);
-    log::trace!(
-        "galaxy scene: {} stars in {:.2} ms",
-        scene.instances.len(),
-        started.elapsed().as_secs_f64() * 1e3
-    );
-    // A lit cube a short distance in front of the spawn point, in world space so
-    // it stays put when the camera moves.
-    let spawn = WorldPos::from_f64_metres_around(WorldPos::ZERO, GALAXY_SPAWN_M);
-    let cube = WorldPos::from_f64_metres_around(
-        spawn,
-        GALAXY_SPAWN_FORWARD.map(|c| f64::from(c) * SPAWN_CUBE_DISTANCE_M),
-    );
-    let d = WorldPos::delta(camera.position, cube);
-    scene.push_box(
-        [d[0] as f32, d[1] as f32, d[2] as f32],
-        SPAWN_CUBE_HALF_M,
-        SPAWN_CUBE_COLOR,
-    );
-    let light = WorldPos::from_f64_metres_around(cube, [4.0, 5.0, -6.0]);
-    scene.with_lights(vec![SceneLight {
-        position: light,
-        color: [1.0, 1.0, 1.0],
-        intensity: 60.0,
-    }])
-}
-
-fn scene_for(mode: Mode, width: u32, height: u32) -> Scene {
-    match mode {
-        Mode::Galaxy => galaxy_scene(width, height),
-        Mode::Materials => scenes::materials_scene(&scenes::materials_camera(width, height)),
-        Mode::Solar => scenes::solar_scene(&scenes::solar_camera(width, height)),
-        Mode::Demo | Mode::Window => demo_scene(width, height),
-    }
-}
-
-/// Write an RGBA8 buffer as a binary PPM (P6) file.
-fn write_ppm(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
-    let pixels = width as usize * height as usize;
-    if rgba.len() != pixels * 4 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} bytes is not a {width}x{height} RGBA8 frame", rgba.len()),
-        ));
-    }
-    let mut out = Vec::with_capacity(16 + pixels * 3);
-    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-    for px in rgba.as_chunks::<4>().0 {
-        out.extend_from_slice(&px[..3]);
-    }
-    std::fs::write(path, out)
-}
-
-/// The cheap, deterministic render options every front end uses (offline
-/// render, window, stream), so the same preset gates the same features —
-/// including the SSR/refraction post pass — whichever way the frame leaves the
-/// GPU; the preset selects the optional render features.
-fn demo_options(preset: QualityPreset) -> RenderOptions {
-    RenderOptions {
-        gi_enabled: false,
-        quality: Quality::CI,
-        preset,
-        ..Default::default()
-    }
-}
-
-/// [`demo_options`] for a particular scene: the scenes at astronomical scale
-/// turn the presets' distance fog off (it is tuned for metres, and would paint
-/// every star and planet solid fog colour).
-fn scene_options(mode: Mode, preset: QualityPreset) -> RenderOptions {
-    let fog_scale = match mode {
-        Mode::Galaxy | Mode::Solar => 0.0,
-        Mode::Demo | Mode::Materials | Mode::Window => 1.0,
+    config.front_end = match stream {
+        Some(addr) => FrontEnd::Stream(addr),
+        None if headless => FrontEnd::Headless,
+        None => FrontEnd::Window,
     };
-    RenderOptions {
-        fog_scale,
-        ..demo_options(preset)
+    if config.glb_scale.is_some() && config.glb.is_none() {
+        return Err("--glb-scale needs --glb FILE".into());
+    }
+    if config.script_timeout.is_some() && config.script.is_none() {
+        return Err("--script-timeout needs --script FILE".into());
+    }
+    Ok(Command::Run(Box::new(config)))
+}
+
+fn usage() -> String {
+    format!(
+        "usage: space-client [--server ADDR] [--headless | --stream ADDR]\n\
+        \x20                   [--size WxH] [--quality high|medium|low|ci] [--no-vsync]\n\
+        \x20                   [--frames N] [--fps N] [--glb FILE [--glb-scale S]]\n\
+        \x20                   [--harness ADDR] [--script FILE [--script-timeout S]]\n\
+        \x20                   [--out-dir DIR]\n\
+        \n\
+        The client always plays on a shard. With no arguments a window opens on\n\
+        the connect screen: type the server's address (host, host:port or\n\
+        [ipv6]:port; the port defaults to {DEFAULT_PORT}) and press Enter. Esc quits\n\
+        (the window only: see --headless).\n\
+        The scene that is drawn (demo-area, materials, solar, galaxy) is the\n\
+        server's choice, not the client's.\n\
+        \n\
+        While playing: {KEY_HELP}\n\
+        (C toggles the chase camera and first person. B toggles the brake\n\
+        assist, which stops the ship when no movement key is held. Esc returns\n\
+        to the connect screen.)\n\
+        \n\
+        \x20 --server ADDR  connect to this shard at once instead of showing the\n\
+        \x20                connect screen, and stay connected: if the connection\n\
+        \x20                fails or is lost the connect screen says why and the\n\
+        \x20                client tries again by itself (after 2, 3, 5, then\n\
+        \x20                every 8 seconds) until it is back in. Editing the\n\
+        \x20                address or pressing Esc stops the retrying\n\
+        \x20 --headless     no window: render offscreen at a capped rate, to be\n\
+        \x20                driven through --harness or --script. No key ends a\n\
+        \x20                client without a window (Esc on its connect screen\n\
+        \x20                only stops the retrying or cancels an attempt): it\n\
+        \x20                ends through the harness (POST /quit, client.quit()),\n\
+        \x20                after --frames, when its --script has ended, or by a\n\
+        \x20                signal\n\
+        \x20 --stream ADDR  headless, and serve the frames as JPEG over ws://ADDR\n\
+        \x20                (plain ws://, no TLS) to the space-viewer page; the\n\
+        \x20                viewer's keyboard and mouse drive the client, and\n\
+        \x20                cannot end it\n\
+        \x20 --size WxH     frame/window size in pixels (default 1280x720 in a\n\
+        \x20                window, 640x480 without one)\n\
+        \x20 --quality P    quality preset: high (default), medium, low or ci\n\
+        \x20                (shadows, fog, screen-space reflections, refraction)\n\
+        \x20 --no-vsync     window: present as fast as frames render\n\
+        \x20 --frames N     exit after N frames\n\
+        \x20 --fps N        headless/stream: frame rate cap (default {DEFAULT_FPS})\n\
+        \x20 --glb FILE     also show a .glb model (binary glTF) near the spawn\n\
+        \x20                point; only this client sees it\n\
+        \x20 --glb-scale S  metres per model unit (default: fit to about 3 m)\n\
+        \n\
+        The harness (every front end): drive the client without a human.\n\
+        \x20 --harness ADDR serve the control API over HTTP on ADDR (GET / lists\n\
+        \x20                the routes: /state, /frame.png, /input, /connect,\n\
+        \x20                /script, ...). Loopback needs no credentials; any other\n\
+        \x20                address needs a bearer token in the environment\n\
+        \x20                variable {TOKEN_ENV}\n\
+        \x20 --script FILE  run a Lua script against this client (client.type,\n\
+        \x20                client.press, client.connect, client.screenshot, ...)\n\
+        \x20                and exit with its result: 0 passed, 1 failed (the\n\
+        \x20                message goes to stderr)\n\
+        \x20 --script-timeout S  stop the script after S seconds (default 60)\n\
+        \x20 --out-dir DIR  where scripts write screenshots (default harness-out)"
+    )
+}
+
+/// A fatal error: the message, and the process exit code it deserves.
+struct Fatal {
+    message: String,
+    code: u8,
+}
+
+impl Fatal {
+    /// Something went wrong at run time.
+    fn runtime(message: impl std::fmt::Display) -> Self {
+        Self {
+            message: message.to_string(),
+            code: 1,
+        }
+    }
+
+    /// The command line (or the environment) asks for something impossible.
+    fn usage(message: impl std::fmt::Display) -> Self {
+        Self {
+            message: message.to_string(),
+            code: 2,
+        }
     }
 }
 
-fn run_offscreen(config: &Config) -> Result<(), RenderError> {
+/// How scripts run here: screenshots under `--out-dir`, output echoed live.
+fn script_config(config: &Config) -> ScriptConfig {
+    let mut scripts = ScriptConfig {
+        out_dir: config.out_dir.clone(),
+        on_output: Some(Arc::new(|line: &str| println!("{line}"))),
+        frame_timeout: FRAME_TIMEOUT,
+        ..ScriptConfig::default()
+    };
+    if let Some(timeout) = config.script_timeout {
+        scripts.timeout = timeout;
+    }
+    scripts
+}
+
+/// Serve the harness's HTTP API on `addr`. What the library would refuse (a
+/// non-loopback address without a token) is refused here, before anything
+/// else starts, with the way out.
+fn start_harness(
+    runtime: &tokio::runtime::Runtime,
+    addr: &str,
+    control: Arc<dyn Control>,
+    scripts: ScriptConfig,
+) -> Result<(), Fatal> {
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind(addr))
+        .map_err(|e| Fatal::usage(format!("--harness {addr}: cannot listen there: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| Fatal::runtime(format!("--harness {addr}: {e}")))?;
+    let token = std::env::var(TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty());
+    let config = HttpConfig {
+        token,
+        script: scripts,
+        frame_timeout: FRAME_TIMEOUT,
+        ..HttpConfig::default()
+    };
+    http::Api::new(Arc::clone(&control), config.clone(), bound).map_err(|refused| {
+        Fatal::usage(format!(
+            "--harness {addr}: {refused}\n\
+             Use a loopback address (127.0.0.1:PORT), or put a token of at least {} \
+             characters in the environment variable {TOKEN_ENV}; requests then need the \
+             header \"Authorization: Bearer <token>\".",
+            http::MIN_TOKEN_LEN
+        ))
+    })?;
+    eprintln!(
+        "space-client: harness API on http://{bound}/ ({})",
+        if config.token.is_some() {
+            "bearer token required"
+        } else {
+            "no token: loopback only"
+        }
+    );
+    runtime.spawn(async move {
+        // `serve` only returns to refuse the listener, which was ruled out above.
+        if let Err(refused) = http::serve(listener, control, config).await {
+            eprintln!("space-client: harness API stopped: {refused}");
+        }
+    });
+    Ok(())
+}
+
+/// A `--script` run on its own thread.
+struct ScriptRun {
+    path: PathBuf,
+    stop: StopHandle,
+    thread: std::thread::JoinHandle<ScriptReport>,
+}
+
+impl ScriptRun {
+    /// Read the script and start it against `hub`. When it ends — passed or
+    /// failed — the client is asked to quit: the script's end is the
+    /// process's end.
+    fn start(path: PathBuf, hub: &Arc<Hub>, mut scripts: ScriptConfig) -> Result<Self, Fatal> {
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| Fatal::usage(format!("--script {}: {e}", path.display())))?;
+        scripts.name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stop = StopHandle::new();
+        let (hub, stopper) = (Arc::clone(hub), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("space-script-host".into())
+            .spawn(move || {
+                let control: Arc<dyn Control> = hub.clone();
+                let report = run_script(control, &source, &scripts, &stopper);
+                hub.quit();
+                report
+            })
+            .map_err(|e| Fatal::runtime(format!("cannot start the script thread: {e}")))?;
+        Ok(Self { path, stop, thread })
+    }
+
+    /// The client has stopped: collect the script's outcome, print it and
+    /// turn it into the exit code (0 passed, 1 failed).
+    fn finish(self) -> u8 {
+        // Normally the script ended first and asked for the quit. If the
+        // client ended for another reason, the script may be on its last
+        // lines; after that it is cut short (and has failed).
+        let patience = Instant::now() + SCRIPT_GRACE;
+        while !self.thread.is_finished() && Instant::now() < patience {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.stop.stop();
+        let name = self.path.display();
+        let report = match self.thread.join() {
+            Ok(report) => report,
+            Err(_) => {
+                eprintln!("space-client: script {name}: FAILED: the script host panicked");
+                return 1;
+            }
+        };
+        for screenshot in &report.screenshots {
+            eprintln!("space-client: screenshot {screenshot}");
+        }
+        match &report.error {
+            None => eprintln!("space-client: script {name}: ok ({} ms)", report.elapsed_ms),
+            Some(error) => {
+                let near = match (error.line, report.last_call_line) {
+                    (None, Some(line)) => format!(" (after the call on line {line})"),
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "space-client: script {name}: FAILED ({:?}): {error}{near}",
+                    error.kind
+                );
+            }
+        }
+        u8::from(!report.ok)
+    }
+}
+
+fn run(config: &Config) -> Result<u8, Fatal> {
+    let model = match &config.glb {
+        Some(path) => {
+            let model = TestModel::load(path, config.glb_scale)
+                .map_err(|e| Fatal::usage(format!("--glb {e}")))?;
+            let mesh = model.mesh();
+            eprintln!(
+                "space-client: model {}: {} triangles, {} parts, {:.2} m across at scale {}",
+                path.display(),
+                mesh.triangle_count(),
+                mesh.parts.len(),
+                2.0 * mesh.radius() * model.scale(),
+                model.scale()
+            );
+            Some(model)
+        }
+        None => None,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| Fatal::runtime(format!("tokio runtime: {e}")))?;
+    let hub = Hub::new();
+    let scripts = script_config(config);
+    if let Some(addr) = &config.harness {
+        start_harness(&runtime, addr, hub.clone(), scripts.clone())?;
+    }
+    // Bind the stream before anything is drawn, so a taken port fails at once.
+    let stream = match &config.front_end {
+        FrontEnd::Stream(addr) => Some(
+            runtime
+                .block_on(StreamServer::bind(addr.as_str()))
+                .map_err(|e| Fatal::usage(format!("--stream {addr}: cannot listen there: {e}")))?,
+        ),
+        _ => None,
+    };
+    let app = App::new(
+        AppConfig {
+            server: config.server.clone(),
+            quality: config.quality,
+            model,
+            escape_quits: config.front_end.user_may_quit(),
+        },
+        runtime.handle().clone(),
+        Arc::clone(&hub),
+    );
+    let (width, height) = config.size();
+    // The script starts with the client: let it find the real state at once.
+    app.announce(width, height);
+    let script = match &config.script {
+        Some(path) => Some(ScriptRun::start(path.clone(), &hub, scripts)?),
+        None => None,
+    };
+    let outcome = match &config.front_end {
+        FrontEnd::Window => window::run_window(
+            app,
+            &window::WindowConfig {
+                width,
+                height,
+                vsync: config.vsync,
+                frames: config.frames,
+            },
+        ),
+        FrontEnd::Headless | FrontEnd::Stream(_) => {
+            let headless = HeadlessConfig {
+                width,
+                height,
+                fps: config.fps,
+                frames: config.frames,
+                idle_unwatched: !config.harnessed(),
+            };
+            run_offscreen(app, &headless, stream.as_ref())
+        }
+    };
+    // The app is gone by now, and with it the harness's client: a script
+    // still running finds the client closed.
+    hub.close();
+    let code = script.map(ScriptRun::finish);
+    drop(stream);
+    outcome.map_err(Fatal::runtime)?;
+    Ok(code.unwrap_or(0))
+}
+
+/// The headless and stream front ends: the application in an offscreen loop.
+fn run_offscreen(
+    mut app: App,
+    config: &HeadlessConfig,
+    stream: Option<&(StreamServer, space_stream::StreamClient)>,
+) -> Result<(), space_render::RenderError> {
     let ctx = RenderContext::new(&ContextOptions::default())?;
     eprintln!(
-        "space-client: device {:?} ray_query={}",
+        "space-client: device {:?} ray_query={}; headless {}x{} at up to {} fps",
         ctx.device_name(),
-        ctx.ray_query_support().complete()
-    );
-    let mut scene = scene_for(config.mode, config.width, config.height);
-    if let Some(model) = &config.model {
-        model.add_to(&mut scene);
-    }
-    let out = ctx.render_offscreen(
-        &scene,
+        ctx.ray_query_support().complete(),
         config.width,
         config.height,
-        &scene_options(config.mode, config.quality),
-    )?;
-    let default = PathBuf::from(format!("{}.ppm", config.mode.name()));
-    let path = config.out.clone().unwrap_or(default);
-    write_ppm(&path, out.width, out.height, &out.pixels)
-        .map_err(|e| RenderError::new(format!("write {}: {e}", path.display())))?;
+        config.fps
+    );
+    if let Some((server, _)) = stream {
+        eprintln!(
+            "space-client: streaming on ws://{} (plain ws://, no TLS)",
+            server.local_addr()
+        );
+    }
+    let stop = AtomicBool::new(false);
+    let started = Instant::now();
+    let report = run_headless(
+        &ctx,
+        &mut app,
+        config,
+        stream.map(|(_, client)| client),
+        &stop,
+    );
+    // The link and the harness go first, then the GPU context.
+    drop(app);
+    let report = report?;
     eprintln!(
-        "space-client: wrote {} ({}x{}, {} instances, {} validation messages)",
-        path.display(),
-        out.width,
-        out.height,
-        out.instance_count,
-        out.validation_messages
+        "space-client: rendered {} frames in {:.1} s, {} validation messages",
+        report.frames,
+        started.elapsed().as_secs_f64(),
+        report.validation_messages
     );
     Ok(())
 }
 
-fn main() {
-    env_logger::init();
-    let mut config = parse_args();
-    if let Some(path) = &config.glb {
-        match PlacedModel::load(path, config.glb_scale, config.mode) {
-            Ok(model) => config.model = Some(model),
-            Err(e) => {
-                eprintln!("space-client: {e}");
-                std::process::exit(1);
-            }
+fn main() -> ExitCode {
+    // What the client does on its own initiative — connecting, why an attempt
+    // failed, when it tries again, a scene change — is said on stderr unless
+    // `RUST_LOG` asks for something else: an unattended client (a container)
+    // has no other way to tell its operator. Everything else stays quiet.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("error,space_client=info"),
+    )
+    .init();
+    let config = match parse_args(std::env::args().skip(1)) {
+        Ok(Command::Run(config)) => config,
+        Ok(Command::Help) => {
+            println!("{}", usage());
+            return ExitCode::SUCCESS;
         }
-    }
-    let result = match &config.stream {
-        Some(addr) => stream::run_stream(&config, addr),
-        None if config.windowed() => window::run_window(&config),
-        None => run_offscreen(&config),
+        Err(message) => {
+            eprintln!("space-client: {message}\n\n{}", usage());
+            return ExitCode::from(2);
+        }
     };
-    if let Err(e) = result {
-        eprintln!("space-client: {e}");
-        std::process::exit(1);
+    match run(&config) {
+        Ok(code) => ExitCode::from(code),
+        Err(fatal) => {
+            eprintln!("space-client: {}", fatal.message);
+            ExitCode::from(fatal.code)
+        }
     }
 }
 
@@ -543,221 +644,231 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The offline demo renders a lit sphere headlessly (no window), proving
-    /// the client's render path works end to end on a real device. Skips
-    /// loudly when no Vulkan device is available.
-    #[test]
-    fn demo_renders_lit_pixels() {
-        let ctx = match RenderContext::new(&ContextOptions::default()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                space_render::skip_or_require_gpu(&e);
-                return;
-            }
-        };
-        // Same guard as the space-render GPU tests: with the var set the layer
-        // must really be active, or `validation_messages == 0` below is vacuous.
-        assert!(
-            std::env::var("SPACE_RENDER_VALIDATION").as_deref() != Ok("1")
-                || ctx.validation_active(),
-            "SPACE_RENDER_VALIDATION=1 but VK_LAYER_KHRONOS_validation is not active"
-        );
-        let size = 64;
-        let scene = demo_scene(size, size);
-        let out = ctx
-            .render_offscreen(&scene, size, size, &demo_options(QualityPreset::Ci))
-            .expect("demo render");
-        assert_eq!(out.validation_messages, 0);
-        let lit = out
-            .pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
-            .count();
-        assert!(lit > 0, "the demo scene rendered nothing");
-    }
-
-    /// Every preset (including the SSR/refraction presets) renders cleanly with
-    /// the client's options, with zero validation messages, and the presets
-    /// actually *differ*: High/Medium show the SSR reflection and fog that
-    /// Low/Ci (identical to each other) do not, and High's denser fog differs
-    /// from Medium's. Rendering each scene at every preset back to back also
-    /// makes the context rebuild its cached frame whenever the feature set
-    /// changes, and each preset is rendered twice to prove the reused frame
-    /// reproduces the first render exactly.
-    #[test]
-    fn every_preset_renders_and_the_presets_differ() {
-        let ctx = match RenderContext::new(&ContextOptions::default()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                space_render::skip_or_require_gpu(&e);
-                return;
-            }
-        };
-        assert!(
-            std::env::var("SPACE_RENDER_VALIDATION").as_deref() != Ok("1")
-                || ctx.validation_active(),
-            "SPACE_RENDER_VALIDATION=1 but VK_LAYER_KHRONOS_validation is not active"
-        );
-        let size = 64;
-        let camera = CameraPose {
-            position: WorldPos::ZERO,
-            forward: [0.0, 0.0, -1.0],
-            up: [0.0, 1.0, 0.0],
-            fov_y: std::f32::consts::FRAC_PI_3,
-            aspect: 1.0,
-            near: 0.05,
-            far: 1.0e5,
-        };
-        let instance = |center: [f32; 4], albedo: [f32; 4], emissive: [f32; 4], shape| {
-            space_render::GpuInstance {
-                center,
-                albedo,
-                emissive,
-                roughness: 0.1,
-                shape,
-                transmission: 0.0,
-                _pad1: 0.0,
-            }
-        };
-        // SSR scene: a smooth metallic floor under a bright red sphere.
-        let mirror = Scene::from_instances(
-            camera,
-            vec![
-                instance(
-                    [0.0, -101.0, 0.0, 100.0],
-                    [0.8, 0.8, 0.8, 1.0],
-                    [0.0; 4],
-                    space_render::SHAPE_BOX,
-                ),
-                instance(
-                    [0.0, -0.4, -6.0, 0.5],
-                    [0.0; 4],
-                    [6.0, 0.0, 0.0, 1.0],
-                    space_render::SHAPE_SPHERE,
-                ),
-            ],
-        );
-        // Fog scene: a big bright sphere 800 m away.
-        let far = Scene::from_instances(
-            camera,
-            vec![instance(
-                [0.0, 0.0, -800.0, 100.0],
-                [1.0, 1.0, 1.0, 0.0],
-                [4.0, 4.0, 4.0, 1.0],
-                space_render::SHAPE_SPHERE,
-            )],
-        );
-
-        let render = |scene: &Scene, preset: QualityPreset| {
-            let options = demo_options(preset);
-            assert_eq!(options.preset, preset);
-            let out = ctx
-                .render_offscreen(scene, size, size, &options)
-                .expect("frame render");
-            assert_eq!(out.validation_messages, 0, "{preset}");
-            assert!(
-                out.pixels.as_chunks::<4>().0.iter().any(|px| px[0] > 8),
-                "{preset}: nothing rendered"
-            );
-            // The second render reuses the cached frame resources.
-            let again = ctx
-                .render_offscreen(scene, size, size, &options)
-                .expect("second render");
-            assert_eq!(again.validation_messages, 0, "{preset} (reused frame)");
-            assert!(
-                out.pixels == again.pixels,
-                "{preset}: the reused frame rendered different pixels"
-            );
-            out.pixels
-        };
-        for scene in [&mirror, &far] {
-            let [high, medium, low, ci] = QualityPreset::ALL.map(|p| render(scene, p));
-            assert!(low == ci, "Low and Ci have every optional feature off");
-            assert!(high != ci, "High must differ from Ci");
-            assert!(medium != ci, "Medium must differ from Ci");
-            assert!(high != medium, "High and Medium must differ");
+    fn parse(args: &[&str]) -> Result<Config, String> {
+        match parse_args(args.iter().map(|arg| (*arg).to_owned()))? {
+            Command::Run(config) => Ok(*config),
+            Command::Help => Err("help".into()),
         }
     }
 
-    /// The galaxy scene builds through the LOD selector and stays within the
-    /// `MAX_SELECTED` bound.
     #[test]
-    fn galaxy_scene_is_bounded() {
-        let scene = galaxy_scene(64, 64);
-        assert!(scene.instances.len() <= space_world::MAX_SELECTED);
-    }
-
-    /// The spawn cube is the last instance: a box straight ahead (+Z) of the
-    /// spawn camera at `SPAWN_CUBE_DISTANCE_M`.
-    #[test]
-    fn galaxy_scene_has_a_cube_in_front_of_the_spawn_camera() {
-        let scene = galaxy_scene(64, 64);
-        let cube = scene.instances.last().expect("cube instance");
-        assert_eq!(cube.shape, space_render::SHAPE_BOX);
-        assert!(cube.center[0].abs() < 1e-3 && cube.center[1].abs() < 1e-3);
-        assert!((f64::from(cube.center[2]) - SPAWN_CUBE_DISTANCE_M).abs() < 1e-3);
-        assert_eq!(cube.center[3], SPAWN_CUBE_HALF_M);
+    fn no_arguments_is_a_window_on_the_connect_screen() {
+        let config = parse(&[]).expect("parses");
+        assert_eq!(config, Config::default());
+        assert_eq!(config.front_end, FrontEnd::Window);
+        assert_eq!(config.server, None, "no server: the connect screen");
+        assert_eq!(config.size(), (1280, 720));
+        assert!(config.vsync && !config.harnessed());
+        assert_eq!(config.out_dir, PathBuf::from("harness-out"));
     }
 
     #[test]
-    fn size_argument_is_validated() {
+    fn the_front_end_is_window_headless_or_stream() {
+        assert_eq!(
+            parse(&["--headless"]).unwrap().front_end,
+            FrontEnd::Headless
+        );
+        let stream = FrontEnd::Stream("0.0.0.0:8099".into());
+        assert_eq!(
+            parse(&["--stream", "0.0.0.0:8099"]).unwrap().front_end,
+            stream
+        );
+        // --stream is headless already.
+        assert_eq!(
+            parse(&["--headless", "--stream", "0.0.0.0:8099"])
+                .unwrap()
+                .front_end,
+            stream
+        );
+        assert_eq!(parse(&["--headless"]).unwrap().size(), (640, 480));
+        assert_eq!(
+            parse(&["--stream", "a:1", "--size", "800x600"])
+                .unwrap()
+                .size(),
+            (800, 600)
+        );
+        // The container entrypoint's form.
+        let docker = parse(&[
+            "--stream",
+            "0.0.0.0:8099",
+            "--server",
+            "shard:7777",
+            "--quality",
+            "low",
+        ])
+        .expect("the entrypoint form parses");
+        assert_eq!(docker.server.as_deref(), Some("shard:7777"));
+        assert_eq!(docker.quality, QualityPreset::Low);
+        // Only the window's own keyboard may end the client: the keys of the
+        // other front ends come from whoever can reach them.
+        assert!(parse(&[]).unwrap().front_end.user_may_quit());
+        assert!(!parse(&["--headless"]).unwrap().front_end.user_may_quit());
+        assert!(!stream.user_may_quit() && !docker.front_end.user_may_quit());
+        let help = usage();
+        assert!(help.contains("No key ends a") && help.contains("cannot end it"));
+    }
+
+    #[test]
+    fn the_server_address_is_checked_for_shape_only() {
+        for good in [
+            "127.0.0.1",
+            "127.0.0.1:7000",
+            "shard.example.org",
+            "[::1]:7777",
+        ] {
+            assert_eq!(
+                parse(&["--server", good]).unwrap().server.as_deref(),
+                Some(good)
+            );
+        }
+        for bad in ["", "host:port", "a b", "[::1"] {
+            let err = parse(&["--server", bad]).expect_err(bad);
+            assert!(err.contains("--server"), "{err}");
+        }
+        assert!(parse(&["--server"]).is_err());
+    }
+
+    #[test]
+    fn the_harness_flags_work_with_every_front_end() {
+        for front in [
+            &[][..],
+            &["--headless"][..],
+            &["--stream", "127.0.0.1:0"][..],
+        ] {
+            let mut args = front.to_vec();
+            args.extend([
+                "--harness",
+                "127.0.0.1:8098",
+                "--script",
+                "test.lua",
+                "--out-dir",
+                "shots",
+                "--script-timeout",
+                "2.5",
+            ]);
+            let config = parse(&args).expect("parses");
+            assert_eq!(config.harness.as_deref(), Some("127.0.0.1:8098"));
+            assert_eq!(config.script, Some(PathBuf::from("test.lua")));
+            assert_eq!(config.out_dir, PathBuf::from("shots"));
+            assert_eq!(config.script_timeout, Some(Duration::from_millis(2500)));
+            assert!(config.harnessed());
+            let scripts = script_config(&config);
+            assert_eq!(scripts.out_dir, PathBuf::from("shots"));
+            assert_eq!(scripts.timeout, Duration::from_millis(2500));
+        }
+        assert!(parse(&["--harness", "127.0.0.1:1"]).unwrap().harnessed());
+        assert!(parse(&["--script", "x.lua"]).unwrap().harnessed());
+        assert_eq!(
+            script_config(&Config::default()).timeout,
+            ScriptConfig::default().timeout
+        );
+        for bad in [
+            &["--script-timeout", "5"][..],
+            &["--script", "x.lua", "--script-timeout", "0"],
+            &["--script", "x.lua", "--script-timeout", "-1"],
+            &["--script", "x.lua", "--script-timeout", "soon"],
+            &["--harness"],
+            &["--script"],
+            &["--out-dir"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_remaining_flags_are_validated() {
+        let config = parse(&[
+            "--size",
+            "64X48",
+            "--quality",
+            "medium",
+            "--no-vsync",
+            "--frames",
+            "600",
+            "--fps",
+            "60",
+            "--glb",
+            "ship.glb",
+            "--glb-scale",
+            "0.5",
+        ])
+        .expect("parses");
+        assert_eq!(config.size(), (64, 48));
+        assert_eq!(config.quality, QualityPreset::Medium);
+        assert!(!config.vsync);
+        assert_eq!((config.frames, config.fps), (Some(600), 60));
+        assert_eq!(config.glb, Some(PathBuf::from("ship.glb")));
+        assert_eq!(config.glb_scale, Some(0.5));
         assert_eq!(parse_size("1280x720"), Some((1280, 720)));
-        assert_eq!(parse_size("64X48"), Some((64, 48)));
         for bad in [
             "", "640", "640x", "x480", "0x480", "640x0", "-1x4", "99999x4", "axb",
         ] {
             assert_eq!(parse_size(bad), None, "{bad:?}");
+            assert!(parse(&["--size", bad]).is_err(), "{bad:?}");
+        }
+        for bad in [
+            &["--quality", "ultra"][..],
+            &["--frames", "many"],
+            &["--fps", "0"],
+            &["--fps", "100000"],
+            &["--glb-scale", "1.0"],
+            &["--glb", "a.glb", "--glb-scale", "0"],
+            &["--glb", "a.glb", "--glb-scale", "nan"],
+            &["--nope"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The scene flags of the offline client change nothing and do not stop
+    /// the client (an old deployment's `CLIENT_ARGS=--galaxy` must survive an
+    /// image update); the other offline flags are refused with a pointer.
+    #[test]
+    fn the_old_scene_flags_are_ignored_and_the_other_offline_flags_refused() {
+        let deployed = ["--stream", "0.0.0.0:8099", "--server", "10.0.0.2:7870"];
+        for scene in ["--demo", "--galaxy", "--materials", "--solar"] {
+            assert_eq!(parse(&[scene]), parse(&[]), "{scene}");
+            let mut with_flag = deployed.to_vec();
+            with_flag.push(scene);
+            assert_eq!(parse(&with_flag), parse(&deployed), "{scene}");
+            assert!(parse(&with_flag).is_ok(), "{scene}");
+        }
+        for gone in ["--window", "--out"] {
+            let err = parse(&[gone]).expect_err(gone);
+            assert!(err.contains("is gone"), "{err}");
         }
     }
 
     #[test]
-    fn a_window_opens_unless_a_scene_is_rendered_offline_or_streamed() {
-        let base = Config::default();
-        assert!(base.windowed(), "no arguments: window");
-        let offline = |mode| Config {
-            mode,
-            ..Config::default()
-        };
-        assert!(!offline(Mode::Demo).windowed(), "--demo renders offline");
-        assert!(!offline(Mode::Galaxy).windowed());
-        let shown = Config {
-            window: true,
-            ..offline(Mode::Galaxy)
-        };
-        assert!(shown.windowed(), "--window --galaxy");
-        let online = Config {
-            server: Some(([127, 0, 0, 1], 7777).into()),
-            ..offline(Mode::Galaxy)
-        };
-        assert!(online.windowed(), "--server implies a window");
-        let streamed = Config {
-            stream: Some("127.0.0.1:8099".into()),
-            ..online
-        };
-        assert!(!streamed.windowed(), "--stream never opens a window");
-    }
-
-    /// A buffer that is not `width * height` RGBA pixels is an error, not a
-    /// panic (the size comes from the command line).
-    #[test]
-    fn write_ppm_rejects_a_mismatched_buffer() {
-        let path = std::env::temp_dir().join("space_client_bad.ppm");
-        assert!(write_ppm(&path, 2, 2, &[0u8; 4]).is_err());
-        assert!(!path.exists());
-    }
-
-    /// `write_ppm` emits a valid P6 header and one RGB triple per pixel.
-    #[test]
-    fn write_ppm_writes_a_valid_p6_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("space_client_test.ppm");
-        let rgba = [1u8, 2, 3, 255, 4, 5, 6, 255];
-        write_ppm(&path, 2, 1, &rgba).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.starts_with(b"P6\n2 1\n255\n"));
-        assert_eq!(&bytes[b"P6\n2 1\n255\n".len()..], &[1, 2, 3, 4, 5, 6]);
-        let _ = std::fs::remove_file(&path);
+    fn help_is_help_and_lists_every_flag_and_the_keys() {
+        assert_eq!(parse_args(["--help".to_owned()]), Ok(Command::Help));
+        assert_eq!(
+            parse_args(["--headless".to_owned(), "-h".to_owned()]),
+            Ok(Command::Help)
+        );
+        let usage = usage();
+        for flag in [
+            "--server",
+            "--headless",
+            "--stream",
+            "--size",
+            "--quality",
+            "--no-vsync",
+            "--frames",
+            "--fps",
+            "--glb",
+            "--glb-scale",
+            "--harness",
+            "--script",
+            "--script-timeout",
+            "--out-dir",
+        ] {
+            assert!(usage.contains(flag), "{flag} is not in --help");
+        }
+        assert!(usage.contains(TOKEN_ENV) && usage.contains(KEY_HELP));
+        assert!(usage.contains("C toggles") && usage.contains("7777"));
+        for gone in ["--demo", "--galaxy", "--window", "--out "] {
+            assert!(!usage.contains(gone), "{gone} is still in --help");
+        }
     }
 }

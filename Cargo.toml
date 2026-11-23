@@ -16,6 +16,7 @@ members = [
     "crates/space-mcp",
     "crates/space-mcp-server",
     "crates/space-mcp-client",
+    "crates/space-harness",
 ]
 
 [workspace.package]
@@ -87,6 +88,34 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # Cargo.lock (xtask uses it), so this adds no new crate to the build. There is no
 # HTTP or MCP framework crate: HTTP/1.1 + SSE are hand-rolled on tokio.
 serde_json = "1"
+
+# Model textures (space-render's GLB loader), both pure Rust with no build
+# script. `miniz_oxide` is the inflate/deflate under the PNG decoder and encoder
+# in `space-render/src/texture.rs` (the PNG container itself is implemented
+# there, so no `png`/`flate2`/`crc32fast` crates); its only dependency is
+# `adler2`. `jpeg-decoder` reads JPEG base-colour images; with default features
+# off it has no dependencies (no rayon).
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+jpeg-decoder = { version = "0.3", default-features = false }
+
+# Headless client harness (`space-harness`): the control trait, the HTTP API and
+# Lua test scripts. The Lua interpreter must be pure Rust (no `mlua`/`rlua`: they
+# compile or link C Lua). `lunita` is a pure-Rust Lua VM, a fork of kyren's
+# `piccolo` made for untrusted scripts: memory and string-length limits, fuel
+# charged in proportion to work (so one VM step is bounded and a script can
+# always be stopped) and the complete `string` and `table` libraries — all of
+# which crates/space-harness/tests/lua.rs exercises. No build script, no proc
+# macro of its own, no file/network/process access in the library; it adds four
+# crates to the lockfile (`lunita`, `gc-arena`, `gc-arena-derive`, `anyhow`).
+# Pinned exactly: it is a young (first release 2026-10), single-maintainer crate,
+# so an upgrade should be a reviewed change, not a `cargo update`.
+# Why not `piccolo` itself: 0.3.3 (its last release, 2024) panics on ordinary
+# table code (`t.a=nil; t.d=4` after three inserts), has no `tonumber`,
+# `string.format` or `table.insert`, and cannot bound memory or the time of one
+# step; see crates/space-harness/src/script.rs. Everything that touches the
+# interpreter is in that one file, should it ever be replaced.
+space-harness = { path = "crates/space-harness" }
+lunita = "=0.1.2"
 
 [workspace.lints.cargo]
 # `space-world` in [workspace.dependencies] is reserved for the later Phase-1

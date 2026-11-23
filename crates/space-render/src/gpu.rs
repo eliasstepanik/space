@@ -18,11 +18,13 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use raw_window_handle::RawDisplayHandle;
 
 use crate::alloc::SharedAllocator;
+use crate::environment::Environment;
 use crate::mesh::{MeshData, ModelInstance};
-use crate::params::{self, GpuInstance, MeshInstanceGpu};
+use crate::overlay::Overlay;
+use crate::params::{self, GpuInstance, MeshInstanceGpu, OverlayInstance};
 use crate::passes::{
     DrawRun, FrameDraw, FrameGpu, FrameKey, FrameTarget, InstanceBuffer, MeshDraw, MeshGpu,
-    ShapeBlas, Tlas,
+    MeshTlasInstance, PipelineConfig, ShapeBlas, Tlas, WhiteTexture, MAX_CUSTOM_INDEX,
 };
 use crate::quality::{self, QualityPreset};
 use crate::scene::{sphere_level_for, sphere_vertex_count, Scene, SHAPE_BOX, SPHERE_LEVELS};
@@ -203,6 +205,21 @@ pub struct FrameOutput {
     pub instance_count: usize,
 }
 
+/// What a context has done for the mesh models it has drawn (see
+/// [`RenderContext::model_cache_stats`]). The counters only ever grow: a
+/// model's buffers, textures and acceleration structure are created once and
+/// reused for as long as consecutive frames keep drawing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelCacheStats {
+    /// Models currently on the device.
+    pub cached: usize,
+    /// Models uploaded so far (vertex and index buffers, textures).
+    pub uploads: u64,
+    /// Bottom-level acceleration structures built so far: one per model, the
+    /// first time a frame that traces rays draws it.
+    pub blas_builds: u64,
+}
+
 /// Ray-query capability of the selected device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RayQuerySupport {
@@ -302,7 +319,8 @@ pub(crate) fn carray_to_string(array: &[std::ffi::c_char]) -> String {
 /// GPU objects kept between frames (see [`crate::passes`]). Rendering a
 /// steady stream of frames of one size and feature set allocates nothing: the
 /// frame's images, buffers, descriptor sets and command buffer, the instance
-/// buffer and the acceleration structures are all reused.
+/// buffer, the uploaded models (buffers, textures, BLAS) and the acceleration
+/// structures are all reused.
 #[derive(Default)]
 struct RenderCache {
     frame: Option<(FrameKey, FrameGpu)>,
@@ -311,7 +329,18 @@ struct RenderCache {
     mesh_records: Option<InstanceBuffer<MeshInstanceGpu>>,
     /// Uploaded mesh models, by the address of their shared `MeshData` (the
     /// `Arc` kept alongside pins that address for as long as the entry lives).
+    /// An entry holds the model's vertex and index buffers, its textures and,
+    /// once a frame that traces rays has drawn it, its BLAS: each is created
+    /// once per mesh, never per frame.
     meshes: std::collections::HashMap<usize, (Arc<MeshData>, MeshGpu)>,
+    /// How many models have been uploaded, and BLASes built, so far.
+    model_uploads: u64,
+    blas_builds: u64,
+    /// What an untextured mesh part samples; created with the first model.
+    white: Option<WhiteTexture>,
+    /// The overlay's rectangles (an instance-rate vertex buffer); created
+    /// with the first non-empty overlay.
+    overlay: Option<InstanceBuffer<OverlayInstance>>,
     /// The unit sphere/cube BLASes; built on the first frame that traces rays.
     shapes: Option<ShapeBlas>,
     tlas: Option<Tlas>,
@@ -345,6 +374,9 @@ pub struct RenderContext {
     cache: Mutex<RenderCache>,
     device_name: String,
     ray_query: RayQuerySupport,
+    /// The device's `maxImageDimension2D`: a texture level larger than this
+    /// is not uploaded.
+    max_texture_dimension: u32,
     /// True only when `VK_LAYER_KHRONOS_validation` was actually enabled on the
     /// instance (requested *and* installed). Lets a test tell "validated and
     /// clean" apart from "no layer, so nothing to report".
@@ -525,12 +557,35 @@ impl RenderContext {
         }
         let ext_names: Vec<*const c_char> = required.iter().map(|c| c.as_ptr()).collect();
 
+        // Anisotropic filtering for model textures: an optional core feature,
+        // enabled where the device has it (nearly everywhere).
+        let (max_anisotropy, max_texture_dimension) = unsafe {
+            let limits = instance
+                .get_physical_device_properties(physical_device)
+                .limits;
+            let anisotropy = instance
+                .get_physical_device_features(physical_device)
+                .sampler_anisotropy
+                != 0;
+            (
+                if anisotropy {
+                    limits.max_sampler_anisotropy
+                } else {
+                    0.0
+                },
+                limits.max_image_dimension2_d,
+            )
+        };
+        let core_features =
+            vk::PhysicalDeviceFeatures::default().sampler_anisotropy(max_anisotropy > 1.0);
+
         let mut rq_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
         let mut as_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
             .acceleration_structure(true);
         let mut bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .features(core_features)
             .push_next(&mut bda_features)
             .push_next(&mut as_features);
         if ray_query_support.complete() {
@@ -572,8 +627,18 @@ impl RenderContext {
             .map_err(|e| RenderError::new(format!("gpu-allocator init: {e}")))?,
         ));
 
-        let pipelines =
-            crate::passes::Pipelines::create(&device, &crate::passes::Shaders::from_spv())?;
+        let pipelines = crate::passes::Pipelines::create(
+            &device,
+            &crate::passes::Shaders::from_spv(),
+            PipelineConfig {
+                ray_query: ray_query_support.complete(),
+                max_anisotropy: if max_anisotropy > 1.0 {
+                    max_anisotropy
+                } else {
+                    0.0
+                },
+            },
+        )?;
 
         let cmd_pool = unsafe {
             device
@@ -601,6 +666,7 @@ impl RenderContext {
             cache: Mutex::new(RenderCache::default()),
             device_name,
             ray_query: ray_query_support,
+            max_texture_dimension,
             validation_active: with_debug_utils,
             window_surface,
         })
@@ -672,6 +738,31 @@ impl RenderContext {
     #[must_use]
     pub fn supports_gi(&self) -> bool {
         self.ray_query.complete()
+    }
+
+    /// How many mesh models are on the device, and how many uploads and
+    /// acceleration-structure builds it took to get there.
+    #[must_use]
+    pub fn model_cache_stats(&self) -> ModelCacheStats {
+        let cache = self.cache();
+        ModelCacheStats {
+            cached: cache.meshes.len(),
+            uploads: cache.model_uploads,
+            blas_builds: cache.blas_builds,
+        }
+    }
+
+    /// Does a frame of `scene` with `options` trace shadow rays? Only when the
+    /// preset has shadows ([`crate::quality`]), the device can trace rays and
+    /// the scene has a light to be shadowed from. (The raw ray probe draws no
+    /// lit surface at all.) A frame for which this is false runs exactly the
+    /// forward shaders it would without the feature.
+    #[must_use]
+    pub fn shadows_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
+        options.preset.features().shadows
+            && self.ray_query.complete()
+            && !options.ray_probe
+            && !scene.lights.is_empty()
     }
 
     /// Render one frame of `scene` offscreen and read the pixels back.
@@ -866,7 +957,10 @@ impl RenderContext {
         let allocator = self.allocator()?;
         let count = u32::try_from(scene.instances.len())
             .map_err(|_| RenderError::new("the scene has more than u32::MAX instances"))?;
-        let grown = |min: u32| count.max(min).checked_next_power_of_two().unwrap_or(count);
+        let grown = |n: u32, min: u32| n.max(min).checked_next_power_of_two().unwrap_or(n);
+        let Some((width, height)) = cache.frame.as_ref().map(|(k, _)| (k.width, k.height)) else {
+            return Err(RenderError::new("no frame resources to record into"));
+        };
 
         if cache
             .instances
@@ -877,43 +971,105 @@ impl RenderContext {
             cache.instances = Some(InstanceBuffer::new(
                 &self.device,
                 allocator,
-                grown(64),
+                grown(count, 64),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
                 "render-instances",
             )?);
         }
 
-        // Mesh models: upload any model seen for the first time, drop the ones
-        // this scene no longer uses (nothing is pending, so that is safe), and
-        // lay out one record + one indexed draw per material part.
+        // Acceleration structures only for a frame that actually traces rays.
+        let shadows = self.shadows_active(scene, options);
+        let traces_rays = options.gi_enabled || options.ray_probe || shadows;
+
+        // Mesh models: upload any model seen for the first time (buffers and
+        // textures; its BLAS when a frame first traces rays against it), drop
+        // the ones this scene no longer uses (nothing is pending, so that is
+        // safe), and lay out one record + one indexed draw per material part
+        // and one TLAS instance per placement.
         let in_use: std::collections::HashSet<usize> =
             scene.models.iter().map(|m| mesh_key(&m.mesh)).collect();
         cache.meshes.retain(|key, _| in_use.contains(key));
+        let white = if scene.models.is_empty() {
+            vk::DescriptorSet::null()
+        } else {
+            if cache.white.is_none() {
+                cache.white = Some(WhiteTexture::new(
+                    &self.device,
+                    allocator,
+                    self.queue,
+                    self.cmd_pool,
+                    &self.pipelines,
+                )?);
+            }
+            match &cache.white {
+                Some(white) => white.set()?,
+                None => vk::DescriptorSet::null(),
+            }
+        };
         let mut mesh_records = Vec::new();
         let mut mesh_draws = Vec::new();
+        let mut mesh_placements = Vec::new();
         for model in &scene.models {
             let key = mesh_key(&model.mesh);
             let gpu = match cache.meshes.entry(key) {
-                std::collections::hash_map::Entry::Occupied(entry) => &entry.into_mut().1,
+                std::collections::hash_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let gpu = MeshGpu::upload(
                         &self.device,
                         allocator,
                         self.queue,
                         self.cmd_pool,
+                        &self.pipelines,
                         &model.mesh,
+                        white,
+                        self.max_texture_dimension,
                     )?;
-                    &entry.insert((Arc::clone(&model.mesh), gpu)).1
+                    cache.model_uploads += 1;
+                    &mut entry.insert((Arc::clone(&model.mesh), gpu)).1
                 }
             };
-            for part in &model.mesh.parts {
+            let first_record = mesh_records.len() as u32;
+            for part in &gpu.parts {
+                let Some(source) = model.mesh.parts.get(part.part) else {
+                    continue;
+                };
                 mesh_draws.push(MeshDraw {
                     vertices: gpu.vertices.handle,
                     indices: gpu.indices.handle,
                     first_index: part.first_index,
                     index_count: part.index_count,
                     record: mesh_records.len() as u32,
+                    texture_set: part.texture_set,
                 });
-                mesh_records.push(mesh_record(model, &part.material));
+                mesh_records.push(mesh_record(model, &source.material));
+            }
+            // A placement the rays can see: its records start at `first_record`
+            // and follow the BLAS's geometry order (one per drawn part).
+            if traces_rays && is_placeable(model) {
+                if first_record >= MAX_CUSTOM_INDEX {
+                    return Err(RenderError::new(
+                        "the scene has more mesh parts than a ray hit can address",
+                    ));
+                }
+                cache.blas_builds += u64::from(!gpu.has_blas());
+                let blas = gpu.ensure_blas(
+                    &self.device,
+                    &self.accel,
+                    allocator,
+                    self.queue,
+                    self.cmd_pool,
+                )?;
+                let [x, y, z] = model_rows(model);
+                mesh_placements.push(MeshTlasInstance {
+                    transform: [
+                        x[0], x[1], x[2], x[3], //
+                        y[0], y[1], y[2], y[3], //
+                        z[0], z[1], z[2], z[3],
+                    ],
+                    blas,
+                    custom_index: first_record + 1,
+                    flags: gpu.instance_flags,
+                });
             }
         }
         let record_count = mesh_records.len() as u32;
@@ -926,15 +1082,13 @@ impl RenderContext {
             cache.mesh_records = Some(InstanceBuffer::new(
                 &self.device,
                 allocator,
-                record_count
-                    .max(16)
-                    .checked_next_power_of_two()
-                    .unwrap_or(record_count),
+                grown(record_count, 16),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
                 "mesh-records",
             )?);
         }
-        // Acceleration structures only for a frame that actually traces rays.
-        let traces_rays = options.gi_enabled || options.ray_probe;
+        let tlas_count = u32::try_from(scene.instances.len() + mesh_placements.len())
+            .map_err(|_| RenderError::new("the scene has more than u32::MAX ray-traced objects"))?;
         if traces_rays {
             if cache.shapes.is_none() {
                 cache.shapes = Some(ShapeBlas::build(
@@ -945,27 +1099,77 @@ impl RenderContext {
                     self.cmd_pool,
                 )?);
             }
-            if cache.tlas.as_ref().is_none_or(|t| t.capacity() < count) {
+            if cache
+                .tlas
+                .as_ref()
+                .is_none_or(|t| t.capacity() < tlas_count)
+            {
                 cache.tlas = None;
-                cache.tlas = Some(Tlas::new(&self.device, &self.accel, allocator, grown(16))?);
+                cache.tlas = Some(Tlas::new(
+                    &self.device,
+                    &self.accel,
+                    allocator,
+                    grown(tlas_count, 16),
+                )?);
             }
         }
 
+        // The overlay's rectangles, in normalised device coordinates. An
+        // empty overlay touches nothing here.
+        let overlay_rects = overlay_instances(&scene.overlay, width, height);
+        let overlay_count = u32::try_from(overlay_rects.len())
+            .map_err(|_| RenderError::new("the overlay has more than u32::MAX rectangles"))?;
+        if overlay_count > 0
+            && cache
+                .overlay
+                .as_ref()
+                .is_none_or(|b| b.capacity() < overlay_count)
+        {
+            cache.overlay = None;
+            cache.overlay = Some(InstanceBuffer::new(
+                &self.device,
+                allocator,
+                grown(overlay_count, 256),
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                "overlay-rects",
+            )?);
+        }
+
         // Group the instances by detail level: one instanced draw per level.
-        let frame_height = cache.frame.as_ref().map_or(1, |(key, _)| key.height);
-        let runs = group_by_detail(scene, frame_height, &mut cache.ordered);
+        let runs = group_by_detail(scene, height, &mut cache.ordered);
 
         let cache: &'c RenderCache = cache;
-        let (Some((key, frame)), Some(instances), Some(mesh_buffer)) =
+        let (Some((_, frame)), Some(instances), Some(mesh_buffer)) =
             (&cache.frame, &cache.instances, &cache.mesh_records)
         else {
             return Err(RenderError::new("no frame resources to record into"));
         };
         instances.write(&cache.ordered)?;
         mesh_buffer.write(&mesh_records)?;
+        let overlay = match &cache.overlay {
+            Some(buffer) if overlay_count > 0 => {
+                buffer.write(&overlay_rects)?;
+                Some((buffer.buffer.handle, overlay_count))
+            }
+            _ => None,
+        };
+
+        let (forward_params, gi_params, tone_params) =
+            build_uniforms(scene, width, height, options);
         let tlas = match (traces_rays, &cache.shapes, &cache.tlas) {
             (true, Some(shapes), Some(tlas)) => {
-                tlas.write_instances(shapes, &cache.ordered)?;
+                // Two kinds of instance cast no shadow: glass (a hard black
+                // shadow behind a window is worse than none), and a body with
+                // a light inside it — it is that light's lamp (the Sun around
+                // the solar system's point light), not something in its way.
+                let lights = &forward_params.lights[..scene.lights.len().min(8)];
+                let casts_shadow = |instance: &GpuInstance| {
+                    instance.transmission <= 0.0
+                        && !lights
+                            .iter()
+                            .any(|light| instance_contains(instance, light.position))
+                };
+                tlas.write_instances(shapes, &cache.ordered, casts_shadow, &mesh_placements)?;
                 Some(tlas)
             }
             _ => None,
@@ -980,9 +1184,6 @@ impl RenderContext {
         // Uniform data is written straight into the CPU-mapped uniform
         // buffers; nothing is pending on the frame, so the GPU is not reading
         // them.
-        let (width, height) = (key.width, key.height);
-        let (forward_params, gi_params, tone_params) =
-            build_uniforms(scene, width, height, options);
         frame
             .forward_params
             .write(params::as_bytes(&forward_params))?;
@@ -1003,11 +1204,14 @@ impl RenderContext {
             &self.device,
             &self.pipelines,
             &FrameDraw {
-                instance_count: count,
+                tlas_instances: tlas_count,
                 runs: &runs,
                 meshes: &mesh_draws,
                 tlas,
                 gi_dispatch: options.gi_enabled && !options.mutate_skip_gi_dispatch,
+                shadows: shadows && tlas.is_some(),
+                sky: scene.environment.background && !scene.environment.is_none(),
+                overlay,
             },
             options,
             target,
@@ -1021,9 +1225,9 @@ fn mesh_key(mesh: &Arc<MeshData>) -> usize {
     Arc::as_ptr(mesh) as usize
 }
 
-/// The GPU record of one part of `model`: its placement and `material`.
-fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> MeshInstanceGpu {
-    let row = |r: usize| {
+/// The rows of `model`'s 3x4 model -> camera-relative world matrix.
+fn model_rows(model: &ModelInstance) -> [[f32; 4]; 3] {
+    [0, 1, 2].map(|r| {
         let [x, y, z] = model.rotation[r];
         [
             x * model.scale,
@@ -1031,16 +1235,66 @@ fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> M
             z * model.scale,
             model.position[r],
         ]
-    };
+    })
+}
+
+/// Can `model` be an instance of the ray-traced scene? Its transform has to
+/// be finite and invertible, which the rasteriser does not care about (a
+/// zero-scale model is simply not visible).
+fn is_placeable(model: &ModelInstance) -> bool {
+    let finite = model
+        .rotation
+        .iter()
+        .flatten()
+        .chain(&model.position)
+        .all(|v| v.is_finite());
+    finite && model.scale.is_finite() && model.scale != 0.0
+}
+
+/// The GPU record of one part of `model`: its placement and `material`.
+fn mesh_record(model: &ModelInstance, material: &crate::mesh::MeshMaterial) -> MeshInstanceGpu {
+    let [model_x, model_y, model_z] = model_rows(model);
     let [r, g, b] = material.base_color;
     let [er, eg, eb] = material.emissive;
     MeshInstanceGpu {
-        model_x: row(0),
-        model_y: row(1),
-        model_z: row(2),
+        model_x,
+        model_y,
+        model_z,
         albedo: [r, g, b, material.metallic],
         emissive: [er, eg, eb, material.roughness],
     }
+}
+
+/// Is the camera-relative point `p` inside `instance` — within its radius for
+/// a sphere, within its half-extent on every axis for a box?
+fn instance_contains(instance: &GpuInstance, p: [f32; 4]) -> bool {
+    let [x, y, z, radius] = instance.center;
+    let d = [p[0] - x, p[1] - y, p[2] - z];
+    if instance.shape == SHAPE_BOX {
+        d.iter().all(|c| c.abs() <= radius.abs())
+    } else {
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= radius * radius
+    }
+}
+
+/// `overlay`'s rectangles for a `width` x `height` frame: pixel coordinates
+/// (origin top-left, +y down) to normalised device coordinates, which run
+/// from -1 at the left/top edge to +1 at the right/bottom one.
+fn overlay_instances(overlay: &Overlay, width: u32, height: u32) -> Vec<OverlayInstance> {
+    let (sx, sy) = (2.0 / width.max(1) as f32, 2.0 / height.max(1) as f32);
+    overlay
+        .rects()
+        .iter()
+        .map(|r| OverlayInstance {
+            rect: [
+                r.x * sx - 1.0,
+                r.y * sy - 1.0,
+                (r.x + r.width) * sx - 1.0,
+                (r.y + r.height) * sy - 1.0,
+            ],
+            color: r.color,
+        })
+        .collect()
 }
 
 /// The sphere detail level an instance is drawn at: from the radius of its
@@ -1187,6 +1441,7 @@ fn build_uniforms(
         ],
         features: feature_flags,
         _pad2: [0; 3],
+        environment: environment_gpu(&scene.environment),
     };
     for (slot, light) in scene.lights.iter().take(8).enumerate() {
         // World-space light -> camera-relative f32 offset.
@@ -1253,6 +1508,24 @@ fn build_post_params(
         refract_distance: REFRACT_DISTANCE_M,
         refract_eta: REFRACT_ETA,
         _pad: 0.0,
+        environment: forward.environment,
+    }
+}
+
+/// The scene's environment as the shaders read it: the three colours times
+/// the intensity, with the "there is one" flag in `zenith.w`. All zero for a
+/// scene without an environment ([`Environment::is_none`]), so its shaders
+/// skip every environment term after reading that one value.
+fn environment_gpu(environment: &Environment) -> params::EnvironmentGpu {
+    if environment.is_none() {
+        return params::EnvironmentGpu::default();
+    }
+    let [zenith, horizon, ground] = environment.colors();
+    let rgb = |c: [f32; 3], w: f32| [c[0], c[1], c[2], w];
+    params::EnvironmentGpu {
+        zenith: rgb(zenith, 1.0),
+        horizon: rgb(horizon, 0.0),
+        ground: rgb(ground, 0.0),
     }
 }
 

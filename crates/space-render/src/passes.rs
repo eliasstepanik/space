@@ -4,30 +4,47 @@
 //!
 //! [TLAS build] -> [GI probe compute] -> forward render pass (HDR + material)
 //! -> [glass render pass] -> [post compute: SSR + refraction] -> tone map ->
-//! readback copy *or* blit into a swapchain image
+//! [overlay render pass] -> readback copy *or* blit into a swapchain image
 //!
 //! The bracketed passes only exist when they are needed: the TLAS build for a
-//! frame that traces rays (GI or the raw ray probe), the glass and post passes
-//! when the quality preset enables SSR or refraction
-//! (`RenderFeatures::needs_post`).
+//! frame that traces rays (GI, ray-traced shadows or the raw ray probe), the
+//! glass and post passes when the quality preset enables SSR or refraction
+//! (`RenderFeatures::needs_post`), the overlay pass when the scene's
+//! [`Overlay`](crate::Overlay) has something in it.
 //!
 //! The GPU objects behind a frame ([`FrameGpu`], [`InstanceBuffer`], [`Tlas`],
-//! [`ShapeBlas`]) are created once and reused by `RenderContext` for as long
-//! as they fit, so rendering a steady stream of frames allocates nothing.
+//! [`ShapeBlas`], the uploaded [`MeshGpu`] models with their textures and
+//! acceleration structures) are created once and reused by `RenderContext`
+//! for as long as they fit, so rendering a steady stream of frames builds and
+//! uploads nothing.
 
 use ash::vk;
 
 use crate::alloc::{Buffer, Image, SharedAllocator};
 use crate::gpu::{RenderError, RenderOptions};
 use crate::params::{
-    self, ForwardParams, GiParams, GpuInstance, GpuPod, PostParams, RqParams, ToneParams,
+    self, ForwardParams, GiParams, GpuInstance, GpuPod, OverlayInstance, PostParams, RqParams,
+    ToneParams,
 };
 use crate::quality::FEATURE_REFRACT;
 use crate::scene::{cube_mesh, sphere_mesh, SHAPE_BOX};
+use crate::texture::Texture;
 
 /// Format of the material buffer: r = metallic, g = roughness, ba = the
 /// shading normal (octahedral, signed), so it has to be a float format.
 const MATERIAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Format of the tone-mapped output image (what is read back or blitted to
+/// the swapchain, and what the overlay is blended onto).
+const OUT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// Format of a model's base-colour texture: sRGB-encoded, so the sampler hands
+/// the shader linear values.
+const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+
+/// Anisotropic filtering level for model textures (clamped to what the device
+/// offers; off when it offers none).
+const TEXTURE_ANISOTROPY: f32 = 8.0;
 
 /// SPIR-V modules compiled by `build.rs` (naga >= 30).
 pub(crate) struct Shaders {
@@ -39,7 +56,17 @@ pub(crate) struct Shaders {
     pub forward_glass_vs: Vec<u32>,
     pub forward_glass_fs: Vec<u32>,
     pub forward_mesh_vs: Vec<u32>,
+    pub forward_mesh_fs: Vec<u32>,
+    /// The three fragment shaders again, with ray-traced shadows.
+    pub forward_fs_shadow: Vec<u32>,
+    pub forward_glass_fs_shadow: Vec<u32>,
+    pub forward_mesh_fs_shadow: Vec<u32>,
+    /// The background: the scene's environment where nothing was drawn.
+    pub forward_sky_vs: Vec<u32>,
+    pub forward_sky_fs: Vec<u32>,
     pub post: Vec<u32>,
+    pub overlay_vs: Vec<u32>,
+    pub overlay_fs: Vec<u32>,
 }
 
 impl Shaders {
@@ -71,7 +98,33 @@ impl Shaders {
                 env!("OUT_DIR"),
                 "/forward_mesh_vs.spv"
             ))),
+            forward_mesh_fs: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_mesh_fs.spv"
+            ))),
+            forward_fs_shadow: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_fs_shadow.spv"
+            ))),
+            forward_glass_fs_shadow: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_glass_fs_shadow.spv"
+            ))),
+            forward_mesh_fs_shadow: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_mesh_fs_shadow.spv"
+            ))),
+            forward_sky_vs: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_sky_vs.spv"
+            ))),
+            forward_sky_fs: words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/forward_sky_fs.spv"
+            ))),
             post: words(include_bytes!(concat!(env!("OUT_DIR"), "/post.spv"))),
+            overlay_vs: words(include_bytes!(concat!(env!("OUT_DIR"), "/overlay_vs.spv"))),
+            overlay_fs: words(include_bytes!(concat!(env!("OUT_DIR"), "/overlay_fs.spv"))),
         }
     }
 }
@@ -80,8 +133,12 @@ impl Shaders {
 /// pass and the sampler.
 pub(crate) struct Pipelines {
     modules: Vec<vk::ShaderModule>,
+    /// Set 0 = [`Pipelines::forward_set_layout`], set 1 =
+    /// [`Pipelines::texture_set_layout`] (used by the mesh pipelines only).
     pub forward_layout: vk::PipelineLayout,
     pub forward_set_layout: vk::DescriptorSetLayout,
+    /// A mesh part's base-colour texture: 0 sampled image, 1 sampler.
+    pub texture_set_layout: vk::DescriptorSetLayout,
     pub gi_layout: vk::PipelineLayout,
     pub gi_set_layout: vk::DescriptorSetLayout,
     pub tone_layout: vk::PipelineLayout,
@@ -98,11 +155,51 @@ pub(crate) struct Pipelines {
     pub graphics_glass: vk::Pipeline,
     /// Opaque pass, mesh models: vertex buffers instead of procedural shapes.
     pub graphics_mesh: vk::Pipeline,
+    /// The three forward pipelines with ray-traced shadows (their fragment
+    /// shaders query the TLAS at forward binding 5). Null handles on a device
+    /// without ray query, where shadows are never enabled.
+    pub graphics_shadow: vk::Pipeline,
+    pub graphics_glass_shadow: vk::Pipeline,
+    pub graphics_mesh_shadow: vk::Pipeline,
+    /// Opaque pass, last: the environment as the background, on the pixels
+    /// whose depth is still the clear value.
+    pub graphics_sky: vk::Pipeline,
     pub gi_pipeline: vk::Pipeline,
     pub tone_pipeline: vk::Pipeline,
     pub rq_pipeline: vk::Pipeline,
     pub post_pipeline: vk::Pipeline,
+    /// Overlay pass: the tone-mapped output image, LOADed and blended onto.
+    pub render_pass_overlay: vk::RenderPass,
+    pub overlay_layout: vk::PipelineLayout,
+    pub overlay_pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
+    /// Model textures: trilinear, repeating, anisotropic where available.
+    pub texture_sampler: vk::Sampler,
+}
+
+/// What [`Pipelines::create`] needs to know about the device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PipelineConfig {
+    /// The ray-query chain is enabled: create the shadow pipelines.
+    pub ray_query: bool,
+    /// The device's anisotropy limit, or 0 when the feature is not enabled.
+    pub max_anisotropy: f32,
+}
+
+/// What a graphics pipeline draws, which decides what feeds its vertex stage
+/// and its fixed-function state (see `Created::graphics_pipeline`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VertexInput {
+    /// Nothing: the procedural shapes are generated in the vertex shader.
+    Procedural,
+    /// [`MeshVertex`](crate::mesh::MeshVertex) buffers: position, normal, uv.
+    Mesh,
+    /// The background: no vertex input, and only where nothing was drawn —
+    /// depth test "equal" against the clear value, no depth write.
+    Sky,
+    /// One [`OverlayInstance`] per instance: a rectangle and its colour.
+    /// Alpha blending, no depth test.
+    Overlay,
 }
 
 struct Created<'a> {
@@ -145,11 +242,12 @@ impl<'a> Created<'a> {
 }
 
 impl Created<'_> {
-    /// The forward graphics pipeline (dynamic viewport/scissor, depth test +
-    /// write) with `colour_attachments` identical blend-off targets. With
-    /// `mesh_vertices` it takes [`MeshVertex`](crate::mesh::MeshVertex) buffers
-    /// (position, normal); otherwise it has no vertex input at all (the
-    /// procedural shapes are generated in the vertex shader).
+    /// A graphics pipeline with dynamic viewport/scissor and
+    /// `colour_attachments` identical targets. The forward pipelines
+    /// ([`VertexInput::Procedural`], [`VertexInput::Mesh`]) test and write
+    /// depth and do not blend; the background ([`VertexInput::Sky`]) passes
+    /// only at the depth clear value and writes none; the overlay pipeline
+    /// ([`VertexInput::Overlay`]) blends with straight alpha and has no depth.
     fn graphics_pipeline(
         &self,
         vs: (vk::ShaderModule, &'static std::ffi::CStr),
@@ -157,39 +255,66 @@ impl Created<'_> {
         layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         colour_attachments: usize,
-        mesh_vertices: bool,
+        vertex: VertexInput,
     ) -> Result<vk::Pipeline, RenderError> {
-        let blend_attachments = vec![
+        let overlay = vertex == VertexInput::Overlay;
+        let blend = if overlay {
+            // Straight alpha over the display-referred image. The target's
+            // own alpha is left as the tone map wrote it.
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                .alpha_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+        } else {
             vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(false)
-                .color_write_mask(vk::ColorComponentFlags::RGBA);
-            colour_attachments
-        ];
-        let vertex_bindings = [vk::VertexInputBindingDescription {
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+        };
+        let blend_attachments = vec![blend; colour_attachments];
+        let attribute =
+            |location: u32, format: vk::Format, offset: u32| vk::VertexInputAttributeDescription {
+                location,
+                binding: 0,
+                format,
+                offset,
+            };
+        let mesh_bindings = [vk::VertexInputBindingDescription {
             binding: 0,
             stride: std::mem::size_of::<crate::mesh::MeshVertex>() as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         }];
-        let vertex_attributes = [
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: 0,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 1,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: 12,
-            },
+        // `MeshVertex`: position, normal, uv.
+        let mesh_attributes = [
+            attribute(0, vk::Format::R32G32B32_SFLOAT, 0),
+            attribute(1, vk::Format::R32G32B32_SFLOAT, 12),
+            attribute(2, vk::Format::R32G32_SFLOAT, 24),
         ];
-        let vertex_input = if mesh_vertices {
-            vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&vertex_bindings)
-                .vertex_attribute_descriptions(&vertex_attributes)
-        } else {
-            vk::PipelineVertexInputStateCreateInfo::default()
+        let overlay_bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<OverlayInstance>() as u32,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        }];
+        // `OverlayInstance`: rect, colour.
+        let overlay_attributes = [
+            attribute(0, vk::Format::R32G32B32A32_SFLOAT, 0),
+            attribute(1, vk::Format::R32G32B32A32_SFLOAT, 16),
+        ];
+        let sky = vertex == VertexInput::Sky;
+        let vertex_input = match vertex {
+            VertexInput::Procedural | VertexInput::Sky => {
+                vk::PipelineVertexInputStateCreateInfo::default()
+            }
+            VertexInput::Mesh => vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&mesh_bindings)
+                .vertex_attribute_descriptions(&mesh_attributes),
+            VertexInput::Overlay => vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&overlay_bindings)
+                .vertex_attribute_descriptions(&overlay_attributes),
         };
         unsafe {
             self.device
@@ -232,11 +357,17 @@ impl Created<'_> {
                         )
                         .depth_stencil_state(
                             &vk::PipelineDepthStencilStateCreateInfo::default()
-                                .depth_test_enable(true)
-                                .depth_write_enable(true)
+                                .depth_test_enable(!overlay)
+                                .depth_write_enable(!overlay && !sky)
                                 // Reversed depth (1 = near, towards 0 = far;
-                                // see `mat4_perspective_reversed`).
-                                .depth_compare_op(vk::CompareOp::GREATER),
+                                // see `mat4_perspective_reversed`). The
+                                // background is drawn at exactly 0, the clear
+                                // value: it passes where that is still there.
+                                .depth_compare_op(if sky {
+                                    vk::CompareOp::EQUAL
+                                } else {
+                                    vk::CompareOp::GREATER
+                                }),
                         )
                         .color_blend_state(
                             &vk::PipelineColorBlendStateCreateInfo::default()
@@ -275,11 +406,15 @@ fn binding(
 }
 
 impl Pipelines {
-    /// Create every shader module, layout and pipeline. `rq` gates the
-    /// ray-query pipelines (they are still created when the device lacks ray
-    /// query — creation is legal, use is not — but the GI pass is never
-    /// dispatched without support).
-    pub fn create(device: &ash::Device, shaders: &Shaders) -> Result<Self, RenderError> {
+    /// Create every shader module, layout and pipeline. The GI and ray-probe
+    /// compute pipelines are created even when the device lacks ray query
+    /// (they are never dispatched there); the shadow variants of the forward
+    /// pipelines only with `config.ray_query`.
+    pub fn create(
+        device: &ash::Device,
+        shaders: &Shaders,
+        config: PipelineConfig,
+    ) -> Result<Self, RenderError> {
         let c = Created { device };
         let mut modules = Vec::new();
         let m_rq = c.module(&shaders.rq_triangle, "rq_triangle")?;
@@ -290,8 +425,29 @@ impl Pipelines {
         let m_gvs = c.module(&shaders.forward_glass_vs, "forward_glass_vs")?;
         let m_gfs = c.module(&shaders.forward_glass_fs, "forward_glass_fs")?;
         let m_mvs = c.module(&shaders.forward_mesh_vs, "forward_mesh_vs")?;
+        let m_mfs = c.module(&shaders.forward_mesh_fs, "forward_mesh_fs")?;
+        let m_svs = c.module(&shaders.forward_sky_vs, "forward_sky_vs")?;
+        let m_sfs = c.module(&shaders.forward_sky_fs, "forward_sky_fs")?;
         let m_post = c.module(&shaders.post, "post")?;
-        modules.extend_from_slice(&[m_rq, m_gi, m_tone, m_vs, m_fs, m_gvs, m_gfs, m_mvs, m_post]);
+        let m_ovs = c.module(&shaders.overlay_vs, "overlay_vs")?;
+        let m_ofs = c.module(&shaders.overlay_fs, "overlay_fs")?;
+        modules.extend_from_slice(&[
+            m_rq, m_gi, m_tone, m_vs, m_fs, m_gvs, m_gfs, m_mvs, m_mfs, m_svs, m_sfs, m_post,
+            m_ovs, m_ofs,
+        ]);
+        // The shadowed fragment shaders use ray queries, so their modules only
+        // exist where the feature does.
+        let shadow_modules = if config.ray_query {
+            let shadowed = [
+                c.module(&shaders.forward_fs_shadow, "forward_fs_shadow")?,
+                c.module(&shaders.forward_glass_fs_shadow, "forward_glass_fs_shadow")?,
+                c.module(&shaders.forward_mesh_fs_shadow, "forward_mesh_fs_shadow")?,
+            ];
+            modules.extend_from_slice(&shadowed);
+            Some(shadowed)
+        } else {
+            None
+        };
 
         // ---- descriptor set layouts ------------------------------------------
         let forward_set_layout = unsafe {
@@ -329,10 +485,39 @@ impl Pipelines {
                             1,
                             vk::ShaderStageFlags::VERTEX,
                         ),
+                        // The scene's TLAS, for shadow rays (the shadowed
+                        // fragment shaders only; left unwritten otherwise).
+                        binding(
+                            5,
+                            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                            1,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
                     ]),
                     None,
                 )
                 .map_err(|e| RenderError::new(format!("forward set layout: {e}")))?
+        };
+        let texture_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                        binding(
+                            0,
+                            vk::DescriptorType::SAMPLED_IMAGE,
+                            1,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                        binding(
+                            1,
+                            vk::DescriptorType::SAMPLER,
+                            1,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                    ]),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("texture set layout: {e}")))?
         };
         let gi_set_layout = unsafe {
             device
@@ -359,6 +544,13 @@ impl Pipelines {
                         binding(
                             3,
                             vk::DescriptorType::STORAGE_IMAGE,
+                            1,
+                            vk::ShaderStageFlags::COMPUTE,
+                        ),
+                        // Mesh part records, for rays that hit a model.
+                        binding(
+                            4,
+                            vk::DescriptorType::STORAGE_BUFFER,
                             1,
                             vk::ShaderStageFlags::COMPUTE,
                         ),
@@ -469,8 +661,13 @@ impl Pipelines {
         };
         let forward_layout = pl(
             &vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(std::slice::from_ref(&forward_set_layout)),
+                .set_layouts(&[forward_set_layout, texture_set_layout]),
             "forward pipeline layout",
+        )?;
+        // The overlay's rectangles carry everything: no descriptors at all.
+        let overlay_layout = pl(
+            &vk::PipelineLayoutCreateInfo::default(),
+            "overlay pipeline layout",
         )?;
         let gi_layout = pl(
             &vk::PipelineLayoutCreateInfo::default()
@@ -629,30 +826,111 @@ impl Pipelines {
                 .map_err(|e| RenderError::new(format!("glass render pass: {e}")))?
         };
 
+        // Overlay pass: the finished `out` image as the only attachment,
+        // LOADed, blended onto, and left ready for the readback copy or the
+        // swapchain blit.
+        let render_pass_overlay = unsafe {
+            let color_refs = [color_ref(0)];
+            device
+                .create_render_pass(
+                    &vk::RenderPassCreateInfo::default()
+                        .attachments(&[vk::AttachmentDescription::default()
+                            .format(OUT_FORMAT)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .load_op(vk::AttachmentLoadOp::LOAD)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            // As the tone map (a compute pass) left it.
+                            .initial_layout(vk::ImageLayout::GENERAL)
+                            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)])
+                        .subpasses(&[vk::SubpassDescription::default()
+                            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                            .color_attachments(&color_refs)])
+                        .dependencies(&[
+                            // The compute pass's storage writes -> blending.
+                            vk::SubpassDependency::default()
+                                .src_subpass(vk::SUBPASS_EXTERNAL)
+                                .dst_subpass(0)
+                                .src_stage_mask(vk::PipelineStageFlags::COMPUTE_SHADER)
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                                .dst_access_mask(
+                                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                                ),
+                            // Blended pixels -> the copy / blit out of it.
+                            vk::SubpassDependency::default()
+                                .src_subpass(0)
+                                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+                        ]),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("overlay render pass: {e}")))?
+        };
+
         // ---- graphics pipelines --------------------------------------------------
-        let graphics = c.graphics_pipeline(
+        let forward = |vs: (vk::ShaderModule, &'static std::ffi::CStr),
+                       fs: (vk::ShaderModule, &'static std::ffi::CStr),
+                       pass: vk::RenderPass,
+                       vertex: VertexInput| {
+            c.graphics_pipeline(vs, fs, forward_layout, pass, 2, vertex)
+        };
+        let (procedural, mesh) = (VertexInput::Procedural, VertexInput::Mesh);
+        let graphics = forward(
             (m_vs, c"vs_main"),
             (m_fs, c"fs_main"),
-            forward_layout,
             render_pass,
-            2,
-            false,
+            procedural,
         )?;
-        let graphics_mesh = c.graphics_pipeline(
-            (m_mvs, c"vs_mesh"),
-            (m_fs, c"fs_main"),
-            forward_layout,
+        let graphics_mesh = forward((m_mvs, c"vs_mesh"), (m_mfs, c"fs_mesh"), render_pass, mesh)?;
+        let graphics_sky = forward(
+            (m_svs, c"vs_sky"),
+            (m_sfs, c"fs_sky"),
             render_pass,
-            2,
-            true,
+            VertexInput::Sky,
         )?;
-        let graphics_glass = c.graphics_pipeline(
+        let graphics_glass = forward(
             (m_gvs, c"vs_glass"),
             (m_gfs, c"fs_glass"),
-            forward_layout,
             render_pass_glass,
-            2,
-            false,
+            procedural,
+        )?;
+        // The same three with shadow rays in the fragment shader.
+        let [graphics_shadow, graphics_glass_shadow, graphics_mesh_shadow] = match shadow_modules {
+            Some([fs, glass_fs, mesh_fs]) => [
+                forward(
+                    (m_vs, c"vs_main"),
+                    (fs, c"fs_main"),
+                    render_pass,
+                    procedural,
+                )?,
+                forward(
+                    (m_gvs, c"vs_glass"),
+                    (glass_fs, c"fs_glass"),
+                    render_pass_glass,
+                    procedural,
+                )?,
+                forward(
+                    (m_mvs, c"vs_mesh"),
+                    (mesh_fs, c"fs_mesh"),
+                    render_pass,
+                    mesh,
+                )?,
+            ],
+            None => [vk::Pipeline::null(); 3],
+        };
+        let overlay_pipeline = c.graphics_pipeline(
+            (m_ovs, c"vs_overlay"),
+            (m_ofs, c"fs_overlay"),
+            overlay_layout,
+            render_pass_overlay,
+            1,
+            VertexInput::Overlay,
         )?;
 
         let gi_pipeline = c.compute_pipeline(m_gi, gi_layout, "gi pipeline")?;
@@ -674,11 +952,34 @@ impl Pipelines {
                 )
                 .map_err(|e| RenderError::new(format!("sampler: {e}")))?
         };
+        // Model textures: trilinear over the whole mip chain, repeating, and
+        // anisotropic where the device has the feature (it keeps a floor
+        // texture sharp at grazing angles).
+        let anisotropy = TEXTURE_ANISOTROPY.min(config.max_anisotropy);
+        let texture_sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                        .anisotropy_enable(anisotropy > 1.0)
+                        .max_anisotropy(anisotropy.max(1.0))
+                        .min_lod(0.0)
+                        .max_lod(vk::LOD_CLAMP_NONE),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("texture sampler: {e}")))?
+        };
 
         Ok(Self {
             modules,
             forward_layout,
             forward_set_layout,
+            texture_set_layout,
             gi_layout,
             gi_set_layout,
             tone_layout,
@@ -692,11 +993,19 @@ impl Pipelines {
             graphics,
             graphics_glass,
             graphics_mesh,
+            graphics_shadow,
+            graphics_glass_shadow,
+            graphics_mesh_shadow,
+            graphics_sky,
             gi_pipeline,
             tone_pipeline,
             rq_pipeline,
             post_pipeline,
+            render_pass_overlay,
+            overlay_layout,
+            overlay_pipeline,
             sampler,
+            texture_sampler,
         })
     }
 }
@@ -712,21 +1021,31 @@ impl Pipelines {
         device.destroy_pipeline_layout(self.tone_layout, None);
         device.destroy_pipeline_layout(self.rq_layout, None);
         device.destroy_pipeline_layout(self.post_layout, None);
+        device.destroy_pipeline_layout(self.overlay_layout, None);
         device.destroy_descriptor_set_layout(self.post_set_layout, None);
         device.destroy_descriptor_set_layout(self.forward_set_layout, None);
+        device.destroy_descriptor_set_layout(self.texture_set_layout, None);
         device.destroy_descriptor_set_layout(self.gi_set_layout, None);
         device.destroy_descriptor_set_layout(self.tone_set_layout, None);
         device.destroy_descriptor_set_layout(self.rq_set_layout, None);
         device.destroy_render_pass(self.render_pass, None);
         device.destroy_render_pass(self.render_pass_glass, None);
+        device.destroy_render_pass(self.render_pass_overlay, None);
         device.destroy_pipeline(self.graphics, None);
         device.destroy_pipeline(self.graphics_glass, None);
         device.destroy_pipeline(self.graphics_mesh, None);
+        // (Null on a device without ray query: destroying null is a no-op.)
+        device.destroy_pipeline(self.graphics_shadow, None);
+        device.destroy_pipeline(self.graphics_glass_shadow, None);
+        device.destroy_pipeline(self.graphics_mesh_shadow, None);
+        device.destroy_pipeline(self.graphics_sky, None);
+        device.destroy_pipeline(self.overlay_pipeline, None);
         device.destroy_pipeline(self.post_pipeline, None);
         device.destroy_pipeline(self.gi_pipeline, None);
         device.destroy_pipeline(self.tone_pipeline, None);
         device.destroy_pipeline(self.rq_pipeline, None);
         device.destroy_sampler(self.sampler, None);
+        device.destroy_sampler(self.texture_sampler, None);
     }
 }
 
@@ -779,23 +1098,30 @@ fn allocate_command_buffer(
 // and one top-level structure with an instance per render instance carrying
 // that instance's scale and translation.
 //
+// A mesh model adds a bottom-level structure of its own — built once, the
+// first time a frame that traces rays draws the model, with one geometry per
+// material part ([`MeshGpu::ensure_blas`]) — and one top-level instance per
+// placement, after the render instances ([`Tlas::write_instances`]).
+//
 // The BLAS is created as BOTTOM_LEVEL and the TLAS as TOP_LEVEL: only a
 // **descriptor-bound** acceleration structure must be GENERIC or TOP_LEVEL
 // (VUID-...-03579) and only the TLAS is ever bound, so each structure has its
 // honest type and an accidental descriptor write of a BLAS is a validation
 // error rather than silent UB.
 
+/// Storage and scratch sizes for a build of `info`, whose geometries hold at
+/// most `prim_counts` primitives each.
 fn build_sizes(
     accel: &ash::khr::acceleration_structure::Device,
     info: &vk::AccelerationStructureBuildGeometryInfoKHR<'_>,
-    prim_count: u32,
+    prim_counts: &[u32],
 ) -> vk::AccelerationStructureBuildSizesInfoKHR<'static> {
     let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
     unsafe {
         accel.get_acceleration_structure_build_sizes(
             vk::AccelerationStructureBuildTypeKHR::DEVICE,
             info,
-            &[prim_count],
+            prim_counts,
             &mut sizes,
         )
     };
@@ -816,10 +1142,11 @@ fn as_scratch_usage() -> vk::BufferUsageFlags {
     vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
 }
 
-/// Triangle-list geometry (flat `vec3<f32>` vertices, `u32` indices) for a
-/// BLAS size query or build.
+/// Triangle-list geometry (a `vec3<f32>` position at the start of every
+/// `vertex_stride` bytes, `u32` indices) for a BLAS size query or build.
 fn triangles_geometry(
     vertex_addr: u64,
+    vertex_stride: u64,
     index_addr: u64,
     max_vertex: u32,
 ) -> vk::AccelerationStructureGeometryKHR<'static> {
@@ -832,7 +1159,7 @@ fn triangles_geometry(
                 .vertex_data(vk::DeviceOrHostAddressConstKHR {
                     device_address: vertex_addr,
                 })
-                .vertex_stride(12)
+                .vertex_stride(vertex_stride)
                 .max_vertex(max_vertex)
                 .index_type(vk::IndexType::UINT32)
                 .index_data(vk::DeviceOrHostAddressConstKHR {
@@ -855,7 +1182,57 @@ fn instances_geometry(instance_addr: u64) -> vk::AccelerationStructureGeometryKH
         })
 }
 
-/// A bottom-level acceleration structure over one unit placeholder mesh.
+/// Bytes of one vertex of the placeholder shapes' BLAS input: a bare position.
+const SHAPE_VERTEX_STRIDE: u64 = 12;
+
+/// Record commands with `record`, submit them and wait until they have run
+/// (one fenced submission; nothing else may be pending on `queue`'s pool).
+fn submit_once(
+    device: &ash::Device,
+    queue: vk::Queue,
+    cmd_pool: vk::CommandPool,
+    what: &'static str,
+    record: impl FnOnce(vk::CommandBuffer),
+) -> Result<(), RenderError> {
+    let cmd = allocate_command_buffer(device, cmd_pool)?;
+    let run = (|| {
+        begin(cmd, device)?;
+        record(cmd);
+        end(cmd, device)?;
+        unsafe {
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| RenderError::new(format!("create_fence: {e}")))?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            let run = device
+                .queue_submit(queue, std::slice::from_ref(&submit), fence)
+                .map_err(|e| RenderError::with_name(what, format!("submit: {e}")))
+                .and_then(|()| {
+                    device
+                        .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                        .map_err(|e| RenderError::with_name(what, format!("wait: {e}")))
+                });
+            if run.is_err() {
+                // The fence may still be pending: it cannot be destroyed yet.
+                let _ = device.device_wait_idle();
+            }
+            device.destroy_fence(fence, None);
+            run
+        }
+    })();
+    unsafe {
+        if run.is_err() {
+            // Whatever was submitted must be off the queue before the command
+            // buffer (and the caller's staging buffers) go away.
+            let _ = device.device_wait_idle();
+        }
+        device.free_command_buffers(cmd_pool, &[cmd]);
+    }
+    run
+}
+
+/// A bottom-level acceleration structure: one of the unit placeholder shapes,
+/// or a mesh model.
 struct Blas {
     handle: vk::AccelerationStructureKHR,
     /// The structure's device address: what a TLAS instance references.
@@ -919,6 +1296,7 @@ impl BlasBuild {
         let max_vertex = mesh.len().saturating_sub(1) as u32;
         let geometry = triangles_geometry(
             vertices.device_address(),
+            SHAPE_VERTEX_STRIDE,
             indices.device_address(),
             max_vertex,
         );
@@ -927,7 +1305,7 @@ impl BlasBuild {
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
             .geometries(std::slice::from_ref(&geometry));
-        let sizes = build_sizes(accel, &info, triangles);
+        let sizes = build_sizes(accel, &info, &[triangles]);
         let storage = Buffer::new(
             device,
             allocator,
@@ -1035,6 +1413,7 @@ impl ShapeBlas {
         let geometries = builds.map(|b| {
             triangles_geometry(
                 b.vertices.device_address(),
+                SHAPE_VERTEX_STRIDE,
                 b.indices.device_address(),
                 b.max_vertex,
             )
@@ -1099,11 +1478,81 @@ impl ShapeBlas {
             self.sphere.address
         }
     }
+
+    /// How shadow rays tell the outside of an instance of `shape` from its
+    /// inside: both shapes are closed solids, but the cube's triangles run
+    /// clockwise seen from outside and the sphere's counter-clockwise.
+    fn flags_for(shape: u32) -> vk::GeometryInstanceFlagsKHR {
+        if shape == SHAPE_BOX {
+            INSIDE_OUT_FLAGS
+        } else {
+            SOLID_FLAGS
+        }
+    }
 }
 
-/// The top-level acceleration structure over a frame's render instances. The
-/// storage is sized for `capacity` instances and reused: each frame that needs
-/// ray queries rewrites the instance records and rebuilds it in place.
+/// Instance mask bit of a shadow caster: the only bit shadow rays look for
+/// (`SHADOW_MASK` in shaders/forward.wgsl). Rays with a full mask — GI, the
+/// ray probe — see every instance whatever this bit says.
+const MASK_SHADOW_CASTER: u8 = 0x01;
+const MASK_EVERYTHING: u8 = 0xff;
+
+/// Instance flags of a closed solid wound counter-clockwise seen from outside
+/// (the unit sphere, and any well-formed closed mesh): with these, the faces a
+/// ray *enters* such a solid through are front faces and the ones it leaves
+/// through are back faces — which is what shadow rays cull
+/// (`RAY_FLAG_CULL_BACK_FACING`, see `light_visible` in shaders/forward.wgsl).
+///
+/// No flag at all: without `TRIANGLE_FLIP_FACING` a triangle is front-facing
+/// for a ray whose origin sees its vertices run counter-clockwise (its
+/// geometric normal `(v1 - v0) x (v2 - v0)` points back at the origin), the
+/// rasteriser convention used everywhere else here. A solid wound the other
+/// way round gets the flip ([`INSIDE_OUT_FLAGS`]). A GPU test pins both:
+/// `shadow_rays_ignore_the_faces_they_leave_a_solid_through`.
+const SOLID_FLAGS: vk::GeometryInstanceFlagsKHR = vk::GeometryInstanceFlagsKHR::empty();
+
+/// Instance flags of a closed solid wound *clockwise* seen from outside: the
+/// unit cube (`cube_mesh` — a unit test in `scene.rs` keeps an eye on both
+/// shapes' winding) and any closed mesh with a negative volume.
+const INSIDE_OUT_FLAGS: vk::GeometryInstanceFlagsKHR =
+    vk::GeometryInstanceFlagsKHR::TRIANGLE_FLIP_FACING;
+
+/// How shadow rays must treat the faces of `mesh`: single-sided like the
+/// placeholder shapes when it is closed (inverted when it is wound inside
+/// out), two-sided when it is open — an open surface has no inside for a ray
+/// to leave, and a floor quad must block light from either side.
+fn instance_flags_for(mesh: &crate::mesh::MeshData) -> vk::GeometryInstanceFlagsKHR {
+    if !mesh.is_closed() {
+        vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE
+    } else if mesh.signed_volume() < 0.0 {
+        INSIDE_OUT_FLAGS
+    } else {
+        SOLID_FLAGS
+    }
+}
+
+/// One placement of a mesh model in the top-level structure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MeshTlasInstance {
+    /// Row-major 3x4 model -> camera-relative world matrix.
+    pub transform: [f32; 12],
+    /// Device address of the model's BLAS ([`MeshGpu::ensure_blas`]).
+    pub blas: u64,
+    /// `1 +` the index of the model's first part record in the mesh record
+    /// buffer (24 bits). A ray hit adds its geometry index — the BLAS has one
+    /// geometry per drawn part — to find the part it hit; 0 is reserved for
+    /// the render instances.
+    pub custom_index: u32,
+    pub flags: vk::GeometryInstanceFlagsKHR,
+}
+
+/// Largest [`MeshTlasInstance::custom_index`]: it is a 24-bit field.
+pub(crate) const MAX_CUSTOM_INDEX: u32 = (1 << 24) - 1;
+
+/// The top-level acceleration structure over a frame's render instances and
+/// model placements. The storage is sized for `capacity` instances and reused:
+/// each frame that needs ray queries rewrites the instance records and
+/// rebuilds it in place.
 pub(crate) struct Tlas {
     pub handle: vk::AccelerationStructureKHR,
     capacity: u32,
@@ -1140,7 +1589,7 @@ impl Tlas {
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .flags(Self::FLAGS)
             .geometries(std::slice::from_ref(&geometry));
-        let sizes = build_sizes(accel, &info, capacity);
+        let sizes = build_sizes(accel, &info, &[capacity]);
         let storage = Buffer::new(
             device,
             allocator,
@@ -1183,54 +1632,89 @@ impl Tlas {
         self.capacity
     }
 
-    /// Write one TLAS instance record per render instance: a uniform scale by
-    /// the instance radius plus a translation to its camera-relative centre,
-    /// referencing the BLAS of its shape. The record's index is the render
-    /// instance index, which is what a ray-query hit reports.
+    /// Write the TLAS instance records and return how many there are.
+    ///
+    /// First one per render instance: a uniform scale by the instance radius
+    /// plus a translation to its camera-relative centre, referencing the BLAS
+    /// of its shape. The record's index is the render instance index, which is
+    /// what a ray-query hit reports, and its custom index is 0. An instance
+    /// for which `casts_shadow` is false is hidden from shadow rays (and from
+    /// nothing else).
+    ///
+    /// Then one per model placement in `meshes`, with the model's own BLAS,
+    /// transform and (non-zero) custom index.
     pub fn write_instances(
         &self,
         shapes: &ShapeBlas,
         instances: &[GpuInstance],
-    ) -> Result<(), RenderError> {
-        if instances.len() > self.capacity as usize {
+        casts_shadow: impl Fn(&GpuInstance) -> bool,
+        meshes: &[MeshTlasInstance],
+    ) -> Result<u32, RenderError> {
+        let total = instances.len() + meshes.len();
+        if total > self.capacity as usize {
             return Err(RenderError::new(format!(
-                "{} instances exceed the TLAS capacity {}",
-                instances.len(),
+                "{total} instances exceed the TLAS capacity {}",
                 self.capacity
             )));
         }
-        let records: Vec<vk::AccelerationStructureInstanceKHR> = instances
-            .iter()
-            .map(|inst| {
-                let [x, y, z, scale] = inst.center;
-                vk::AccelerationStructureInstanceKHR {
-                    // Row-major 3x4.
-                    transform: vk::TransformMatrixKHR {
-                        matrix: [
-                            scale, 0.0, 0.0, x, //
-                            0.0, scale, 0.0, y, //
-                            0.0, 0.0, scale, z,
-                        ],
-                    },
-                    instance_custom_index_and_mask: vk::Packed24_8::new(0, 0xff),
-                    instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
-                        0, 0,
-                    ),
-                    acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                        device_handle: shapes.address_for(inst.shape),
-                    },
-                }
-            })
-            .collect();
+        let record = |matrix: [f32; 12],
+                      custom_index: u32,
+                      mask: u8,
+                      flags: vk::GeometryInstanceFlagsKHR,
+                      blas: u64| {
+            vk::AccelerationStructureInstanceKHR {
+                // Row-major 3x4.
+                transform: vk::TransformMatrixKHR { matrix },
+                instance_custom_index_and_mask: vk::Packed24_8::new(custom_index, mask),
+                instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                    0,
+                    flags.as_raw() as u8,
+                ),
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: blas,
+                },
+            }
+        };
+        let mut records: Vec<vk::AccelerationStructureInstanceKHR> = Vec::with_capacity(total);
+        records.extend(instances.iter().map(|inst| {
+            let [x, y, z, scale] = inst.center;
+            let mask = if casts_shadow(inst) {
+                MASK_EVERYTHING
+            } else {
+                MASK_EVERYTHING & !MASK_SHADOW_CASTER
+            };
+            record(
+                [
+                    scale, 0.0, 0.0, x, //
+                    0.0, scale, 0.0, y, //
+                    0.0, 0.0, scale, z,
+                ],
+                0,
+                mask,
+                ShapeBlas::flags_for(inst.shape),
+                shapes.address_for(inst.shape),
+            )
+        }));
+        records.extend(meshes.iter().map(|mesh| {
+            record(
+                mesh.transform,
+                mesh.custom_index.min(MAX_CUSTOM_INDEX),
+                MASK_EVERYTHING,
+                mesh.flags,
+                mesh.blas,
+            )
+        }));
         // SAFETY: `AccelerationStructureInstanceKHR` is a `repr(C)` 64-byte
         // record of plain numbers with no padding.
         self.instances
-            .write(unsafe { params::slice_bytes(&records) })
+            .write(unsafe { params::slice_bytes(&records) })?;
+        Ok(total as u32)
     }
 
     /// Record the device-side build over the first `count` instance records,
-    /// then the barrier that makes the result visible to compute-shader ray
-    /// queries later in the same command buffer.
+    /// then the barrier that makes the result visible to the ray queries later
+    /// in the same command buffer (the GI and ray-probe compute passes, and
+    /// the shadow rays of the forward pass's fragment shaders).
     pub fn record_build(&self, device: &ash::Device, cmd: vk::CommandBuffer, count: u32) {
         let geometry = instances_geometry(self.instances.device_address());
         let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -1257,7 +1741,7 @@ impl Tlas {
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
@@ -1275,9 +1759,9 @@ impl Drop for Tlas {
     }
 }
 
-/// A storage buffer of `T` records (`array<Instance>` / `array<MeshInstance>`
-/// in the shaders), kept across frames and regrown only when a scene outgrows
-/// it.
+/// A CPU-written buffer of `T` records — a storage buffer (`array<Instance>` /
+/// `array<MeshInstance>` in the shaders) or the overlay's instance-rate vertex
+/// buffer — kept across frames and regrown only when a scene outgrows it.
 pub(crate) struct InstanceBuffer<T: GpuPod> {
     pub buffer: Buffer,
     capacity: u32,
@@ -1289,6 +1773,7 @@ impl<T: GpuPod> InstanceBuffer<T> {
         device: &ash::Device,
         allocator: &SharedAllocator,
         capacity: u32,
+        usage: vk::BufferUsageFlags,
         name: &'static str,
     ) -> Result<Self, RenderError> {
         let capacity = capacity.max(1);
@@ -1296,7 +1781,7 @@ impl<T: GpuPod> InstanceBuffer<T> {
             device,
             allocator,
             u64::from(capacity) * std::mem::size_of::<T>() as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            usage,
             gpu_allocator::MemoryLocation::CpuToGpu,
             name,
         )?;
@@ -1316,7 +1801,7 @@ impl<T: GpuPod> InstanceBuffer<T> {
     pub fn write(&self, records: &[T]) -> Result<(), RenderError> {
         if records.len() > self.capacity as usize {
             return Err(RenderError::new(format!(
-                "{} records exceed the storage buffer capacity {}",
+                "{} records exceed the buffer capacity {}",
                 records.len(),
                 self.capacity
             )));
@@ -1326,23 +1811,378 @@ impl<T: GpuPod> InstanceBuffer<T> {
     }
 }
 
-/// A mesh model's vertex and index buffers on the device.
+/// A model texture on the device: an sRGB image with its full mip chain.
+pub(crate) struct TextureGpu {
+    // Held so the dedicated allocation outlives the view.
+    _image: Image,
+    pub view: vk::ImageView,
+    device: ash::Device,
+}
+
+impl Drop for TextureGpu {
+    fn drop(&mut self) {
+        // The view goes first; the image is freed by the field drop.
+        unsafe { self.device.destroy_image_view(self.view, None) };
+    }
+}
+
+impl TextureGpu {
+    /// Create one sampled image per texture — [`TEXTURE_FORMAT`], every mip
+    /// level from the CPU-side chain — and upload them all through one
+    /// staging buffer and one fenced submission (nothing else may be pending
+    /// on `queue`'s pool). A level larger than `max_dimension` (the device's
+    /// 2D image limit) is left out, so an oversized texture loses its
+    /// sharpest levels instead of failing.
+    pub fn upload_all(
+        device: &ash::Device,
+        allocator: &SharedAllocator,
+        queue: vk::Queue,
+        cmd_pool: vk::CommandPool,
+        textures: &[&Texture],
+        max_dimension: u32,
+    ) -> Result<Vec<Self>, RenderError> {
+        if textures.is_empty() {
+            return Ok(Vec::new());
+        }
+        let layers = |mip_level: u32| vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let mut uploads = Vec::with_capacity(textures.len());
+        // Per image: its handle, level count and the copy of every level.
+        let mut copies: Vec<(vk::Image, u32, Vec<vk::BufferImageCopy>)> = Vec::new();
+        let mut staged: Vec<u8> = Vec::new();
+        for texture in textures {
+            let chain = texture.mip_chain();
+            let levels: Vec<_> = chain
+                .iter()
+                .filter(|level| level.width.max(level.height) <= max_dimension.max(1))
+                .collect();
+            // (Never empty: the chain ends in a 1x1 level.)
+            let Some(top) = levels.first() else {
+                return Err(RenderError::new("a texture has no mip level"));
+            };
+            let level_count = levels.len() as u32;
+            let image = Image::new(
+                device,
+                allocator,
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(TEXTURE_FORMAT)
+                    .extent(vk::Extent3D {
+                        width: top.width,
+                        height: top.height,
+                        depth: 1,
+                    })
+                    .mip_levels(level_count)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                gpu_allocator::MemoryLocation::GpuOnly,
+                "mesh-texture",
+            )?;
+            let view = unsafe {
+                device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image.handle)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(TEXTURE_FORMAT)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .map_err(|e| {
+                        RenderError::with_name("mesh-texture", format!("create_image_view: {e}"))
+                    })?
+            };
+            let regions = levels
+                .iter()
+                .enumerate()
+                .map(|(level, mip)| {
+                    // (Every level is whole RGBA8 texels, so offsets stay
+                    // multiples of four, as a buffer-to-image copy requires.)
+                    let offset = staged.len() as u64;
+                    staged.extend_from_slice(&mip.pixels);
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(layers(level as u32))
+                        .image_extent(vk::Extent3D {
+                            width: mip.width,
+                            height: mip.height,
+                            depth: 1,
+                        })
+                })
+                .collect();
+            copies.push((image.handle, level_count, regions));
+            // RAII from here: a later failure destroys the view and the image.
+            uploads.push(Self {
+                _image: image,
+                view,
+                device: device.clone(),
+            });
+        }
+        let staging = Buffer::new(
+            device,
+            allocator,
+            staged.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+            "texture-staging",
+        )?;
+        staging.write(&staged)?;
+        submit_once(device, queue, cmd_pool, "texture upload", |cmd| unsafe {
+            for (image, level_count, regions) in &copies {
+                let transition = |from: vk::ImageLayout,
+                                  to: vk::ImageLayout,
+                                  src: vk::AccessFlags,
+                                  dst: vk::AccessFlags| {
+                    vk::ImageMemoryBarrier::default()
+                        .image(*image)
+                        .old_layout(from)
+                        .new_layout(to)
+                        .src_access_mask(src)
+                        .dst_access_mask(dst)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: *level_count,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                };
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[transition(
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                device.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging.handle,
+                    *image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    regions,
+                );
+                // Sampled by the mesh pipeline's fragment shader from here on.
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[transition(
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    )],
+                );
+            }
+        })?;
+        Ok(uploads)
+    }
+}
+
+/// Descriptor sets for model textures: one set of
+/// [`Pipelines::texture_set_layout`] (the image and the texture sampler) per
+/// view, from a pool of their own that lives exactly as long as they do.
+pub(crate) struct TextureSets {
+    pool: vk::DescriptorPool,
+    pub sets: Vec<vk::DescriptorSet>,
+    device: ash::Device,
+}
+
+impl Drop for TextureSets {
+    fn drop(&mut self) {
+        if self.pool != vk::DescriptorPool::null() {
+            // Destroying the pool frees its sets.
+            unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+        }
+    }
+}
+
+impl TextureSets {
+    pub fn new(
+        device: &ash::Device,
+        pipelines: &Pipelines,
+        views: &[vk::ImageView],
+    ) -> Result<Self, RenderError> {
+        let mut out = Self {
+            pool: vk::DescriptorPool::null(),
+            sets: Vec::new(),
+            device: device.clone(),
+        };
+        if views.is_empty() {
+            return Ok(out);
+        }
+        let count = views.len() as u32;
+        out.pool = unsafe {
+            device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(count)
+                        .pool_sizes(&[
+                            vk::DescriptorPoolSize {
+                                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                                descriptor_count: count,
+                            },
+                            vk::DescriptorPoolSize {
+                                ty: vk::DescriptorType::SAMPLER,
+                                descriptor_count: count,
+                            },
+                        ]),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("texture descriptor pool: {e}")))?
+        };
+        let layouts = vec![pipelines.texture_set_layout; views.len()];
+        out.sets = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(out.pool)
+                        .set_layouts(&layouts),
+                )
+                .map_err(|e| RenderError::new(format!("texture descriptor sets: {e}")))?
+        };
+        let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = views
+            .iter()
+            .map(|view| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(*view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            })
+            .collect();
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(pipelines.texture_sampler)];
+        let mut writes = Vec::with_capacity(2 * views.len());
+        for (set, image_info) in out.sets.iter().zip(&image_infos) {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(image_info),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler_info),
+            );
+        }
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok(out)
+    }
+}
+
+/// The 1x1 white texture an untextured mesh part samples (white times the
+/// base-colour factor is the factor), with its descriptor set. One per
+/// context, created with the first model.
+pub(crate) struct WhiteTexture {
+    // Field order: the set's pool goes before the image it points at.
+    sets: TextureSets,
+    _texture: Vec<TextureGpu>,
+}
+
+impl WhiteTexture {
+    pub fn new(
+        device: &ash::Device,
+        allocator: &SharedAllocator,
+        queue: vk::Queue,
+        cmd_pool: vk::CommandPool,
+        pipelines: &Pipelines,
+    ) -> Result<Self, RenderError> {
+        let white = Texture::solid([255; 3]);
+        let texture = TextureGpu::upload_all(device, allocator, queue, cmd_pool, &[&white], 1)?;
+        let views: Vec<vk::ImageView> = texture.iter().map(|t| t.view).collect();
+        let sets = TextureSets::new(device, pipelines, &views)?;
+        Ok(Self {
+            sets,
+            _texture: texture,
+        })
+    }
+
+    /// The descriptor set to bind for an untextured part.
+    pub fn set(&self) -> Result<vk::DescriptorSet, RenderError> {
+        self.sets
+            .sets
+            .first()
+            .copied()
+            .ok_or_else(|| RenderError::new("the white texture has no descriptor set"))
+    }
+}
+
+/// One drawn part of an uploaded mesh model.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MeshPartGpu {
+    /// Which of `MeshData::parts` this is.
+    pub part: usize,
+    pub first_index: u32,
+    pub index_count: u32,
+    /// The part's base-colour texture ([`WhiteTexture`]'s for a part without).
+    pub texture_set: vk::DescriptorSet,
+}
+
+/// A mesh model on the device: vertex and index buffers, its textures, and —
+/// once a frame that traces rays has drawn it — its acceleration structure.
 pub(crate) struct MeshGpu {
     pub vertices: Buffer,
     pub indices: Buffer,
+    /// The parts that have triangles, in mesh order. Draw records and the
+    /// BLAS's geometries both follow this order, which is what lets a ray hit
+    /// find its part's record (see [`MeshTlasInstance::custom_index`]).
+    pub parts: Vec<MeshPartGpu>,
+    /// How shadow rays treat the model's faces ([`instance_flags_for`]).
+    pub instance_flags: vk::GeometryInstanceFlagsKHR,
+    max_vertex: u32,
+    blas: Option<Blas>,
+    // Field order: the sets' pool goes before the textures they point at.
+    _texture_sets: TextureSets,
+    _textures: Vec<TextureGpu>,
 }
 
 impl MeshGpu {
-    /// Upload `mesh` into device-local buffers (through staging buffers and one
-    /// fenced copy submission; nothing else may be pending on `queue`'s pool).
+    /// Upload `mesh` — vertices and indices into device-local buffers (through
+    /// staging buffers), every texture with its mip chain — in fenced
+    /// submissions (nothing else may be pending on `queue`'s pool). `white` is
+    /// the set an untextured part binds; `max_texture_dimension` the device's
+    /// 2D image limit.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload(
         device: &ash::Device,
         allocator: &SharedAllocator,
         queue: vk::Queue,
         cmd_pool: vk::CommandPool,
+        pipelines: &Pipelines,
         mesh: &crate::mesh::MeshData,
+        white: vk::DescriptorSet,
+        max_texture_dimension: u32,
     ) -> Result<Self, RenderError> {
-        // SAFETY: `MeshVertex` is `repr(C)` with six `f32`s and no padding;
+        // Out-of-range indices would send the GPU (and the BLAS build) past
+        // the end of the vertex buffer: refuse a broken mesh here.
+        mesh.validate()
+            .map_err(|e| RenderError::new(format!("mesh model: {e}")))?;
+        // SAFETY: `MeshVertex` is `repr(C)` with eight `f32`s and no padding;
         // `u32` is plain data.
         let (vertex_bytes, index_bytes) = unsafe {
             (
@@ -1350,9 +2190,16 @@ impl MeshGpu {
                 params::slice_bytes(&mesh.indices),
             )
         };
-        if vertex_bytes.is_empty() || index_bytes.is_empty() {
+        let drawn: Vec<(usize, &crate::mesh::MeshPart)> = mesh
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.index_count >= 3)
+            .collect();
+        if vertex_bytes.is_empty() || drawn.is_empty() {
             return Err(RenderError::new("a mesh model has no triangles"));
         }
+        // Both buffers are also the BLAS build's input.
         let staged = |bytes: &[u8], usage: vk::BufferUsageFlags, name: &'static str| {
             let staging = Buffer::new(
                 device,
@@ -1367,7 +2214,7 @@ impl MeshGpu {
                 device,
                 allocator,
                 bytes.len() as u64,
-                usage | vk::BufferUsageFlags::TRANSFER_DST,
+                usage | vk::BufferUsageFlags::TRANSFER_DST | as_input_usage(),
                 gpu_allocator::MemoryLocation::GpuOnly,
                 name,
             )?;
@@ -1383,50 +2230,160 @@ impl MeshGpu {
             vk::BufferUsageFlags::INDEX_BUFFER,
             "mesh-indices",
         )?;
+        submit_once(device, queue, cmd_pool, "mesh upload", |cmd| unsafe {
+            for (from, to, size) in [
+                (&vertex_staging, &vertices, vertex_size),
+                (&index_staging, &indices, index_size),
+            ] {
+                device.cmd_copy_buffer(
+                    cmd,
+                    from.handle,
+                    to.handle,
+                    &[vk::BufferCopy::default().size(size)],
+                );
+            }
+        })?;
 
-        let cmd = allocate_command_buffer(device, cmd_pool)?;
-        let copied = (|| {
-            begin(cmd, device)?;
-            unsafe {
-                for (from, to, size) in [
-                    (&vertex_staging, &vertices, vertex_size),
-                    (&index_staging, &indices, index_size),
-                ] {
-                    device.cmd_copy_buffer(
-                        cmd,
-                        from.handle,
-                        to.handle,
-                        &[vk::BufferCopy::default().size(size)],
-                    );
-                }
-            }
-            end(cmd, device)?;
-            unsafe {
-                let fence = device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(|e| RenderError::new(format!("create_fence: {e}")))?;
-                let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-                let run = device
-                    .queue_submit(queue, std::slice::from_ref(&submit), fence)
-                    .map_err(|e| RenderError::new(format!("mesh upload submit: {e}")))
-                    .and_then(|()| {
-                        device
-                            .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
-                            .map_err(|e| RenderError::new(format!("mesh upload wait: {e}")))
-                    });
-                device.destroy_fence(fence, None);
-                run
-            }
-        })();
-        unsafe {
-            if copied.is_err() {
-                // The staging buffers must outlive whatever was submitted.
-                let _ = device.device_wait_idle();
-            }
-            device.free_command_buffers(cmd_pool, &[cmd]);
+        let sources: Vec<&Texture> = mesh.textures.iter().collect();
+        let textures = TextureGpu::upload_all(
+            device,
+            allocator,
+            queue,
+            cmd_pool,
+            &sources,
+            max_texture_dimension,
+        )?;
+        let views: Vec<vk::ImageView> = textures.iter().map(|t| t.view).collect();
+        let texture_sets = TextureSets::new(device, pipelines, &views)?;
+        let parts = drawn
+            .iter()
+            .map(|&(part, source)| MeshPartGpu {
+                part,
+                first_index: source.first_index,
+                index_count: source.index_count,
+                texture_set: source
+                    .material
+                    .base_color_texture
+                    .and_then(|slot| texture_sets.sets.get(slot as usize))
+                    .copied()
+                    .unwrap_or(white),
+            })
+            .collect();
+        Ok(Self {
+            vertices,
+            indices,
+            parts,
+            instance_flags: instance_flags_for(mesh),
+            max_vertex: (mesh.vertices.len() - 1) as u32,
+            blas: None,
+            _texture_sets: texture_sets,
+            _textures: textures,
+        })
+    }
+
+    /// Has the model's acceleration structure been built yet?
+    pub fn has_blas(&self) -> bool {
+        self.blas.is_some()
+    }
+
+    /// The device address of the model's bottom-level acceleration structure,
+    /// building it first if this is the first frame that needs it (one fenced
+    /// submission; nothing else may be pending on `queue`'s pool). It has one
+    /// geometry per drawn part, in order, all over the shared vertex buffer.
+    pub fn ensure_blas(
+        &mut self,
+        device: &ash::Device,
+        accel: &ash::khr::acceleration_structure::Device,
+        allocator: &SharedAllocator,
+        queue: vk::Queue,
+        cmd_pool: vk::CommandPool,
+    ) -> Result<u64, RenderError> {
+        if let Some(blas) = &self.blas {
+            return Ok(blas.address);
         }
-        copied?;
-        Ok(Self { vertices, indices })
+        let geometry = triangles_geometry(
+            self.vertices.device_address(),
+            std::mem::size_of::<crate::mesh::MeshVertex>() as u64,
+            self.indices.device_address(),
+            self.max_vertex,
+        );
+        let geometries = vec![geometry; self.parts.len()];
+        let mut ranges = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            // The part's triangles: a byte offset into the index data.
+            let offset = part
+                .first_index
+                .checked_mul(4)
+                .ok_or_else(|| RenderError::new("a mesh part starts past 4 GiB of indices"))?;
+            ranges.push(vk::AccelerationStructureBuildRangeInfoKHR {
+                primitive_count: part.index_count / 3,
+                primitive_offset: offset,
+                first_vertex: 0,
+                transform_offset: 0,
+            });
+        }
+        let counts: Vec<u32> = ranges.iter().map(|r| r.primitive_count).collect();
+        let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .geometries(&geometries);
+        let sizes = build_sizes(accel, &info, &counts);
+        let storage = Buffer::new(
+            device,
+            allocator,
+            sizes.acceleration_structure_size.max(16),
+            as_storage_usage(),
+            gpu_allocator::MemoryLocation::GpuOnly,
+            "mesh-blas",
+        )?;
+        // Only needed until the build below has run.
+        let scratch = Buffer::new(
+            device,
+            allocator,
+            sizes.build_scratch_size.max(256),
+            as_scratch_usage(),
+            gpu_allocator::MemoryLocation::GpuOnly,
+            "mesh-blas-scratch",
+        )?;
+        let handle = unsafe {
+            accel
+                .create_acceleration_structure(
+                    &vk::AccelerationStructureCreateInfoKHR::default()
+                        .buffer(storage.handle)
+                        .size(sizes.acceleration_structure_size)
+                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL),
+                    None,
+                )
+                .map_err(|e| RenderError::with_name("mesh-blas", format!("create BLAS: {e}")))?
+        };
+        let address = unsafe {
+            accel.get_acceleration_structure_device_address(
+                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                    .acceleration_structure(handle),
+            )
+        };
+        // RAII from here: a failed build destroys the structure again.
+        let blas = Blas {
+            handle,
+            address,
+            _storage: storage,
+            accel: accel.clone(),
+        };
+        let info =
+            info.dst_acceleration_structure(handle)
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: scratch.device_address(),
+                });
+        submit_once(device, queue, cmd_pool, "mesh BLAS build", |cmd| unsafe {
+            accel.cmd_build_acceleration_structures(
+                cmd,
+                std::slice::from_ref(&info),
+                &[ranges.as_slice()],
+            );
+        })?;
+        self.blas = Some(blas);
+        Ok(address)
     }
 }
 
@@ -1439,6 +2396,8 @@ pub(crate) struct MeshDraw {
     pub index_count: u32,
     /// Index of the part's record in the mesh instance buffer.
     pub record: u32,
+    /// The part's base-colour texture (descriptor set 1).
+    pub texture_set: vk::DescriptorSet,
 }
 
 // ---- per-frame resources -------------------------------------------------------
@@ -1499,6 +2458,8 @@ pub(crate) struct FrameGpu {
     out: Image,
     out_view: vk::ImageView,
     framebuffer: vk::Framebuffer,
+    /// `out` as the overlay pass's colour attachment.
+    overlay_framebuffer: vk::Framebuffer,
     gi_tex: Option<(Image, vk::ImageView)>,
     gi_extent: (u32, u32),
     dummy_tex: (Image, vk::ImageView),
@@ -1556,17 +2517,28 @@ pub(crate) struct DrawRun {
 
 /// What one frame draws.
 pub(crate) struct FrameDraw<'a> {
-    /// Every instance in the instance buffer (what the TLAS is built over).
-    pub instance_count: u32,
+    /// Instance records the TLAS is built over: every render instance, then
+    /// every model placement ([`Tlas::write_instances`]).
+    pub tlas_instances: u32,
     /// The instanced draws, together covering every instance once.
     pub runs: &'a [DrawRun],
     /// The mesh model parts (opaque pass only).
     pub meshes: &'a [MeshDraw],
-    /// Rebuild this TLAS over the instances before any ray query runs. `Some`
-    /// exactly when the frame traces rays (GI or the raw ray probe).
+    /// Rebuild this TLAS before any ray query runs. `Some` exactly when the
+    /// frame traces rays (GI, shadows or the raw ray probe).
     pub tlas: Option<&'a Tlas>,
     /// Dispatch the GI probe pass (false with GI off or for the mutation test).
     pub gi_dispatch: bool,
+    /// Draw with the shadowed forward pipelines, whose fragment shaders trace
+    /// a ray to every light. Only ever set together with `tlas`.
+    pub shadows: bool,
+    /// Draw the scene's environment as the background (after the opaque
+    /// geometry, on the pixels it left empty). False for a scene without an
+    /// environment or one that only wants its light: nothing is drawn then.
+    pub sky: bool,
+    /// The overlay's instance buffer and how many rectangles it holds; `None`
+    /// for an empty overlay, and then the overlay pass is not recorded at all.
+    pub overlay: Option<(vk::Buffer, u32)>,
 }
 
 fn aspect_for(format: vk::Format) -> vk::ImageAspectFlags {
@@ -1762,8 +2734,12 @@ impl FrameGpu {
         let (out, out_view) = image(
             width,
             height,
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            OUT_FORMAT,
+            // Written by the tone map (storage), blended onto by the overlay
+            // pass (attachment), then copied or blitted out (transfer source).
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             "out-image",
             &mut partial,
         )?;
@@ -1772,6 +2748,8 @@ impl FrameGpu {
             &[hdr_view, material_view, depth_view],
             &mut partial,
         )?;
+        let overlay_framebuffer =
+            framebuffer(pipelines.render_pass_overlay, &[out_view], &mut partial)?;
 
         // Post pass resources (SSR + refraction): only when the preset needs
         // them.
@@ -1875,7 +2853,7 @@ impl FrameGpu {
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                                descriptor_count: 3,
+                                descriptor_count: 4,
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::SAMPLED_IMAGE,
@@ -1891,7 +2869,7 @@ impl FrameGpu {
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-                                descriptor_count: 2,
+                                descriptor_count: 3,
                             },
                         ]),
                     None,
@@ -1932,12 +2910,13 @@ impl FrameGpu {
         };
         let sampler_info = [vk::DescriptorImageInfo::default().sampler(pipelines.sampler)];
 
-        // Everything except the scene's own buffers (the instance array and
-        // the TLAS, see `bind_scene`).
+        // Everything except the scene's own buffers (the instance array, the
+        // mesh part records and the TLAS, see `bind_scene`).
         unsafe {
             device.update_descriptor_sets(
                 &[
-                    // forward: 0 params, [1 instances], 2 gi tex, 3 sampler
+                    // forward: 0 params, [1 instances], 2 gi tex, 3 sampler,
+                    // [4 mesh records], [5 TLAS]
                     vk::WriteDescriptorSet::default()
                         .dst_set(forward_set)
                         .dst_binding(0)
@@ -1956,7 +2935,8 @@ impl FrameGpu {
                         .dst_binding(3)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
                         .image_info(&sampler_info),
-                    // gi: [0 TLAS], 1 params, [2 instances], 3 out
+                    // gi: [0 TLAS], 1 params, [2 instances], 3 out,
+                    // [4 mesh records]
                     vk::WriteDescriptorSet::default()
                         .dst_set(gi_set)
                         .dst_binding(1)
@@ -2100,6 +3080,7 @@ impl FrameGpu {
             out,
             out_view,
             framebuffer: main_framebuffer,
+            overlay_framebuffer,
             gi_tex,
             gi_extent,
             dummy_tex: (dummy_tex, dummy_view),
@@ -2126,8 +3107,9 @@ impl FrameGpu {
     }
 
     /// Point the descriptor sets at the scene's instance buffer, its mesh part
-    /// records and, for a frame that traces rays, its TLAS. Only legal while
-    /// no submission is pending ([`FrameGpu::wait`]).
+    /// records (the forward pass draws with them, the GI pass looks up what a
+    /// ray hit in them) and, for a frame that traces rays, its TLAS. Only
+    /// legal while no submission is pending ([`FrameGpu::wait`]).
     pub fn bind_scene(
         &self,
         device: &ash::Device,
@@ -2155,24 +3137,32 @@ impl FrameGpu {
             .acceleration_structures(&structures);
         let mut as_write_rq = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&structures);
+        let mut as_write_forward = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+            .acceleration_structures(&structures);
+        let mesh_write = |set: vk::DescriptorSet| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&mesh_info)
+        };
         let mut writes = vec![
             instance_write(self.forward_set, 1),
             instance_write(self.gi_set, 2),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.forward_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&mesh_info),
+            mesh_write(self.forward_set),
+            mesh_write(self.gi_set),
         ];
         if tlas.is_some() {
-            for (set, next) in [
-                (self.gi_set, &mut as_write_gi),
-                (self.rq_set, &mut as_write_rq),
+            // (The forward set's TLAS is only read by the shadowed pipelines.)
+            for (set, binding, next) in [
+                (self.gi_set, 0, &mut as_write_gi),
+                (self.rq_set, 0, &mut as_write_rq),
+                (self.forward_set, 5, &mut as_write_forward),
             ] {
                 writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_set(set)
-                        .dst_binding(0)
+                        .dst_binding(binding)
                         .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                         .descriptor_count(1)
                         .dst_array_element(0)
@@ -2271,26 +3261,41 @@ impl FrameGpu {
         }
     }
 
-    /// Draw the mesh model parts with the mesh pipeline (inside the opaque
-    /// render pass, after [`FrameGpu::draw_scene`] has set viewport, scissor
-    /// and the descriptor set).
-    fn draw_meshes(&self, device: &ash::Device, pipelines: &Pipelines, draw: &FrameDraw<'_>) {
+    /// Draw the mesh model parts with `pipeline` (a mesh pipeline; inside the
+    /// opaque render pass, after [`FrameGpu::draw_scene`] has set viewport,
+    /// scissor and descriptor set 0 — the forward pipelines share one layout,
+    /// so that set stays bound).
+    fn draw_meshes(
+        &self,
+        device: &ash::Device,
+        pipelines: &Pipelines,
+        pipeline: vk::Pipeline,
+        draw: &FrameDraw<'_>,
+    ) {
         if draw.meshes.is_empty() {
             return;
         }
         unsafe {
-            device.cmd_bind_pipeline(
-                self.cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipelines.graphics_mesh,
-            );
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             // Parts of one model are consecutive: rebind only on a change.
             let mut bound = (vk::Buffer::null(), vk::Buffer::null());
+            let mut texture = vk::DescriptorSet::null();
             for part in draw.meshes {
                 if (part.vertices, part.indices) != bound {
                     device.cmd_bind_vertex_buffers(self.cmd, 0, &[part.vertices], &[0]);
                     device.cmd_bind_index_buffer(self.cmd, part.indices, 0, vk::IndexType::UINT32);
                     bound = (part.vertices, part.indices);
+                }
+                if part.texture_set != texture {
+                    device.cmd_bind_descriptor_sets(
+                        self.cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipelines.forward_layout,
+                        1,
+                        std::slice::from_ref(&part.texture_set),
+                        &[],
+                    );
+                    texture = part.texture_set;
                 }
                 device.cmd_draw_indexed(
                     self.cmd,
@@ -2327,7 +3332,8 @@ impl FrameGpu {
     /// 2. the forward render pass (or the raw ray-query probe instead), then
     ///    the glass pass when refraction is on,
     /// 3. the post pass (SSR + refraction, optional) and the tone map,
-    /// 4. the hand-off to `target`.
+    /// 4. the overlay pass (only for a non-empty overlay),
+    /// 5. the hand-off to `target`.
     ///
     /// Only legal while no submission is pending ([`FrameGpu::wait`]).
     pub fn record(
@@ -2345,8 +3351,24 @@ impl FrameGpu {
             // 0a. The scene's TLAS, with the barrier that makes it visible to
             //     the compute-shader ray queries below.
             if let Some(tlas) = draw.tlas {
-                tlas.record_build(device, cmd, draw.instance_count);
+                tlas.record_build(device, cmd, draw.tlas_instances);
             }
+            // With shadows the fragment shaders trace a ray to every light;
+            // without, these are the pipelines a frame has always used.
+            let shadows = draw.shadows && draw.tlas.is_some();
+            let (opaque_pipeline, glass_pipeline, mesh_pipeline) = if shadows {
+                (
+                    pipelines.graphics_shadow,
+                    pipelines.graphics_glass_shadow,
+                    pipelines.graphics_mesh_shadow,
+                )
+            } else {
+                (
+                    pipelines.graphics,
+                    pipelines.graphics_glass,
+                    pipelines.graphics_mesh,
+                )
+            };
 
             // 0b. Deterministically zero the probe texture, so a skipped GI
             //     dispatch reads zeros, not whatever the last frame left.
@@ -2510,7 +3532,8 @@ impl FrameGpu {
                     &[],
                 );
                 self.dispatch_full_frame(device);
-                self.record_target(device, target);
+                let overlaid = self.record_overlay(device, pipelines, draw);
+                self.record_target(device, target, overlaid);
                 return end(cmd, device);
             }
 
@@ -2522,9 +3545,13 @@ impl FrameGpu {
                     .framebuffer(self.framebuffer)
                     .render_area(self.full_rect())
                     .clear_values(&[
+                        // Black, and alpha 0: every surface writes alpha 1, so
+                        // the post pass can tell "nothing here" (the refracted
+                        // view of glass then shows the environment) from a
+                        // black surface. Nothing else reads this alpha.
                         vk::ClearValue {
                             color: vk::ClearColorValue {
-                                float32: [0.0, 0.0, 0.0, 1.0],
+                                float32: [0.0, 0.0, 0.0, 0.0],
                             },
                         },
                         // Material channel: zero = "no surface / not metallic".
@@ -2544,8 +3571,20 @@ impl FrameGpu {
                 vk::SubpassContents::INLINE,
             );
             if !options.mutate_skip_forward_draw {
-                self.draw_scene(device, pipelines, pipelines.graphics, draw);
-                self.draw_meshes(device, pipelines, draw);
+                self.draw_scene(device, pipelines, opaque_pipeline, draw);
+                self.draw_meshes(device, pipelines, mesh_pipeline, draw);
+                if draw.sky {
+                    // The background, last: one triangle over the frame that
+                    // only lands where the depth buffer is still clear.
+                    // (Viewport, scissor and descriptor set 0 are as
+                    // `draw_scene` left them.)
+                    device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipelines.graphics_sky,
+                    );
+                    device.cmd_draw(cmd, 3, 1, 0, 0);
+                }
             }
             device.cmd_end_render_pass(cmd);
 
@@ -2583,7 +3622,7 @@ impl FrameGpu {
                     vk::SubpassContents::INLINE,
                 );
                 if !options.mutate_skip_forward_draw {
-                    self.draw_scene(device, pipelines, pipelines.graphics_glass, draw);
+                    self.draw_scene(device, pipelines, glass_pipeline, draw);
                 }
                 device.cmd_end_render_pass(cmd);
             }
@@ -2648,31 +3687,85 @@ impl FrameGpu {
             );
             self.dispatch_full_frame(device);
 
-            // 4. Hand the finished image to its target.
-            self.record_target(device, target);
+            // 4. The overlay, on top of the finished image.
+            let overlaid = self.record_overlay(device, pipelines, draw);
+
+            // 5. Hand the finished image to its target.
+            self.record_target(device, target, overlaid);
         }
         end(cmd, device)
     }
 
-    /// Step 4 of [`FrameGpu::record`]: `out` GENERAL -> TRANSFER_SRC, then
-    /// either the readback copy or the blit into the swapchain image.
-    unsafe fn record_target(&self, device: &ash::Device, target: FrameTarget) {
+    /// Step 4 of [`FrameGpu::record`]: blend the overlay's rectangles onto
+    /// `out`. Returns whether the pass was recorded — it is skipped entirely
+    /// for an empty overlay — in which case it has also left `out` in
+    /// TRANSFER_SRC_OPTIMAL, synchronised for the copy that follows.
+    unsafe fn record_overlay(
+        &self,
+        device: &ash::Device,
+        pipelines: &Pipelines,
+        draw: &FrameDraw<'_>,
+    ) -> bool {
+        let Some((instances, count)) = draw.overlay.filter(|(_, count)| *count > 0) else {
+            return false;
+        };
         let cmd = self.cmd;
-        device.cmd_pipeline_barrier(
+        device.cmd_begin_render_pass(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[vk::ImageMemoryBarrier::default()
-                .image(self.out.handle)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .subresource_range(color_range())],
+            &vk::RenderPassBeginInfo::default()
+                .render_pass(pipelines.render_pass_overlay)
+                .framebuffer(self.overlay_framebuffer)
+                .render_area(self.full_rect()),
+            vk::SubpassContents::INLINE,
         );
+        device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipelines.overlay_pipeline,
+        );
+        device.cmd_set_viewport(
+            cmd,
+            0,
+            &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.width as f32,
+                height: self.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+        );
+        device.cmd_set_scissor(cmd, 0, &[self.full_rect()]);
+        device.cmd_bind_vertex_buffers(cmd, 0, &[instances], &[0]);
+        // Six vertices (two triangles) per rectangle instance, in list order:
+        // later rectangles blend over earlier ones.
+        device.cmd_draw(cmd, 6, count, 0, 0);
+        device.cmd_end_render_pass(cmd);
+        true
+    }
+
+    /// Step 5 of [`FrameGpu::record`]: `out` to TRANSFER_SRC (unless the
+    /// overlay pass already left it there: `overlaid`), then either the
+    /// readback copy or the blit into the swapchain image.
+    unsafe fn record_target(&self, device: &ash::Device, target: FrameTarget, overlaid: bool) {
+        let cmd = self.cmd;
+        if !overlaid {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(self.out.handle)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(color_range())],
+            );
+        }
         let extent = vk::Extent3D {
             width: self.width,
             height: self.height,
@@ -2777,6 +3870,7 @@ impl Drop for FrameGpu {
         let d = &self.device;
         unsafe {
             d.destroy_framebuffer(self.framebuffer, None);
+            d.destroy_framebuffer(self.overlay_framebuffer, None);
             d.destroy_image_view(self.hdr_view, None);
             d.destroy_image_view(self.depth_view, None);
             d.destroy_image_view(self.material_view, None);

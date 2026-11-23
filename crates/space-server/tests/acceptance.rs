@@ -23,8 +23,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_protocol::{
-    EntityGuid, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, ShardId,
-    ShardMap, ShardRegion, Welcome, PROTOCOL_VERSION,
+    EntityGuid, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, Scene,
+    SceneState, ShardId, ShardMap, ShardRegion, Welcome, PROTOCOL_VERSION,
 };
 use space_sim::ShipState;
 use space_world::{NodeRef, WorldPos};
@@ -518,6 +518,70 @@ fn client_gets_a_snapshot_then_deltas_and_its_input_ack_advances() {
         .expect("the ship is alive")
         .pos;
     assert_ne!(moved, region_center(0), "thrust must move the ship");
+}
+
+/// The second connection a client opens during a handoff — to the accepting
+/// shard, while the offering shard still simulates its ship — is told the scene
+/// like any other join. (The offering shard goes on saying the same scene at
+/// its re-announce interval, which changes nothing for the client.)
+///
+/// Mutation this catches: announcing the scene only to a client that is given
+/// a ship at join. A redirected player is *awaiting adopt* (no ship yet), so it
+/// would arrive on the new shard without ever being told what to draw there.
+#[test]
+fn a_redirected_clients_second_connection_is_told_the_scene() {
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let scene = SceneState::new(Scene::Solar.id(), 3);
+    assert!(pair.a.set_scene(scene));
+    assert!(pair.b.set_scene(scene));
+    let (session_a, _guid) = join(&mut pair.a, "player");
+
+    // Fly out of A until it offers the ship to B and redirects the client.
+    let mut redirected = false;
+    let mut told_by_a = Vec::new();
+    for _ in 0..600 {
+        pair.thrust(id_a, session_a, 0, 1.0);
+        pair.tick();
+        for message in pair.frames_for(id_a, session_a) {
+            match message {
+                Message::Redirect(_) => redirected = true,
+                Message::SceneUpdate(state) => told_by_a.push(state),
+                _ => {}
+            }
+        }
+        if redirected {
+            break;
+        }
+    }
+    assert!(redirected, "A never redirected the client");
+    // On join, and again at each re-announce interval the flight lasted: the
+    // same scene every time, never anything else.
+    assert!(!told_by_a.is_empty(), "A announced the scene on join");
+    assert!(told_by_a.iter().all(|told| *told == scene), "{told_by_a:?}");
+
+    // The client follows the redirect. Its hello matches the transfer B has
+    // staged, so it gets no ship of its own — and still the scene.
+    let session_b = pair
+        .b
+        .join(&space_net::hello("player"))
+        .expect("the accepting shard admits the redirected player")
+        .session;
+    assert_eq!(
+        pair.b.ship_of(session_b),
+        None,
+        "precondition: this is the handoff connection, awaiting adopt"
+    );
+    pair.deliver();
+    let told_by_b: Vec<SceneState> = pair
+        .frames_for(id_b, session_b)
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::SceneUpdate(state) => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told_by_b, vec![scene]);
 }
 
 /// Drive a ship out of shard A into shard B and run the whole exchange.
@@ -1409,9 +1473,13 @@ fn a_commit_installs_on_the_accepting_shards_own_clock() {
             connected: true,
         },
     );
-    // Deliver B's mirror: it is what opens A's commit gate.
+    // Deliver B's mirror: it is what opens A's commit gate. (Only what B
+    // addressed to a shard: its outbox also holds the scene announcement for
+    // the client that just joined.)
     for out in b.take_outbox() {
-        a.peer_message(id_b, out.message);
+        if matches!(out.dest, Destination::Shard(_)) {
+            a.peer_message(id_b, out.message);
+        }
     }
     // A reaches its activation tick and commits.
     let mut commit = None;
@@ -2218,12 +2286,17 @@ fn an_epoch_commit_mid_handoff_aborts_with_epoch_changed_and_reoffers() {
 // names the mutation that makes it fail.
 
 /// The frames one shard queued for `session`, draining its whole outbox.
+///
+/// The scene announcement a join queues behind the welcome is not a frame of
+/// the world (it has no tick and names no entity), so it is left out here; the
+/// scene tests look at it on its own.
 fn frames_of(shard: &mut Shard, session: u64) -> Vec<Message> {
     shard
         .take_outbox()
         .into_iter()
         .filter(|o| o.dest == Destination::Client(session))
         .map(|o| o.message)
+        .filter(|message| !matches!(message, Message::SceneUpdate(_)))
         .collect()
 }
 

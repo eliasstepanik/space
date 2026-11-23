@@ -5,6 +5,12 @@
 //! *unclaimed*: the orchestrator reserves the id (so a restart resumes above it,
 //! H9) but launches no shard for it, so the first live shard that asks for the
 //! root adopts it ([`ControlPlane::handle_shard_hello`]).
+//!
+//! It also opens the scene file next to the counter ([`crate::scene`]): the
+//! scene an operator chose before a restart is restored, otherwise the
+//! configured initial scene applies. Unlike the counter, a scene file that
+//! cannot be used never fails the boot — it is reported and the initial scene
+//! is used.
 
 use space_protocol::shard::{ShardMap, ShardRegion};
 
@@ -12,6 +18,7 @@ use crate::config::OrchestratorConfig;
 use crate::control::ControlPlane;
 use crate::epoch::EpochPublisher;
 use crate::ids::PersistentShardIdAllocator;
+use crate::scene::{scene_path, SceneStore};
 
 /// Build the control plane the binary runs.
 ///
@@ -39,7 +46,14 @@ pub fn boot(config: OrchestratorConfig, peer_token: String) -> Result<ControlPla
             config.bind,
         )],
     );
+    let scene = SceneStore::open(&scene_path(&config.state_path), config.initial_scene);
+    if let Some(warning) = scene.warning() {
+        // Not an error: see the module docs. The orchestrator also puts it in
+        // its event log, so it shows on the operator's page.
+        eprintln!("space-orchestrator: {warning}");
+    }
     let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), peer_token);
+    control.scene = scene;
     control.set_unclaimed_root_owner(root_owner);
     Ok(control)
 }
@@ -96,5 +110,56 @@ mod tests {
         let again = boot(config, String::new()).expect("second boot");
         assert!(again.unclaimed_root_owner().expect("a root owner") > owner);
         std::fs::remove_file(&state_path).ok();
+    }
+
+    /// The scene is opened next to the counter: the configured initial scene
+    /// on a fresh state directory, the saved one after a restart — and a scene
+    /// file that makes no sense is a warning, never a refusal to boot.
+    ///
+    /// Mutation this catches: `?` on the scene file like on the counter (one
+    /// stray byte would keep the whole control plane down), or booting with the
+    /// in-memory store (a restart forgets the operator's choice).
+    #[test]
+    fn boot_restores_a_saved_scene_and_survives_a_corrupt_scene_file() {
+        use space_protocol::{Scene, SceneState};
+        let state_path = temp_path("scene").with_extension("id");
+        let scene_file = scene_path(&state_path);
+        let _ = std::fs::remove_file(&state_path);
+        let _ = std::fs::remove_file(&scene_file);
+        let config = OrchestratorConfig {
+            state_path: state_path.clone(),
+            initial_scene: Scene::Materials,
+            ..OrchestratorConfig::default()
+        };
+
+        let mut control = boot(config.clone(), String::new()).expect("boot");
+        assert_eq!(
+            control.scene.current(),
+            SceneState::new(Scene::Materials.id(), 1),
+            "the initial scene, since nothing was saved"
+        );
+        assert_eq!(control.scene.path(), Some(scene_file.as_path()));
+        control.scene.set(Scene::Solar).expect("saved");
+        drop(control);
+
+        // Restarted with the same flags: the saved scene wins over `--scene`.
+        let control = boot(config.clone(), String::new()).expect("second boot");
+        assert_eq!(
+            control.scene.current(),
+            SceneState::new(Scene::Solar.id(), 2)
+        );
+        assert!(control.scene.restored());
+        drop(control);
+
+        // The file is damaged: the orchestrator still starts.
+        std::fs::write(&scene_file, b"\xff\xfe not a scene").expect("damage it");
+        let control = boot(config, String::new()).expect("a bad scene file never stops a boot");
+        assert_eq!(
+            control.scene.current(),
+            SceneState::new(Scene::Materials.id(), 1)
+        );
+        assert!(control.scene.warning().is_some());
+        std::fs::remove_file(&state_path).ok();
+        std::fs::remove_file(&scene_file).ok();
     }
 }

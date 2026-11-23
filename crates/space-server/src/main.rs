@@ -8,8 +8,15 @@
 //!
 //! ```text
 //!   space-server --shard 1 --bind 127.0.0.1:7777 --region 64:0:0:0 \
-//!                --peer 2:127.0.0.1:7778:64:1:0:0
+//!                --peer 2:127.0.0.1:7778:64:1:0:0 --scene galaxy
 //! ```
+//!
+//! `--scene <name>` is the scene a **standalone** shard tells its clients to
+//! draw (default `demo-area`; the names are [`space_protocol::Scene`]'s). An
+//! orchestrated shard takes no `--scene`: the orchestrator owns the cluster's
+//! scene and tells every shard, so the flag together with `--orchestrator` is
+//! an error rather than a setting that would silently lose. Shards wired
+//! together by hand with `--peer` should all be given the same `--scene`.
 //!
 //! A region is the octree node a shard is authoritative for, written
 //! `depth:x:y:z` ([`NodeRef::new`]). The world map is assembled from the
@@ -18,8 +25,8 @@
 //! from it is never handed anything, and a client's [`Welcome`] would send it a
 //! map with holes in it.
 //!
-//! There is no argument-parsing dependency: the grammar is four flags, so it is
-//! matched by hand against [`std::env::args`]. Ctrl-C terminates the process
+//! There is no argument-parsing dependency: the grammar is a handful of flags,
+//! so it is matched by hand against [`std::env::args`]. Ctrl-C terminates the process
 //! (the runtime installs no handler), which is the right shutdown for a
 //! stateless-per-tick shard: the world is rebuilt from snapshots on restart.
 //!
@@ -29,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use space_protocol::{ShardId, ShardMap, ShardRegion};
+use space_protocol::{Scene, SceneState, ShardId, ShardMap, ShardRegion};
 use space_world::NodeRef;
 
 use space_server::net::ShardNet;
@@ -67,13 +74,25 @@ struct Options {
     claim_region: Option<NodeRef>,
     /// The cluster id forwarded in `ShardHello`.
     cluster: String,
+    /// The scene a standalone shard shows (`--scene`, default
+    /// [`Scene::DEFAULT`]). Never set together with `orchestrator`: there the
+    /// orchestrator says which scene it is.
+    scene: Scene,
 }
 
 /// The usage line, printed for `--help` and for any parse error.
 const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
+                     [--scene demo-area|materials|solar|galaxy] \
                      [--orchestrator <addr:port> [--claim-region <depth:x:y:z>] [--cluster <id>] \
                      [--advertise <addr:port>]]";
+
+/// The revision a standalone shard's scene is announced at.
+///
+/// Its scene comes from the command line and never changes while it runs, so
+/// one revision is all it ever has; 1 is the first that
+/// [supersedes](SceneState::supersedes) "never set".
+const STANDALONE_SCENE_REVISION: u64 = 1;
 
 impl Options {
     /// Parse `argv` without the program name.
@@ -86,6 +105,7 @@ impl Options {
         let mut orchestrator: Option<SocketAddr> = None;
         let mut claim_region: Option<NodeRef> = None;
         let mut cluster = "space-local".to_owned();
+        let mut scene: Option<Scene> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -132,6 +152,10 @@ impl Options {
                 "--cluster" => {
                     cluster = value("--cluster")?.clone();
                 }
+                "--scene" => {
+                    let text = value("--scene")?;
+                    scene = Some(text.parse::<Scene>().map_err(|e| format!("--scene: {e}"))?);
+                }
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
             i += if flag == "--help" || flag == "-h" {
@@ -160,6 +184,12 @@ impl Options {
         if advertise.is_some() && !orchestrated {
             return Err(format!("--advertise requires --orchestrator\n{USAGE}"));
         }
+        if scene.is_some() && orchestrated {
+            return Err(format!(
+                "--scene is for a standalone shard; with --orchestrator the scene is the \
+                 orchestrator's (space-orchestrator --scene, or its web UI)\n{USAGE}"
+            ));
+        }
         // Both modes listen on the well-known port unless told otherwise. An
         // orchestrated shard used to default to port 0, so a restart with the
         // same command line came back on a *different* port — and the
@@ -181,6 +211,7 @@ impl Options {
             orchestrator,
             claim_region,
             cluster,
+            scene: scene.unwrap_or(Scene::DEFAULT),
         })
     }
 }
@@ -283,6 +314,12 @@ async fn run(options: Options) -> Result<(), String> {
     // handed out in a Welcome must carry a reachable address for our own region,
     // not the `:0` the command line may have said.
     shard.set_endpoint(bound);
+    // A standalone shard is its own authority on the scene: what the command
+    // line said (or the default), told to every client behind its welcome.
+    shard.set_scene(SceneState::new(
+        options.scene.id(),
+        STANDALONE_SCENE_REVISION,
+    ));
     let shard = Arc::new(tokio::sync::Mutex::new(shard));
 
     // A handoff is addressed by shard id, so the map's endpoints have to be
@@ -294,13 +331,14 @@ async fn run(options: Options) -> Result<(), String> {
     }
 
     println!(
-        "shard {} on {bound}, region depth {} at [{}, {}, {}], {} region(s) in the map",
+        "shard {} on {bound}, region depth {} at [{}, {}, {}], {} region(s) in the map, scene {}",
         options.shard.0,
         options.region.depth,
         options.region.index[0],
         options.region.index[1],
         options.region.index[2],
-        options.regions.len()
+        options.regions.len(),
+        options.scene
     );
 
     let serve = {
@@ -499,6 +537,41 @@ mod tests {
             options.claim_region.is_none(),
             "no claim: place at the root"
         );
+    }
+
+    /// Mutation this catches: a `--scene` that is parsed and then dropped, an
+    /// unknown name falling back to the default instead of being refused (a
+    /// typo would silently show another world), or an orchestrated shard
+    /// accepting a scene it would never use.
+    #[test]
+    fn the_scene_flag_names_a_catalogue_scene_for_a_standalone_shard_only() {
+        let standalone = ["--shard", "1", "--region", "64:0:0:0"];
+        let with = |extra: &[&str]| parse(&[&standalone[..], extra].concat());
+
+        assert_eq!(
+            with(&[]).expect("parses").scene,
+            Scene::DemoArea,
+            "the demo area is the default"
+        );
+        for scene in Scene::ALL {
+            let options = with(&["--scene", scene.name()])
+                .unwrap_or_else(|err| panic!("{scene} must parse: {err}"));
+            assert_eq!(options.scene, scene);
+        }
+        for bad in ["Solar", "demo", "", "3"] {
+            let err = with(&["--scene", bad]).expect_err(bad);
+            assert!(
+                err.contains("--scene") && err.contains("demo-area, materials, solar, galaxy"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(with(&["--scene"]).is_err(), "the flag needs a value");
+
+        let err = parse(&["--orchestrator", "127.0.0.1:7900", "--scene", "solar"])
+            .expect_err("an orchestrated shard is told its scene");
+        assert!(err.contains("standalone"), "{err}");
+        // Without the flag an orchestrated shard parses as before.
+        assert!(parse(&["--orchestrator", "127.0.0.1:7900"]).is_ok());
     }
 
     #[test]

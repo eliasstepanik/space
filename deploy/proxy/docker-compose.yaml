@@ -7,9 +7,14 @@
 # `com.centurylinklabs.watchtower.enable: "true"`; orchestrator, shard-a and client
 # carry it, so a new image on ghcr is pulled and the container recreated within
 # ~60s of the push. The images are public (anonymous pull, no docker login).
+# Every push to main publishes all three.
 #
-# NOT EXECUTED: no Docker daemon in the authoring sandbox; correct by inspection
-# and YAML-parse only. Topology and addressing match deploy/docker-compose.yaml
+# The browser viewer page is NOT served here: it is a local development and
+# agent-testing tool (see AGENTS.md and crates/space-viewer/README.md), not part
+# of the deployment.
+#
+# NOT RUN from here (it pulls the published ghcr images and belongs on the
+# host): checked with `docker compose config` against .env.example only. Topology and addressing match deploy/docker-compose.yaml
 # (fixed IPv4s on the bridge: addresses are parsed as socket addresses).
 # Subnet is 172.29.0.0/24 (NOT 172.31.0.0/24 as in deploy/docker-compose.yaml):
 # 172.31.0.0/24 collides with an existing docker network on the proxy host.
@@ -18,7 +23,8 @@
 # ENTRYPOINT is `/bin/sh -c 'exec <bin> --flags "$ENV"...'` (see deploy/Dockerfile.*),
 # so a compose `command:` would only become ignored positional args to that
 # script. Env vars verified against the Dockerfiles:
-#   orchestrator: ORCHESTRATOR_BIND, ORCHESTRATOR_CONTROL_ADDR (required), SPACE_CLUSTER
+#   orchestrator: ORCHESTRATOR_BIND, ORCHESTRATOR_CONTROL_ADDR (required), SPACE_CLUSTER,
+#                 SPACE_ORCHESTRATOR_SCENE, SPACE_ORCHESTRATOR_WEBUI[_TOKEN] (read by the binary)
 #   shard:        ORCHESTRATOR_ADDR (required), SHARD_BIND, SHARD_ADVERTISE (required), SPACE_CLUSTER
 #   client:       STREAM_BIND (-> --stream), SPACE_SERVER (-> --server), CLIENT_ARGS (extra flags)
 #
@@ -37,10 +43,21 @@ services:
       <<: *cluster
       ORCHESTRATOR_BIND: 0.0.0.0:7900
       ORCHESTRATOR_CONTROL_ADDR: 172.29.0.10:7900
+      # Initial scene only: one chosen in the web UI is saved in ./state and wins.
+      SPACE_ORCHESTRATOR_SCENE: ${SPACE_SCENE:-demo-area}
+      # Operator web UI: OFF while SPACE_WEBUI_BIND is empty. Set BOTH values in
+      # .env to switch it on (see .env.example): with a bind and no token the
+      # orchestrator refuses to start.
+      SPACE_ORCHESTRATOR_WEBUI: ${SPACE_WEBUI_BIND:-}
+      SPACE_ORCHESTRATOR_WEBUI_TOKEN: ${SPACE_WEBUI_TOKEN:-}
     volumes:
       - ./state:/var/lib/space
     ports:
       - "${ORCHESTRATOR_PORT:-7900}:7900/udp"
+      # The web UI is plain HTTP with Basic auth, so it is published on the
+      # host's LOOPBACK only. Reach it through an SSH tunnel:
+      #   ssh -L 7980:127.0.0.1:7980 <host>     then http://127.0.0.1:7980/
+      - "127.0.0.1:${WEBUI_PORT:-7980}:7980/tcp"
     networks:
       space:
         ipv4_address: 172.29.0.10
@@ -77,31 +94,19 @@ services:
     environment:
       STREAM_BIND: 0.0.0.0:8099
       SPACE_SERVER: 172.29.0.11:7870
-      CLIENT_ARGS: "--galaxy"
+      # Extra space-client flags; the scene is the orchestrator's choice.
+      CLIENT_ARGS: ""
     ports:
       - "${CLIENT_PORT:-8099}:8099/tcp"
     networks:
       space:
         ipv4_address: 172.29.0.12
-    # Client needs a ray-tracing-capable GPU (VK_KHR_acceleration_structure); not auto-restarted so it doesn't churn sessions on hosts without one.
+    # The image renders on software Vulkan (lavapipe, Mesa 25), so no GPU is
+    # needed; it exits 1 only when no Vulkan device with
+    # VK_KHR_acceleration_structure can be found. Not auto-restarted so that such
+    # a host does not churn sessions. The client itself reconnects when the shard
+    # restarts, and viewer input cannot make it quit.
     restart: "no"
-
-  # Serves the static web client (index.html + pkg/*.wasm/*.js) from
-  # ./viewer/space-viewer. The browser connects to the stream proxy (client
-  # service) via ?ws=ws://<host>:8099, e.g. http://<host>:8098/?ws=ws://<host>:8099
-  viewer:
-    image: nginx:alpine
-    container_name: space-viewer
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-    volumes:
-      - ./viewer/space-viewer:/usr/share/nginx/html:ro
-    ports:
-      - "${VIEWER_PORT:-8098}:80"
-    networks:
-      space:
-        ipv4_address: 172.29.0.13
-    restart: unless-stopped
 
 networks:
   space:

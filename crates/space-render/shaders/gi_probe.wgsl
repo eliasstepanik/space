@@ -7,6 +7,12 @@
 // average the emissive radiance of the closest hit — that is the 1-bounce
 // indirect light the forward pass reads back as indirect diffuse.
 //
+// The closest hit is either a procedural instance (its record is
+// `instances[instance_index]`) or a part of a mesh model: a model's TLAS
+// instance carries `1 + the index of its first part record` as its custom
+// data (0 marks a procedural instance) and its BLAS has one geometry per part,
+// so the part's record is `mesh_instances[custom - 1 + geometry_index]`.
+//
 // Determinism: ray jitter comes from hash32 over (probe, direction, ray)
 // indices only, so a given scene produces bit-identical probe data on every
 // run and on every device that implements ray query.
@@ -27,6 +33,7 @@ struct GiParams {
 @group(0) @binding(1) var<uniform> gi: GiParams;
 @group(0) @binding(2) var<storage, read> instances: array<Instance>;
 @group(0) @binding(3) var gi_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var<storage, read> mesh_instances: array<MeshInstance>;
 
 // The six stored directions, in texture-row order (row = iy * 6 + dir).
 fn direction(index: u32) -> vec3<f32> {
@@ -91,8 +98,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let hit = rayQueryGetCommittedIntersection(&rq);
             if hit.kind == RAY_QUERY_INTERSECTION_TRIANGLE {
-                let inst = instances[hit.instance_index];
-                sum = sum + inst.emissive.rgb * inst.emissive.a;
+                if hit.instance_custom_data == 0u {
+                    let inst = instances[hit.instance_index];
+                    sum = sum + inst.emissive.rgb * inst.emissive.a;
+                } else {
+                    // A mesh part: what it emits (nothing, for most: the ray
+                    // is then simply blocked by the model).
+                    let part = mesh_instances[hit.instance_custom_data - 1u + hit.geometry_index];
+                    sum = sum + part.emissive.rgb;
+                }
             }
         }
         let radiance = sum / f32(gi.rays_per_probe);

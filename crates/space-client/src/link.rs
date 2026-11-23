@@ -12,7 +12,9 @@
 //! batch per simulation tick) and, per connection, a reader for the
 //! reliable-stream frames (snapshots, redirects) and one for datagram frames
 //! (deltas). They share one [`Replica`] — the client's view of its *own* ship —
-//! which the render loop reads each frame.
+//! which the render loop reads each frame. The replica also keeps the other
+//! ships the shard reports ([`Replica::others`]), so players can see each
+//! other.
 //!
 //! The server is authoritative: the link only sends thrust intent; the ship's
 //! position comes back through replication ([`Replica::offset`]).
@@ -31,13 +33,57 @@
 //! 3. it keeps playing on the old shard — inputs and frames — until a frame on
 //!    the new connection shows its ship, now owned by the new session. That
 //!    frame is the switch: inputs go to the new shard from then on and the old
-//!    connection is closed.
+//!    connection is closed. "Its ship" is the ship it has been flying, by
+//!    guid: a connection that reaches the accepting shard before the shards'
+//!    own offer does is given a placeholder ship there, and a frame showing
+//!    *that* is not the switch (the old shard still simulates the real one).
 //!
 //! The ship keeps its guid and its world position across the switch, so
 //! [`Replica::offset`] — and with it the camera — is continuous: the
 //! transition is invisible apart from [`Replica::handoffs`] ticking up. If the
 //! new shard cannot be reached, or the handoff is aborted, nothing changes:
 //! the old connection was never given up.
+//!
+//! # The anchor
+//!
+//! Every client must agree on *where* the scene is, so it is tied to the map
+//! and not to the client: the scene's spawn point lies on the **anchor**, the
+//! centre of the map's root region ([`map_anchor`]). Every shard hands its
+//! clients the same map in the `Welcome`, so every client derives the same
+//! point, whichever shard it joined through. The link takes it from the first
+//! `Welcome` and keeps it ([`Replica::anchor`]): a handoff, a split or a merge
+//! never moves it.
+//!
+//! # The scene
+//!
+//! Which world is drawn around the ships is the server's decision, not the
+//! client's: every shard sends a [`Message::SceneUpdate`] behind its `Welcome`
+//! and again whenever its scene changes. The link keeps the newest one in
+//! [`Replica::scene`] ([`ServerLink::scene`]): a [`SceneState`], i.e. a scene
+//! id and the revision it was chosen at. The app reads it each frame and
+//! compares it with the one it last drew — a different value is a scene
+//! change:
+//!
+//! ```ignore
+//! let scene = link.scene();
+//! if scene != self.drawn {
+//!     self.drawn = scene;
+//!     self.load(scene.scene.or_default()); // a `space_protocol::Scene`
+//! }
+//! ```
+//!
+//! Revision 0 ([`SceneState::UNSET`]) means the server has not said yet; the
+//! default scene applies until it does. An id this build does not know
+//! resolves to the default scene too ([`space_protocol::SceneId::or_default`]),
+//! and the link says so in the log.
+//!
+//! The rule for which update counts is "the highest revision wins", across
+//! **both** connections of a handoff: the scene belongs to the cluster, so a
+//! newer revision heard from the accepting shard is taken at once, and an older
+//! one — the accepting shard has not caught up yet — never rolls the scene
+//! back, before or after the switch. Between two shards that name *different*
+//! scenes at the *same* revision (standalone shards started with different
+//! `--scene` flags) the one being played on decides.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -46,7 +92,8 @@ use std::time::{Duration, Instant};
 use space_ecs::ComponentDef;
 use space_net::{client_endpoint_for, connect, hello, Conn, NetError};
 use space_protocol::{
-    EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, ShardId,
+    EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
+    SceneState, ShardId, ShardMap,
 };
 use space_sim::{Owner, ShipState};
 use space_world::WorldPos;
@@ -87,6 +134,28 @@ pub fn unique_player_token() -> String {
     format!("{PLAYER_TOKEN_PREFIX}{:016x}", hasher.finish())
 }
 
+/// Where a scene's spawn point lies in the world of `map`: the centre of the
+/// map's **root region**.
+///
+/// The root region is the shallowest region of the map — the one every split
+/// carved its octants out of. Splits only *add* a deeper region and merges
+/// only remove one (`space-orchestrator`'s topology), so the root, and with it
+/// this point, stays where it is for as long as the cluster lives, and it is
+/// where the root's shard spawns the ships of the players who join it. A map
+/// without a single root (standalone shards side by side, all of one depth)
+/// takes the region of the lowest shard id; the node index breaks what ties
+/// are left. `None` for a map with no region at all.
+///
+/// A pure function of the map: two clients handed the same map — by whichever
+/// shards — get the same point.
+#[must_use]
+pub fn map_anchor(map: &ShardMap) -> Option<WorldPos> {
+    map.regions
+        .iter()
+        .min_by_key(|region| (region.node.depth, region.shard.0, region.node.index))
+        .map(|region| region.node.center())
+}
+
 /// The client's replicated view of its own ship.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Replica {
@@ -104,10 +173,89 @@ pub struct Replica {
     state_tick: u64,
     /// Where the ship was in the first frame that showed it.
     origin: Option<WorldPos>,
+    /// The anchor of the map the first shard sent ([`map_anchor`]); kept for
+    /// the life of the link.
+    anchor: Option<WorldPos>,
     /// Frames (snapshots + deltas) applied.
     pub frames: u64,
     /// Completed shard transitions.
     pub handoffs: u64,
+    /// The scene the server says to draw, and the revision it was chosen at
+    /// ([`SceneState::UNSET`] until the first [`Message::SceneUpdate`]). It
+    /// survives a shard transition; compare it with the value last drawn to
+    /// notice a change (see the module docs, "The scene").
+    pub scene: SceneState,
+    /// Every ship the shard being played on has reported and not removed
+    /// again, our own included (see [`Replica::others`]).
+    ships: ShipView,
+}
+
+/// Another ship the shard reports: somebody else's, or nobody's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OtherShip {
+    /// The ship's guid (stable across handoffs).
+    pub guid: EntityGuid,
+    /// The session driving it on the shard being played on; 0 for a ship no
+    /// player owns (sessions start at 1).
+    pub owner: u64,
+    /// Its latest replicated state.
+    pub state: ShipState,
+}
+
+/// The ships one connection has been told about: what its snapshots and deltas
+/// add up to.
+///
+/// A shard sends a snapshot (everything in the interest sphere) on join and
+/// deltas (changed ships plus explicit removals) afterwards, on two paths that
+/// may overtake each other — so every ship remembers the tick its state is
+/// from, and an older frame never rewinds or resurrects one.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ShipView {
+    ships: Vec<Seen>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Seen {
+    ship: OtherShip,
+    /// The tick `ship.state` is from.
+    tick: u64,
+}
+
+impl ShipView {
+    /// Apply one snapshot or delta; anything else is ignored.
+    fn apply(&mut self, message: &Message) {
+        let (tick, entities) = match message {
+            Message::Snapshot(s) => (s.tick, &s.entities),
+            Message::Delta(d) => (d.tick, &d.entities),
+            _ => return,
+        };
+        for entity in entities {
+            let Some(state) = ship_state_of(entity) else {
+                continue;
+            };
+            let ship = OtherShip {
+                guid: entity.guid,
+                owner: owner_of(entity).unwrap_or(0),
+                state,
+            };
+            match self.ships.iter_mut().find(|s| s.ship.guid == entity.guid) {
+                Some(seen) if tick >= seen.tick => *seen = Seen { ship, tick },
+                Some(_) => {}
+                None => self.ships.push(Seen { ship, tick }),
+            }
+        }
+        match message {
+            // A snapshot is the whole interest set: what it does not name is
+            // gone — unless a newer frame has already said otherwise.
+            Message::Snapshot(s) => self.ships.retain(|seen| {
+                seen.tick > tick || s.entities.iter().any(|e| e.guid == seen.ship.guid)
+            }),
+            Message::Delta(d) => self
+                .ships
+                .retain(|seen| seen.tick > tick || !d.removed.contains(&seen.ship.guid)),
+            _ => {}
+        }
+    }
 }
 
 impl Replica {
@@ -119,6 +267,40 @@ impl Replica {
         }
     }
 
+    /// A view on the shard that sent `map` in its welcome: anchored to it.
+    fn joined(session: u64, shard: ShardId, map: &ShardMap) -> Self {
+        Self {
+            anchor: map_anchor(map),
+            ..Self::new(session, shard)
+        }
+    }
+
+    /// The point of the world a scene's spawn point lies on (see the module
+    /// docs, "The anchor"): the anchor of the map this link was welcomed
+    /// with. It never changes while the link lives. A map without regions
+    /// (no shard sends one) falls back to where the ship first appeared;
+    /// `None` only until then.
+    #[must_use]
+    pub fn anchor(&self) -> Option<WorldPos> {
+        self.anchor.or(self.origin)
+    }
+
+    /// Take `update` as the scene if it counts (see the module docs, "The
+    /// scene"): a newer revision always does; the same revision naming another
+    /// scene does only when it comes from the shard being played on
+    /// (`from_active`). Returns whether the scene changed.
+    fn adopt_scene(&mut self, update: SceneState, from_active: bool) -> bool {
+        let newer = update.supersedes(&self.scene);
+        let same_revision_other_scene = from_active
+            && update.revision == self.scene.revision
+            && update.scene != self.scene.scene;
+        if !(newer || same_revision_other_scene) {
+            return false;
+        }
+        self.scene = update;
+        true
+    }
+
     /// Apply one server message; anything that is not a snapshot/delta is
     /// ignored. Returns whether the frame carried this session's ship.
     pub fn apply(&mut self, message: &Message) -> bool {
@@ -128,6 +310,7 @@ impl Replica {
             _ => return false,
         };
         self.frames += 1;
+        self.ships.apply(message);
         // Frames arrive on two paths (reliable snapshots, datagram deltas) and
         // may overtake each other, so the clock only moves forwards — but an
         // older frame is not thrown away wholesale: it may be the only one
@@ -149,16 +332,23 @@ impl Replica {
         seen
     }
 
-    /// Whether `message` is a frame carrying a ship owned by `session`.
-    fn frame_has_ship_of(message: &Message, session: u64) -> bool {
+    /// Whether `message` is a frame carrying the ship `guid`, owned by
+    /// `session`.
+    ///
+    /// The guid matters: a shard gives a client that joins it a ship of its
+    /// own unless it already holds the handoff's offer for that player, so a
+    /// ship owned by `session` is not necessarily the one being handed over.
+    fn frame_has_ship_of(message: &Message, session: u64, guid: EntityGuid) -> bool {
         let entities = match message {
             Message::Snapshot(s) => &s.entities,
             Message::Delta(d) => &d.entities,
             _ => return false,
         };
-        entities
-            .iter()
-            .any(|entity| owner_of(entity) == Some(session) && ship_state_of(entity).is_some())
+        entities.iter().any(|entity| {
+            entity.guid == guid
+                && owner_of(entity) == Some(session)
+                && ship_state_of(entity).is_some()
+        })
     }
 
     /// The ship state in `entity`, if it is this session's ship.
@@ -170,14 +360,36 @@ impl Replica {
     }
 
     /// Continue this view on another shard after a handoff: a new session and
-    /// a new tick domain (every shard runs its own clock), the same ship and
-    /// the same origin.
-    fn switch_to(&mut self, session: u64, shard: ShardId) {
+    /// a new tick domain (every shard runs its own clock), the same ship, the
+    /// same origin and the same scene. `ships` is what the new shard has
+    /// reported on its connection so far (its ticks are that shard's).
+    fn switch_to(&mut self, session: u64, shard: ShardId, ships: ShipView) {
         self.session = session;
         self.shard = Some(shard);
         self.tick = 0;
         self.state_tick = 0;
         self.handoffs += 1;
+        self.ships = ships;
+    }
+
+    /// Where the ship was in the first frame that showed it: the point
+    /// [`Replica::offset`] is measured from. `None` until that frame.
+    #[must_use]
+    pub fn origin(&self) -> Option<WorldPos> {
+        self.origin
+    }
+
+    /// The other ships the shard reports: every ship in the interest sphere
+    /// except our own. Ships owned by a session are other players'; owner 0
+    /// is a ship nobody flies.
+    pub fn others(&self) -> impl Iterator<Item = &OtherShip> {
+        let own = self.ship;
+        let session = self.session;
+        self.ships
+            .ships
+            .iter()
+            .map(|seen| &seen.ship)
+            .filter(move |ship| Some(ship.guid) != own && ship.owner != session)
     }
 
     /// The ship's displacement from where it first appeared, metres.
@@ -217,7 +429,16 @@ struct Pending {
     generation: u64,
     session: u64,
     shard: ShardId,
+    /// The entity the redirect was about: the ship being handed over.
+    entity: EntityGuid,
     opened: Instant,
+    /// The newest scene this shard has announced on this connection, kept for
+    /// the moment it becomes the shard being played on.
+    scene: Option<SceneState>,
+    /// The ships this shard has reported on this connection, kept for the
+    /// same moment: its join snapshot arrives long before the switch, and the
+    /// deltas after it only name ships that change.
+    ships: ShipView,
 }
 
 #[derive(Debug)]
@@ -282,7 +503,7 @@ impl ServerLink {
             connect(&endpoint, addr, SERVER_NAME, &hello(player_token.as_ref())).await?;
         // `endpoint` may drop: the connection keeps the endpoint driver alive.
         let shared = Arc::new(Mutex::new(Shared {
-            replica: Replica::new(welcome.session, welcome.shard),
+            replica: Replica::joined(welcome.session, welcome.shard, &welcome.shard_map),
             tick_seen: Instant::now(),
             thrust: [0.0; 3],
             seq: 0,
@@ -326,6 +547,17 @@ impl ServerLink {
     #[must_use]
     pub fn replica(&self) -> Replica {
         lock(&self.shared).replica.clone()
+    }
+
+    /// The scene the server says to draw, and its revision.
+    ///
+    /// Cheap enough to call every frame. The value changes exactly when the
+    /// scene does, so an app keeps the one it last drew and compares; the
+    /// scene itself is `scene().scene.or_default()`. Revision 0 means the
+    /// server has not said yet (see the module docs, "The scene").
+    #[must_use]
+    pub fn scene(&self) -> SceneState {
+        lock(&self.shared).replica.scene
     }
 
     /// Whether the connection to the world is gone.
@@ -444,6 +676,7 @@ async fn read_frames(
             Ok(Some(Message::Redirect(redirect))) => {
                 follow_redirect(&shared, &player_token, generation, redirect);
             }
+            Ok(Some(Message::SceneUpdate(update))) => on_scene(&shared, generation, update),
             Ok(Some(message)) => on_frame(&shared, generation, &message),
             // Peer gone.
             Ok(None) => return,
@@ -456,6 +689,44 @@ async fn read_frames(
                 }
             }
         }
+    }
+}
+
+/// Take a scene announcement from the connection with reader `generation`: the
+/// shard being played on, or the accepting shard of a handoff in flight. One
+/// from any other connection (already retired, or superseded) is not ours.
+fn on_scene(shared: &SharedRef, generation: u64, update: SceneState) {
+    let mut s = lock(shared);
+    let from_active = generation == s.active_generation;
+    if !from_active {
+        let Some(pending) = s.pending.as_mut().filter(|p| p.generation == generation) else {
+            return;
+        };
+        // Remembered for the switch; meanwhile only a newer revision counts.
+        if pending.scene.is_none_or(|held| update.supersedes(&held)) {
+            pending.scene = Some(update);
+        }
+    }
+    if s.replica.adopt_scene(update, from_active) {
+        log_scene(update);
+    }
+}
+
+/// Say which scene the server chose — and, for one this build does not know,
+/// what is drawn instead.
+fn log_scene(scene: SceneState) {
+    match scene.scene.known() {
+        Some(known) => log::info!(
+            "space-client: the server's scene is {known} (revision {})",
+            scene.revision
+        ),
+        None => log::warn!(
+            "space-client: the server's scene (id {}, revision {}) is not known to this build; \
+             showing {} instead",
+            scene.scene.0,
+            scene.revision,
+            scene.scene.or_default()
+        ),
     }
 }
 
@@ -472,10 +743,15 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     }
     // A frame from the accepting shard of a handoff in flight. Until it shows
     // our ship under the new session the old shard is still the authority.
-    let Some(pending) = s.pending.as_ref().filter(|p| p.generation == generation) else {
+    let flying = s.replica.ship;
+    let Some(pending) = s.pending.as_mut().filter(|p| p.generation == generation) else {
         return;
     };
-    if !Replica::frame_has_ship_of(message, pending.session) {
+    pending.ships.apply(message);
+    // The ship we have been flying — or, before any frame has named it, the
+    // one the redirect was about.
+    let ours = flying.unwrap_or(pending.entity);
+    if !Replica::frame_has_ship_of(message, pending.session, ours) {
         return;
     }
     // The switch: the new shard is simulating our ship.
@@ -484,12 +760,21 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     };
     let retired = std::mem::replace(&mut s.active, pending.conn);
     s.active_generation = pending.generation;
-    s.replica.switch_to(pending.session, pending.shard);
+    s.replica
+        .switch_to(pending.session, pending.shard, pending.ships);
     s.replica.apply(message);
     s.tick_seen = Instant::now();
+    // What the new shard announced while the handoff was in flight now comes
+    // from the shard being played on. (A newer revision was taken when it
+    // arrived; an older one still changes nothing.)
+    if let Some(theirs) = pending.scene {
+        if s.replica.adopt_scene(theirs, true) {
+            log_scene(theirs);
+        }
+    }
     log::info!(
-        "space-client: now on shard {:?} (session {}), transition {}",
-        pending.shard,
+        "space-client: now on shard {} (session {}), transition {}",
+        pending.shard.0,
         pending.session,
         s.replica.handoffs
     );
@@ -580,7 +865,10 @@ async fn open_redirect(
             generation,
             session: welcome.session,
             shard: redirect.new_shard,
+            entity: redirect.entity,
             opened: Instant::now(),
+            scene: None,
+            ships: ShipView::default(),
         }) {
             previous.conn.close(0, "superseded");
         }
@@ -680,8 +968,8 @@ mod tests {
         // The accepting shard's frame: our ship, its session, its own clock.
         let from_new = frame(40, vec![ship(guid, 3, 512.5)]);
         assert!(!r.apply(&from_new), "not ours until the switch");
-        assert!(Replica::frame_has_ship_of(&from_new, 3));
-        r.switch_to(3, ShardId::new(2));
+        assert!(Replica::frame_has_ship_of(&from_new, 3, guid));
+        r.switch_to(3, ShardId::new(2), ShipView::default());
         assert!(r.apply(&from_new));
         assert_eq!(
             (r.session, r.shard, r.handoffs),
@@ -689,6 +977,292 @@ mod tests {
         );
         assert_eq!((r.ship, r.tick), (Some(guid), 40));
         assert!((r.offset()[0] - 512.5).abs() < 1e-3, "{:?}", r.offset());
+    }
+
+    /// A client that reaches the accepting shard before the shards' own offer
+    /// does is given a placeholder ship there. A frame showing that ship is
+    /// not the switch: the ship being handed over is still simulated by the
+    /// old shard, and switching would abandon it there.
+    ///
+    /// Mutation this catches: switching on any ship the new session owns — the
+    /// player (or a bystander redirected because it was watching the ship)
+    /// jumps to the accepting shard's spawn point.
+    #[test]
+    fn a_placeholder_ship_on_the_accepting_shard_is_not_the_switch() {
+        let ours = EntityGuid::new(ShardId::new(1), 1);
+        let placeholder = EntityGuid::new(ShardId::new(2), 1);
+        let new_session = 3;
+        let with_placeholder = frame(5, vec![ship(placeholder, new_session, 512.0)]);
+        assert!(!Replica::frame_has_ship_of(
+            &with_placeholder,
+            new_session,
+            ours
+        ));
+        // Our ship still under another session (a ghost of it): not yet either.
+        let not_yet_ours = frame(6, vec![ship(ours, 9, 0.0)]);
+        assert!(!Replica::frame_has_ship_of(
+            &not_yet_ours,
+            new_session,
+            ours
+        ));
+        // Our ship, owned by the new session: that is the switch.
+        let handed_over = frame(
+            7,
+            vec![
+                ship(placeholder, new_session, 512.0),
+                ship(ours, new_session, 1.0),
+            ],
+        );
+        assert!(Replica::frame_has_ship_of(&handed_over, new_session, ours));
+        // Not a frame at all.
+        assert!(!Replica::frame_has_ship_of(
+            &Message::SceneUpdate(SceneState::UNSET),
+            new_session,
+            ours
+        ));
+    }
+
+    fn scene(scene: space_protocol::Scene, revision: u64) -> SceneState {
+        SceneState::new(scene.id(), revision)
+    }
+
+    /// The scene a replica holds only ever moves to a newer revision — whatever
+    /// connection the announcement arrives on, in whatever order.
+    ///
+    /// Mutation this catches: taking the last announcement received (a late
+    /// message, or an accepting shard that has not caught up, rolls the scene
+    /// back), or `>=` for a pending connection (a shard one is not yet on
+    /// overrides the one being played on).
+    #[test]
+    fn the_scene_follows_the_highest_revision_and_never_rolls_back() {
+        use space_protocol::Scene;
+        let mut r = Replica::new(7, ShardId::new(1));
+        assert_eq!(r.scene, SceneState::UNSET, "nothing heard yet");
+        assert_eq!(r.scene.scene.or_default(), Scene::DEFAULT);
+
+        // A shard nobody configured announces "unset": that is what is held.
+        assert!(!r.adopt_scene(SceneState::UNSET, true));
+        assert!(r.adopt_scene(scene(Scene::Galaxy, 2), true));
+        assert_eq!(r.scene, scene(Scene::Galaxy, 2));
+
+        // Repeats and late messages change nothing, on either connection.
+        for from_active in [true, false] {
+            assert!(!r.adopt_scene(scene(Scene::Galaxy, 2), from_active));
+            assert!(!r.adopt_scene(scene(Scene::Solar, 1), from_active));
+            assert!(!r.adopt_scene(SceneState::UNSET, from_active));
+        }
+        assert_eq!(r.scene, scene(Scene::Galaxy, 2));
+
+        // A newer revision counts wherever it is heard: the scene is the
+        // cluster's, and the accepting shard may learn of a change first.
+        assert!(r.adopt_scene(scene(Scene::Solar, 3), false));
+        assert_eq!(r.scene, scene(Scene::Solar, 3));
+
+        // The handoff itself keeps the scene.
+        r.switch_to(3, ShardId::new(2), ShipView::default());
+        assert_eq!(r.scene, scene(Scene::Solar, 3));
+        assert_eq!(r.handoffs, 1);
+    }
+
+    /// Two shards that name different scenes at the same revision (standalone
+    /// shards with different `--scene` flags): the one being played on decides.
+    #[test]
+    fn at_the_same_revision_the_shard_being_played_on_decides() {
+        use space_protocol::Scene;
+        let mut r = Replica::new(7, ShardId::new(1));
+        assert!(r.adopt_scene(scene(Scene::Galaxy, 1), true));
+        assert!(
+            !r.adopt_scene(scene(Scene::Solar, 1), false),
+            "not while it is only the accepting shard of a handoff in flight"
+        );
+        assert_eq!(r.scene, scene(Scene::Galaxy, 1));
+        assert!(
+            r.adopt_scene(scene(Scene::Solar, 1), true),
+            "once it is the shard being played on"
+        );
+        assert_eq!(r.scene, scene(Scene::Solar, 1));
+    }
+
+    /// A scene this build does not know is kept as it was sent (the revision
+    /// still orders it) and resolves to the default scene for drawing.
+    #[test]
+    fn an_unknown_scene_is_kept_and_resolves_to_the_default() {
+        use space_protocol::{Scene, SceneId};
+        let mut r = Replica::new(7, ShardId::new(1));
+        let unknown = SceneState::new(SceneId(4_000), 5);
+        assert!(r.adopt_scene(unknown, true));
+        assert_eq!(r.scene, unknown);
+        assert_eq!(r.scene.scene.known(), None);
+        assert_eq!(r.scene.scene.or_default(), Scene::DEFAULT);
+        log_scene(unknown); // says so; must not panic
+        assert!(
+            !r.adopt_scene(scene(Scene::Solar, 4), true),
+            "still ordered"
+        );
+        assert!(r.adopt_scene(scene(Scene::Solar, 6), true));
+    }
+
+    fn region(depth: u8, index: [i64; 3], shard: u32) -> space_protocol::ShardRegion {
+        space_protocol::ShardRegion::new(
+            space_world::NodeRef::new(depth, index),
+            ShardId::new(shard),
+            "127.0.0.1:7777".parse().expect("an address"),
+        )
+    }
+
+    /// The anchor is the centre of the root region: the spawn point of the
+    /// first shard in each of the topologies the dev scripts start, the same
+    /// for every client whatever the order of the map's entries, and the
+    /// same before and after a split or a merge.
+    #[test]
+    fn the_anchor_is_the_centre_of_the_maps_root_region() {
+        use space_world::NodeRef;
+        let centre = |depth, index| NodeRef::new(depth, index).center();
+        // One standalone shard: its cell's centre, the world origin.
+        let single = ShardMap::new(1, vec![region(64, [0, 0, 0], 1)]);
+        assert_eq!(map_anchor(&single), Some(WorldPos::ZERO));
+        // Two standalone neighbours of one depth: the lower shard id's cell,
+        // whichever way round the map lists them (each shard lists itself
+        // first).
+        let two = ShardMap::new(1, vec![region(64, [0, 0, 0], 1), region(64, [1, 0, 0], 2)]);
+        let owt = ShardMap::new(1, vec![region(64, [1, 0, 0], 2), region(64, [0, 0, 0], 1)]);
+        assert_eq!(map_anchor(&two), Some(WorldPos::ZERO));
+        assert_eq!(map_anchor(&owt), map_anchor(&two));
+        // An orchestrated cluster: the root, before a split, after it (a
+        // child octant is added, whoever owns it and wherever it is listed)
+        // and after the merge that takes it away again.
+        let root = region(40, [3, -2, 5], 7);
+        let before = ShardMap::new(4, vec![root.clone()]);
+        let anchor = map_anchor(&before);
+        assert_eq!(anchor, Some(centre(40, [3, -2, 5])));
+        let child = NodeRef::new(41, [7, -4, 11]);
+        assert!(space_world::octree::children(root.node)
+            .expect("children")
+            .contains(&child));
+        for split in [
+            vec![root.clone(), region(41, [7, -4, 11], 8)],
+            vec![region(41, [7, -4, 11], 8), root.clone()],
+            // The new shard's id may be lower than the root's (a restarted
+            // root): depth decides before the id does.
+            vec![region(41, [7, -4, 11], 2), root.clone()],
+            vec![
+                root.clone(),
+                region(41, [7, -4, 11], 8),
+                region(42, [14, -8, 22], 9),
+                region(41, [6, -4, 10], 10),
+            ],
+        ] {
+            assert_eq!(map_anchor(&ShardMap::new(5, split)), anchor);
+        }
+        assert_eq!(map_anchor(&ShardMap::new(6, vec![root])), anchor);
+        // The handoff test's topology: A owns the node, B an octant of it.
+        let carved = ShardMap::new(1, vec![region(63, [0, 0, 0], 1), region(64, [1, 1, 1], 2)]);
+        assert_eq!(map_anchor(&carved), Some(centre(63, [0, 0, 0])));
+        // No region, no anchor.
+        assert_eq!(map_anchor(&ShardMap::new(1, Vec::new())), None);
+    }
+
+    /// A link keeps the anchor it was welcomed with: a handoff does not move
+    /// it, and without a map it is where the ship first appeared.
+    #[test]
+    fn a_replica_keeps_its_anchor_across_a_handoff() {
+        let map = ShardMap::new(1, vec![region(63, [0, 0, 0], 1), region(64, [1, 1, 1], 2)]);
+        let guid = EntityGuid::new(ShardId::new(1), 1);
+        let mut r = Replica::joined(7, ShardId::new(1), &map);
+        let anchor = map_anchor(&map);
+        assert!(anchor.is_some());
+        assert_eq!(r.anchor(), anchor, "known before any frame");
+        r.apply(&frame(10, vec![ship(guid, 7, 300.0)]));
+        assert_eq!(r.anchor(), anchor, "not where the ship appeared");
+        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.apply(&frame(4, vec![ship(guid, 3, 400.0)]));
+        assert_eq!(r.anchor(), anchor);
+
+        let mut bare = Replica::new(7, ShardId::new(1));
+        assert_eq!(bare.anchor(), None);
+        bare.apply(&frame(10, vec![ship(guid, 7, 300.0)]));
+        assert_eq!(bare.anchor(), bare.origin());
+        assert!(bare.anchor().is_some());
+    }
+
+    fn delta(tick: u64, entities: Vec<EntitySnapshot>, removed: Vec<EntityGuid>) -> Message {
+        Message::Delta(space_protocol::Delta {
+            tick,
+            base_tick: tick.saturating_sub(1),
+            shard: ShardId::new(1),
+            epoch: 1,
+            entities,
+            removed,
+            input_ack: 0,
+        })
+    }
+
+    /// The replica keeps the other ships the shard reports — other players'
+    /// and unowned ones — follows their moves, and forgets them when the shard
+    /// says so; its own ship is never one of them.
+    #[test]
+    fn other_ships_are_tracked_and_removed() {
+        let shard = ShardId::new(1);
+        let (mine, theirs, drone) = (
+            EntityGuid::new(shard, 1),
+            EntityGuid::new(shard, 2),
+            EntityGuid::new(shard, 3),
+        );
+        let mut r = Replica::new(7, shard);
+        assert_eq!(r.others().count(), 0);
+        r.apply(&frame(
+            10,
+            vec![
+                ship(mine, 7, 0.0),
+                ship(theirs, 8, 5.0),
+                ship(drone, 0, 9.0),
+            ],
+        ));
+        let seen: Vec<(EntityGuid, u64)> = r.others().map(|s| (s.guid, s.owner)).collect();
+        assert_eq!(seen, vec![(theirs, 8), (drone, 0)]);
+        assert_eq!(r.origin(), r.state.map(|s| s.pos));
+
+        // A delta moves one of them; a late one does not move it back.
+        r.apply(&delta(12, vec![ship(theirs, 8, 6.0)], vec![]));
+        r.apply(&delta(11, vec![ship(theirs, 8, 5.5)], vec![]));
+        let x = |r: &Replica, guid| {
+            let s = r.others().find(|s| s.guid == guid).expect("still there");
+            WorldPos::delta(WorldPos::ZERO, s.state.pos)[0]
+        };
+        assert!((x(&r, theirs) - 6.0).abs() < 1e-3);
+
+        // An explicit removal; a removal older than the ship's state is stale.
+        r.apply(&delta(13, vec![ship(drone, 0, 9.5)], vec![]));
+        r.apply(&delta(12, vec![], vec![drone]));
+        assert_eq!(r.others().count(), 2, "a stale removal removes nothing");
+        r.apply(&delta(14, vec![], vec![drone]));
+        assert_eq!(r.others().map(|s| s.guid).collect::<Vec<_>>(), [theirs]);
+
+        // A snapshot is the whole interest set: who is not in it is gone.
+        r.apply(&frame(20, vec![ship(mine, 7, 1.0)]));
+        assert_eq!(r.others().count(), 0);
+        assert!(r.state.is_some(), "our own ship is still ours");
+    }
+
+    /// What the accepting shard reported while the handoff was in flight is
+    /// the view after the switch (its join snapshot is never repeated).
+    #[test]
+    fn the_new_shards_ships_are_taken_over_at_the_switch() {
+        let (ours, other) = (
+            EntityGuid::new(ShardId::new(1), 1),
+            EntityGuid::new(ShardId::new(2), 5),
+        );
+        let mut r = Replica::new(7, ShardId::new(1));
+        r.apply(&frame(100, vec![ship(ours, 7, 0.0)]));
+        let mut pending = ShipView::default();
+        pending.apply(&frame(3, vec![ship(other, 4, 20.0)]));
+        // The frame that shows our ship there is an ordinary delta.
+        let switch = delta(4, vec![ship(ours, 9, 1.0)], vec![]);
+        pending.apply(&switch);
+        r.switch_to(9, ShardId::new(2), pending);
+        r.apply(&switch);
+        assert_eq!(r.others().map(|s| s.guid).collect::<Vec<_>>(), [other]);
+        assert_eq!(r.ship, Some(ours));
     }
 
     /// Inputs are tagged ahead of the server's clock even when frames stop

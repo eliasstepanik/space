@@ -1,0 +1,21 @@
+[package]
+name = "space-harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Headless test harness for the client: a control trait (input, state, frames), Lua scripts that simulate a user, and a loopback HTTP API"
+
+[dependencies]
+# The input vocabulary (`ViewerInput`, `Key`) shared with the browser viewer and
+# the window, plus the JPEG encoder. No tokio/WebSocket from this dependency.
+space-stream = { workspace = true, features = ["jpeg"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The HTTP API (hand-rolled HTTP/1.1, as in `space-mcp`).
+tokio = { workspace = true }
+# The Lua interpreter: pure Rust (see the workspace manifest).
+lunita = { workspace = true }
+
+[lints]
+workspace = true

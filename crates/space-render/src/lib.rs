@@ -7,15 +7,25 @@
 //!
 //! * a **forward PBR pass** (Cook-Torrance GGX + Smith visibility, analytic
 //!   point lights) into an HDR `rgba16f` target,
+//! * optional **ray-traced shadows** from those lights (one ray query per
+//!   light in the forward pass's fragment shaders, see [`quality`]),
 //! * **ray-query probe GI** (`VK_KHR_ray_query`, DDGI-style, 1-bounce diffuse)
 //!   feeding that pass as indirect diffuse,
 //! * an optional **post pass** (screen-space reflections + refraction, see
 //!   [`quality`]) skipped entirely on the `Ci`/`Low` presets,
+//! * an optional **environment** ([`Environment`]): a sky-and-ground gradient
+//!   that gives every surface ambient light and something to reflect, glass
+//!   something to show where there is no geometry, and — if asked — the frame
+//!   a background,
 //! * an **ACES tone map** into an 8-bit image,
+//! * a **2D overlay** ([`Overlay`]): rectangles and text in a built-in bitmap
+//!   font, blended over the tone-mapped image,
 //! * LOD integration: the scene is built from `space-world`'s deterministic
 //!   galaxy through its LOD selector (≤ [`space_world::MAX_SELECTED`] nodes),
-//! * **mesh models** ([`mesh`]): triangle meshes loaded from `.glb` files,
-//!   drawn through the same shading as the procedural spheres and boxes.
+//! * **mesh models** ([`mesh`]): triangle meshes loaded from `.glb` files or
+//!   built in code, with base-colour [`Texture`]s, drawn through the same
+//!   shading as the procedural spheres and boxes and part of the same
+//!   ray-traced scene (shadows, GI).
 //!
 //! WGSL is compiled to SPIR-V at build time with naga ≥ 30 (see `build.rs`);
 //! the ray-query shaders need `enable wgpu_ray_query;`, which naga 24 cannot
@@ -40,22 +50,28 @@
 //! loader at runtime, so no C code is linked into this crate.
 
 pub mod alloc;
+pub mod environment;
 pub mod gpu;
 pub mod mesh;
+pub mod overlay;
 pub mod params;
 pub mod passes;
 pub mod quality;
 pub mod scene;
 pub mod swapchain;
+pub mod texture;
 
+pub use environment::Environment;
 pub use gpu::{
-    skip_or_require_gpu, validation_message_count, ContextOptions, FrameOutput, Quality,
-    RayQuerySupport, RenderContext, RenderError, RenderOptions, MAX_FRAME_DIMENSION, MAX_GI_GRID,
+    skip_or_require_gpu, validation_message_count, ContextOptions, FrameOutput, ModelCacheStats,
+    Quality, RayQuerySupport, RenderContext, RenderError, RenderOptions, MAX_FRAME_DIMENSION,
+    MAX_GI_GRID,
 };
 pub use mesh::{
-    rotation_y, sample_ship, MeshData, MeshError, MeshMaterial, MeshPart, MeshVertex,
-    ModelInstance, IDENTITY_ROTATION,
+    rotation_y, sample_character, sample_ship, MeshData, MeshError, MeshMaterial, MeshPart,
+    MeshVertex, ModelInstance, IDENTITY_ROTATION,
 };
+pub use overlay::Overlay;
 pub use params::{
     Camera, ForwardParams, GiParams, GpuInstance, Light, MeshInstanceGpu, PostParams, RqParams,
     ToneParams,
@@ -66,6 +82,7 @@ pub use scene::{
     SHAPE_SPHERE, STAR_RADIUS_M,
 };
 pub use swapchain::{PresentOutcome, Swapchain, SwapchainConfig, WindowHandles};
+pub use texture::Texture;
 
 /// The renderer interface the client and any capture tool code against.
 ///

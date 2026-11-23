@@ -5,32 +5,46 @@ canvas and sends mouse/keyboard input back. It holds no game state; the player
 in the multiplayer sense is the native proxy (`space-client --stream`), which
 connects to the server through the normal `space-net` path.
 
-## Build
+It is a **local development and testing tool** (people and AI agents use it to
+watch and drive the game in a browser); it is not part of any deployment.
+
+## Build and run
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown -p space-viewer
-
-# JS glue (needs wasm-bindgen-cli matching the lockfile, 0.2.130):
-cargo install wasm-bindgen-cli --version 0.2.130
-wasm-bindgen --target web --out-dir crates/space-viewer/pkg \
-    target/wasm32-unknown-unknown/release/space_viewer.wasm
+cargo run -p space-client -- --stream 127.0.0.1:8099 --server 127.0.0.1:7777
+cargo run -p xtask -- viewer            # builds the wasm + JS glue, serves the page
+# open http://127.0.0.1:8097/
 ```
 
-## Run
+`xtask viewer` runs the wasm build and `wasm-bindgen`, puts `index.html` and
+`pkg/` together in `<target dir>/viewer-site` and serves that on loopback with
+`Cache-Control: no-cache`. It needs the `wasm-bindgen` CLI in exactly the
+version `Cargo.lock` pins: if it is missing or different the command exits 2
+and prints the `cargo install` line to run (`--install-bindgen` runs it).
+`--port N`, `--ws URL` (print the link with `?ws=`), `--site-only` (build the
+site and exit), `--no-build`.
 
-```sh
-cargo run -p space-client -- --stream 127.0.0.1:8099 --galaxy
-cd crates/space-viewer && python3 -m http.server 8000
-# open http://127.0.0.1:8000/index.html
-```
-
-The page connects to `ws://<host the page was loaded from>:8099` (so the line
-above reaches `ws://127.0.0.1:8099`, and a page served from another machine
-reaches the proxy on that machine). Pass `?ws=ws://HOST:PORT` to name another
+The page connects to `ws://<host the page was loaded from>:8099` (so the lines
+above reach `ws://127.0.0.1:8099`). Pass `?ws=ws://HOST:PORT` to name another
 address.
 
-Controls: WASD / arrows move, Space up, Shift down, left-drag looks around.
+Without `--server` the client shows its connect screen in the page: click the
+picture, type the shard's address and press Enter. While playing: WASD / arrows
+move, Space up, Shift down, left-drag looks around, `C` camera, `B` brake
+assist, `H` HUD, Esc back to the connect screen. Browser shortcuts (F5, F12,
+Ctrl/Cmd combinations) stay with the browser.
+
+## Typing
+
+Text reaches the game through an invisible, always-focused text field
+(`#space-viewer-input`), so it works from a keyboard (any layout, AltGr, dead
+keys), an input method (the committed text), an on-screen keyboard, paste, and
+browser automation that inserts text without key events (`Input.insertText`,
+`execCommand('insertText')`, or filling that element and dispatching `input`).
+Each character is sent once. Inserted `\n` is Enter and `\t` is Tab; pasted
+newlines are dropped and a paste is cut at 256 characters. Movement keys and
+Enter/Backspace/Delete/caret keys still come from key events; a synthetic
+`keydown` alone types nothing, as with any text field.
 
 ## Behaviour
 

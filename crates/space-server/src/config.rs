@@ -51,6 +51,21 @@ pub const ADOPT_TIMEOUT_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 /// change clears the pause, because the refusal was about the old map.
 pub const REOFFER_BACKOFF_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 
+/// How often a shard tells every connected client its scene again, in ticks
+/// (5 s).
+///
+/// A [`SceneUpdate`](space_protocol::Message::SceneUpdate) is offered to a
+/// client's write queue like any other message, and the front end drops what
+/// it offers to a queue that is full (it never waits: see
+/// [`crate::net::ShardNet::flush`]). A frame lost that way is sent again once
+/// the client's acknowledgements show it is missing; a scene announcement has
+/// no acknowledgement, so a client that lost one would draw the old scene
+/// until the next change or a reconnect. Saying it again every few seconds
+/// closes that: the message is a dozen bytes, the revision makes a repeat a
+/// no-op for a client that already has it, and the cost on the tick is one
+/// comparison (the clients are only walked on the tick it is due).
+pub const SCENE_REANNOUNCE_TICKS: SimTick = 5 * space_sim::TICK_HZ as SimTick;
+
 /// How many inputs one client may have waiting between two ticks.
 ///
 /// Every input is rewritten to the session's one ship and the simulation keeps

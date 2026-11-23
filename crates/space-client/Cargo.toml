@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Native client: winit window + space-render, offline demo of the deterministic galaxy"
+description = "Native client: always online, with a connect screen; window, headless and pixel-stream front ends over one core, drivable through space-harness"
 
 [lib]
 path = "src/lib.rs"
@@ -17,6 +17,7 @@ path = "src/main.rs"
 space-render = { workspace = true }
 space-world = { workspace = true }
 space-stream = { workspace = true, features = ["net"] }
+space-harness = { workspace = true }
 space-net = { path = "../space-net" }
 space-protocol = { workspace = true }
 space-sim = { workspace = true }

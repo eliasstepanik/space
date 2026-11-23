@@ -36,6 +36,8 @@
 //! * [`shard`] — [`ShardId`], [`ShardMap`], [`ShardRegion`], epoch handshake
 //! * [`messages`] — the message types and the [`Message`] enum
 //! * [`control`] — orchestrator load reports, directory and admin messages
+//! * [`scene`] — the scene catalogue ([`Scene`], [`SceneId`]) and the
+//!   revisioned [`SceneState`] the scene messages carry
 //! * [`codec`] — [`encode_frame`], [`decode_frame`], [`CodecError`]
 //! * [`snapshot`] — [`SnapshotBuilder`], the per-client byte budget
 //!
@@ -49,6 +51,7 @@ pub mod control;
 pub mod guid;
 pub mod messages;
 pub mod pos;
+pub mod scene;
 pub mod shard;
 pub mod snapshot;
 
@@ -64,6 +67,7 @@ pub use messages::{
     RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
+pub use scene::{Scene, SceneAck, SceneId, SceneState, UnknownScene};
 pub use shard::{
     AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
 };

@@ -1,34 +1,55 @@
 //! Triangle meshes and the GLB (binary glTF 2.0) loader.
 //!
-//! [`MeshData`] is a model ready to draw: one vertex buffer (position +
-//! normal), one index buffer, and a list of [`MeshPart`]s — index ranges that
-//! each carry a metallic-roughness material. A [`ModelInstance`] places a
-//! shared `MeshData` in a [`Scene`](crate::Scene).
+//! [`MeshData`] is a model ready to draw: one vertex buffer (position, normal,
+//! texture coordinate), one index buffer, a list of [`MeshPart`]s — index
+//! ranges that each carry a metallic-roughness material — and the base-colour
+//! [`Texture`]s those materials refer to by index. A [`ModelInstance`] places
+//! a shared `MeshData` in a [`Scene`](crate::Scene).
+//!
+//! # Conventions
+//!
+//! Triangles are counter-clockwise seen from outside, +Y is up, and the built-in
+//! models ([`sample_ship`], [`sample_character`]) face **-Z** (the default
+//! camera's view direction, so a model in front of the camera is seen from
+//! behind). Texture coordinate (0, 0) is the top-left corner of the image, as
+//! in glTF.
 //!
 //! # What the GLB loader supports
 //!
 //! [`MeshData::from_glb`] reads a self-contained `.glb` file: the default
 //! scene's node hierarchy (matrix or translation/rotation/scale, baked into the
 //! vertices), every triangle primitive (lists, strips and fans, indexed or
-//! not), `POSITION` and `NORMAL` (normals are generated when a primitive has
-//! none), and each material's `baseColorFactor`, `metallicFactor`,
-//! `roughnessFactor` and `emissiveFactor` (with
-//! `KHR_materials_emissive_strength`).
+//! not), `POSITION`, `NORMAL` (normals are generated when a primitive has
+//! none) and `TEXCOORD_0` (float or normalised integer), and each material's
+//! `baseColorFactor`, `metallicFactor`, `roughnessFactor`, `emissiveFactor`
+//! (with `KHR_materials_emissive_strength`) and `baseColorTexture` — a PNG or
+//! JPEG image embedded in the file (see [`crate::texture`]).
 //!
-//! Not supported, by design for now: textures (a textured material renders
-//! with its factors only), vertex colours, skins, animations, morph targets,
-//! cameras and lights (ignored); sparse accessors, quantised or compressed
-//! geometry (`KHR_mesh_quantization`, Draco, meshopt) and buffers outside the
-//! file (rejected with an error rather than drawn wrongly).
+//! Texture features the renderer does not have are **ignored with a logged
+//! warning** and the model still loads: the other texture slots
+//! (metallic-roughness, normal, occlusion, emissive), `KHR_texture_transform`,
+//! a second UV set, wrap modes other than repeat, images outside the file or
+//! in another format, and images that fail to decode or exceed the size caps
+//! (such a material is drawn with its factors only). Base-colour alpha is not
+//! used (no blending or cut-outs).
+//!
+//! Not supported, by design for now: vertex colours, skins, animations, morph
+//! targets, cameras and lights (ignored); sparse accessors, quantised or
+//! compressed geometry (`KHR_mesh_quantization`, Draco, meshopt) and buffers
+//! outside the file (rejected with an error rather than drawn wrongly).
 //!
 //! The loader treats the file as untrusted input: every offset, count and
-//! index is bounds-checked, sizes are capped, and a malformed file is an
+//! index is bounds-checked, sizes are capped (decoded images at
+//! [`MAX_TEXTURE_DIMENSION`](crate::texture::MAX_TEXTURE_DIMENSION) per side
+//! and [`MAX_GLB_TEXTURE_BYTES`] per file), and a malformed file is a
 //! [`MeshError`], never a panic.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
+
+use crate::texture::{decode_image, encode_png, Texture};
 
 /// Why a model could not be loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,24 +67,30 @@ fn err<T>(message: impl Into<String>) -> Result<T, MeshError> {
     Err(MeshError(message.into()))
 }
 
-/// One mesh vertex: 24 bytes, position then normal (the mesh pipeline's
-/// vertex layout).
+/// One mesh vertex: 32 bytes — position, normal, texture coordinate (the mesh
+/// pipeline's vertex layout).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    /// Texture coordinate; (0, 0) is the top-left corner of the image and
+    /// values outside 0..1 repeat it.
+    pub uv: [f32; 2],
 }
 
-/// A metallic-roughness material (factors only, no textures).
+/// A metallic-roughness material: factors plus an optional base-colour texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshMaterial {
-    /// Base colour, linear rgb.
+    /// Base colour, linear rgb. Multiplied with the texture, if there is one.
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
     /// Emitted radiance, linear rgb.
     pub emissive: [f32; 3],
+    /// The base-colour texture: an index into [`MeshData::textures`]. `None`
+    /// (or an index past the end of that list) is an untextured material.
+    pub base_color_texture: Option<u32>,
 }
 
 impl Default for MeshMaterial {
@@ -74,6 +101,7 @@ impl Default for MeshMaterial {
             metallic: 1.0,
             roughness: 1.0,
             emissive: [0.0; 3],
+            base_color_texture: None,
         }
     }
 }
@@ -93,6 +121,9 @@ pub struct MeshData {
     /// Triangle list; every index is `< vertices.len()`.
     pub indices: Vec<u32>,
     pub parts: Vec<MeshPart>,
+    /// The base-colour textures the parts' materials name by index
+    /// ([`MeshMaterial::base_color_texture`]). Uploaded with the mesh.
+    pub textures: Vec<Texture>,
     /// Axis-aligned bounds of the vertices, in model space.
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
@@ -125,6 +156,9 @@ pub fn rotation_y(radians: f32) -> [[f32; 3]; 3] {
 /// "exhaust memory because a header said so".
 pub const MAX_GLB_BYTES: usize = 1 << 30;
 const MAX_ELEMENTS: usize = 64_000_000;
+/// The most memory the decoded (RGBA8) textures of one file may take. An image
+/// that would go past it is skipped with a warning.
+pub const MAX_GLB_TEXTURE_BYTES: usize = 1 << 29;
 /// Deepest node hierarchy followed (a cycle guard as much as a limit).
 const MAX_NODE_DEPTH: usize = 128;
 
@@ -144,6 +178,12 @@ const MODE_TRIANGLE_FAN: u64 = 6;
 /// Extensions a file may *require* and still load correctly.
 const SUPPORTED_REQUIRED_EXTENSIONS: &[&str] = &["KHR_materials_emissive_strength"];
 
+/// Extensions a file may require that are not implemented but safe to leave
+/// out: the model loads, with a warning, drawn without the feature.
+const IGNORED_REQUIRED_EXTENSIONS: &[&str] = &["KHR_texture_transform"];
+
+const WRAP_REPEAT: u64 = 10497;
+
 impl MeshData {
     /// Read a `.glb` file from disk.
     pub fn load(path: &Path) -> Result<Self, MeshError> {
@@ -161,17 +201,31 @@ impl MeshData {
         Self::from_glb(&bytes).map_err(|e| MeshError(format!("{}: {e}", path.display())))
     }
 
-    /// Parse the bytes of a `.glb` file.
+    /// Parse the bytes of a `.glb` file. Anything the loader leaves out on
+    /// purpose (see the module docs) is logged as a warning.
     pub fn from_glb(bytes: &[u8]) -> Result<Self, MeshError> {
+        let (mesh, warnings) = Self::from_glb_with_warnings(bytes)?;
+        for warning in &warnings {
+            log::warn!("glb: {warning}");
+        }
+        Ok(mesh)
+    }
+
+    /// [`MeshData::from_glb`], returning the warnings instead of logging them
+    /// (each distinct warning once).
+    pub fn from_glb_with_warnings(bytes: &[u8]) -> Result<(Self, Vec<String>), MeshError> {
         if bytes.len() > MAX_GLB_BYTES {
             return err("file is larger than the size limit");
         }
         let (json, bin) = split_chunks(bytes)?;
         let doc: Value = serde_json::from_slice(json)
             .map_err(|e| MeshError(format!("the JSON chunk is not valid JSON: {e}")))?;
+        let mut out = Builder::default();
         for required in array(&doc["extensionsRequired"]) {
             let name = required.as_str().unwrap_or("?");
-            if !SUPPORTED_REQUIRED_EXTENSIONS.contains(&name) {
+            if IGNORED_REQUIRED_EXTENSIONS.contains(&name) {
+                out.warn(format!("the required extension {name} is ignored"));
+            } else if !SUPPORTED_REQUIRED_EXTENSIONS.contains(&name) {
                 return err(format!(
                     "the file requires the unsupported extension {name}"
                 ));
@@ -184,14 +238,110 @@ impl MeshData {
             ));
         }
 
-        let mut out = Builder::default();
         let nodes = array(&doc["nodes"]);
         let roots = scene_roots(&doc, nodes.len());
         let mut visited = vec![false; nodes.len()];
         for root in roots {
             visit_node(&doc, bin, root, &IDENTITY4, 0, &mut visited, &mut out)?;
         }
-        out.finish()
+        let warnings = std::mem::take(&mut out.warnings);
+        Ok((out.finish()?, warnings))
+    }
+
+    /// Add `texture` to the mesh and return its index, for
+    /// [`MeshMaterial::base_color_texture`].
+    pub fn add_texture(&mut self, texture: Texture) -> u32 {
+        self.textures.push(texture);
+        (self.textures.len() - 1) as u32
+    }
+
+    /// The texture a material samples, if it names one that exists.
+    #[must_use]
+    pub fn texture_of(&self, material: &MeshMaterial) -> Option<&Texture> {
+        self.textures.get(material.base_color_texture? as usize)
+    }
+
+    /// Check what the renderer relies on before it hands the mesh to the GPU:
+    /// every index names a vertex, every part is a whole number of triangles
+    /// inside the index buffer, and every position is finite. (The loader and
+    /// the built-in models always produce valid meshes; this is for meshes
+    /// assembled by hand.)
+    pub fn validate(&self) -> Result<(), MeshError> {
+        if self.vertices.len() > u32::MAX as usize || self.indices.len() > u32::MAX as usize {
+            return err("the mesh has more than u32::MAX vertices or indices");
+        }
+        let count = self.vertices.len() as u32;
+        if self.indices.iter().any(|&i| i >= count) {
+            return err("an index points past the end of the vertices");
+        }
+        for (i, part) in self.parts.iter().enumerate() {
+            let end = u64::from(part.first_index) + u64::from(part.index_count);
+            if end > self.indices.len() as u64 || !part.index_count.is_multiple_of(3) {
+                return err(format!(
+                    "part {i} is not a whole number of triangles inside the index buffer"
+                ));
+            }
+        }
+        if !self
+            .vertices
+            .iter()
+            .all(|v| v.position.iter().all(|c| c.is_finite()))
+        {
+            return err("a vertex position is not finite");
+        }
+        Ok(())
+    }
+
+    /// True when the triangles form closed, consistently wound surfaces: after
+    /// welding vertices that share a position, every edge is used by exactly
+    /// two triangles, in opposite directions. Such a mesh has an inside and an
+    /// outside, which lets ray-traced shadows ignore the faces a ray leaves
+    /// through (see `passes.rs`). Degenerate triangles are ignored.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        // -0.0 and 0.0 are the same place.
+        let place = |i: u32| {
+            self.vertices
+                .get(i as usize)
+                .map(|v| v.position.map(|c| (c + 0.0).to_bits()))
+        };
+        let mut edges = std::collections::HashSet::new();
+        for tri in self.indices.as_chunks::<3>().0 {
+            let (Some(a), Some(b), Some(c)) = (place(tri[0]), place(tri[1]), place(tri[2])) else {
+                return false;
+            };
+            if a == b || b == c || c == a {
+                continue;
+            }
+            for edge in [(a, b), (b, c), (c, a)] {
+                // The same directed edge twice: a fold, or flipped winding.
+                if !edges.insert(edge) {
+                    return false;
+                }
+            }
+        }
+        !edges.is_empty() && edges.iter().all(|&(a, b)| edges.contains(&(b, a)))
+    }
+
+    /// The volume the triangles enclose (model units cubed), by the divergence
+    /// theorem: positive for a closed mesh wound counter-clockwise seen from
+    /// outside, negative for one that is inside out. Only meaningful when
+    /// [`MeshData::is_closed`].
+    #[must_use]
+    pub fn signed_volume(&self) -> f64 {
+        let position = |i: u32| {
+            self.vertices
+                .get(i as usize)
+                .map_or([0.0; 3], |v| v.position.map(f64::from))
+        };
+        let mut six_volumes = 0.0;
+        for tri in self.indices.as_chunks::<3>().0 {
+            let [a, b, c] = tri.map(position);
+            six_volumes += a[0] * (b[1] * c[2] - b[2] * c[1])
+                + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        six_volumes / 6.0
     }
 
     /// Centre of the bounding box, model space.
@@ -215,20 +365,46 @@ impl MeshData {
     }
 
     /// Serialise as a minimal, valid `.glb`: one node, one mesh, one primitive
-    /// per part. The inverse of [`MeshData::from_glb`] for anything it can
-    /// load (used for tests and for writing sample assets).
+    /// per part, and every texture as an embedded PNG. The inverse of
+    /// [`MeshData::from_glb`] for anything it can load (used for tests and for
+    /// writing sample assets).
     #[must_use]
     pub fn to_glb(&self) -> Vec<u8> {
-        let vertex_bytes = self.vertices.len() * 24;
+        const VERTEX_BYTES: usize = std::mem::size_of::<MeshVertex>();
+        let vertex_bytes = self.vertices.len() * VERTEX_BYTES;
         let index_bytes = self.indices.len() * 4;
         let mut bin = Vec::with_capacity(vertex_bytes + index_bytes);
         for v in &self.vertices {
-            for c in v.position.iter().chain(&v.normal) {
+            for c in v.position.iter().chain(&v.normal).chain(&v.uv) {
                 bin.extend_from_slice(&c.to_le_bytes());
             }
         }
         for i in &self.indices {
             bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut views = vec![
+            serde_json::json!({
+                "buffer": 0, "byteOffset": 0, "byteLength": vertex_bytes,
+                "byteStride": VERTEX_BYTES, "target": 34962,
+            }),
+            serde_json::json!({
+                "buffer": 0, "byteOffset": vertex_bytes, "byteLength": index_bytes,
+                "target": 34963,
+            }),
+        ];
+        // Each texture is a PNG in its own (4-byte aligned) buffer view.
+        let (mut images, mut textures) = (Vec::new(), Vec::new());
+        for texture in &self.textures {
+            while !bin.len().is_multiple_of(4) {
+                bin.push(0);
+            }
+            let png = encode_png(texture);
+            images.push(serde_json::json!({ "bufferView": views.len(), "mimeType": "image/png" }));
+            textures.push(serde_json::json!({ "source": textures.len(), "sampler": 0 }));
+            views.push(serde_json::json!({
+                "buffer": 0, "byteOffset": bin.len(), "byteLength": png.len(),
+            }));
+            bin.extend_from_slice(&png);
         }
 
         let mut accessors = vec![
@@ -241,6 +417,10 @@ impl MeshData {
                 "bufferView": 0, "byteOffset": 12, "componentType": COMPONENT_F32,
                 "count": self.vertices.len(), "type": "VEC3",
             }),
+            serde_json::json!({
+                "bufferView": 0, "byteOffset": 24, "componentType": COMPONENT_F32,
+                "count": self.vertices.len(), "type": "VEC2",
+            }),
         ];
         let mut materials = Vec::new();
         let mut primitives = Vec::new();
@@ -249,7 +429,7 @@ impl MeshData {
             // glTF's emissiveFactor is capped at 1; anything brighter is
             // carried by the strength extension (factor * strength = radiance).
             let strength = m.emissive.iter().fold(1.0f32, |a, &c| a.max(c));
-            materials.push(serde_json::json!({
+            let mut material = serde_json::json!({
                 "pbrMetallicRoughness": {
                     "baseColorFactor": [m.base_color[0], m.base_color[1], m.base_color[2], 1.0],
                     "metallicFactor": m.metallic,
@@ -259,9 +439,17 @@ impl MeshData {
                 "extensions": { "KHR_materials_emissive_strength": {
                     "emissiveStrength": strength,
                 }},
-            }));
+            });
+            if let Some(texture) = m
+                .base_color_texture
+                .filter(|&t| (t as usize) < self.textures.len())
+            {
+                material["pbrMetallicRoughness"]["baseColorTexture"] =
+                    serde_json::json!({ "index": texture });
+            }
+            materials.push(material);
             primitives.push(serde_json::json!({
-                "attributes": { "POSITION": 0, "NORMAL": 1 },
+                "attributes": { "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 },
                 "indices": accessors.len(),
                 "material": materials.len() - 1,
                 "mode": MODE_TRIANGLES,
@@ -271,7 +459,7 @@ impl MeshData {
                 "componentType": COMPONENT_U32, "count": part.index_count, "type": "SCALAR",
             }));
         }
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "asset": { "version": "2.0", "generator": "space-render" },
             "extensionsUsed": ["KHR_materials_emissive_strength"],
             "scene": 0,
@@ -280,14 +468,19 @@ impl MeshData {
             "meshes": [{ "primitives": primitives }],
             "materials": materials,
             "accessors": accessors,
-            "bufferViews": [
-                { "buffer": 0, "byteOffset": 0, "byteLength": vertex_bytes,
-                  "byteStride": 24, "target": 34962 },
-                { "buffer": 0, "byteOffset": vertex_bytes, "byteLength": index_bytes,
-                  "target": 34963 },
-            ],
+            "bufferViews": views,
             "buffers": [{ "byteLength": bin.len() }],
         });
+        if !images.is_empty() {
+            // (glTF does not allow empty arrays, hence only when there are any.)
+            doc["images"] = images.into();
+            doc["textures"] = textures.into();
+            // Trilinear filtering, repeating in both directions.
+            doc["samplers"] = serde_json::json!([{
+                "magFilter": 9729, "minFilter": 9987,
+                "wrapS": WRAP_REPEAT, "wrapT": WRAP_REPEAT,
+            }]);
+        }
         let mut json = doc.to_string().into_bytes();
         while !json.len().is_multiple_of(4) {
             json.push(b' ');
@@ -469,6 +662,13 @@ fn local_transform(node: &Value) -> Mat4d {
     out
 }
 
+/// Determinant of `m`'s upper 3x3: negative for a transform that mirrors.
+fn determinant3(m: &Mat4d) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[2][1] * m[1][2])
+        - m[1][0] * (m[0][1] * m[2][2] - m[2][1] * m[0][2])
+        + m[2][0] * (m[0][1] * m[1][2] - m[1][1] * m[0][2])
+}
+
 fn transform_point(m: &Mat4d, p: [f32; 3]) -> [f32; 3] {
     let p = p.map(f64::from);
     [0, 1, 2].map(|r| (m[0][r] * p[0] + m[1][r] * p[1] + m[2][r] * p[2] + m[3][r]) as f32)
@@ -619,6 +819,20 @@ impl Accessor<'_> {
             _ => u32::from_le_bytes([e[0], e[1], e[2], e[3]]),
         }
     }
+
+    /// A texture coordinate: float, or an unsigned integer normalised to
+    /// 0..=1. A non-finite coordinate becomes 0.
+    fn uv(&self, i: usize) -> [f32; 2] {
+        let e = self.element(i);
+        let uv = match self.component {
+            COMPONENT_U8 => [f32::from(e[0]) / 255.0, f32::from(e[1]) / 255.0],
+            COMPONENT_U16 => {
+                [0, 2].map(|o| f32::from(u16::from_le_bytes([e[o], e[o + 1]])) / 65535.0)
+            }
+            _ => [0, 4].map(|o| f32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]])),
+        };
+        uv.map(|c| if c.is_finite() { c } else { 0.0 })
+    }
 }
 
 // ---- building the mesh ---------------------------------------------------------
@@ -628,13 +842,55 @@ struct Builder {
     vertices: Vec<MeshVertex>,
     indices: Vec<u32>,
     parts: Vec<MeshPart>,
-    /// Vertex ranges already loaded, by `(node, POSITION accessor, NORMAL
-    /// accessor)`: primitives of one mesh often differ only in material and
-    /// index range, and must not each get their own copy of the vertices.
-    shared: std::collections::HashMap<(usize, usize, usize), (usize, usize)>,
+    textures: Vec<Texture>,
+    /// The texture slot of every glTF image looked at so far (`None`: it could
+    /// not be used), so an image shared by several materials is decoded once.
+    images: std::collections::HashMap<usize, Option<u32>>,
+    /// Bytes of decoded textures so far, against [`MAX_GLB_TEXTURE_BYTES`].
+    texture_bytes: usize,
+    /// What was left out on purpose; each distinct message once.
+    warnings: Vec<String>,
+    /// Vertex ranges (first vertex, count) already loaded, by where they came
+    /// from: primitives of one mesh often differ only in material and index
+    /// range, and must not each get their own copy of the vertices.
+    shared: std::collections::HashMap<VertexSource, (usize, usize)>,
 }
 
+/// Where a primitive's vertices come from: its node and its `POSITION`,
+/// `NORMAL` and (if any) `TEXCOORD_0` accessors.
+type VertexSource = (usize, usize, usize, Option<usize>);
+
 impl Builder {
+    fn warn(&mut self, message: String) {
+        if !self.warnings.contains(&message) {
+            self.warnings.push(message);
+        }
+    }
+
+    /// The texture slot for glTF image `image_index`, decoding it on first use.
+    /// An image that cannot be used is a warning and `None`.
+    fn image(&mut self, doc: &Value, bin: &[u8], image_index: usize) -> Option<u32> {
+        if let Some(slot) = self.images.get(&image_index) {
+            return *slot;
+        }
+        let budget = MAX_GLB_TEXTURE_BYTES.saturating_sub(self.texture_bytes);
+        let slot = match load_image(doc, bin, image_index, budget) {
+            Ok(texture) => {
+                self.texture_bytes += texture.pixels().len();
+                self.textures.push(texture);
+                Some((self.textures.len() - 1) as u32)
+            }
+            Err(e) => {
+                self.warn(format!(
+                    "image {image_index}: {e}; its material is drawn untextured"
+                ));
+                None
+            }
+        };
+        self.images.insert(image_index, slot);
+        slot
+    }
+
     fn finish(self) -> Result<MeshData, MeshError> {
         if self.indices.is_empty() {
             return err("the file contains no triangles");
@@ -650,10 +906,99 @@ impl Builder {
             vertices: self.vertices,
             indices: self.indices,
             parts: self.parts,
+            textures: self.textures,
             bounds_min: min,
             bounds_max: max,
         })
     }
+}
+
+/// Decode glTF image `image_index` from its buffer view in the BIN chunk.
+fn load_image(
+    doc: &Value,
+    bin: &[u8],
+    image_index: usize,
+    budget: usize,
+) -> Result<Texture, MeshError> {
+    let image = array(&doc["images"])
+        .get(image_index)
+        .ok_or_else(|| MeshError("does not exist".into()))?;
+    if image["uri"].is_string() {
+        return err("is not embedded in the file (uri)");
+    }
+    let view = index(&image["bufferView"])
+        .and_then(|i| array(&doc["bufferViews"]).get(i))
+        .ok_or_else(|| MeshError("has no bufferView".into()))?;
+    if index(&view["buffer"]).unwrap_or(0) != 0 {
+        return err("uses a buffer other than the file's BIN chunk");
+    }
+    let offset = index(&view["byteOffset"]).unwrap_or(0);
+    let bytes = index(&view["byteLength"])
+        .and_then(|length| offset.checked_add(length))
+        .and_then(|end| bin.get(offset..end))
+        .ok_or_else(|| MeshError("runs past the end of the BIN chunk".into()))?;
+    decode_image(bytes, budget)
+}
+
+/// The texture slot of `material`'s `baseColorTexture`, if it has one the
+/// renderer can use. Everything it cannot honour is a warning, not an error.
+fn base_color_texture(
+    doc: &Value,
+    bin: &[u8],
+    material: &Value,
+    has_uv: bool,
+    out: &mut Builder,
+) -> Option<u32> {
+    let pbr = &material["pbrMetallicRoughness"];
+    for (slot, present) in [
+        (
+            "metallicRoughnessTexture",
+            !pbr["metallicRoughnessTexture"].is_null(),
+        ),
+        ("normalTexture", !material["normalTexture"].is_null()),
+        ("occlusionTexture", !material["occlusionTexture"].is_null()),
+        ("emissiveTexture", !material["emissiveTexture"].is_null()),
+    ] {
+        if present {
+            out.warn(format!(
+                "{slot} is not supported: the material's factors are used alone"
+            ));
+        }
+    }
+    let info = &pbr["baseColorTexture"];
+    if info.is_null() {
+        return None;
+    }
+    if !has_uv {
+        out.warn("a textured primitive has no TEXCOORD_0: drawn untextured".into());
+        return None;
+    }
+    if info["texCoord"].as_u64().unwrap_or(0) != 0 {
+        out.warn("a baseColorTexture uses a second UV set: drawn untextured".into());
+        return None;
+    }
+    if !info["extensions"]["KHR_texture_transform"].is_null() {
+        out.warn("KHR_texture_transform is ignored: the texture is mapped untransformed".into());
+    }
+    let Some(texture) = index(&info["index"]).and_then(|i| array(&doc["textures"]).get(i)) else {
+        out.warn("a baseColorTexture names a texture that does not exist".into());
+        return None;
+    };
+    if let Some(sampler) = index(&texture["sampler"]).and_then(|i| array(&doc["samplers"]).get(i)) {
+        let wrap = |key: &str| sampler[key].as_u64().unwrap_or(WRAP_REPEAT);
+        if wrap("wrapS") != WRAP_REPEAT || wrap("wrapT") != WRAP_REPEAT {
+            out.warn("texture wrap modes other than REPEAT are ignored".into());
+        }
+    }
+    let Some(image_index) = index(&texture["source"]) else {
+        out.warn(
+            "a texture has no PNG/JPEG source (other image formats are not supported): \
+             drawn untextured"
+                .into(),
+        );
+        return None;
+    };
+    out.image(doc, bin, image_index)
 }
 
 fn visit_node(
@@ -689,7 +1034,13 @@ fn visit_node(
     Ok(())
 }
 
-fn material_of(doc: &Value, primitive: &Value) -> MeshMaterial {
+fn material_of(
+    doc: &Value,
+    bin: &[u8],
+    primitive: &Value,
+    has_uv: bool,
+    out: &mut Builder,
+) -> MeshMaterial {
     let Some(material) =
         index(&primitive["material"]).and_then(|i| array(&doc["materials"]).get(i))
     else {
@@ -714,6 +1065,7 @@ fn material_of(doc: &Value, primitive: &Value) -> MeshMaterial {
         metallic: unit(&pbr["metallicFactor"], 1.0),
         roughness: unit(&pbr["roughnessFactor"], 1.0),
         emissive: emissive.map(|c| (c.clamp(0.0, 1.0) * strength).min(1.0e6) as f32),
+        base_color_texture: base_color_texture(doc, bin, material, has_uv, out),
     }
 }
 
@@ -754,11 +1106,25 @@ fn add_primitive(
         }
         None => None,
     };
+    let uv_index = index(&primitive["attributes"]["TEXCOORD_0"]);
+    let uvs = match uv_index {
+        Some(i) => {
+            let uvs = accessor(doc, bin, i, "VEC2", 2)?;
+            if !matches!(uvs.component, COMPONENT_F32 | COMPONENT_U8 | COMPONENT_U16) {
+                return err("TEXCOORD_0 is neither float nor a normalised unsigned integer");
+            }
+            if uvs.count != positions.count {
+                return err("TEXCOORD_0 and POSITION have different counts");
+            }
+            Some(uvs)
+        }
+        None => None,
+    };
 
     // Vertices this node already loaded from the same accessors are reused.
     // (Only with normals from the file: generated normals depend on the
     // primitive's own triangles, so those vertices stay private to it.)
-    let share_key = normal_index.map(|n| (node_index, position_index, n));
+    let share_key = normal_index.map(|n| (node_index, position_index, n, uv_index));
     let reused = share_key.and_then(|key| out.shared.get(&key).copied());
     let base = match reused {
         Some((base, count)) if count == positions.count => base,
@@ -777,6 +1143,7 @@ fn add_primitive(
                     normal: normals
                         .as_ref()
                         .map_or([0.0; 3], |n| transform_normal(world, n.vec3(i))),
+                    uv: uvs.as_ref().map_or([0.0; 2], |t| t.uv(i)),
                 });
             }
             if let Some(key) = share_key {
@@ -833,6 +1200,14 @@ fn add_primitive(
     if added == 0 {
         return Ok(());
     }
+    if determinant3(world) < 0.0 {
+        // A mirroring transform turns counter-clockwise triangles clockwise
+        // (glTF: a node with a negative determinant has reversed winding), so
+        // put them back: front faces stay counter-clockwise in model space.
+        for tri in out.indices[first_index..].as_chunks_mut::<3>().0 {
+            tri.swap(1, 2);
+        }
+    }
     if normals.is_none() {
         // Without NORMAL the vertices are this primitive's own, at the end.
         generate_normals(
@@ -841,10 +1216,11 @@ fn add_primitive(
             base,
         );
     }
+    let material = material_of(doc, bin, primitive, uvs.is_some(), out);
     out.parts.push(MeshPart {
         first_index: first_index as u32,
         index_count: added as u32,
-        material: material_of(doc, primitive),
+        material,
     });
     Ok(())
 }
@@ -879,31 +1255,105 @@ fn generate_normals(vertices: &mut [MeshVertex], indices: &[u32], base: u32) {
     }
 }
 
-/// A small multi-part sample model — a stylised ship: a painted hull, a
-/// polished steel nose, gold wings, a red fin, a glossy cockpit and a glowing
-/// engine, about 4 units long with its
-/// nose along -Z. Deterministic; used by the tests and by the
-/// `make_test_glb` example to produce a `.glb` without any external asset.
-#[must_use]
-pub fn sample_ship() -> MeshData {
-    let mut out = Builder::default();
-    let mut add_box = |centre: [f32; 3], half: [f32; 3], material: MeshMaterial| {
-        let first_index = out.indices.len() as u32;
-        // Six faces, each its own four vertices so the normals are flat.
+// ---- procedural models ---------------------------------------------------------
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// One horizontal cross-section of a [`Shape::loft`]: an ellipse at height
+/// `y`, centred on (`centre[0]`, `centre[1]`) in x and z.
+#[derive(Clone, Copy)]
+struct Ring {
+    y: f32,
+    centre: [f32; 2],
+    /// Radii along x and z.
+    radii: [f32; 2],
+}
+
+impl Ring {
+    /// Point `i` of `segments` around the ring (`i == segments` is point 0
+    /// again, bit for bit, so the seam welds).
+    fn point(&self, i: usize, segments: usize) -> [f32; 3] {
+        let (sin, cos) = Self::angle(i, segments).sin_cos();
+        [
+            self.centre[0] + self.radii[0] * cos,
+            self.y,
+            self.centre[1] + self.radii[1] * sin,
+        ]
+    }
+
+    fn angle(i: usize, segments: usize) -> f32 {
+        (i % segments) as f32 / segments as f32 * std::f32::consts::TAU
+    }
+
+    /// Circumference (Ramanujan's approximation for an ellipse).
+    fn girth(&self) -> f32 {
+        let [a, b] = self.radii;
+        std::f32::consts::PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt())
+    }
+}
+
+/// How many times a texture repeats along `length` at one repeat per `tile`:
+/// a whole number (at least one), so the pattern meets itself at the seam.
+fn whole_tiles(length: f32, tile: f32) -> f32 {
+    (length / tile).round().max(1.0)
+}
+
+/// The geometry of one material part under construction. Every primitive it
+/// adds is a closed surface wound counter-clockwise seen from outside, with
+/// texture coordinates at roughly one repeat per `tile` model units, laid out
+/// so that a texture is seen the right way round from outside (never
+/// mirrored) and, on every side face, the right way up.
+#[derive(Default)]
+struct Shape {
+    vertices: Vec<MeshVertex>,
+    indices: Vec<u32>,
+}
+
+impl Shape {
+    /// An axis-aligned box: six faces, each its own four vertices so the
+    /// normals are flat. The texture's top is +Y on the four side faces and
+    /// -Z on the top face (+Z on the bottom one), and its origin the face's
+    /// top-left corner seen from outside.
+    fn cuboid(&mut self, centre: [f32; 3], half: [f32; 3], tile: f32) {
         for axis in 0..3 {
             for sign in [-1.0f32, 1.0] {
                 let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-                let base = out.vertices.len() as u32;
+                let base = self.vertices.len() as u32;
                 let mut normal = [0.0; 3];
                 normal[axis] = sign;
+                // The image's "up" on this face, and its "right" seen from
+                // outside: right x up = the outward normal.
+                let up = if axis == 1 {
+                    [0.0, 0.0, -sign]
+                } else {
+                    [0.0, 1.0, 0.0]
+                };
+                let right = cross3(up, normal);
+                let extent =
+                    |dir: [f32; 3]| -> f32 { (0..3).map(|k| dir[k].abs() * half[k]).sum() };
                 for (du, dv) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                    let mut offset = [0.0; 3];
+                    offset[axis] = sign * half[axis];
+                    offset[u] = du * half[u];
+                    offset[v] = dv * half[v];
+                    let along = |dir: [f32; 3]| -> f32 { (0..3).map(|k| dir[k] * offset[k]).sum() };
                     let mut p = centre;
                     p[axis] += sign * half[axis];
                     p[u] += du * half[u];
                     p[v] += dv * half[v];
-                    out.vertices.push(MeshVertex {
+                    self.vertices.push(MeshVertex {
                         position: p,
                         normal,
+                        uv: [
+                            (extent(right) + along(right)) / tile,
+                            (extent(up) - along(up)) / tile,
+                        ],
                     });
                 }
                 // Counter-clockwise seen from outside.
@@ -912,67 +1362,444 @@ pub fn sample_ship() -> MeshData {
                 } else {
                     [0, 2, 1, 0, 3, 2]
                 };
-                out.indices.extend(quad.map(|i| base + i));
+                self.indices.extend(quad.map(|i| base + i));
             }
         }
+    }
+
+    /// A tube through `rings` (given bottom to top), smooth-shaded around and
+    /// along, with a flat cap at each end.
+    fn loft(&mut self, rings: &[Ring], segments: usize, tile: f32) {
+        let (Some(first), Some(last)) = (rings.first(), rings.last()) else {
+            return;
+        };
+        let base = self.vertices.len() as u32;
+        let widest = rings.iter().map(Ring::girth).fold(0.0, f32::max);
+        let u_tiles = whole_tiles(widest, tile);
+        // `v` runs down the tube from 0 at its top, so the texture is upright.
+        let step = |a: &Ring, b: &Ring| {
+            let (dx, dz) = (b.centre[0] - a.centre[0], b.centre[1] - a.centre[1]);
+            (dx * dx + (b.y - a.y).powi(2) + dz * dz).sqrt() / tile
+        };
+        let mut down: f32 = rings.windows(2).map(|w| step(&w[0], &w[1])).sum();
+        for (j, ring) in rings.iter().enumerate() {
+            let below = &rings[j.saturating_sub(1)];
+            let above = &rings[(j + 1).min(rings.len() - 1)];
+            if j > 0 {
+                down = (down - step(below, ring)).max(0.0);
+            }
+            for i in 0..=segments {
+                // The surface's two tangents: up the tube and around it.
+                let (lower, upper) = (below.point(i, segments), above.point(i, segments));
+                let up = [0, 1, 2].map(|k| upper[k] - lower[k]);
+                let (sin, cos) = Ring::angle(i, segments).sin_cos();
+                let around = [-ring.radii[0] * sin, 0.0, ring.radii[1] * cos];
+                self.vertices.push(MeshVertex {
+                    position: ring.point(i, segments),
+                    normal: normalised(cross3(up, around)),
+                    // (The ring runs anticlockwise seen from above: `u` has to
+                    // run the other way for the texture not to be mirrored.)
+                    uv: [u_tiles * (1.0 - i as f32 / segments as f32), down],
+                });
+            }
+        }
+        let row = segments as u32 + 1;
+        for j in 0..rings.len() as u32 - 1 {
+            for i in 0..segments as u32 {
+                let a = base + j * row + i;
+                let b = a + row;
+                self.indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+            }
+        }
+        self.cap(first, segments, false, tile);
+        self.cap(last, segments, true, tile);
+    }
+
+    /// The flat end of a loft: a fan over `ring`, facing up or down.
+    fn cap(&mut self, ring: &Ring, segments: usize, up: bool, tile: f32) {
+        let base = self.vertices.len() as u32;
+        let normal = [0.0, if up { 1.0 } else { -1.0 }, 0.0];
+        self.vertices.push(MeshVertex {
+            position: [ring.centre[0], ring.y, ring.centre[1]],
+            normal,
+            uv: [0.5, 0.5],
+        });
+        // Seen from outside, +X is to the right on the top cap and to the
+        // left on the bottom one.
+        let side = if up { 1.0 } else { -1.0 };
+        for i in 0..segments {
+            let p = ring.point(i, segments);
+            self.vertices.push(MeshVertex {
+                position: p,
+                normal,
+                uv: [
+                    0.5 + side * (p[0] - ring.centre[0]) / tile,
+                    0.5 + (p[2] - ring.centre[1]) / tile,
+                ],
+            });
+        }
+        let n = segments as u32;
+        for i in 0..n {
+            let (p, q) = (base + 1 + i, base + 1 + (i + 1) % n);
+            self.indices
+                .extend(if up { [base, q, p] } else { [base, p, q] });
+        }
+    }
+
+    /// An ellipsoid: `segments` around, `bands` from pole to pole.
+    fn ellipsoid(
+        &mut self,
+        centre: [f32; 3],
+        radii: [f32; 3],
+        segments: usize,
+        bands: usize,
+        tile: f32,
+    ) {
+        let base = self.vertices.len() as u32;
+        let equator = Ring {
+            y: 0.0,
+            centre: [0.0; 2],
+            radii: [radii[0], radii[2]],
+        };
+        let meridian = Ring {
+            y: 0.0,
+            centre: [0.0; 2],
+            radii: [radii[0].max(radii[2]), radii[1]],
+        };
+        let u_tiles = whole_tiles(equator.girth(), tile);
+        let v_tiles = whole_tiles(0.5 * meridian.girth(), tile);
+        for j in 0..=bands {
+            // The poles are exact points, so every triangle around them meets.
+            let (sin_lat, cos_lat) = if j == 0 {
+                (-1.0, 0.0)
+            } else if j == bands {
+                (1.0, 0.0)
+            } else {
+                let latitude = (j as f32 / bands as f32 - 0.5) * std::f32::consts::PI;
+                latitude.sin_cos()
+            };
+            for i in 0..=segments {
+                let (sin, cos) = Ring::angle(i, segments).sin_cos();
+                let unit = [cos_lat * cos, sin_lat, cos_lat * sin];
+                self.vertices.push(MeshVertex {
+                    position: [0, 1, 2].map(|k| centre[k] + radii[k] * unit[k]),
+                    // The gradient of (x/a)^2 + (y/b)^2 + (z/c)^2.
+                    normal: normalised([0, 1, 2].map(|k| unit[k] / radii[k])),
+                    uv: [
+                        u_tiles * (1.0 - i as f32 / segments as f32),
+                        v_tiles * (1.0 - j as f32 / bands as f32),
+                    ],
+                });
+            }
+        }
+        let row = segments as u32 + 1;
+        for j in 0..bands as u32 {
+            for i in 0..segments as u32 {
+                let a = base + j * row + i;
+                let b = a + row;
+                // A band next to a pole is a row of triangles, not quads.
+                if j > 0 {
+                    self.indices.extend([a, b, a + 1]);
+                }
+                if j + 1 < bands as u32 {
+                    self.indices.extend([a + 1, b, b + 1]);
+                }
+            }
+        }
+    }
+}
+
+/// One mesh out of shapes: a part per (non-empty) shape, in order.
+fn assemble(shapes: Vec<(Shape, MeshMaterial)>, textures: Vec<Texture>) -> MeshData {
+    let mut out = Builder {
+        textures,
+        ..Builder::default()
+    };
+    for (shape, material) in shapes {
+        if shape.indices.is_empty() {
+            continue;
+        }
+        let base = out.vertices.len() as u32;
+        let first_index = out.indices.len() as u32;
+        out.vertices.extend(shape.vertices);
+        out.indices.extend(shape.indices.iter().map(|i| base + i));
         out.parts.push(MeshPart {
             first_index,
-            index_count: out.indices.len() as u32 - first_index,
+            index_count: shape.indices.len() as u32,
             material,
         });
-    };
-    let paint = |base_color: [f32; 3], metallic: f32, roughness: f32| MeshMaterial {
-        base_color,
-        metallic,
-        roughness,
-        emissive: [0.0; 3],
-    };
-    // Hull, nose, wings, tail fin, cockpit, engine.
-    // (Mostly dielectric paint: with point lights only and no environment to
-    // reflect, a fully metallic hull would be black away from its highlight.)
-    add_box(
-        [0.0, 0.0, 0.0],
-        [0.5, 0.35, 1.6],
-        paint([0.78, 0.79, 0.82], 0.1, 0.5),
-    );
-    add_box(
-        [0.0, -0.05, -1.9],
-        [0.3, 0.2, 0.35],
-        paint([0.56, 0.57, 0.58], 1.0, 0.2),
-    );
-    add_box(
-        [0.0, -0.1, 0.5],
-        [1.9, 0.06, 0.6],
-        paint([1.0, 0.72, 0.25], 0.4, 0.4),
-    );
-    add_box(
-        [0.0, 0.6, 1.2],
-        [0.05, 0.4, 0.4],
-        paint([0.8, 0.08, 0.08], 0.0, 0.5),
-    );
-    add_box(
-        [0.0, 0.4, -0.7],
-        [0.3, 0.12, 0.45],
-        paint([0.05, 0.2, 0.6], 0.0, 0.1),
-    );
-    add_box(
-        [0.0, 0.0, 1.7],
-        [0.3, 0.2, 0.12],
-        MeshMaterial {
-            base_color: [0.1, 0.1, 0.1],
-            metallic: 0.0,
-            roughness: 0.8,
-            emissive: [0.6, 2.2, 6.0],
-        },
-    );
-    // Infallible: the builder above always produces triangles.
+    }
+    // `finish` only fails for a mesh without triangles.
     out.finish().unwrap_or_else(|_| MeshData {
         vertices: Vec::new(),
         indices: Vec::new(),
         parts: Vec::new(),
+        textures: Vec::new(),
         bounds_min: [0.0; 3],
         bounds_max: [0.0; 3],
     })
+}
+
+/// A positive tile size (a non-positive or NaN one becomes 1).
+fn tile_or_one(tile: f32) -> f32 {
+    if tile > 0.0 {
+        tile
+    } else {
+        1.0
+    }
+}
+
+impl MeshData {
+    /// A box centred on the origin, `half` model units from the centre to each
+    /// face: one material part, closed, flat-shaded. The texture repeats once
+    /// per `tile` model units across every face. (The textured counterpart of
+    /// a box instance — a floor, a wall, a crate.)
+    #[must_use]
+    pub fn cuboid(half: [f32; 3], tile: f32, material: MeshMaterial) -> Self {
+        let mut shape = Shape::default();
+        shape.cuboid([0.0; 3], half, tile_or_one(tile));
+        assemble(vec![(shape, material)], Vec::new())
+    }
+
+    /// A rectangle in the XZ plane at y = 0, facing +Y, `half[0]` by `half[1]`
+    /// model units from its centre to its edges in x and z. The texture's
+    /// origin is at the (-x, -z) corner, `u` runs along +X and `v` along +Z,
+    /// repeating `tiles` times across: seen from above with -Z at the top, the
+    /// image is upright. One-sided and open (it has no thickness); use
+    /// [`MeshData::cuboid`] for a floor that should also block light from
+    /// below.
+    #[must_use]
+    pub fn plane(half: [f32; 2], tiles: [f32; 2], material: MeshMaterial) -> Self {
+        let corner = |x: f32, z: f32| MeshVertex {
+            position: [x * half[0], 0.0, z * half[1]],
+            normal: [0.0, 1.0, 0.0],
+            uv: [(x + 1.0) * 0.5 * tiles[0], (z + 1.0) * 0.5 * tiles[1]],
+        };
+        let shape = Shape {
+            vertices: vec![
+                corner(-1.0, -1.0),
+                corner(1.0, -1.0),
+                corner(1.0, 1.0),
+                corner(-1.0, 1.0),
+            ],
+            indices: vec![0, 3, 2, 0, 2, 1],
+        };
+        assemble(vec![(shape, material)], Vec::new())
+    }
+}
+
+/// A small multi-part sample model — a stylised ship: a painted, panelled
+/// hull, a polished steel nose, brushed gold wings, a red fin, a glossy
+/// cockpit and a glowing engine, about 4 units long, centred on its origin.
+///
+/// **Orientation:** the nose points along -Z, +Y is up (the fin), +X is the
+/// starboard wing — the same convention as [`sample_character`].
+///
+/// Deterministic; used by the tests and by the `make_test_glb` example to
+/// produce a `.glb` without any external asset. Two procedural textures: hull
+/// plating (hull) and brushed metal (nose and wings).
+#[must_use]
+pub fn sample_ship() -> MeshData {
+    /// Model units per texture repeat.
+    const TILE: f32 = 1.6;
+    let paint =
+        |base_color: [f32; 3], metallic: f32, roughness: f32, texture: Option<u32>| MeshMaterial {
+            base_color,
+            metallic,
+            roughness,
+            emissive: [0.0; 3],
+            base_color_texture: texture,
+        };
+    let boxed = |centre: [f32; 3], half: [f32; 3], material: MeshMaterial| {
+        let mut shape = Shape::default();
+        shape.cuboid(centre, half, TILE);
+        (shape, material)
+    };
+    let (plating, brushed) = (Some(0), Some(1));
+    // Hull, nose, wings, tail fin, cockpit, engine.
+    // (Mostly dielectric paint: with point lights only and no environment to
+    // reflect, a fully metallic hull would be black away from its highlight.)
+    let shapes = vec![
+        boxed(
+            [0.0, 0.0, 0.0],
+            [0.5, 0.35, 1.6],
+            paint([0.78, 0.79, 0.82], 0.1, 0.5, plating),
+        ),
+        boxed(
+            [0.0, -0.05, -1.9],
+            [0.3, 0.2, 0.35],
+            paint([0.56, 0.57, 0.58], 1.0, 0.2, brushed),
+        ),
+        boxed(
+            [0.0, -0.1, 0.5],
+            [1.9, 0.06, 0.6],
+            paint([1.0, 0.72, 0.25], 0.4, 0.4, brushed),
+        ),
+        boxed(
+            [0.0, 0.6, 1.2],
+            [0.05, 0.4, 0.4],
+            paint([0.8, 0.08, 0.08], 0.0, 0.5, None),
+        ),
+        boxed(
+            [0.0, 0.4, -0.7],
+            [0.3, 0.12, 0.45],
+            paint([0.05, 0.2, 0.6], 0.0, 0.1, None),
+        ),
+        boxed(
+            [0.0, 0.0, 1.7],
+            [0.3, 0.2, 0.12],
+            MeshMaterial {
+                base_color: [0.1, 0.1, 0.1],
+                metallic: 0.0,
+                roughness: 0.8,
+                emissive: [0.6, 2.2, 6.0],
+                base_color_texture: None,
+            },
+        ),
+    ];
+    let textures = vec![
+        Texture::hull_panels(256, [236, 238, 242]),
+        Texture::brushed_metal(128, [240, 240, 240]),
+    ];
+    assemble(shapes, textures)
+}
+
+/// The placeholder player character: a low-poly astronaut, 1.8 units (metres)
+/// tall — helmet with a glowing visor, torso, arms hanging slightly away from
+/// the body, legs, boots, gloves, belt and a backpack.
+///
+/// **Orientation and origin:** the origin is on the ground between the feet;
+/// +Y is up; the character faces **-Z** (visor, chest light and toes point
+/// along -Z, the backpack along +Z) and +X is its right-hand side — the same
+/// convention as [`sample_ship`], whose nose points along -Z. To face a
+/// direction `d` in the XZ plane, rotate by [`rotation_y`]`(atan2(-d.x, -d.z))`.
+///
+/// About 1 700 triangles in four material parts — suit (the hull-plating
+/// procedural texture), trim, visor (emissive) and pack — every piece a closed
+/// surface with outward normals, and texture coordinates that tile at one
+/// repeat per 0.8 m (all within 0..=4).
+#[must_use]
+pub fn sample_character() -> MeshData {
+    /// Metres per texture repeat.
+    const TILE: f32 = 0.8;
+    const ROUND: usize = 16;
+    const LIMB: usize = 12;
+    let ring = |y: f32, x: f32, z: f32, rx: f32, rz: f32| Ring {
+        y,
+        centre: [x, z],
+        radii: [rx, rz],
+    };
+    let (mut suit, mut trim, mut visor, mut pack) = (
+        Shape::default(),
+        Shape::default(),
+        Shape::default(),
+        Shape::default(),
+    );
+
+    // Torso: hips, waist, chest, shoulders.
+    suit.loft(
+        &[
+            ring(0.86, 0.0, 0.0, 0.175, 0.125),
+            ring(0.95, 0.0, 0.0, 0.190, 0.130),
+            ring(1.08, 0.0, 0.0, 0.165, 0.115),
+            ring(1.26, 0.0, 0.0, 0.205, 0.135),
+            ring(1.40, 0.0, 0.0, 0.220, 0.130),
+            ring(1.47, 0.0, 0.0, 0.170, 0.110),
+        ],
+        ROUND,
+        TILE,
+    );
+    // Collar, helmet, and the visor bulging out of the helmet's front.
+    trim.loft(
+        &[
+            ring(1.45, 0.0, 0.0, 0.085, 0.085),
+            ring(1.53, 0.0, 0.0, 0.080, 0.080),
+        ],
+        LIMB,
+        TILE,
+    );
+    suit.ellipsoid([0.0, 1.65, 0.0], [0.150, 0.150, 0.155], ROUND, 10, TILE);
+    visor.ellipsoid([0.0, 1.66, -0.07], [0.125, 0.07, 0.10], ROUND, 8, TILE);
+    // A light on the chest: the front is recognisable from the side too.
+    visor.cuboid([0.08, 1.33, -0.135], [0.03, 0.018, 0.012], TILE);
+    // Belt and backpack.
+    trim.loft(
+        &[
+            ring(1.015, 0.0, 0.0, 0.190, 0.135),
+            ring(1.075, 0.0, 0.0, 0.182, 0.128),
+        ],
+        ROUND,
+        TILE,
+    );
+    pack.cuboid([0.0, 1.25, 0.16], [0.14, 0.2, 0.07], TILE);
+
+    for side in [-1.0f32, 1.0] {
+        // Leg (ankle, calf, knee, thigh, hip) and boot, toes forward.
+        suit.loft(
+            &[
+                ring(0.08, side * 0.110, 0.000, 0.065, 0.072),
+                ring(0.30, side * 0.110, 0.008, 0.078, 0.086),
+                ring(0.50, side * 0.108, -0.004, 0.070, 0.076),
+                ring(0.76, side * 0.105, 0.000, 0.095, 0.105),
+                ring(0.93, side * 0.100, 0.000, 0.100, 0.110),
+            ],
+            LIMB,
+            TILE,
+        );
+        trim.cuboid([side * 0.11, 0.05, -0.05], [0.07, 0.05, 0.14], TILE);
+        // Arm (wrist, elbow, upper arm, shoulder), shoulder pad and glove.
+        suit.loft(
+            &[
+                ring(0.86, side * 0.370, -0.030, 0.045, 0.048),
+                ring(1.12, side * 0.330, 0.000, 0.054, 0.058),
+                ring(1.36, side * 0.280, 0.000, 0.064, 0.068),
+                ring(1.44, side * 0.265, 0.000, 0.056, 0.058),
+            ],
+            LIMB,
+            TILE,
+        );
+        trim.ellipsoid(
+            [side * 0.275, 1.43, 0.0],
+            [0.085, 0.055, 0.085],
+            LIMB,
+            6,
+            TILE,
+        );
+        trim.ellipsoid(
+            [side * 0.378, 0.80, -0.03],
+            [0.05, 0.075, 0.058],
+            LIMB,
+            6,
+            TILE,
+        );
+    }
+
+    let plain =
+        |base_color: [f32; 3], metallic: f32, roughness: f32, texture: Option<u32>| MeshMaterial {
+            base_color,
+            metallic,
+            roughness,
+            emissive: [0.0; 3],
+            base_color_texture: texture,
+        };
+    assemble(
+        vec![
+            (suit, plain([0.90, 0.91, 0.94], 0.0, 0.55, Some(0))),
+            (trim, plain([0.90, 0.36, 0.06], 0.0, 0.5, None)),
+            (
+                visor,
+                MeshMaterial {
+                    base_color: [0.03, 0.06, 0.08],
+                    metallic: 0.0,
+                    roughness: 0.15,
+                    emissive: [0.5, 2.2, 3.0],
+                    base_color_texture: None,
+                },
+            ),
+            (pack, plain([0.42, 0.45, 0.50], 0.3, 0.45, Some(0))),
+        ],
+        vec![Texture::hull_panels(256, [236, 238, 242])],
+    )
 }
 
 #[cfg(test)]
@@ -1099,7 +1926,12 @@ mod tests {
             for k in 0..3 {
                 assert!((a.material.emissive[k] - b.material.emissive[k]).abs() < 1e-4);
             }
+            assert_eq!(a.material.base_color_texture, b.material.base_color_texture);
         }
+        // Both textures come back pixel for pixel (PNG is lossless).
+        assert_eq!(ship.textures.len(), 2);
+        assert_eq!(loaded.textures, ship.textures);
+        assert!(ship.is_closed() && ship.signed_volume() > 0.0);
         // Normals are unit length and the nose points down -Z.
         assert!(ship.vertices.iter().all(|v| {
             let n = v.normal;
@@ -1231,5 +2063,556 @@ mod tests {
             }
         }
         assert_eq!(rotation_y(0.0), IDENTITY_ROTATION);
+    }
+
+    fn plain(texture: Option<u32>) -> MeshMaterial {
+        MeshMaterial {
+            base_color: [0.9, 0.8, 0.7],
+            metallic: 0.25,
+            roughness: 0.5,
+            emissive: [0.0; 3],
+            base_color_texture: texture,
+        }
+    }
+
+    /// A mesh with texture coordinates and two textures survives the GLB round
+    /// trip exactly: vertices (coordinates included), indices, parts with
+    /// their texture slots, and the textures pixel for pixel.
+    #[test]
+    fn uvs_and_textures_survive_a_round_trip_through_glb() {
+        let mut mesh = MeshData::plane([2.0, 1.0], [4.0, 2.0], plain(None));
+        // The quad's two triangles as two parts, each with its own texture.
+        mesh.parts = vec![
+            MeshPart {
+                first_index: 0,
+                index_count: 3,
+                material: plain(Some(0)),
+            },
+            MeshPart {
+                first_index: 3,
+                index_count: 3,
+                material: plain(Some(1)),
+            },
+        ];
+        assert_eq!(mesh.add_texture(Texture::uv_grid(64)), 0);
+        let checker = Texture::checkerboard(8, 4, [255, 0, 0], [0, 0, 255]);
+        assert_eq!(mesh.add_texture(checker), 1);
+        let uvs: Vec<[f32; 2]> = mesh.vertices.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, [[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [0.0, 2.0]]);
+
+        let bytes = mesh.to_glb();
+        let (loaded, warnings) =
+            MeshData::from_glb_with_warnings(&bytes).expect("our own writer's output loads");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded, mesh);
+        assert_eq!(
+            loaded.texture_of(&loaded.parts[1].material),
+            Some(&mesh.textures[1])
+        );
+        // A second trip changes nothing, byte for byte.
+        assert_eq!(loaded.to_glb(), bytes);
+
+        // The character too: 1 texture shared by two of its four parts.
+        let character = sample_character();
+        let loaded = MeshData::from_glb(&character.to_glb()).expect("the character loads");
+        assert_eq!(loaded.vertices.len(), character.vertices.len());
+        for (a, b) in loaded.vertices.iter().zip(&character.vertices) {
+            assert_eq!((a.position, a.uv), (b.position, b.uv));
+            // (The loader renormalises normals: equal to the last bit or so.)
+            for k in 0..3 {
+                assert!((a.normal[k] - b.normal[k]).abs() < 1e-6);
+            }
+        }
+        assert_eq!(loaded.indices, character.indices);
+        assert_eq!(loaded.textures, character.textures);
+        let slots = |m: &MeshData| -> Vec<Option<u32>> {
+            m.parts
+                .iter()
+                .map(|p| p.material.base_color_texture)
+                .collect()
+        };
+        assert_eq!(slots(&loaded), slots(&character));
+
+        // A slot past the texture list is written (and read back) as untextured.
+        let mut dangling = MeshData::plane([1.0, 1.0], [1.0, 1.0], plain(Some(7)));
+        assert!(dangling.texture_of(&dangling.parts[0].material).is_none());
+        let loaded = MeshData::from_glb(&dangling.to_glb()).expect("loads");
+        assert_eq!(loaded.parts[0].material.base_color_texture, None);
+        dangling.add_texture(Texture::solid([1, 2, 3]));
+        assert!(dangling.texture_of(&dangling.parts[0].material).is_none());
+    }
+
+    /// `triangle_file` plus texture coordinates (normalised `u16`), an
+    /// embedded PNG and a material that uses it.
+    fn textured_triangle_file() -> (Value, Vec<u8>) {
+        let (mut doc, mut bin) = triangle_file();
+        bin.extend_from_slice(&[0, 0]); // align the next view to 4 bytes
+        let uv_offset = bin.len();
+        for uv in [[0u16, 0], [65535, 0], [0, 65535]] {
+            for c in uv {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let png = encode_png(&Texture::checkerboard(4, 2, [255, 0, 0], [0, 0, 255]));
+        let png_offset = bin.len();
+        bin.extend_from_slice(&png);
+        doc["accessors"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "bufferView": 2, "componentType": 5123, "normalized": true,
+                "count": 3, "type": "VEC2",
+            }));
+        doc["bufferViews"].as_array_mut().unwrap().extend([
+            serde_json::json!({ "buffer": 0, "byteOffset": uv_offset, "byteLength": 12 }),
+            serde_json::json!({ "buffer": 0, "byteOffset": png_offset, "byteLength": png.len() }),
+        ]);
+        doc["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"] = 2.into();
+        doc["images"] = serde_json::json!([{ "bufferView": 3, "mimeType": "image/png" }]);
+        doc["samplers"] = serde_json::json!([{ "wrapS": 10497, "wrapT": 10497 }]);
+        doc["textures"] = serde_json::json!([{ "source": 0, "sampler": 0 }]);
+        doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"] =
+            serde_json::json!({ "index": 0 });
+        doc["buffers"][0]["byteLength"] = bin.len().into();
+        (doc, bin)
+    }
+
+    #[test]
+    fn texture_coordinates_and_an_embedded_png_load() {
+        let (doc, bin) = textured_triangle_file();
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&doc, &bin)).expect("valid file");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let uvs =
+            |mesh: &MeshData| -> Vec<[f32; 2]> { mesh.vertices.iter().map(|v| v.uv).collect() };
+        assert_eq!(uvs(&mesh), [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+        assert_eq!(mesh.parts[0].material.base_color_texture, Some(0));
+        let checker = Texture::checkerboard(4, 2, [255, 0, 0], [0, 0, 255]);
+        assert_eq!(mesh.textures, [checker]);
+        // The factors are still there, to be multiplied with the texture.
+        assert_eq!(mesh.parts[0].material.base_color, [0.2, 0.4, 0.6]);
+
+        // The other two encodings: normalised bytes and plain floats (which
+        // may leave 0..1, and whose NaN becomes 0).
+        let with_uvs = |component: u64, data: &[u8]| {
+            let (mut doc, mut bin) = (doc.clone(), bin.clone());
+            doc["bufferViews"][2] = serde_json::json!({
+                "buffer": 0, "byteOffset": bin.len(), "byteLength": data.len(),
+            });
+            doc["accessors"][2]["componentType"] = component.into();
+            bin.extend_from_slice(data);
+            doc["buffers"][0]["byteLength"] = bin.len().into();
+            MeshData::from_glb(&glb(&doc, &bin)).expect("valid file")
+        };
+        assert_eq!(
+            uvs(&with_uvs(5121, &[0, 255, 255, 0, 51, 0])),
+            [[0.0, 1.0], [1.0, 0.0], [0.2, 0.0]]
+        );
+        let floats: Vec<u8> = [0.25f32, -1.5, 3.0, f32::NAN, f32::INFINITY, 0.5]
+            .iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(
+            uvs(&with_uvs(5126, &floats)),
+            [[0.25, -1.5], [3.0, 0.0], [0.0, 0.5]]
+        );
+
+        // A JPEG in place of the PNG (still declared `image/png`: the bytes
+        // decide, not the label).
+        let (mut jpeg_doc, mut jpeg_bin) = (doc.clone(), bin.clone());
+        jpeg_doc["bufferViews"][3] = serde_json::json!({
+            "buffer": 0, "byteOffset": jpeg_bin.len(),
+            "byteLength": crate::texture::TINY_JPEG.len(),
+        });
+        jpeg_bin.extend_from_slice(&crate::texture::TINY_JPEG);
+        jpeg_doc["buffers"][0]["byteLength"] = jpeg_bin.len().into();
+        let (mesh, warnings) =
+            MeshData::from_glb_with_warnings(&glb(&jpeg_doc, &jpeg_bin)).expect("valid file");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(mesh.parts[0].material.base_color_texture, Some(0));
+        assert_eq!(
+            (mesh.textures[0].width(), mesh.textures[0].height()),
+            (16, 8)
+        );
+
+        // Two materials sharing one image: decoded once, one texture.
+        let mut shared = doc.clone();
+        let second = shared["materials"][0].clone();
+        shared["materials"].as_array_mut().unwrap().push(second);
+        let mut primitive = shared["meshes"][0]["primitives"][0].clone();
+        primitive["material"] = 1.into();
+        shared["meshes"][0]["primitives"]
+            .as_array_mut()
+            .unwrap()
+            .push(primitive);
+        shared["textures"] = serde_json::json!([{ "source": 0 }, { "source": 0 }]);
+        shared["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"]["index"] = 1.into();
+        let mesh = MeshData::from_glb(&glb(&shared, &bin)).expect("valid file");
+        assert_eq!((mesh.parts.len(), mesh.textures.len()), (2, 1));
+        assert!(mesh
+            .parts
+            .iter()
+            .all(|p| p.material.base_color_texture == Some(0)));
+    }
+
+    /// Texture features the renderer lacks never fail the load: each is a
+    /// warning, and the material falls back to something drawable.
+    #[test]
+    fn unsupported_texture_features_are_warnings_not_errors() {
+        let (doc, bin) = textured_triangle_file();
+        let load = |edit: &dyn Fn(&mut Value), bin: &[u8]| {
+            let mut doc = doc.clone();
+            edit(&mut doc);
+            MeshData::from_glb_with_warnings(&glb(&doc, bin)).expect("the model still loads")
+        };
+        let textured = |mesh: &MeshData| mesh.parts[0].material.base_color_texture.is_some();
+        fn info(d: &mut Value) -> &mut Value {
+            &mut d["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]
+        }
+
+        // The other texture slots: named in a warning each, base colour kept.
+        let slots = ["normalTexture", "occlusionTexture", "emissiveTexture"];
+        let (mesh, warnings) = load(
+            &|d| {
+                for slot in slots {
+                    d["materials"][0][slot] = serde_json::json!({ "index": 0 });
+                }
+                d["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
+                    serde_json::json!({ "index": 0 });
+            },
+            &bin,
+        );
+        assert!(textured(&mesh));
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for slot in slots.iter().chain(&["metallicRoughnessTexture"]) {
+            assert!(warnings.iter().any(|w| w.contains(slot)), "{slot}");
+        }
+
+        // KHR_texture_transform, even when required: mapped untransformed.
+        let (mesh, warnings) = load(
+            &|d| {
+                d["extensionsRequired"] = serde_json::json!(["KHR_texture_transform"]);
+                info(d)["extensions"] =
+                    serde_json::json!({ "KHR_texture_transform": { "scale": [2.0, 2.0] } });
+            },
+            &bin,
+        );
+        assert!(textured(&mesh));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("KHR_texture_transform")));
+
+        // A wrap mode other than repeat: the texture is used, repeating.
+        let (mesh, warnings) = load(&|d| d["samplers"][0]["wrapS"] = 33071.into(), &bin);
+        assert!(textured(&mesh));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // Everything below leaves the material untextured, with one warning
+        // and no texture decoded for nothing.
+        type Edit<'a> = (&'a str, &'a dyn Fn(&mut Value));
+        let untextured: [Edit<'_>; 8] = [
+            ("a second UV set", &|d| info(d)["texCoord"] = 1.into()),
+            ("no texture coordinates", &|d| {
+                d["meshes"][0]["primitives"][0]["attributes"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("TEXCOORD_0");
+            }),
+            ("a missing texture", &|d| info(d)["index"] = 5.into()),
+            ("a missing image", &|d| {
+                d["textures"][0]["source"] = 9.into()
+            }),
+            ("an image outside the file", &|d| {
+                d["images"][0] = serde_json::json!({ "uri": "albedo.png" });
+            }),
+            ("a texture without a PNG/JPEG source", &|d| {
+                d["textures"][0] = serde_json::json!({
+                    "extensions": { "KHR_texture_basisu": { "source": 0 } },
+                });
+            }),
+            ("an image view past the BIN chunk", &|d| {
+                d["bufferViews"][3]["byteLength"] = 1_000_000.into();
+            }),
+            ("an image in a second buffer", &|d| {
+                d["bufferViews"][3]["buffer"] = 1.into();
+            }),
+        ];
+        for (what, edit) in untextured {
+            let (mesh, warnings) = load(edit, &bin);
+            assert!(!textured(&mesh), "{what}");
+            assert!(mesh.textures.is_empty(), "{what}");
+            assert_eq!(warnings.len(), 1, "{what}: {warnings:?}");
+        }
+
+        // A corrupt image (here: its header's CRC no longer matches), and one
+        // that is not an image at all.
+        let png_offset = doc["bufferViews"][3]["byteOffset"].as_u64().unwrap() as usize;
+        let mut corrupt = bin.clone();
+        corrupt[png_offset + 20] ^= 0xff;
+        let mut garbage = bin.clone();
+        garbage[png_offset] = b'x';
+        for bad in [&corrupt, &garbage] {
+            let (mesh, warnings) = load(&|_| {}, bad);
+            assert!(!textured(&mesh) && mesh.textures.is_empty());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(mesh.triangle_count(), 1, "the geometry is unaffected");
+        }
+        // Every prefix of the textured file: must return, not panic.
+        let good = glb(&doc, &bin);
+        for cut in 0..good.len() {
+            let _ = MeshData::from_glb_with_warnings(&good[..cut]);
+        }
+
+        // Still errors, not warnings: broken texture *coordinates* (they are
+        // geometry) and extensions that change the geometry.
+        let fails = |edit: &dyn Fn(&mut Value)| {
+            let mut doc = doc.clone();
+            edit(&mut doc);
+            MeshData::from_glb(&glb(&doc, &bin)).is_err()
+        };
+        assert!(fails(&|d| d["accessors"][2]["count"] = 2.into()));
+        assert!(fails(&|d| d["accessors"][2]["componentType"] = 5125.into()));
+        assert!(fails(&|d| d["accessors"][2]["type"] = "VEC3".into()));
+        assert!(fails(&|d| {
+            d["extensionsRequired"] = serde_json::json!(["KHR_texture_basisu"]);
+        }));
+    }
+
+    /// A node that mirrors (negative determinant) reverses the winding of its
+    /// triangles; the loader puts it back, so front faces stay counter-clockwise
+    /// and a generated normal still points out of the front.
+    #[test]
+    fn a_mirroring_node_keeps_triangles_counter_clockwise() {
+        let (mut doc, bin) = triangle_file();
+        doc["nodes"][0]["scale"] = serde_json::json!([-2.0, 2.0, 2.0]);
+        let mesh = MeshData::from_glb(&glb(&doc, &bin)).expect("valid file");
+        let positions: Vec<[f32; 3]> = mesh.vertices.iter().map(|v| v.position).collect();
+        assert_eq!(
+            positions,
+            [[-20.0, 0.0, 0.0], [-22.0, 0.0, 0.0], [-20.0, 2.0, 0.0]]
+        );
+        assert_eq!(mesh.indices, [0, 2, 1]);
+        for v in &mesh.vertices {
+            assert_eq!(v.normal, [0.0, 0.0, 1.0]);
+        }
+    }
+
+    fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    /// Every triangle's geometric normal agrees with the normals of its three
+    /// vertices: the mesh is wound counter-clockwise seen from where its
+    /// normals point, nowhere inside out.
+    fn assert_winding_matches_normals(mesh: &MeshData, name: &str) {
+        for (t, tri) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
+            let [a, b, c] = tri.map(|i| mesh.vertices[i as usize]);
+            let face = cross3(sub(b.position, a.position), sub(c.position, a.position));
+            let area = dot(face, face).sqrt();
+            assert!(area > 1e-9, "{name}: triangle {t} is degenerate");
+            for v in [a, b, c] {
+                assert!(
+                    dot(face, v.normal) / area > 0.2,
+                    "{name}: triangle {t} faces away from its vertex normal"
+                );
+            }
+        }
+    }
+
+    /// Seen from outside, every triangle shows its texture the right way
+    /// round: with `u` to the right and `v` downwards, the surface faces the
+    /// viewer. (Otherwise lettering in a texture would read backwards.)
+    fn assert_textures_are_not_mirrored(mesh: &MeshData, name: &str) {
+        for (t, tri) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
+            let [a, b, c] = tri.map(|i| mesh.vertices[i as usize]);
+            let (e1, e2) = (sub(b.position, a.position), sub(c.position, a.position));
+            let (u1, v1) = (b.uv[0] - a.uv[0], b.uv[1] - a.uv[1]);
+            let (u2, v2) = (c.uv[0] - a.uv[0], c.uv[1] - a.uv[1]);
+            // Triangles are counter-clockwise seen from outside; so must their
+            // texture coordinates be, with `v` flipped to point up.
+            let area = u1 * -v2 - u2 * -v1;
+            let face = cross3(e1, e2);
+            if dot(face, face) > 1e-12 {
+                assert!(area > 0.0, "{name}: triangle {t} maps its texture mirrored");
+            }
+        }
+    }
+
+    #[test]
+    fn the_sample_character_is_a_closed_upright_textured_person() {
+        let character = sample_character();
+        character.validate().expect("a valid mesh");
+        assert_eq!(character, sample_character(), "deterministic");
+
+        // 1.8 m tall, standing on the origin, symmetric left to right, and
+        // person-shaped: much taller than wide, wider than deep.
+        let (min, max) = (character.bounds_min, character.bounds_max);
+        assert!(min[1].abs() < 1e-6, "feet on the ground: {}", min[1]);
+        assert!((max[1] - 1.8).abs() < 0.005, "height {}", max[1]);
+        assert!((min[0] + max[0]).abs() < 1e-5, "symmetric: {min:?} {max:?}");
+        let (width, depth) = (max[0] - min[0], max[2] - min[2]);
+        assert!((0.6..0.9).contains(&width), "width {width}");
+        assert!((0.3..0.5).contains(&depth), "depth {depth}");
+
+        let triangles = character.triangle_count();
+        assert!((1000..5000).contains(&triangles), "{triangles} triangles");
+        eprintln!(
+            "character: {triangles} triangles, {} vertices",
+            character.vertices.len()
+        );
+
+        // Unit normals; closed surfaces wound outwards; about a person's
+        // volume (the pieces overlap, so somewhat more than the 0.07 m^3 of
+        // a real one).
+        for v in &character.vertices {
+            assert!((dot(v.normal, v.normal).sqrt() - 1.0).abs() < 1e-5);
+        }
+        assert!(character.is_closed(), "every piece is a closed surface");
+        let volume = character.signed_volume();
+        assert!((0.06..0.2).contains(&volume), "volume {volume} m^3");
+        assert_winding_matches_normals(&character, "character");
+
+        // Texture coordinates tile within 0..=4 and actually vary.
+        let (mut uv_min, mut uv_max) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for v in &character.vertices {
+            for k in 0..2 {
+                assert!(v.uv[k].is_finite());
+                uv_min[k] = uv_min[k].min(v.uv[k]);
+                uv_max[k] = uv_max[k].max(v.uv[k]);
+            }
+        }
+        for k in 0..2 {
+            assert!(
+                uv_min[k] >= 0.0 && uv_max[k] <= 4.0,
+                "{uv_min:?}..{uv_max:?}"
+            );
+            assert!(uv_max[k] - uv_min[k] > 0.9, "{uv_min:?}..{uv_max:?}");
+        }
+        assert_textures_are_not_mirrored(&character, "character");
+
+        // Four parts: suit (textured), trim, visor (emissive), pack (textured).
+        assert_eq!(character.parts.len(), 4);
+        let [suit, trim, visor, pack] = [0, 1, 2, 3].map(|i| character.parts[i]);
+        assert_eq!(character.textures.len(), 1);
+        assert_eq!(suit.material.base_color_texture, Some(0));
+        assert_eq!(pack.material.base_color_texture, Some(0));
+        assert_eq!(trim.material.base_color_texture, None);
+        assert!(visor.material.emissive.iter().all(|&c| c > 0.4));
+        assert!(suit.material.emissive == [0.0; 3] && trim.material.emissive == [0.0; 3]);
+        assert!(suit.index_count > trim.index_count, "mostly suit");
+
+        // Facing -Z: the visor and the toes are in front, the pack behind.
+        let mean_z = |part: MeshPart| {
+            let range = part.first_index as usize..(part.first_index + part.index_count) as usize;
+            let z: f32 = character.indices[range.clone()]
+                .iter()
+                .map(|&i| character.vertices[i as usize].position[2])
+                .sum();
+            z / range.len() as f32
+        };
+        assert!(mean_z(visor) < -0.07, "visor at z = {}", mean_z(visor));
+        assert!(mean_z(pack) > 0.15, "pack at z = {}", mean_z(pack));
+        let toes = character
+            .vertices
+            .iter()
+            .filter(|v| v.position[1] < 0.1)
+            .map(|v| v.position[2])
+            .fold(f32::MAX, f32::min);
+        assert!(toes < -0.15 && toes == min[2], "toes at z = {toes}");
+        // The head is the highest thing, centred over the feet.
+        let top = character
+            .vertices
+            .iter()
+            .max_by(|a, b| a.position[1].total_cmp(&b.position[1]))
+            .unwrap();
+        assert!(top.position[0].abs() < 1e-6 && top.position[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn closed_and_open_meshes_are_told_apart() {
+        let cube = MeshData::cuboid([1.0, 2.0, 3.0], 1.0, plain(None));
+        cube.validate().expect("valid");
+        assert_eq!(cube.triangle_count(), 12);
+        assert!(cube.is_closed());
+        assert!((cube.signed_volume() - 48.0).abs() < 1e-4);
+        assert_winding_matches_normals(&cube, "cuboid");
+        assert_eq!(
+            (cube.bounds_min, cube.bounds_max),
+            ([-1.0, -2.0, -3.0], [1.0, 2.0, 3.0])
+        );
+        // The first face is the -X one, 6 units (z) by 4 (y): at one repeat
+        // per unit its coordinates run 0..6 across and 0..4 down.
+        let uv_max = cube.vertices[..4]
+            .iter()
+            .fold([0.0f32; 2], |m, v| [m[0].max(v.uv[0]), m[1].max(v.uv[1])]);
+        assert_eq!(uv_max, [6.0, 4.0]);
+        assert_textures_are_not_mirrored(&cube, "cuboid");
+        // The texture's top edge (v = 0) is the top of every side face, and
+        // the far (-Z) edge of the top face.
+        for v in &cube.vertices {
+            if v.normal[1] == 0.0 {
+                assert_eq!(v.uv[1] == 0.0, v.position[1] == 2.0, "{v:?}");
+            } else if v.normal[1] > 0.0 {
+                assert_eq!(v.uv[1] == 0.0, v.position[2] == -3.0, "{v:?}");
+            }
+        }
+
+        // Inside out: still closed, negative volume.
+        let mut inverted = cube.clone();
+        for tri in inverted.indices.as_chunks_mut::<3>().0 {
+            tri.swap(1, 2);
+        }
+        assert!(inverted.is_closed());
+        assert!((inverted.signed_volume() + 48.0).abs() < 1e-4);
+        // One triangle flipped: an edge is used twice in the same direction.
+        let mut folded = cube.clone();
+        folded.indices.swap(1, 2);
+        assert!(!folded.is_closed());
+        // A face missing: open.
+        let mut open = cube.clone();
+        open.indices.truncate(30);
+        assert!(!open.is_closed());
+
+        let plane = MeshData::plane([3.0, 2.0], [1.0, 1.0], plain(None));
+        plane.validate().expect("valid");
+        assert!(!plane.is_closed());
+        assert_winding_matches_normals(&plane, "plane");
+        assert_eq!(plane.triangle_count(), 2);
+        assert_eq!(
+            (plane.bounds_min, plane.bounds_max),
+            ([-3.0, 0.0, -2.0], [3.0, 0.0, 2.0])
+        );
+        // The texture's origin is the (-x, -z) corner.
+        let origin = plane.vertices.iter().find(|v| v.uv == [0.0, 0.0]).unwrap();
+        assert_eq!(origin.position, [-3.0, 0.0, -2.0]);
+
+        // The ship's six boxes and the built-in shapes are valid too.
+        sample_ship().validate().expect("valid");
+        assert_winding_matches_normals(&sample_ship(), "ship");
+        assert_textures_are_not_mirrored(&sample_ship(), "ship");
+    }
+
+    #[test]
+    fn hand_built_meshes_are_validated() {
+        let good = MeshData::cuboid([1.0; 3], 1.0, plain(None));
+        let broken = |edit: &dyn Fn(&mut MeshData)| {
+            let mut mesh = good.clone();
+            edit(&mut mesh);
+            mesh.validate().is_err()
+        };
+        assert!(broken(&|m| m.indices[5] = 24));
+        assert!(broken(&|m| m.parts[0].index_count = 37));
+        assert!(broken(&|m| m.parts[0].index_count = 35));
+        assert!(broken(&|m| m.parts[0].first_index = 3));
+        assert!(broken(&|m| m.vertices[3].position[1] = f32::NAN));
+        assert!(broken(&|m| m.vertices[0].position[0] = f32::INFINITY));
+        // Out-of-range indices make a mesh "not closed" rather than a panic.
+        let mut wild = good.clone();
+        wild.indices[0] = 9999;
+        assert!(!wild.is_closed());
+        assert!(wild.signed_volume().is_finite());
     }
 }

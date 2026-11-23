@@ -63,8 +63,9 @@ pub struct GpuInstance {
     pub _pad1: f32,
 }
 
-/// `MeshInstance` in `shaders/forward.wgsl` (80 bytes): one drawn part of a
-/// mesh model.
+/// `MeshInstance` in `shaders/common.wgsl` (80 bytes): one drawn part of a
+/// mesh model. The forward pass draws with it; a GI ray that hits the model
+/// reads its part's emission from it.
 /// Offsets: 0 model_x, 16 model_y, 32 model_z, 48 albedo, 64 emissive -> 80.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,10 +74,37 @@ pub struct MeshInstanceGpu {
     pub model_x: [f32; 4],
     pub model_y: [f32; 4],
     pub model_z: [f32; 4],
-    /// rgb + metallic in .w.
+    /// rgb base-colour factor + metallic in .w.
     pub albedo: [f32; 4],
     /// rgb radiance + roughness in .w.
     pub emissive: [f32; 4],
+}
+
+/// One rectangle of the overlay: the instance-rate vertex of `vs_overlay` in
+/// `shaders/overlay.wgsl` (32 bytes; attribute 0 at offset 0, 1 at offset 16).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverlayInstance {
+    /// x0, y0, x1, y1 in normalised device coordinates (y = -1 is the top).
+    pub rect: [f32; 4],
+    /// Display-referred sRGB, straight alpha.
+    pub color: [f32; 4],
+}
+
+/// `Environment` in `shaders/common.wgsl` (48 bytes): the scene's sky-and-ground
+/// gradient ([`crate::Environment`]) as the shaders read it.
+/// Offsets: 0 zenith, 16 horizon, 32 ground -> 48.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EnvironmentGpu {
+    /// rgb radiance from straight up (intensity included); w = 1 when the
+    /// scene has an environment and 0 when it has none — the one value a
+    /// shader reads to skip everything else.
+    pub zenith: [f32; 4],
+    /// rgb radiance from the horizon.
+    pub horizon: [f32; 4],
+    /// rgb radiance from straight down.
+    pub ground: [f32; 4],
 }
 
 /// `Camera` in `shaders/forward.wgsl` (160 bytes: two `mat4x4` at 64 bytes
@@ -102,12 +130,12 @@ pub struct Light {
     pub color: [f32; 4],
 }
 
-/// `Params` in `shaders/forward.wgsl` (496 bytes).
+/// `Params` in `shaders/forward.wgsl` (544 bytes).
 /// Offsets: 0 camera(160), 160 lights(8x32=256) -> 416, 416 light_count,
 /// 420 gi_enabled, 424 _pad0(8) -> 432, 432 gi_grid_origin(16) -> 448,
 /// 448 gi_spacing, 452 gi_grid_size_x, 456 gi_grid_size_y, 460 _pad1 -> 464,
 /// 464 fog (rgb colour, w = density), 480 features (bitmask, see
-/// [`crate::quality`]), 484..496 padding.
+/// [`crate::quality`]), 484..496 padding, 496 environment(48) -> 544.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardParams {
@@ -126,11 +154,14 @@ pub struct ForwardParams {
     /// `FEATURE_*` bitmask from [`crate::quality`].
     pub features: u32,
     pub _pad2: [u32; 3],
+    /// The scene's environment (all zero for none).
+    pub environment: EnvironmentGpu,
 }
 
-/// `PostParams` in `shaders/post.wgsl` (192 bytes).
+/// `PostParams` in `shaders/post.wgsl` (240 bytes).
 /// Offsets: 0 camera(160), 160 features, 164 ssr_steps, 168 image_size(8),
-/// 176 ssr_max_roughness, 180 refract_distance, 184 refract_eta, 188 pad -> 192.
+/// 176 ssr_max_roughness, 180 refract_distance, 184 refract_eta, 188 pad -> 192,
+/// 192 environment(48) -> 240.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PostParams {
@@ -146,6 +177,9 @@ pub struct PostParams {
     /// Index-of-refraction ratio entering the medium (air -> glass = 1/1.5).
     pub refract_eta: f32,
     pub _pad: f32,
+    /// The scene's environment (all zero for none): what glass shows where
+    /// its refracted view finds no geometry.
+    pub environment: EnvironmentGpu,
 }
 
 /// `ToneParams` in `shaders/tonemap.wgsl` (32 bytes).
@@ -195,6 +229,8 @@ gpu_pod!(
     GiParams,
     GpuInstance,
     MeshInstanceGpu,
+    OverlayInstance,
+    EnvironmentGpu,
     Camera,
     Light,
     ForwardParams,
@@ -307,7 +343,13 @@ mod tests {
             gi_grid_size_y => FORWARDPARAMS_GI_GRID_SIZE_Y,
             fog => FORWARDPARAMS_FOG,
             features => FORWARDPARAMS_FEATURES,
+            environment => FORWARDPARAMS_ENVIRONMENT,
         } size = FORWARDPARAMS_SIZE);
+        assert_layout!(EnvironmentGpu {
+            zenith => ENVIRONMENTGPU_ZENITH,
+            horizon => ENVIRONMENTGPU_HORIZON,
+            ground => ENVIRONMENTGPU_GROUND,
+        } size = ENVIRONMENTGPU_SIZE);
         assert_layout!(Camera {
             view_proj => CAMERA_VIEW_PROJ,
             inv_view_proj => CAMERA_INV_VIEW_PROJ,
@@ -330,6 +372,7 @@ mod tests {
             ssr_max_roughness => POSTPARAMS_SSR_MAX_ROUGHNESS,
             refract_distance => POSTPARAMS_REFRACT_DISTANCE,
             refract_eta => POSTPARAMS_REFRACT_ETA,
+            environment => POSTPARAMS_ENVIRONMENT,
         } size = POSTPARAMS_SIZE);
     }
 

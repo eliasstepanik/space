@@ -3,8 +3,8 @@
 #
 #   docker build -t space/ci .          # runs CI as a build step; fails if CI fails
 #
-# NOT EXECUTED: the authoring sandbox has no Docker daemon. Correct by
-# inspection only (deploy/README.md). The authoritative CI is
+# Not built locally: CI's `docker` job builds it (deploy/README.md says what
+# has and has not been run). The authoritative CI is
 # .github/workflows/ci.yml and `cargo xtask ci`.
 FROM rust:1-slim-bookworm
 WORKDIR /src
