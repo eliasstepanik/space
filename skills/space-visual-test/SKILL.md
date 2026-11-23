@@ -34,6 +34,18 @@ That builds the release binaries and starts, in the background:
 | shard | `127.0.0.1:7777` — the address a client connects to |
 | logs | `target/dev/*.log` |
 
+- `--min-shards 4` / `-MinShards 4` lets the orchestrator start the shards
+  itself (`space-orchestrator --launcher process --min-shards 4`): four
+  `space-server` processes on ports from 7870, logs in
+  `target/dev/shard-<port>.log`, the demo area in four shard areas that meet at
+  HUD `pos` x = -6 / z = -4. The script waits until all four own their regions
+  (about a second) and prints the address of the shard that owns the spawn
+  point: connect a client **there** (the other shards do not put a joiner on
+  the spawn point yet). `--stop` stops those shards too: it reads their pids
+  from `target/dev/launched-shards.pid` — the orchestrator's own list of the
+  shards it has running — and stops each only if its executable lies in this
+  checkout's `target/release` (a pid may belong to something else by now).
+  At most 8: the orchestrator refuses a `--min-shards` it cannot place.
 - `--topology single` is one shard with no orchestrator (scene from
   `--scene`); `--topology two-shards` is the seamless-handoff setup (fly +X,
   hold D about 15 s, the HUD goes to `shard 2  handoffs 1`).
@@ -50,7 +62,12 @@ Without the scripts:
 ```sh
 space-orchestrator --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
 space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+# a second, third ... shard is given the next layout cell beside the spawn point:
+space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7778
 ```
+
+A shard names neither id nor region: the orchestrator gives it both (the first
+one the root, so start it first and connect clients to it).
 
 ## 2. Drive a client
 
@@ -167,8 +184,10 @@ curl -s -D - -o /dev/null -X POST --data "csrf=$T&scene=solar" http://127.0.0.1:
 ```
 
 `X-Space-Result` is `accepted` or `refused`; `X-Space-Confirmed: 1/1` says how
-many connected shards run the new revision. Shards do not re-register with an
-orchestrator that was restarted: restart the shards after the orchestrator.
+many connected shards run the new revision. A shard that loses its orchestrator
+**exits** (within about 10 s when the orchestrator was killed, at once when it
+closed the link): after restarting the orchestrator start the shards again —
+or run it with `--min-shards`, and it does.
 
 The page also splits and merges regions, pauses the autoscaler and shows which
 shards have confirmed the scene. Actions are rate-limited (429 when hurried).
@@ -209,6 +228,27 @@ Check what your change touches, and one step either side of it.
   lands (HUD `gravity 9.81 m/s2  landed`) and lifts off again with Space.
 - **Other scenes:** switch to each one and back.
 - **Players:** a second client must see the first one's character.
+- **Four shard areas:** `--min-shards 4`. `GET /api/state` (and the page)
+  show four regions, each with a connected owner; `fleet` says what the
+  orchestrator keeps running and what is starting. From the spawn point
+  (`pos 0 0 0`, the root's shard) cross x = -6 and z = -4: the HUD's shard
+  number changes at each crossing and `handoffs` counts up; nothing may
+  vanish or turn black. Stop one shard **by its pid**, never by name:
+  `target/dev/launched-shards.pid` lists the pids of exactly the shards the
+  orchestrator has running (it rewrites the file whenever one starts, stops
+  or is seen to have exited) — and check what a pid is before you stop it
+  (`(Get-Process -Id N).Path` / `readlink /proc/N/exe` must be this
+  checkout's `target/release/space-server`). Within a second or two the event
+  log says `shard N lost: its process exited`, a replacement registers under
+  a **new id**, its epoch commits, the scene's revision rises by one — the
+  bodies are built again — and the pid file names the replacement in place of
+  the dead one. The replacement listens on **another port** (the next free
+  one of the range; `/api/state` has it), so a client that was on the dead
+  shard does not come back by itself: it keeps retrying the old address and
+  has to be pointed at the new one. That holds for the root's shard too —
+  after it was replaced, the address the dev script printed is stale, and the
+  owner of the spawn point is whatever `/api/state` names for the region with
+  `nesting` 0.
 - **Handoff:** `--topology two-shards`, fly across (the border is at HUD
   `pos` x = 512); the picture must not jump and the scene must stay where it
   was. Players and bodies within 64 m (plus 3 s of their motion) of a border

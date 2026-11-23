@@ -55,12 +55,14 @@ Needs the Rust toolchain from `rust-toolchain.toml`.
 
 ```powershell
 .\scripts\dev.ps1                          # orchestrator + web UI + one shard + the window client
+.\scripts\dev.ps1 -MinShards 4             # the orchestrator starts four shards itself: the demo area in four shard areas
 .\scripts\dev.ps1 -Topology two-shards     # two neighbouring shards: fly across the border
 .\scripts\dev.ps1 -Client headless -Script scripts\harness\smoke.lua   # a scripted test run
 ```
 
 ```sh
 bash scripts/dev.sh                        # the same on Linux
+bash scripts/dev.sh --min-shards 4
 ```
 
 The scripts build the release binaries, start the server side in the
@@ -76,6 +78,47 @@ cargo build --release -p space-client -p space-server -p space-orchestrator
 .\target\release\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
 .\target\release\space-client.exe --server 127.0.0.1:7777
 ```
+
+### Shards
+
+A shard starts without a region and is given one when it registers with the
+orchestrator: the first gets the root (the whole world, and the scene's spawn
+point), each further one the next *layout cell* beside the spawn point — so
+four shards are the four quadrants of the demo area, meeting at `pos` x = -6 /
+z = -4 — up to `--max-shards` (default 8). Start more by hand with the same
+`space-server --orchestrator ...` line and another `--bind`, or let the
+orchestrator do it:
+
+```powershell
+.\target\release\space-orchestrator.exe --webui 127.0.0.1:7980 --launcher process --min-shards 4
+```
+
+`--launcher process` starts the `space-server` lying next to the orchestrator,
+one process per shard on a port from `--host-port-range` (default 7870-7899;
+keep it out of the operating system's dynamic port range), logging to
+`shard-<port>.log` in `--shard-log-dir`; `launched-shards.pid` there lists the
+pids of the shards that are running, and nothing else. `--min-shards` can be 8
+at most (the root and the seven layout cells) and not more than `--max-shards`
+or `--max-regions`. A shard that dies — its process exits, its connection to
+the orchestrator closes, or it stops acknowledging map changes — is replaced:
+its region goes to a new shard under a new id and the scene's bodies are built
+again. The replacement listens on the next free port of the range, so a client
+that was on the dead shard has to be pointed at the new address. A shard that
+loses its orchestrator exits by itself. For now a client has to be pointed at
+the shard that owns the spawn point (the web UI lists the root region's
+address; `dev.ps1 -MinShards` does it for you).
+
+The orchestrator's control port takes any shard on a loopback address. On any
+other address a shard needs the **cluster secret** (`SPACE_CLUSTER_SECRET` on
+both, or `--cluster-secret` / `--cluster-secret-file` on the orchestrator), and
+the orchestrator refuses to start there without one. A connection whose hello
+is refused is closed; one that is welcomed speaks for its own shard only.
+Shards of one cluster prove themselves to each other with a **peer token** the
+orchestrator hands out: generated at start, or given with
+`SPACE_ORCHESTRATOR_PEER_TOKEN` / `--peer-token-file` / `--peer-token` (at
+least 16 characters). Neither secret is printed, and a shard the orchestrator
+starts does not inherit the orchestrator's own settings
+(`SPACE_ORCHESTRATOR_*`, the web UI token among them).
 
 ### Scenes and the orchestrator web UI
 

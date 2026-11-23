@@ -55,6 +55,8 @@
 pub mod crypto;
 pub mod endpoint;
 pub mod framed;
+pub mod log_budget;
+pub mod secret;
 
 pub use crypto::{make_server_config, make_tls_client_config, make_tls_server_config, CertPair};
 pub use endpoint::{
@@ -65,6 +67,8 @@ pub use endpoint::{
 pub use framed::{
     read_frame, recv_datagram, send_datagram, send_message, send_on_stream, MessageClass,
 };
+pub use log_budget::{held_back_note, LogBudget};
+pub use secret::{constant_time_eq, Secret};
 
 /// The ALPN protocol name both sides advertise.
 ///

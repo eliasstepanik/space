@@ -9,7 +9,8 @@
 //! Every time in a snapshot is an orchestrator **tick** (the loop runs at
 //! [`crate::config::TICK_HZ`]); `tick` is "now" on the same clock.
 //!
-//! The shared peer token is deliberately **not** part of a snapshot.
+//! The peer token and the cluster secret are deliberately **not** part of a
+//! snapshot.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -56,6 +57,18 @@ pub struct Snapshot {
     pub regions: Vec<RegionView>,
     /// The most regions the map may hold; a split at the limit is refused.
     pub max_regions: usize,
+    /// How many shards the orchestrator keeps running by itself (0: none).
+    pub min_shards: usize,
+    /// The most shards the cluster may have.
+    pub max_shards: usize,
+    /// Whether a shard's hello must carry the cluster's credential (which
+    /// is itself never part of a snapshot).
+    pub hello_auth_required: bool,
+    /// Launches that have not become a registered shard yet.
+    pub starting: usize,
+    /// The node a split or a carve asked for that is waiting for a shard to
+    /// register and take it.
+    pub wanted: Option<NodeRef>,
     /// Every shard the orchestrator knows of, by id.
     pub shards: Vec<ShardView>,
     /// The epoch change in flight, if any.
@@ -266,6 +279,9 @@ pub struct ShardView {
     /// registered). Compare with [`Snapshot::scene`] through
     /// [`SceneView::sync_of`].
     pub scene: Option<SceneState>,
+    /// Whether the orchestrator started it (and so watches and stops its
+    /// process); `false` for a shard started by hand.
+    pub launched: bool,
 }
 
 /// What a shard is to the cluster.
@@ -275,9 +291,12 @@ pub enum ShardRole {
     Owner,
     /// The root owner reserved at startup; no live shard has claimed it yet.
     ReservedRoot,
-    /// The child of the split in flight: launched, owns nothing until the
-    /// epoch commits.
-    SplitChild,
+    /// The shard the change in flight gives its region: registered, owns
+    /// nothing until the epoch commits.
+    Joining,
+    /// Known to be dead and still the owner of regions: they go to the next
+    /// shard that registers.
+    Dead,
     /// The shard the merge in flight removes once its epoch commits.
     Merging,
     /// Known (it said hello) but it owns no region of the committed map.
@@ -285,13 +304,14 @@ pub enum ShardRole {
 }
 
 impl ShardRole {
-    /// A short lower-case name (`"owner"`, `"split-child"`, …).
+    /// A short lower-case name (`"owner"`, `"joining"`, …).
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             ShardRole::Owner => "owner",
             ShardRole::ReservedRoot => "reserved-root",
-            ShardRole::SplitChild => "split-child",
+            ShardRole::Joining => "joining",
+            ShardRole::Dead => "dead",
             ShardRole::Merging => "merging",
             ShardRole::Unowned => "unowned",
         }

@@ -814,24 +814,27 @@ impl Shard {
 
     /// A message arrived from another shard.
     ///
-    /// # Peer identity is only a map-membership check
+    /// # Who a peer is
     ///
     /// A peer connection announces itself with the hello token
     /// <code>"shard:&lt;id&gt;"</code> ([`crate::net::peer_shard_id`]), which is a
-    /// string any client could type. There is **no** shard-to-shard
-    /// authentication today: the transport is QUIC with a self-signed
-    /// certificate (no pinning), the hello check covers the protocol version
-    /// only, and the orchestrator-issued `ShardWelcome::peer_token` is never
-    /// presented by shards nor verified here. The only check is that the claimed
-    /// [`ShardId`] is one of the ids in **this shard's own shard map**; a peer
-    /// outside it is dropped. A commit is additionally required to come from the
-    /// shard that actually staged the transfer ([`Ledger::take_incoming_from`]).
+    /// string any client could type. Two checks stand behind it:
     ///
-    /// So a party that can reach this shard's port and guesses a *valid*
-    /// neighbour's id can speak the handoff protocol as that neighbour. The map
-    /// check closes "anyone can be a peer"; it does not close "anyone can
-    /// impersonate a known peer". Enforcing `peer_token` is deferred (see
-    /// `docs/security-notes.md`).
+    /// * **The cluster's peer token**, at the front end, before a single peer
+    ///   message is read: an orchestrated shard holds the token of its
+    ///   `ShardWelcome`, presents it in every hello to another shard and
+    ///   refuses a peer hello without it ([`crate::net::ShardNet::set_peer_token`]).
+    ///   A shard that holds none — standalone shards wired by hand — skips
+    ///   this one.
+    /// * **Map membership**, here: the claimed [`ShardId`] must be one of the
+    ///   ids in **this shard's own shard map**; a peer outside it is dropped. A
+    ///   commit is additionally required to come from the shard that actually
+    ///   staged the transfer ([`Ledger::take_incoming_from`]).
+    ///
+    /// The token says "a shard of this cluster", not *which* one: it is one
+    /// secret for all of them, the transport is QUIC with a self-signed
+    /// certificate and no pinning, and a shard that holds the token can still
+    /// claim a neighbour's id. See `docs/security-notes.md`.
     ///
     /// Every handoff message is then epoch-checked (guarantee 7): a message under a
     /// stale epoch is answered with [`Message::StaleEpoch`] or abandons the

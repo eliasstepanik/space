@@ -374,6 +374,47 @@ pub fn carve_plan(
     })
 }
 
+/// The **layout cells** of a root: the cells handed, in this order, to the
+/// shards that register after the root's own (`docs/plan-sharding.md` §2).
+///
+/// With `k` the cell index of the root's centre corner, the scene's spawn
+/// point lies in the cell `[k, k, k]`, which stays with the root's shard. The
+/// three other cells of that layer that meet at the corner come first —
+/// `[k, k, k-1]`, `[k-1, k, k]`, `[k-1, k, k-1]`: with the root's shard these
+/// are the four quadrants of the scene, meeting at scene x = -6 / z = -4
+/// (`space_scene::ANCHOR_OFFSET`) — then the four cells of the layer below
+/// (`y = k-1`). Seven cells: with the root that is the default `--max-shards`.
+///
+/// A pure function of the root; whether a cell can still be given away is
+/// [`next_layout_cell`]'s question.
+#[must_use]
+pub fn layout_cells(root: NodeRef) -> [NodeRef; 7] {
+    let k = root.center().cell;
+    let cell = |dx: i64, dy: i64, dz: i64| {
+        NodeRef::new(space_world::MAX_DEPTH, [k[0] + dx, k[1] + dy, k[2] + dz])
+    };
+    [
+        cell(0, 0, -1),
+        cell(-1, 0, 0),
+        cell(-1, 0, -1),
+        cell(0, -1, 0),
+        cell(0, -1, -1),
+        cell(-1, -1, 0),
+        cell(-1, -1, -1),
+    ]
+}
+
+/// The next layout cell of `root` that can be carved out of `map` for a new
+/// shard: the first of [`layout_cells`] that is not a region already and lies
+/// inside one ([`carve_plan`] accepts it). `None` when every one is taken —
+/// or when the root is a single cell, which has no cells to give.
+#[must_use]
+pub fn next_layout_cell(map: &ShardMap, root: NodeRef) -> Option<NodeRef> {
+    layout_cells(root)
+        .into_iter()
+        .find(|cell| carve_plan(map, *cell, ShardId::NONE).is_ok())
+}
+
 /// Plan a one-octant split of `shard`'s region: the [`carve_plan`] of one of
 /// its eight child octants, behind the split's own gate ([`can_split`]).
 ///
@@ -596,6 +637,83 @@ mod tests {
 
     fn shard(n: u32) -> ShardId {
         ShardId::new(n)
+    }
+
+    /// The order in which new shards are given their cells is fixed: the three
+    /// cells that share the spawn cell's layer and meet it at the root's centre
+    /// corner, then the four below. Each is carved in turn; the spawn point's
+    /// own cell is never given away, and when all seven are taken there is
+    /// nothing left.
+    ///
+    /// Mutation this catches: handing out the spawn cell (the root's shard
+    /// would own no ground at the scene), a different order (which shard owns
+    /// which quadrant would depend on something else), or an eighth cell.
+    #[test]
+    fn layout_cells_are_handed_out_in_a_fixed_order_around_the_spawn_cell() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = root.center().cell;
+        let cells = layout_cells(root);
+        let offsets: Vec<[i64; 3]> = cells
+            .iter()
+            .map(|c| [c.index[0] - k[0], c.index[1] - k[1], c.index[2] - k[2]])
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                [0, 0, -1],
+                [-1, 0, 0],
+                [-1, 0, -1],
+                [0, -1, 0],
+                [0, -1, -1],
+                [-1, -1, 0],
+                [-1, -1, -1],
+            ]
+        );
+        assert!(cells.iter().all(|c| c.depth == 64), "single cells");
+        let spawn_cell = NodeRef::new(64, k);
+        assert!(!cells.contains(&spawn_cell), "the spawn cell stays put");
+        // The scene's spawn point is in the spawn cell, a few metres from the
+        // corner the first three cells meet it at.
+        let map = root_map();
+        let anchor = space_scene::scene_anchor(&map).expect("a map has an anchor");
+        assert!(octree::contains(spawn_cell, anchor));
+
+        // Carved in turn, each for the next shard, until none is left.
+        let mut map = map;
+        for (i, expected) in cells.iter().enumerate() {
+            let next = next_layout_cell(&map, root).expect("a cell is left");
+            assert_eq!(next, *expected, "cell {i}");
+            map = carve_plan(&map, next, shard(10 + i as u32))
+                .expect("a layout cell lies inside the root")
+                .map;
+            assert_eq!(map.lookup(&next.center()), Some(shard(10 + i as u32)));
+            assert_eq!(
+                map.lookup(&anchor),
+                Some(shard(1)),
+                "the root keeps the spawn"
+            );
+        }
+        assert_eq!(next_layout_cell(&map, root), None, "all seven are taken");
+        validate(&map).expect("eight regions, one owner everywhere");
+
+        // After the first three, the four quadrants of the scene have four
+        // owners: a point a few metres either side of scene x = -6 / z = -4.
+        let at =
+            |x: f64, z: f64| map.lookup(&WorldPos::from_f64_metres_around(anchor, [x, 0.0, z]));
+        assert_eq!(at(0.0, 0.0), Some(shard(1)));
+        assert_eq!(at(0.0, -10.0), Some(shard(10)));
+        assert_eq!(at(-12.0, 0.0), Some(shard(11)));
+        assert_eq!(at(-12.0, -10.0), Some(shard(12)));
+
+        // A cell that was merged away is the next one handed out again.
+        let mut freed = map.clone();
+        freed.regions.retain(|r| r.node != cells[1]);
+        assert_eq!(next_layout_cell(&freed, root), Some(cells[1]));
+
+        // A root of one cell has nothing to give.
+        let one_cell = NodeRef::new(64, [3, 3, 3]);
+        let tiny = ShardMap::new(1, vec![ShardRegion::new(one_cell, shard(1), addr(1))]);
+        assert_eq!(next_layout_cell(&tiny, one_cell), None);
     }
 
     fn region(depth: u8, index: [i64; 3], owner: u32) -> ShardRegion {

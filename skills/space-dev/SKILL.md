@@ -23,9 +23,9 @@ server state** owned by the orchestrator; **every push to `main` is a release an
 | `space-protocol` | wire messages, codec, `PROTOCOL_VERSION`, `Message::VARIANT_COUNT`; `scene.rs` = the scene catalogue (`Scene`, `SceneId`, `SceneState`) |
 | `space-sim` | deterministic simulation, `SimWorld`: ship flight (`physics.rs`), rigid bodies on `rapier3d-f64` in floating-origin **bubbles** (`rigid.rs`: merge/split/re-anchor rules, statics, islands, ghosts), components `Body`/`Visual`/`Springs`/`Articulation`/`PartStates`/`PosResidual` (ids 4-10, versioned wire forms), gravity zones + large bodies (`gravity.rs`; a `LargeBody` has a `reach`: the pull fades over its outer quarter and is exactly 0 beyond, `f64::INFINITY` = no limit, as the solar scene's bodies), orbits, prediction (`PredictedShip`, `PredictedPhysics`). Ships: `ShipParams::lift` (1.0) = lift engines, the part of the input that pushes against the local pull gets `lift × |g|` more (`physics::lift_accel`, any direction, nothing in weightless space, so free flight is bit-identical); `Body::ship` has friction 0 (half the floor's by the average rule), so a landed ship can walk |
 | `space-scene` | the physical definition of every scene, shared by shards and clients: statics (the demo area's stations with the client's numbers, the Kestrel collider read from `kestrel_lod1.glb`), the demo area's physics showcase (the gravity room, whose curbs stop balls but not ships; the zero-g corner; the planetoid at `demo::PLANETOID_CENTER`: a 4 m rock with large-body gravity, 4 m/s² on its surface, a 16 m reach, crates resting on it and three balls in orbit), gravity, the shape catalogue, the `visual` ids and names, `scene_anchor` (where a scene is in the map: the centre of a one-cell root, else the root's centre corner + `ANCHOR_OFFSET` = 6 m, 512 m up, 4 m) |
-| `space-net` | quinn QUIC transport (self-signed rustls, `ring`), hello/handshake (a version mismatch is answered with a `Reject`, not a dropped connection) |
-| `space-server` | authoritative shard (`space-server` bin), `handoff.rs` seamless handoff (ships and unowned bodies, island groups); holds and relays the scene (`--scene` standalone only) and simulates it (`shard_physics.rs`: the scene's bodies, spawned once per cluster by the shallowest region's shard; free spawn points, on the shard's own ground only around the scene's spawn point; ghosts); `border.rs` = the cross-shard physics rules (ghost margin 64 m + 3 s of motion, islands 0.5 m + 1 s of motion, consolidation onto the home of an island's lowest guid; hysteresis: a body moves 2 m into a region or after 3 s in it, an island that was in a group waits until it has wanted the move for 3 s, doubling up to 48 s for a body that keeps coming back; a player's ship carries `Visual(PLAYER)`, ghosts included); `replicate.rs` = every body in interest, changed components only in deltas (`ComponentLog`) |
-| `space-orchestrator` | epoch-versioned shard map (`topology.rs`: `carve_plan` carves any node inside a region for a new owner, down to one cell; the octant split is that with a size floor; a merge gives a region back to the nearest region around it; `epoch.rs`: every shard of the map is sent and must ack a change), `Orchestrator::begin_carve`, autoscaler, ShardId counter, `--launcher local`; owns the scene (`scene.rs`, persisted in `<state>.scene`); operator path `ops.rs`/`snapshot.rs`/`events.rs`; built-in web UI `webui/` (hand-rolled HTTP, server-rendered HTML, **no JavaScript**) |
+| `space-net` | quinn QUIC transport (self-signed rustls, `ring`), hello/handshake (a version mismatch is answered with a `Reject`, not a dropped connection); `secret.rs` = the one constant-time compare every shared secret uses and `Secret`, the type every holder of one keeps it in (its `Debug` prints `<redacted>`); `log_budget.rs` = `LogBudget`, a few log lines per window for what a stranger can cause |
+| `space-server` | authoritative shard (`space-server` bin), `handoff.rs` seamless handoff (ships and unowned bodies, island groups); `orchestrated.rs` = an orchestrated shard's life: it registers **without id or region** and is given both, asks again while told "not yet" (`Reject`/`Draining`), ends on any other refusal, and **stops when it loses the orchestrator** (the process exits non-zero); `net.rs` = the front end, incl. the cluster's peer token (`shard:<id>:<token>` in a peer hello, refused without it when the shard holds one); holds and relays the scene (`--scene` standalone only) and simulates it (`shard_physics.rs`: the scene's bodies, spawned once per cluster by the shallowest region's shard; free spawn points, on the shard's own ground only around the scene's spawn point; ghosts); `border.rs` = the cross-shard physics rules (ghost margin 64 m + 3 s of motion, islands 0.5 m + 1 s of motion, consolidation onto the home of an island's lowest guid; hysteresis: a body moves 2 m into a region or after 3 s in it, an island that was in a group waits until it has wanted the move for 3 s, doubling up to 48 s for a body that keeps coming back; a player's ship carries `Visual(PLAYER)`, ghosts included); `replicate.rs` = every body in interest, changed components only in deltas (`ComponentLog`) |
+| `space-orchestrator` | epoch-versioned shard map (`topology.rs`: `carve_plan` carves any node inside a region for a new owner, down to one cell; the octant split is that with a size floor; a merge gives a region back to the nearest region around it; `epoch.rs`: every shard of the map is sent and must ack a change), `Orchestrator::begin_carve` (asks for a node; nothing is proposed before a shard registers to take it), autoscaler, ShardId counter; the **shard lifecycle** (`orchestrator.rs`: a region is given at the hello - the root, a dead shard's regions, a wanted node, else the next layout cell of `topology::layout_cells` - through an epoch proposed with the shard already connected; `--min-shards`/`--max-shards` and the reconciler, which also stops launches that are no longer needed; supervision: a dead shard - its process gone, its link closed, or three map changes in a row unacknowledged - is replaced under a new id and the scene revision raised); launchers `launcher/{local,process,docker}.rs` (`local` = inside this process, `process` = one `space-server` process per shard, `docker` = stub); cluster secret + peer token (`control.rs`, `config.rs`); `control.rs` is also the control port's front end: a connection is read only after its hello was welcomed, and then only about the shard it was welcomed as; owns the scene (`scene.rs`, persisted in `<state>.scene`); operator path `ops.rs`/`snapshot.rs`/`events.rs`; built-in web UI `webui/` (hand-rolled HTTP, server-rendered HTML, **no JavaScript**) |
 | `space-render` | ash/Vulkan renderer, naga WGSL->SPIR-V in `build.rs`, ray-query GI and shadows, presets, reversed-Z, `mesh.rs` (GLB models, in the TLAS), `texture.rs` (PNG/JPEG decode, procedural textures), `overlay.rs` (2D rects + built-in 5x7 font), `environment.rs`, `swapchain.rs` |
 | `space-client` | the client, one core (`app.rs`) with three front ends: window (`window.rs`), `--headless` and `--stream` (`headless.rs`); `connect.rs`/`address.rs` (connect screen), `input.rs`, `ui.rs` (HUD), `scenes.rs` + `demo_area.rs` (what each server scene looks like; the physics showcase's statics drawn from `space-scene`'s definition), `link.rs` (player link, scene, shard transitions, replicated bodies merged per protocol 5), `bodies.rs` + `meshes.rs` (bodies drawn from their collision shapes, interpolated between ticks, springs as coils, joints as pins), `predict.rs` (the own ship predicted through `PredictedPhysics` with the scene's statics, gravity and nearby bodies; the draw clock) |
 | `space-harness` | drive a client without a human: `Control` trait + `Hub`, loopback HTTP API (`http.rs`), sandboxed Lua scripts (`script.rs`, interpreter `lunita`), `examples/fake.rs` |
@@ -128,7 +128,9 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   reference pictures; open them after any renderer change.
 
 ## Invariants - do not break
-- **Wire gate**: `PROTOCOL_VERSION` (`space-protocol/src/codec.rs`, now 5: bodies with component ids 4-10 in
+- **Wire gate**: `PROTOCOL_VERSION` (`space-protocol/src/codec.rs`, now 6: `ShardHello` carries the cluster
+  secret as its last field, a `Reject`/`Draining` answer to it means "ask again", and a shard-to-shard `Hello`
+  carries the peer token behind the id in its token field; since 5: bodies with component ids 4-10 in
   snapshots/deltas, a delta entry for a known entity lists only changed components - `ShipState` and `Owner`
   always, an empty payload removes one - and `GhostUpdate` is the per-tick batch of border ghosts) is checked in every hello
   (`check_hello`). `Message::VARIANT_COUNT` (28) = one past the highest tag; only APPEND variants,
@@ -178,9 +180,43 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   (`--webui`) and the client harness (`--harness`) are off unless asked for, need no credentials on
   loopback only, and refuse any other bind without a token (>= 16 chars). A tokenless web UI serves
   loopback `Host`s only and refuses proxied requests. Do not weaken either.
+- **Shard registration and peers**: the control port takes a `ShardHello` without a secret on a loopback
+  bind only; on any other bind (or with `--cluster-secret`/`SPACE_CLUSTER_SECRET` set) the hello must
+  carry the cluster secret - checked **before** the cluster name, so a stranger learns nothing - and the
+  orchestrator refuses to start off loopback without one (a configured one >= 16 chars, or - with
+  `--min-shards` >= 1 - one it generates and hands its shards in their environment, never argv).
+  **The hello gates the connection** (`control.rs`, `Inbound`): nothing a connection sends is read before
+  the run loop's verdict; refused (for good or "not yet") it is told why and **closed**; welcomed it is
+  admitted as one shard id, and a `LoadReport`/`EpochAck`/`SceneAck` is taken only if it names that id -
+  the run loop gets the sender from the connection (`handle_*_from`), never from the message. Shards
+  present the `ShardWelcome`'s peer token to each other and refuse a peer hello without it; a configured
+  one (`--peer-token[-file]`, `SPACE_ORCHESTRATOR_PEER_TOKEN[_FILE]`) must be >= 16 chars (an empty one
+  would switch the check off). Constant-time compares (`space_net::constant_time_eq`). **No secret in a
+  derived `Debug`**: hold one in `space_net::Secret` (`ControlPlane`, `ShardNet` do), and a message that
+  carries one gets a hand-written `Debug` (`Hello` - its token field is the peer token between shards -
+  `ShardHello`, `ShardWelcome`; `SpawnSpec`, `OrchestratedOptions`); each has a test that prints it. Log
+  lines a stranger can cause (refused hellos, refused peers, misattributed acks) go through a budget
+  (`space_net::LogBudget`, the orchestrator's peer-caused event ring): a few per window, the rest counted.
+- **Shard lifecycle** (`docs/plan-sharding.md` §2): a shard never names its id or region; **ids are never
+  reused**, also not for a shard that restarts in place (it replaces itself under a new id - but only a
+  hello that is going to be served, from the IP it advertises, makes the old shard dead, and a launched
+  shard's process is kept); a region is owned only once its epoch has committed; one epoch change at a
+  time, and none is proposed while a shard of the map holds no control link (every shard of the map must
+  ack; three deadlines missed in a row make a connected shard dead). A join whose epoch aborts is stopped.
+  **Launches**: matched to their shard by address, never to a dead shard nor to one that registered
+  before the launch was staged; the pause after failures (1 s doubling to 30 s) starts over only when a
+  launch's shard owns a region; a launch that is no longer needed is stopped, not given a layout cell;
+  `--min-shards` <= 8, `--max-shards`, `--max-regions` or the orchestrator does not start; no merge at or
+  below `--min-shards`. The `process` launcher starts the executable by absolute path, keeps
+  `SPACE_ORCHESTRATOR_*` and `SPACE_HARNESS_TOKEN` out of the child's environment, and keeps
+  `launched-shards.pid` equal to its table of running children. `--host-port-range` must stay out of
+  the OS's dynamic port range (a shard binding `127.0.0.1:<p>` takes over the datagrams of a client socket
+  on `0.0.0.0:<p>`); nothing checks that for you.
 - naga must resolve >= 30 (`space-render/build.rs` asserts it). ShardIds are monotonic, never reused.
 - Docker: `Dockerfile.orchestrator`, `Dockerfile.shard` and the local compose have been built and run
-  (Docker 28); say plainly which files you did and did not execute when you touch them.
+  (Docker 28) - the compose files **not** since they were given the cluster secret (required, no default:
+  `${SPACE_CLUSTER_SECRET:?...}` in the local one) and stopped publishing the control port; say plainly
+  which files you did and did not execute when you touch them. The control port is never published.
 - **Pipeline** (details: `deploy/README.md`, `deploy/proxy/README.md`): EVERY push to `main` (no path filter, no
   concurrency group) runs both `release-images.yml`, which pushes
   `ghcr.io/eliasstepanik/space-{shard,orchestrator,client}` as `:sha-<short>` and then moves `:latest`, and
@@ -218,9 +254,18 @@ For anything a real client shows (connect screen, HUD, scene switches) prefer th
 
 ## Run the stack by hand
 `scripts/dev.ps1` / `scripts/dev.sh`: `-Topology orchestrated|single|two-shards` (default orchestrated:
-orchestrator + web UI `http://127.0.0.1:7980/` + one shard `127.0.0.1:7777`), `-Scene` (what the SERVERS
+orchestrator + web UI `http://127.0.0.1:7980/` + one shard `127.0.0.1:7777`), `-MinShards N` (orchestrated:
+the orchestrator starts N shards itself with `--launcher process`, ports from 7870, logs
+`target/dev/shard-<port>.log`; 4 = the demo area's four quadrants; the script waits until they own their
+regions and points the client at the spawn point's owner), `-Scene` (what the SERVERS
 show), `-Client window|headless|stream`, `-Harness`, `-Script`, `-ServersOnly`, `-Stop`, `-PortOffset`.
+`-Stop` stops the pids in `target/dev/servers.pid` and `launched-shards.pid` (the orchestrator's list of
+its running shards) - each only if its executable lies in this checkout's `target/release`.
+Orchestrator flags for it: `--min-shards` (at most 8), `--max-shards` (8), `--launcher local|process|docker`,
+`--shard-exe`, `--shard-log-dir`, `--host-port-range`, `--cluster-secret[-file]`, `--peer-token[-file]`
+(env forms in `space-orchestrator`'s `main.rs` docs).
 `two-shards` is the manual seamless-handoff setup (shard 1 owns `64:0:0:0`, shard 2 `64:1:0:0`, `--peer` each
 other); the automated version is `crates/space-client/tests/handoff.rs`.
-Ports: 7777/7778 shards, 7900 orchestrator, 7980 web UI, 8097 viewer page, 8098 harness API, 8099 stream.
+Ports: 7777/7778 shards, 7870-7899 shards the orchestrator starts, 7900 orchestrator, 7980 web UI, 8097
+viewer page, 8098 harness API, 8099 stream.
 Everything else about running and looking at it: `skills/space-visual-test/SKILL.md`. Containers: `deploy/README.md`.

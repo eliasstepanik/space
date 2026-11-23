@@ -26,9 +26,7 @@
 //! already in place. See "Deferred: bollard DockerLauncher" in
 //! `docs/plan-phase3.md`.
 
-use space_protocol::shard::ShardId;
-
-use super::{LaunchError, Launcher, Poll, ShardHandle, SpawnSpec};
+use super::{LaunchError, LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
 
 /// Why the Docker launcher cannot run in this build.
 pub const UNAVAILABLE: &str = "docker launcher requires the bollard dependency, which is not \
@@ -66,11 +64,11 @@ impl Launcher for DockerLauncher {
         Err(unavailable())
     }
 
-    async fn kill(&self, _shard: ShardId) -> Result<(), LaunchError> {
+    async fn kill(&self, _launch: LaunchId) -> Result<(), LaunchError> {
         Err(unavailable())
     }
 
-    async fn poll(&self, _shard: ShardId) -> Result<Poll, LaunchError> {
+    async fn poll(&self, _launch: LaunchId) -> Result<Poll, LaunchError> {
         Err(unavailable())
     }
 }
@@ -78,18 +76,15 @@ impl Launcher for DockerLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use space_protocol::shard::ShardRegion;
-    use space_world::NodeRef;
     use std::net::SocketAddr;
 
     fn spec() -> SpawnSpec {
-        let any = SocketAddr::from(([127, 0, 0, 1], 0));
         SpawnSpec {
-            shard: ShardId::new(1),
-            region: ShardRegion::new(NodeRef::new(40, [0, 0, 0]), ShardId::new(1), any),
+            launch: LaunchId(1),
             cluster: "test".into(),
-            control_addr: any,
+            control_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             host_port: 0,
+            secret: String::new(),
         }
     }
 
@@ -98,8 +93,8 @@ mod tests {
         let launcher = DockerLauncher::new();
         let want = LaunchError::Unavailable(UNAVAILABLE.to_owned());
         assert_eq!(launcher.spawn(spec()).await.unwrap_err(), want);
-        assert_eq!(launcher.kill(ShardId::new(1)).await.unwrap_err(), want);
-        assert_eq!(launcher.poll(ShardId::new(1)).await.unwrap_err(), want);
+        assert_eq!(launcher.kill(LaunchId(1)).await.unwrap_err(), want);
+        assert_eq!(launcher.poll(LaunchId(1)).await.unwrap_err(), want);
         assert_eq!(launcher.ensure_available().unwrap_err(), want);
         assert!(want.to_string().contains("bollard"));
     }

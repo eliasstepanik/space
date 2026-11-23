@@ -104,7 +104,8 @@ above:
 - `Orchestrator::begin_carve(node) -> Result<CarveStarted { node, shard, from, epoch }, String>`
   runs a carve as one epoch with **today's launcher flow** (the new shard is launched, says hello
   with the id and node allocated for it, is handed the prepare, acks). `begin_split` picks the
-  octant and calls the same code. Section 2 replaces the launch by "already connected".
+  octant and calls the same code. Section 2 replaces the launch by "already connected" (done: it
+  returns `CarveWanted { node, from }` now, see the status block there).
 - A merge works for a carved cell end to end (autoscaler, operator, web UI); the snapshot's
   `RegionView::parent` is now the enclosing region (any number of levels up), `octant` only when
   that is the direct parent, and the page says "carved out of ..., N levels up".
@@ -166,6 +167,130 @@ One path for every shard, launched or started by hand: **start without a region,
   must carry it when the control port is not on loopback, and every shard-to-shard hello carries
   the `peer_token` and is refused without it - shard ports become public in section 4, so map
   membership alone is no longer enough.
+
+**Status: built (phase 1, second half), except the `docker` launcher (section 8).** What it
+became, and where it differs from the bullets above:
+
+- **Hello** (`Orchestrator::handle_shard_hello -> Result<ShardWelcome, HelloRefusal>`): a hello
+  without id and region is given, in this order, the unclaimed root; the regions of a **dead**
+  shard (a replacement goes before everything else); the node a pending request waits for
+  (`wanted`: an operator's or the autoscaler's split or carve); the next free layout cell
+  (`topology::layout_cells`, `next_layout_cell`). The id is allocated there and the carve or the
+  replacement is proposed with the shard's control link already registered. The welcome names the
+  region, but the shard owns it only once the map says so (`ShardWelcome` docs).
+- **Waiting** is `HelloRefusal::Wait`, sent as the existing `RejectReason::Draining` - no new wire
+  variant. The shard (`space-server/src/orchestrated.rs`: `register`, `classify`) asks again after
+  250 ms, doubling to 2 s, for as long as it takes - **on a new connection each time**: the
+  orchestrator closes a control connection after every refusal, final or not (see "The control
+  connection" below). An orchestrator it cannot reach at all is given up on after 10 s;
+  `Unauthorized`, `Full` (`max-shards`), `Other` (wrong cluster, a claim that cannot be served, a
+  launched shard that is no longer needed) and a protocol mismatch are final. Hello-driven changes
+  do **not** wait for `MIN_EPOCH_INTERVAL`: `--min-shards 4` settles in about a second. A "wait"
+  that passes by itself (a change in flight, a shard that is not connected yet) is not logged; one
+  that does not - the id counter cannot be written, a hello names a live shard's address from
+  another host - is, once per reason.
+- **The control connection** (`control.rs`, `Inbound`): the cluster secret gates the hello and the
+  hello gates everything else. The connection's task reads nothing after the hello until the run
+  loop's verdict is in; refused, the reason is delivered (`Conn::reject`: written, finished, given
+  up to a second to be read) and the connection closed; welcomed, the connection is admitted as
+  **that shard id** for its life, and a `LoadReport`, `EpochAck` or `SceneAck` is passed on only if
+  it names it. The run loop takes the sender from the connection, not from the message.
+- **A split or carve no longer proposes anything.** `begin_carve(node) -> Result<CarveWanted {
+  node, from }, String>` records the node as wanted and the reconciler launches a shard for it;
+  the epoch is proposed when that shard says hello. One wanted node at a time; it is given up
+  after 60 s (`WANTED_TIMEOUT_TICKS`). The operator's answer reads "region X is wanted for a new
+  shard" instead of "epoch N proposed".
+- **Live recipients**: a change is refused up front while a shard of the map (or one it names) has
+  no control link (`absent_recipient`), with the one exception of the dead shard a replacement
+  takes over from (`EpochPublisher::propose_without`).
+- **Claims**: a hello that names an id is only confirmed for a node that id owns in the map, or
+  the reserved root. An issued id on a node outside the map, an id that is already registered and
+  the old "same endpoint gets its id back" restart are all refused or replaced: a shard that
+  comes back at its address is a new shard with a new id.
+- **Coming back at one's address** (`take_over_in_place`): a hello that advertises the address of
+  a live registered shard replaces that shard - but only (a) when it is going to be served: no
+  change is in flight (it is told to wait, and nobody is made dead) and everybody who has to ack
+  the replacement is connected; (b) when its control connection comes from the IP it advertises
+  (from anywhere else it waits until the old shard's own link has closed); and (c) without
+  killing a process: if the old shard was a launch, the launch *is* the process saying hello, and
+  is matched to the new id. No launch is staged for regions the hello is taking itself.
+- **Reconciler** (`reconcile_launches`): target = max(`min_shards`, live owners + dead shards to
+  replace + the wanted node), never above `max_shards`; one launch at a time until the root is
+  claimed; a failed launch is followed by a pause of 1 s, doubling to 30 s - the count starts
+  over only when *a launch's shard comes to own a region*, not because other launched shards are
+  healthy; a launch that has not registered after 30 s is stopped. A dead shard is replaced by a
+  launch only if it was launched itself or `min_shards > 0` - a shard started by hand is replaced
+  by the next one that says hello. **Surplus launches are stopped**: when there are more live and
+  starting shards than the target (a shard started by hand took a dead shard's regions first, a
+  wanted node was given up or taken), the launches that have not registered are stopped, newest
+  first; one whose hello gets there first and finds nothing left is refused for good and stopped
+  instead of being given a layout cell. (A shard started by hand that registers with nothing
+  missing still gets the next layout cell.) The in-process launcher's shards cannot be told from
+  hand-started ones by their hello, so its surplus is found by counting only, and never while a
+  shard that registered within the last 5 s is still unmatched. `--min-shards` above what can be
+  placed (8: the root and the seven layout cells), above `--max-shards` or above `--max-regions`
+  is refused at startup; a merge that would take the cluster to or below `--min-shards` is
+  refused.
+- **Launchers** are keyed by `LaunchId`, not by shard id (`SpawnSpec { launch, cluster,
+  control_addr, host_port, secret }`): the orchestrator learns which shard a launch became from
+  the handle (`local`) or from the advertised endpoint (`process`: matched at the hello, by the
+  host port the launch was handed). A launch is never matched to a shard that is dead or that
+  registered before the launch was staged, and a launch whose shard is gone is removed when its
+  process is. `process` (`launcher/process.rs`): `space-server` next to the orchestrator's
+  executable or `--shard-exe` (made absolute once and started by exactly that path), one port of
+  `--host-port-range` each, `shard-<port>.log` under `--shard-log-dir`, the secret through the
+  child's environment, the orchestrator's own variables (`SPACE_ORCHESTRATOR_*`,
+  `SPACE_HARNESS_TOKEN`) kept out of it. `launched-shards.pid` lists **exactly the processes
+  that are running**: rewritten (temporary file, rename) at every start, stop and observed exit,
+  removed when none is left. **The host port range must lie outside the OS's dynamic port range**
+  (a shard bound to `127.0.0.1:p` takes the datagrams of a socket another shard got on
+  `0.0.0.0:p`); the binary does not check that.
+- **Supervision**: a closed control link of a registered shard, a launch whose process is gone
+  and the admin `KillShard` all end in `declare_dead`. The replacement's epoch moves every region
+  of the dead shard to the new id; when it commits the scene revision is raised once
+  (`respawn_scene`; a raise that cannot be saved is tried again every second). Measured on
+  real `process` stacks (release build, loopback): 0.3-1.1 s from the kill to a whole cluster on
+  the new revision - up to half a second of it is the wait for the launcher's next poll - also
+  when the range has exactly as many ports as shards and the replacement is handed the dead
+  shard's own port, three times in a row. **A join whose epoch aborts is stopped**
+  (link closed, process killed), not kept - whatever aborted it. A shard started by hand whose
+  join was aborted therefore **exits and has to be started again**; one the orchestrator
+  launched is launched again, after the pause a failed launch earns when the abort was at the
+  deadline. (Keeping a healthy joiner when the abort was another shard's death, and giving it
+  that shard's regions instead, is not built: what a shard owns is what the committed map says,
+  but where it puts a player who joins it directly is still the centre of the region its
+  *welcome* named - `shard_physics.rs` - so a joiner cannot simply be handed other regions.)
+  **A shard that is connected but does not answer** is counted: three map changes in a row that
+  run into their deadline without its ack make it dead, and it is replaced like any other. The
+  outcome of an epoch is *queued* for a shard that is then stopped (an aborted joiner, a merged
+  shard) before its link is closed in the same beat; whether it still reads it is not guaranteed,
+  and it stops either way.
+- **A shard without its orchestrator stops** (`RunningShard::wait` returns the reason, the binary
+  exits non-zero) as soon as the control link is lost - every orchestrated shard, not only
+  launched ones. After a hard kill of the orchestrator that is QUIC's idle timeout, about 11 s.
+- **Secrets**: `--cluster-secret` / `--cluster-secret-file` / `SPACE_CLUSTER_SECRET[_FILE]`
+  (>= 16 characters). A configured secret is required on every bind, loopback included. Off
+  loopback with none configured the orchestrator starts only with `--min-shards >= 1`: it then
+  generates one and hands it to what it launches; otherwise it refuses to start. `ShardHello`
+  ends with `secret` (`PROTOCOL_VERSION` 6). When a secret is required it is checked before the
+  cluster name: without it a hello is told `Unauthorized` and nothing about the cluster. The
+  peer token is generated when none is given (`--peer-token[-file]`,
+  `SPACE_ORCHESTRATOR_PEER_TOKEN[_FILE]`; a configured one under 16 characters is refused at
+  startup - an empty one would switch peer authentication off); a shard that has one refuses a
+  peer hello without it (`shard:<id>:<token>`, `net::peer_token_admits`, compared with
+  `space_net::constant_time_eq`; counted, logged at most three times per ten seconds). Both
+  secrets are held in `space_net::Secret` and `Hello` has a redacting `Debug`: no derived
+  `Debug` prints either.
+- **Not done here**: the `docker` launcher (signatures adapted only, section 8); players of a
+  dead shard are **not** redirected - a client keeps retrying the address it was given until
+  section 4's player port exists (and the replacement of a launched shard is handed the *next*
+  free port of the range, not the dead one's: such a client does not come back by itself, and
+  after the root's shard was replaced the address the dev script printed is stale); a client
+  shows the
+  old and the new scene's bodies together for about 0.3 s after the revision is raised; an
+  orderly exit of the orchestrator on a signal (its shards notice the lost link after QUIC's idle
+  timeout, about 11 s, and stop by themselves; the pid file of a killed orchestrator still lists
+  them).
 
 ## 3. Load and autoscaling
 

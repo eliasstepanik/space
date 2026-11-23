@@ -362,6 +362,7 @@ pub struct ServerInfo {
 pub const fn launcher_label(kind: LauncherKind) -> &'static str {
     match kind {
         LauncherKind::Local => "local",
+        LauncherKind::Process => "process",
         LauncherKind::Docker => "docker",
     }
 }
@@ -1107,7 +1108,7 @@ mod tests {
     use crate::control::ControlPlane;
     use crate::epoch::EpochPublisher;
     use crate::ids::{MemoryCounterSink, PersistentShardIdAllocator};
-    use crate::launcher::{LaunchError, Launcher, Poll, ShardHandle, SpawnSpec};
+    use crate::launcher::{LaunchError, LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
     use crate::ops::OpsPort;
     use crate::orchestrator::Orchestrator;
     use crate::OrchestratorConfig;
@@ -1126,15 +1127,16 @@ mod tests {
     impl Launcher for NoLauncher {
         async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
             Ok(ShardHandle {
-                shard: spec.shard,
-                endpoint: spec.region.endpoint,
+                launch: spec.launch,
+                shard: None,
+                endpoint: spec.control_addr,
                 process: "none".into(),
             })
         }
-        async fn kill(&self, _shard: ShardId) -> Result<(), LaunchError> {
+        async fn kill(&self, _launch: LaunchId) -> Result<(), LaunchError> {
             Ok(())
         }
-        async fn poll(&self, _shard: ShardId) -> Result<Poll, LaunchError> {
+        async fn poll(&self, _launch: LaunchId) -> Result<Poll, LaunchError> {
             Ok(Poll::Alive)
         }
     }
@@ -1167,6 +1169,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 7_001)),
             region: None,
+            secret: String::new(),
         })
         .expect("the root owner registers");
         orch.note_connected([ShardId::new(1)]);
@@ -1463,6 +1466,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: loopback(),
             region: None,
+            secret: String::new(),
         });
         let (handle, _port) = crate::ops::channel(orch.snapshot());
         let service = service_with(handle, None, &[]);
@@ -2023,10 +2027,16 @@ mod tests {
         assert_eq!(response.header("x-space-result"), Some("accepted"));
         let location = response.header("location").expect("a redirect").to_owned();
         assert!(location.starts_with("../?refresh=10&notice="), "{location}");
-        assert!(text(&response).starts_with("accepted: epoch 2 proposed"));
+        assert!(
+            text(&response).starts_with("accepted: region 41:1:1:1 is wanted for a new shard"),
+            "{}",
+            text(&response)
+        );
 
-        // The page the redirect leads to shows the outcome and the change in
-        // flight (nobody acks here, so it stays in flight).
+        // The page the redirect leads to shows the outcome and what is under
+        // way: the octant waits for its shard, and one is being started
+        // (nobody registers here, so that is where it stays — nothing is
+        // proposed before a shard is there to take the octant).
         let page = text(
             &service
                 .handle(&get(location.trim_start_matches("..")))
@@ -2036,16 +2046,16 @@ mod tests {
             page.contains("class=\"notice ok\""),
             "the outcome is on top"
         );
-        assert!(page.contains("Epoch change in flight"));
-        assert!(page.contains("41:1:1:1"));
-        assert!(page.contains("split child, epoch pending"));
+        assert!(page.contains("<dt>waiting for a shard</dt><dd>region 41:1:1:1</dd>"));
+        assert!(page.contains("<dt>starting</dt><dd>1 shard(s)</dd>"));
+        assert!(!page.contains("Epoch change in flight"));
 
-        // A second change while one is in flight is refused, and says why.
+        // A second change while one is under way is refused, and says why.
         let response = service.handle(&post("/action/split", &body)).await;
         assert_eq!(response.status, 303);
         assert_eq!(response.header("x-space-result"), Some("refused"));
         assert!(
-            text(&response).contains("still in flight"),
+            text(&response).contains("still waiting for its new shard"),
             "{}",
             text(&response)
         );
@@ -2073,10 +2083,31 @@ mod tests {
         let root = orch.config().root_node();
         let k = root.center().cell;
         let cell = space_world::NodeRef::new(64, [k[0] - 1, k[1], k[2]]);
-        let started = orch.begin_carve(cell).expect("the cell is inside the root");
-        assert_eq!(started.shard, ShardId::new(2));
-        for shard in [ShardId::new(1), started.shard] {
-            orch.handle_epoch_ack(shard, started.epoch);
+        orch.begin_carve(cell).expect("the cell is inside the root");
+        // The shard for it registers (no id, no region) and is given the cell.
+        let new = orch
+            .handle_shard_hello(&ShardHello {
+                cluster: "space-test".to_owned(),
+                shard: ShardId::NONE,
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 7_002)),
+                region: None,
+                secret: String::new(),
+            })
+            .expect("the new shard registers");
+        assert_eq!((new.shard, new.region.node), (ShardId::new(2), cell));
+        // While its epoch is in flight the page says so.
+        {
+            let (handle, _port) = crate::ops::channel(orch.snapshot());
+            let page = text(&service_with(handle, None, &[]).handle(&get("/")).await);
+            assert!(page.contains("Epoch change in flight"));
+            assert!(page.contains("new, epoch pending"));
+            assert!(page.contains(&format!(
+                "carve of region {} for new shard 2",
+                crate::snapshot::node_path(cell)
+            )));
+        }
+        for shard in [ShardId::new(1), new.shard] {
+            orch.handle_epoch_ack(shard, 2);
         }
         assert_eq!(orch.map().epoch, 2, "the carve committed");
         for _ in 0..crate::config::MIN_EPOCH_INTERVAL_TICKS {
@@ -2084,7 +2115,7 @@ mod tests {
         }
         // The cell's shard says it is empty.
         orch.handle_load_report(&LoadReport {
-            shard: started.shard,
+            shard: new.shard,
             players: 0,
             tick_p95_ms: 1.0,
             load: 0.0,

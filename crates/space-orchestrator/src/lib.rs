@@ -22,7 +22,7 @@
 //! | **H12** | An epoch change cannot strand a handoff. | One epoch change at a time ([`epoch`]), never two bumps inside the handoff timeout for the same region pair. |
 //! | **H13** | A split or merge is invisible to a connected client. | Phase 2's make-before-break, unchanged: the new map reaches the client through `Redirect`. A merge only ever removes a shard whose own load report says it has no players, and kills it only once the merge has committed ([`orchestrator`]). |
 //! | **H14** | The autoscaler is deterministic and never flaps. | [`autoscale`]: pure function of `(reports, tick, prior state)`, dwell in ticks, hysteresis band, per-shard cooldown, one action in flight. |
-//! | **H15** | The world converges back to its declared topology after a shard dies; a dead shard's id is never reused. | `launcher::Launcher::poll` + reassignment through the epoch protocol (wired in a later slice). |
+//! | **H15** | After a shard dies its regions are owned by a live shard again, and nothing else changes until they are; a dead shard's id is never reused. What the dead shard simulated is gone: the scene's bodies are built once, afresh, and its players join again. | A shard is dead when its launcher says its process is ([`launcher::Launcher::poll`], asked twice a second) or its control link has closed ([`orchestrator::Orchestrator::declare_dead`]). The orchestrator keeps `--min-shards` shards running, so a replacement is launched; the shard that registers next is given the dead one's regions under a **new id** ([`ids`]) through one epoch change that every *live* shard acks and the dead one is not asked for ([`epoch::EpochPublisher::propose_without`]). Until it commits no other change is proposed. When it has, the scene's revision is raised once ([`scene::SceneStore::raise_above`]), so every shard drops the scene's bodies and the spawner builds them all again. A shard that only lost its orchestrator stops itself (`space_server::orchestrated`), so no second owner survives. |
 //!
 //! # Shape of the code
 //!
@@ -39,8 +39,9 @@
 //! * [`topology`] — carve/split/merge geometry over `space_world::octree`
 //! * [`epoch`] — the two-phase epoch publication state machine
 //! * [`autoscale`] — the load metric and the split/merge decision
-//! * [`launcher`] — the [`launcher::Launcher`] seam and [`launcher::local::LocalLauncher`]
-//!   (the in-process impl; `launcher::docker` is a later slice)
+//! * [`launcher`] — the [`launcher::Launcher`] seam, [`launcher::local::LocalLauncher`]
+//!   (shards inside this process) and [`launcher::process::ProcessLauncher`]
+//!   (one `space-server` process per shard); `launcher::docker` is a later slice
 //! * [`scene`] — the cluster's scene, its revision and its persistence (not an
 //!   epoch: see below)
 //! * [`control`] — the control-plane message handlers (QUIC front end later)
@@ -78,11 +79,10 @@
 //!
 //! # What this crate is not yet
 //!
-//! The Docker launcher (`launcher/docker.rs`), the QUIC front end, the event
-//! loop, `main.rs` and the H9–H15 acceptance suite are the following Phase-3
-//! slices (plan §4 P3.8–P3.13). The [`launcher::local::LocalLauncher`] and the
-//! shard-side epoch runtime are in place; everything else here is the foundation
-//! they build on.
+//! The Docker launcher (`launcher/docker.rs`) is a stub. Load reports are
+//! received and acted on, but no shard sends one yet, so the autoscaler only
+//! acts in tests and a merge needs its report said on the shard's behalf
+//! (`docs/plan-sharding.md` §3).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]

@@ -199,6 +199,29 @@ impl EpochPublisher {
         observer_ticks: &[(ShardId, u64)],
         tick: u64,
     ) -> Option<Outbound> {
+        self.propose_without(new_map, changes, observer_ticks, tick, &BTreeSet::new())
+    }
+
+    /// [`Self::propose`], with `absent` left out of the recipients: shards the
+    /// orchestrator **knows to be dead**. They are neither sent the prepare nor
+    /// waited for.
+    ///
+    /// This exists for one change only: the one that gives a dead shard's
+    /// regions to its replacement. Every shard of the map must ack a change
+    /// ([`Self::recipients`]), a dead one never will — so without this the
+    /// change that removes it from the map could never commit, and neither
+    /// could any other. Leaving a *live* shard out would break H10 (it would
+    /// run a map nobody told it was replaced), which is why the callers pass
+    /// nothing here for any other change.
+    #[must_use]
+    pub fn propose_without(
+        &mut self,
+        new_map: ShardMap,
+        changes: Vec<EpochChange>,
+        observer_ticks: &[(ShardId, u64)],
+        tick: u64,
+        absent: &BTreeSet<ShardId>,
+    ) -> Option<Outbound> {
         if !matches!(self.phase, Phase::Idle) {
             return None;
         }
@@ -209,7 +232,11 @@ impl EpochPublisher {
         );
         let max_tick = observer_ticks.iter().map(|(_, t)| *t).max().unwrap_or(tick);
         let activation_tick = max_tick + EPOCH_LEAD_TICKS;
-        let awaiting: BTreeSet<ShardId> = self.recipients(&changes);
+        let awaiting: BTreeSet<ShardId> = self
+            .recipients(&changes)
+            .difference(absent)
+            .copied()
+            .collect();
         let recipients = awaiting.clone();
         let epoch = new_map.epoch;
         let outbound = Outbound {
@@ -321,6 +348,16 @@ impl EpochPublisher {
                 reason: AbortReason::Timeout,
             }),
         })
+    }
+
+    /// Abort the outstanding prepare **now**, whatever its deadline: a
+    /// recipient is known to be dead, so the acks can never be complete.
+    /// Returns the `EpochAbort` for every recipient, exactly as
+    /// [`Self::timeout`] does at the deadline; `None` when nothing is in
+    /// flight. The published map is untouched.
+    #[must_use]
+    pub fn abort(&mut self) -> Option<Outbound> {
+        self.timeout(u64::MAX)
     }
 
     /// Return to `Idle` after a commit or abort was delivered, so the next

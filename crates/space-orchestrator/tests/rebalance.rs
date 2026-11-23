@@ -37,7 +37,7 @@ use space_orchestrator::config::OrchestratorConfig;
 use space_orchestrator::control::ControlPlane;
 use space_orchestrator::epoch::EpochPublisher;
 use space_orchestrator::ids::{MemoryCounterSink, PersistentShardIdAllocator};
-use space_orchestrator::launcher::{LaunchError, Launcher, Poll, ShardHandle, SpawnSpec};
+use space_orchestrator::launcher::{LaunchError, LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
 use space_orchestrator::orchestrator::Orchestrator;
 use space_protocol::control::LoadReport;
 use space_protocol::shard::{ShardId, ShardMap, ShardRegion};
@@ -79,7 +79,7 @@ fn root() -> NodeRef {
 #[derive(Debug, Default)]
 struct RecordingLauncher {
     spawned: StdMutex<Vec<SpawnSpec>>,
-    killed: StdMutex<Vec<ShardId>>,
+    killed: StdMutex<Vec<LaunchId>>,
 }
 
 impl RecordingLauncher {
@@ -87,7 +87,7 @@ impl RecordingLauncher {
         self.spawned.lock().unwrap().clone()
     }
 
-    fn killed(&self) -> Vec<ShardId> {
+    fn killed(&self) -> Vec<LaunchId> {
         self.killed.lock().unwrap().clone()
     }
 }
@@ -96,17 +96,18 @@ impl Launcher for RecordingLauncher {
     async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
         self.spawned.lock().unwrap().push(spec.clone());
         Ok(ShardHandle {
-            shard: spec.shard,
-            endpoint: spec.region.endpoint,
+            launch: spec.launch,
+            shard: None,
+            endpoint: spec.control_addr,
             process: "harness".into(),
         })
     }
-    async fn kill(&self, s: ShardId) -> Result<(), LaunchError> {
-        self.killed.lock().unwrap().push(s);
+    async fn kill(&self, launch: LaunchId) -> Result<(), LaunchError> {
+        self.killed.lock().unwrap().push(launch);
         Ok(())
     }
-    async fn poll(&self, s: ShardId) -> Result<Poll, LaunchError> {
-        Ok(if self.killed.lock().unwrap().contains(&s) {
+    async fn poll(&self, launch: LaunchId) -> Result<Poll, LaunchError> {
+        Ok(if self.killed.lock().unwrap().contains(&launch) {
             Poll::Dead
         } else {
             Poll::Alive
@@ -197,6 +198,8 @@ struct Cluster {
     /// Acks this beat's flush is expected to forward (the prepares outstanding
     /// when the beat began); `drain_acks` waits wall-clock time only for these.
     acks_expected: usize,
+    /// The id the member brought up for the latest launch was welcomed as.
+    last_launched: Option<ShardId>,
 }
 
 impl Cluster {
@@ -214,6 +217,7 @@ impl Cluster {
             beats: 0,
             prepares_sent: AtomicUsize::new(0),
             acks_expected: 0,
+            last_launched: None,
         }
     }
 
@@ -221,15 +225,68 @@ impl Cluster {
         Arc::clone(&self.orch.launcher)
     }
 
-    /// Bring up a member: a real shard on loopback QUIC, running the published
-    /// map, registered with the orchestrator by `ShardHello` like a booting
-    /// shard. No peer endpoint is wired by hand.
+    /// Bring up the member that owns `region` under the id `id` — the root's
+    /// owner, which the map names from the start: a real shard on loopback
+    /// QUIC, running the published map, registered with the orchestrator by a
+    /// `ShardHello` naming that id. No peer endpoint is wired by hand.
     async fn add_member(&mut self, id: ShardId, region: NodeRef) -> SocketAddr {
         let net = Arc::new(ShardNet::bind(addr()).expect("bind shard"));
         let bound = net.local_addr().expect("bound addr");
+        // Register with the orchestrator the way a booting shard does (a
+        // `ShardHello` naming its bound endpoint). Nothing else is wired: no
+        // peer endpoint is told to any shard by hand. How a parent learns where
+        // its new child listens is the orchestrator's map push alone.
+        self.orch
+            .handle_shard_hello(&ShardHello {
+                cluster: OrchestratorConfig::default().cluster,
+                shard: id,
+                endpoint: bound,
+                region: Some(ShardRegion::new(region, id, bound)),
+                secret: String::new(),
+            })
+            .expect("the orchestrator accepts the booting shard");
+        self.start_member(net, id, region).await;
+        bound
+    }
+
+    /// Bring up the member a launch asked for, as every shard after the root
+    /// comes up: it says hello with **no id and no region** and runs as the
+    /// shard, on the region, the orchestrator's welcome names. Returns its id.
+    async fn add_launched_member(&mut self, spec: &SpawnSpec) -> ShardId {
+        let net = Arc::new(ShardNet::bind(addr()).expect("bind shard"));
+        let bound = net.local_addr().expect("bound addr");
+        let welcome = self
+            .orch
+            .handle_shard_hello(&ShardHello {
+                cluster: spec.cluster.clone(),
+                shard: ShardId::NONE,
+                endpoint: bound,
+                region: None,
+                secret: spec.secret.clone(),
+            })
+            .expect("the orchestrator welcomes the launched shard");
+        // What the launcher reports: where the shard it started listens.
+        self.orch.note_launch_result(
+            spec.launch,
+            Ok(ShardHandle {
+                launch: spec.launch,
+                shard: None,
+                endpoint: bound,
+                process: "harness".into(),
+            }),
+        );
+        self.start_member(net, welcome.shard, welcome.region.node)
+            .await;
+        self.last_launched = Some(welcome.shard);
+        welcome.shard
+    }
+
+    /// Start a registered shard: on `net`, as `id`, for `region`, running the
+    /// map the orchestrator has published (in which a launched shard does not
+    /// own its region yet).
+    async fn start_member(&mut self, net: Arc<ShardNet>, id: ShardId, region: NodeRef) {
+        let bound = net.local_addr().expect("bound addr");
         let config = ShardConfig::new(id, bound, region);
-        // The member runs the map the orchestrator has published, so its
-        // `lookup` -- and therefore its handoff boundary -- is the cluster's.
         let mut shard = Shard::new(config);
         // Align the new member's clock with the cluster's. Every member is ticked
         // exactly once per beat, so catching a late joiner up to `beats` makes the
@@ -259,20 +316,7 @@ impl Cluster {
                 }
             });
         }
-        // Register with the orchestrator the way a booting shard does (a
-        // `ShardHello` naming its bound endpoint). Nothing else is wired: no
-        // peer endpoint is told to any shard by hand. How a parent learns where
-        // its new child listens is the orchestrator's map push alone.
-        self.orch
-            .handle_shard_hello(&ShardHello {
-                cluster: OrchestratorConfig::default().cluster,
-                shard: id,
-                endpoint: bound,
-                region: Some(ShardRegion::new(region, id, bound)),
-            })
-            .expect("the orchestrator accepts the booting shard");
         self.members.push(Member { id, shard, net });
-        bound
     }
 
     fn member(&self, id: ShardId) -> &Member {
@@ -375,10 +419,13 @@ impl Cluster {
     /// Send an epoch message to one member (the orchestrator's outbox half).
     async fn deliver(&self, to: ShardId, message: Message) {
         match message {
+            // (The scene travels on the same link: it is re-issued when a dead
+            // shard has been replaced. A member adopts it and confirms.)
             Message::EpochPrepare(_)
             | Message::EpochCommit(_)
             | Message::EpochAbort(_)
-            | Message::DirectoryReply(_) => {
+            | Message::DirectoryReply(_)
+            | Message::SceneSet(_) => {
                 if let Some(m) = self.members.iter().find(|m| m.id == to) {
                     if matches!(message, Message::EpochPrepare(_)) {
                         self.prepares_sent.fetch_add(1, Ordering::SeqCst);
@@ -427,20 +474,23 @@ impl Cluster {
         }
     }
 
-    /// Run what the orchestrator staged: a split's child spawn, a merge's kill.
+    /// Run what the orchestrator staged: the launch of a shard that is missing
+    /// (a split's, a dead shard's replacement), and the stopping of one.
     async fn run_pending_launches(&mut self) {
         for spec in self.orch.take_pending_spawn() {
             self.launcher()
                 .spawn(spec.clone())
                 .await
                 .expect("record spawn");
-            // The child boots with the id the orchestrator allocated for it and
-            // the region it was given -- never one it chose itself.
-            self.add_member(spec.shard, spec.region.node).await;
+            // The shard boots with no id and no region and is given both at
+            // its hello -- never one it chose itself.
+            self.add_launched_member(&spec).await;
         }
         for id in self.orch.take_pending_kill() {
-            self.launcher().kill(id).await.expect("record kill");
             self.members.retain(|m| m.id != id);
+        }
+        for launch in self.orch.take_pending_launch_kill() {
+            self.launcher().kill(launch).await.expect("record kill");
         }
     }
 
@@ -454,11 +504,24 @@ impl Cluster {
         self.orch.map()
     }
 
-    /// Stage a split whose child is *not* brought up, so nothing can ack it and
-    /// the prepare is guaranteed to time out.
+    /// Stage a split whose child registers and then is never heard from again
+    /// (it is not brought up as a member), so its ack never comes and the
+    /// prepare is guaranteed to time out.
     async fn stage_split_isolated(&mut self, parent: ShardId) -> Vec<ShardId> {
         self.orch
             .handle_admin(&space_protocol::AdminCommand::ForceSplit(parent));
+        // The staged launch is not run: a hello arrives for it from an address
+        // nothing listens on, and that is the last anybody hears of it.
+        let _ = self.orch.take_pending_spawn();
+        self.orch
+            .handle_shard_hello(&ShardHello {
+                cluster: OrchestratorConfig::default().cluster,
+                shard: ShardId::NONE,
+                endpoint: addr_on(9),
+                region: None,
+                secret: String::new(),
+            })
+            .expect("the shard for the split registers");
         let mut recipients = Vec::new();
         for (to, message) in self.orch.drain_outbox() {
             if matches!(message, Message::EpochPrepare(_)) {
@@ -466,8 +529,6 @@ impl Cluster {
             }
             self.deliver(to, message).await;
         }
-        // The staged spawn is dropped on purpose: no child exists to ack.
-        let _ = self.orch.take_pending_spawn();
         recipients
     }
 
@@ -477,8 +538,10 @@ impl Cluster {
     async fn stage_split(&mut self, parent: ShardId) -> (ShardId, Vec<ShardId>) {
         self.orch
             .handle_admin(&space_protocol::AdminCommand::ForceSplit(parent));
-        // The child must be a member before the prepare is delivered, or its ack
-        // would never be seen.
+        // The child registers -- which is when its id is allocated and the
+        // prepare is proposed -- and is a member before the prepare is
+        // delivered, or its ack would never be seen.
+        self.last_launched = None;
         self.run_pending_launches().await;
         let mut recipients = Vec::new();
         for (to, message) in self.orch.drain_outbox() {
@@ -487,12 +550,7 @@ impl Cluster {
             }
             self.deliver(to, message).await;
         }
-        let child = self
-            .launcher()
-            .spawned()
-            .last()
-            .expect("the split staged a spawn")
-            .shard;
+        let child = self.last_launched.expect("the split launched a shard");
         (child, recipients)
     }
 
@@ -936,21 +994,32 @@ async fn the_orchestrator_allocates_ids_and_no_launch_spec_carries_one() {
         "the client's shard is one the orchestrator published"
     );
 
-    // Now let the orchestrator launch something. The spec it stages carries the
-    // id *it* allocated -- never a placeholder from a config file or argv.
+    // Now let the orchestrator launch something. The spec it stages carries no
+    // shard id at all -- there is no field for one: the launched shard says
+    // hello without an id and the orchestrator allocates it then, from its own
+    // counter. Never a placeholder from a config file or argv.
     let (child, _) = c.stage_split(shard(1)).await;
     let specs = c.launcher().spawned();
     assert_eq!(specs.len(), 1, "the split staged exactly one launch");
     assert_eq!(
-        specs[0].shard,
-        ShardId::new(100),
-        "the child's id came from the orchestrator's counter, not from a spec"
+        specs[0].launch,
+        LaunchId(1),
+        "named by its launch, not by a shard"
     );
-    assert_eq!(child, ShardId::new(100));
-    assert_ne!(
-        specs[0].shard,
-        ShardId::NONE,
-        "a launch spec never carries the unallocated id"
+    assert_eq!(
+        child,
+        ShardId::new(100),
+        "the child's id came from the orchestrator's counter, at its hello"
+    );
+    assert_eq!(
+        c.orch.launch_of(child),
+        Some(specs[0].launch),
+        "and that launch is the one that became the child"
+    );
+    assert_eq!(
+        c.member(child).id,
+        child,
+        "the member runs as the id it was given"
     );
 }
 
@@ -1466,6 +1535,14 @@ async fn a_killed_shard_is_removed_and_the_world_stays_owned() {
     let mut c = Cluster::new(100);
     c.add_member(shard(1), root()).await;
     let child = c.split(shard(1)).await;
+    let child_region = c
+        .map()
+        .regions
+        .iter()
+        .find(|r| r.shard == child)
+        .expect("the child owns its octant")
+        .node;
+    let child_launch = c.orch.launch_of(child).expect("the split launched it");
 
     // Kill the child through the admin verb (the same path the liveness poll
     // drives). The launcher records the kill and the member is dropped.
@@ -1475,9 +1552,32 @@ async fn a_killed_shard_is_removed_and_the_world_stays_owned() {
         "the killed shard is no longer running"
     );
     assert!(
-        c.launcher().killed().contains(&child),
+        c.launcher().killed().contains(&child_launch),
         "the launcher was told to kill it"
     );
+
+    // Its region does not stay with a dead owner: a replacement is launched,
+    // registers, and is given the octant under a fresh id above the dead one.
+    for _ in 0..16 {
+        c.step().await;
+        if c.map().lookup(&child_region.center()) != Some(child) {
+            break;
+        }
+    }
+    c.deliver_outbox().await;
+    let heir = c
+        .map()
+        .lookup(&child_region.center())
+        .expect("the octant has an owner");
+    assert!(
+        heir.0 > child.0,
+        "the dead shard's id ({child}) is never reused: its region went to {heir}"
+    );
+    assert!(
+        c.members.iter().any(|m| m.id == heir),
+        "and its new owner is a live shard"
+    );
+    assert!(!c.map().regions.iter().any(|r| r.shard == child));
 
     // The surviving shard still owns the world outside the dead shard's region,
     // so a client standing anywhere else is still served.

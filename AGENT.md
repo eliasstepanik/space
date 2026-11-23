@@ -58,6 +58,7 @@ You are expected to *use* the game while you build it.
 | I want to… | Use |
 |---|---|
 | start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): orchestrator + web UI + shard + client |
+| run the demo area on four shards | the same with `-MinShards 4` / `--min-shards 4`: the orchestrator starts the shards itself (one `space-server` process each, logs in `target/dev/shard-<port>.log`), replaces one that dies, and `-Stop` stops them too |
 | drive a client without a human | the harness: `space-client --headless --harness 127.0.0.1:8098`, then `GET /state`, `GET /frame.png`, `POST /input`, `POST /script` |
 | script a user | Lua: `space-client --headless --script scripts/harness/smoke.lua` — the exit code is the script's result |
 | watch and play in a browser | `space-client --stream 127.0.0.1:8099` + `cargo run -p xtask -- viewer` → `http://127.0.0.1:8097/` |
@@ -86,10 +87,19 @@ must not be added back to the production stack.
   stopped before you finish; say so in your report. Use spare ports (the dev
   scripts take a port offset) when someone else may be using the defaults.
 - **No secrets in the repository.** Tokens come from the environment or a file
-  outside the tree. The compose files ship with the admin UI off in production.
+  outside the tree — the cluster secret of the compose files too: it has no
+  default. The compose files ship with the admin UI off in production and do
+  not publish the orchestrator's control port.
 - **Admin and control surfaces stay closed by default.** The orchestrator web
   UI and the client harness are off unless asked for, need no credentials on
-  loopback only, and refuse any other bind without a token. Do not weaken that.
+  loopback only, and refuse any other bind without a token. The orchestrator's
+  control port follows the same rule for shards: no secret on loopback, and on
+  any other bind no start without a cluster secret and no hello without it.
+  A control connection is heard only after its hello was welcomed, and then
+  only about the shard it was welcomed as. Shards of one cluster present its
+  peer token to each other. Do not weaken that, and never print a secret: one
+  is held in `space_net::Secret`, and a message that carries one has a `Debug`
+  that leaves it out.
 - **Pure Rust.** No C dependencies (`ring` is the one sanctioned exception), no
   JavaScript toolchain; the orchestrator web UI is server-rendered HTML with no
   script at all. A new third-party crate needs a stated reason.
@@ -105,7 +115,8 @@ must not be added back to the production stack.
 |---|---|
 | 7777/udp | first shard (QUIC) — what a client connects to |
 | 7778/udp | second shard in the two-shard handoff setup |
-| 7900/udp | orchestrator control port (QUIC) |
+| 7870-7899/udp | shards the orchestrator starts itself (`--launcher process`, `--host-port-range`). Which one owns the spawn point is what `/api/state` names for the shallowest region — usually the first port, but not after a first launch that failed or once the root's shard has been replaced |
+| 7900/udp | orchestrator control port (QUIC): shards only. No credentials on loopback; any other bind needs the cluster secret. Never published by the compose files |
 | 7980/tcp | orchestrator web UI (HTTP) |
 | 8097/tcp | browser viewer page (`xtask viewer`) |
 | 8098/tcp | client harness API (HTTP) |

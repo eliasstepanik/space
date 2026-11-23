@@ -265,11 +265,21 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         });
     });
 
+    // The shards the orchestrator runs by itself, and what is still missing.
+    root.object("fleet", |o| {
+        o.uint("min_shards", snapshot.min_shards as u64);
+        o.uint("max_shards", snapshot.max_shards as u64);
+        o.uint("starting", snapshot.starting as u64);
+        o.opt_string("wanted", snapshot.wanted.map(node_path).as_deref());
+        o.boolean("hello_auth_required", snapshot.hello_auth_required);
+    });
+
     root.objects("shards", &snapshot.shards, |o, shard| {
         o.uint("id", u64::from(shard.shard.0));
         o.string("role", shard.role.label());
         o.boolean("connected", shard.connected);
         o.boolean("registered", shard.registered);
+        o.boolean("launched", shard.launched);
         o.opt_display("advertised", shard.advertised);
         o.array("regions", &shard.regions, |out, region| {
             write_string(out, &node_path(*region));

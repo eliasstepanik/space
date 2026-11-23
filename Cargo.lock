@@ -2672,6 +2672,7 @@ dependencies = [
  "quinn",
  "space-net",
  "space-protocol",
+ "space-scene",
  "space-server",
  "space-sim",
  "space-world",

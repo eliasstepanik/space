@@ -114,6 +114,7 @@ impl Cluster {
                 advertise: None,
                 claim_region: None,
                 cluster: self.name.clone(),
+                secret: String::new(),
             },
             self.control_addr,
         )
@@ -401,14 +402,17 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     assert_eq!(accepted.status, 303, "{accepted:?}");
     assert_eq!(accepted.header("X-Space-Result"), Some("accepted"));
     assert!(
-        accepted.body.starts_with("accepted: epoch 2 proposed"),
+        accepted
+            .body
+            .starts_with("accepted: region 41:1:1:1 is wanted for a new shard"),
         "{accepted:?}"
     );
     let location = accepted.header("Location").expect("a redirect").to_owned();
     assert!(location.starts_with("../?refresh=3&notice="), "{location}");
 
-    // ---- ...and commits through the run loop: prepare, launch, hello, acks,
-    // commit. (It would abort after 3 s if the child never acked.)
+    // ---- ...and commits through the run loop: launch, the new shard's
+    // hello, the id, prepare, acks, commit. (It would abort 3 s after the
+    // prepare if somebody never acked.)
     let state = wait_for_state(ui, Duration::from_secs(10), "the split to commit", |s| {
         map_epoch(s) == 2
     })
@@ -512,11 +516,24 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     );
     assert!(pushed.body.contains("epoch 2"), "{pushed:?}");
 
-    cluster
+    // The fleet as the page and the JSON show it: the child was started by
+    // the orchestrator, the root's shard by hand; nothing is starting.
+    let state = get(ui, "/api/state").await.body;
+    assert!(
+        state.contains(
+            "\"fleet\":{\"min_shards\":0,\"max_shards\":8,\"starting\":0,\"wanted\":null,\"hello_auth_required\":false}"
+        ),
+        "{state}"
+    );
+    assert_eq!(state.matches("\"launched\":true").count(), 1, "{state}");
+    assert_eq!(state.matches("\"launched\":false").count(), 1, "{state}");
+
+    let child = cluster
         .launcher
-        .kill(ShardId::new(2))
+        .launch_of(ShardId::new(2))
         .await
-        .expect("stop the child");
+        .expect("the launcher started the child");
+    cluster.launcher.kill(child).await.expect("stop the child");
     root.abort();
     ui_task.abort();
     cluster.stop();
@@ -819,11 +836,12 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "4 materials\n"
     );
 
-    cluster
+    let child = cluster
         .launcher
-        .kill(ShardId::new(2))
+        .launch_of(ShardId::new(2))
         .await
-        .expect("stop the child");
+        .expect("the launcher started the child");
+    cluster.launcher.kill(child).await.expect("stop the child");
     root.abort();
     ui_task.abort();
     let _ = std::fs::remove_file(&scene_file);
@@ -902,6 +920,10 @@ async fn a_token_protected_web_ui_refuses_everything_without_the_token() {
 /// A shard that restarts and registers again is handed the scene that is
 /// current **now** — also one chosen while it was away — not the one from
 /// when the orchestrator started or from the shard's first registration.
+///
+/// (It comes back as a **new** shard: a restarted process is given the old
+/// one's region under a new id, and because a shard was replaced the scene is
+/// then re-issued one revision up, so that its bodies are built once.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
     let at = |scene: Scene, revision: u64| SceneState::new(scene.id(), revision);
@@ -917,7 +939,7 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
     let switch_to = |scene: &str| format!("csrf={token}&scene={scene}");
 
     let first = cluster.root_shard().await;
-    let (id, endpoint) = (first.shard, first.endpoint);
+    let (id, endpoint, first_region) = (first.shard, first.endpoint, first.region);
     let accepted = post(ui, "/action/scene", &switch_to("solar")).await;
     assert_eq!(
         accepted.header("X-Space-Confirmed"),
@@ -954,21 +976,35 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
             advertise: Some(endpoint),
             claim_region: None,
             cluster: cluster.name.clone(),
+            secret: String::new(),
         },
         cluster.control_addr,
     )
     .await
     .expect("the restarted shard is welcomed back");
-    assert_eq!(second.shard, id, "the same shard");
-    wait_for_scene(&second, at(Scene::Galaxy, 3), Duration::from_secs(5)).await;
+    assert_ne!(
+        second.shard, id,
+        "a new shard: an id is used by one process"
+    );
+    assert_eq!(second.shard, ShardId::new(2));
+    assert_eq!(second.region, first_region, "with the old one's region");
+    // Galaxy — the scene chosen while it was away — and, once it has taken
+    // over the region, galaxy one revision up.
+    wait_for_scene(&second, at(Scene::Galaxy, 4), Duration::from_secs(5)).await;
     let state = wait_for_state(ui, Duration::from_secs(5), "the shard to confirm", |s| {
-        s.contains("\"confirmed_by\":[1],\"not_confirmed_by\":[],\"pending\":false")
+        s.contains("\"confirmed_by\":[2],\"not_confirmed_by\":[],\"pending\":false")
     })
     .await;
     assert!(
         cluster_scene(&state)
-            .starts_with("\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":3,"),
+            .starts_with("\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":4,"),
         "{state}"
+    );
+    assert_eq!(map_epoch(&state), 2, "the replacement was an epoch change");
+    assert_eq!(region_count(&state), 1);
+    assert!(
+        !state.contains("\"id\":1,\"role\""),
+        "nothing is left of the old shard: {state}"
     );
 
     second.abort();

@@ -19,7 +19,7 @@ use space_orchestrator::control::ControlPlane;
 use space_orchestrator::epoch::EpochPublisher;
 use space_orchestrator::ids::{MemoryCounterSink, PersistentShardIdAllocator};
 use space_orchestrator::launcher::local::LocalLauncher;
-use space_orchestrator::launcher::{Launcher, Poll, SpawnSpec};
+use space_orchestrator::launcher::{LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
 use space_orchestrator::orchestrator::Orchestrator;
 use space_protocol::control::LoadReport;
 use space_protocol::shard::{ShardId, ShardMap, ShardRegion};
@@ -37,33 +37,77 @@ fn shard(n: u32) -> ShardId {
 /// A launcher that records spawns/kills and never touches a process.
 #[derive(Debug, Default)]
 struct RecordingLauncher {
-    spawned: std::sync::Mutex<Vec<ShardId>>,
-    killed: std::sync::Mutex<Vec<ShardId>>,
+    spawned: std::sync::Mutex<Vec<LaunchId>>,
+    killed: std::sync::Mutex<Vec<LaunchId>>,
 }
 
 impl Launcher for RecordingLauncher {
     async fn spawn(
         &self,
         spec: SpawnSpec,
-    ) -> Result<space_orchestrator::launcher::ShardHandle, space_orchestrator::launcher::LaunchError>
-    {
-        self.spawned.lock().unwrap().push(spec.shard);
-        Ok(space_orchestrator::launcher::ShardHandle {
-            shard: spec.shard,
-            endpoint: spec.region.endpoint,
+    ) -> Result<ShardHandle, space_orchestrator::launcher::LaunchError> {
+        self.spawned.lock().unwrap().push(spec.launch);
+        Ok(ShardHandle {
+            launch: spec.launch,
+            shard: None,
+            endpoint: launched_at(spec.launch),
             process: "rec".into(),
         })
     }
-    async fn kill(&self, shard: ShardId) -> Result<(), space_orchestrator::launcher::LaunchError> {
-        self.killed.lock().unwrap().push(shard);
+    async fn kill(
+        &self,
+        launch: LaunchId,
+    ) -> Result<(), space_orchestrator::launcher::LaunchError> {
+        self.killed.lock().unwrap().push(launch);
         Ok(())
     }
     async fn poll(
         &self,
-        _shard: ShardId,
+        _launch: LaunchId,
     ) -> Result<Poll, space_orchestrator::launcher::LaunchError> {
         Ok(Poll::Alive)
     }
+}
+
+/// Where the shard of `launch` listens in these tests.
+fn launched_at(launch: LaunchId) -> SocketAddr {
+    addr(9_500 + u16::try_from(launch.0).expect("a small launch number"))
+}
+
+/// Play the launcher for `spec`: its shard says hello — with no id and no
+/// region, like every shard — and the launcher reports its handle. Returns
+/// the id the shard was welcomed as.
+fn register(orch: &mut Orchestrator<RecordingLauncher>, spec: &SpawnSpec) -> ShardId {
+    let endpoint = launched_at(spec.launch);
+    let welcome = orch
+        .handle_shard_hello(&space_protocol::ShardHello {
+            cluster: OrchestratorConfig::default().cluster,
+            shard: ShardId::NONE,
+            endpoint,
+            region: None,
+            secret: String::new(),
+        })
+        .expect("the launched shard is welcomed");
+    orch.note_launch_result(
+        spec.launch,
+        Ok(ShardHandle {
+            launch: spec.launch,
+            shard: None,
+            endpoint,
+            process: "rec".into(),
+        }),
+    );
+    welcome.shard
+}
+
+/// An orchestrator over `plane` in which every shard of the map holds a
+/// control link (a map change is only made when every one of them can
+/// acknowledge it).
+fn orchestrator(plane: ControlPlane) -> Orchestrator<RecordingLauncher> {
+    let mut orch = Orchestrator::new(plane, Arc::new(RecordingLauncher::default()));
+    let owners: Vec<ShardId> = orch.map().regions.iter().map(|r| r.shard).collect();
+    orch.note_connected(owners);
+    orch
 }
 
 /// A control plane whose root (depth 40) is owned by `root_owner`.
@@ -101,8 +145,10 @@ fn cold_report(s: ShardId) -> LoadReport {
     }
 }
 
-/// Drive the autoscaler to a split of the root shard, then ack every prepare
-/// recipient so the epoch commits. Returns the orchestrator's new map epoch.
+/// Drive the autoscaler to a split of the root shard — it asks for an octant
+/// and a shard is launched, which registers and is given it — then ack every
+/// prepare recipient so the epoch commits. Returns the orchestrator's new map
+/// epoch.
 fn drive_split_to_commit(orch: &mut Orchestrator<RecordingLauncher>, hot: ShardId) -> u64 {
     // The metric must actually be hot.
     assert!(space_orchestrator::autoscale::load_metric(&hot_report(hot)) >= SPLIT_THRESHOLD);
@@ -110,6 +156,9 @@ fn drive_split_to_commit(orch: &mut Orchestrator<RecordingLauncher>, hot: ShardI
     for _ in 0..(SPLIT_DWELL_TICKS + 5) {
         orch.handle_load_report(&hot_report(hot));
         orch.tick();
+        for spec in orch.take_pending_spawn() {
+            register(orch, &spec);
+        }
         let outbox = orch.drain_outbox();
         if !outbox.is_empty() {
             prepared = true;
@@ -138,11 +187,8 @@ fn drive_split_to_commit(orch: &mut Orchestrator<RecordingLauncher>, hot: ShardI
 }
 
 #[test]
-fn a_hot_shard_splits_the_epoch_and_stages_a_child_spawn() {
-    let mut orch = Orchestrator::new(
-        plane_with_root(shard(1)),
-        Arc::new(RecordingLauncher::default()),
-    );
+fn a_hot_shard_splits_the_epoch_and_a_shard_is_launched_for_the_child() {
+    let mut orch = orchestrator(plane_with_root(shard(1)));
     assert_eq!(orch.map().epoch, 1);
     assert_eq!(orch.map().regions.len(), 1);
 
@@ -160,28 +206,32 @@ fn a_hot_shard_splits_the_epoch_and_stages_a_child_spawn() {
         .shard;
     assert_ne!(child_owner, shard(1), "the child is a new shard");
 
-    // The split staged a spawn for that child id.
-    let spawns = orch.take_pending_spawn();
+    // The child is the shard that was launched for the split: it registered
+    // without an id and was given this one.
     assert!(
-        spawns.iter().any(|s| s.shard == child_owner),
-        "the split staged a spawn for the child {child_owner}"
+        orch.launch_of(child_owner).is_some(),
+        "the split launched the shard that became {child_owner}"
     );
+    assert!(orch.take_pending_spawn().is_empty(), "one launch, no more");
 }
 
 #[test]
 fn a_split_stages_a_spawn_and_the_commit_publishes_the_child_region() {
-    let mut orch = Orchestrator::new(
-        plane_with_root(shard(1)),
-        Arc::new(RecordingLauncher::default()),
-    );
-    // Run the autoscaler to the split; capture the staged spawn before acking.
+    let mut orch = orchestrator(plane_with_root(shard(1)));
+    // Run the autoscaler to the split; the staged launch's shard registers
+    // and is told its id, before anything is acked.
     let mut staged_child: Option<ShardId> = None;
     for _ in 0..(SPLIT_DWELL_TICKS + 5) {
         orch.handle_load_report(&hot_report(shard(1)));
         orch.tick();
         let spawns = orch.take_pending_spawn();
         if !spawns.is_empty() {
-            staged_child = Some(spawns[0].shard);
+            assert!(
+                orch.drain_outbox().is_empty(),
+                "nothing is proposed before the launched shard has registered"
+            );
+            assert_eq!(orch.map().epoch, 1);
+            staged_child = Some(register(&mut orch, &spawns[0]));
             // Ack the prepare so the epoch commits.
             let recipients: Vec<(ShardId, u64)> = orch
                 .drain_outbox()
@@ -220,7 +270,7 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
     );
     let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
     let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
-    let mut orch = Orchestrator::new(control, Arc::new(RecordingLauncher::default()));
+    let mut orch = orchestrator(control);
 
     // The merge dwell is long (1800 ticks); drive it.
     let mut staged_kill = false;
@@ -288,7 +338,7 @@ fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
     space_orchestrator::topology::validate(&map).expect("a cell under the root is a valid map");
     let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
     let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
-    let mut orch = Orchestrator::new(control, Arc::new(RecordingLauncher::default()));
+    let mut orch = orchestrator(control);
 
     let mut merged = false;
     for _ in 0..(space_orchestrator::autoscale::MERGE_DWELL_TICKS + 5) {
@@ -338,15 +388,15 @@ fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
 
 #[test]
 fn an_unacked_prepare_aborts_and_the_map_is_unchanged() {
-    let mut orch = Orchestrator::new(
-        plane_with_root(shard(1)),
-        Arc::new(RecordingLauncher::default()),
-    );
-    // Drive to the split, but ack nobody.
+    let mut orch = orchestrator(plane_with_root(shard(1)));
+    // Drive to the split — its shard registers — but ack nobody.
     let mut prepared_epoch = None;
     for _ in 0..(SPLIT_DWELL_TICKS + 5) {
         orch.handle_load_report(&hot_report(shard(1)));
         orch.tick();
+        for spec in orch.take_pending_spawn() {
+            register(&mut orch, &spec);
+        }
         let outbox = orch.drain_outbox();
         if outbox
             .iter()
@@ -401,13 +451,23 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
         let plane = Arc::clone(&responder_plane);
         tokio::spawn(async move {
             while let Some(inbound) = server.next_inbound().await {
-                if let Inbound::Hello { hello, reply } = inbound {
+                if let Inbound::Hello {
+                    hello,
+                    reply,
+                    verdict,
+                    ..
+                } = inbound
+                {
                     let welcome = plane
                         .lock()
                         .unwrap()
                         .handle_shard_hello(&hello)
                         .expect("welcome");
+                    let admitted = welcome.shard;
                     let _ = reply.send(Message::ShardWelcome(welcome)).await;
+                    // The verdict is what opens the connection: only then is
+                    // what was queued for it — the welcome — written.
+                    let _ = verdict.send(Ok(admitted));
                 }
             }
         });
@@ -418,6 +478,7 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
         shard: ShardId::NONE,
         endpoint: addr(9_100),
         region: None,
+        secret: String::new(),
     };
     let (welcome, _conn) = OrchestratorLink::handshake(bound, hello)
         .await
@@ -467,8 +528,8 @@ async fn run_the_loop_until<T>(
 /// Everything in between is production code: `Orchestrator::run_with` over the
 /// QUIC control endpoint, a root shard booted by `start_orchestrated` (what
 /// `space-server --orchestrator` runs) and the carved cell's shard booted by
-/// [`LocalLauncher`], which registers with the id and the node the orchestrator
-/// allocated. The test only asks for the carve and the merge, and — because no
+/// [`LocalLauncher`], which registers with neither id nor region and is given
+/// both. The test only asks for the carve and the merge, and — because no
 /// shard sends load reports yet — says on the shard's behalf that it is empty;
 /// the loop is stopped for those calls and resumed.
 ///
@@ -514,6 +575,7 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
                 advertise: None,
                 claim_region: None,
                 cluster,
+                secret: String::new(),
             },
             control_addr,
         ),
@@ -528,20 +590,20 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
     let cell = NodeRef::new(64, [k[0], k[1], k[2] - 1]);
     let inside = cell.center();
     assert_eq!(orchestrator.map().lookup(&inside), Some(shard(1)));
-    let started = orchestrator
+    let wanted = orchestrator
         .begin_carve(cell)
-        .expect("the carve is started");
-    let child = started.shard;
-    assert_eq!(
-        (started.node, started.from, started.epoch),
-        (cell, shard(1), 2)
-    );
-    assert_eq!(child, shard(100), "a fresh id (H9)");
-    assert_eq!(orchestrator.map().epoch, 1, "proposed is not published");
+        .expect("the carve is asked for");
+    assert_eq!((wanted.node, wanted.from), (cell, shard(1)));
+    assert_eq!(orchestrator.wanted_node(), Some(cell));
+    assert_eq!(orchestrator.map().epoch, 1, "asked for is not published");
+    // The id of the shard that will own the cell: the next one (H9). It is
+    // allocated when that shard registers, not before.
+    let child = shard(100);
 
-    // --- the loop carries it out: prepare to the root shard and the new one,
-    // launch, hello, the prepare again, both acks, commit, map push. Done when
-    // the root shard runs the new map with both regions at real addresses.
+    // --- the loop carries it out: launch, the shard's hello (no id, no
+    // region), the id, the prepare to the root shard and the new one — which
+    // is connected by then — both acks, commit, map push. Done when the root
+    // shard runs the new map with both regions at real addresses.
     let root_map_when = |epoch: u64, regions: usize| {
         let state = Arc::clone(&root.state);
         async move {
@@ -595,7 +657,15 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
 
     // The cell's shard is alive, serves at the published address and follows
     // the committed map.
-    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Alive);
+    let child_launch = launcher
+        .launch_of(child)
+        .await
+        .expect("the launcher started the cell's shard");
+    assert_eq!(orchestrator.launch_of(child), Some(child_launch));
+    assert_eq!(
+        launcher.poll(child_launch).await.expect("poll"),
+        Poll::Alive
+    );
     let client = space_net::client_endpoint().expect("client endpoint");
     let mut child_map = None;
     for _ in 0..100 {
@@ -650,7 +720,10 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
     });
     assert!(reply.accepted, "{reply:?}");
     assert_eq!(orchestrator.pending_merge(), Some(child));
-    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Alive);
+    assert_eq!(
+        launcher.poll(child_launch).await.expect("poll"),
+        Poll::Alive
+    );
 
     // The loop carries it out: prepare to both shards, acks, commit, push, and
     // only then the kill. Done when the root shard runs the map without the
@@ -660,7 +733,7 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
         let merged = root_map_when(3, 1);
         async move {
             let map = merged.await;
-            while launcher.poll(child).await.expect("poll") != Poll::Dead {
+            while launcher.poll(child_launch).await.expect("poll") != Poll::Dead {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             map
@@ -686,7 +759,8 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
         "the cell fell back to the root's owner"
     );
     assert_eq!(orchestrator.pending_merge(), None);
-    assert_eq!(launcher.poll(child).await.expect("poll"), Poll::Dead);
+    assert_eq!(launcher.poll(child_launch).await.expect("poll"), Poll::Dead);
+    assert_eq!(orchestrator.launch_of(child), None);
 
     root.abort();
     server.close();
@@ -699,11 +773,11 @@ async fn the_local_launcher_spawns_a_reachable_child_over_loopback() {
     // registering launch is proven end to end in `boot_loopback.rs`.
     let launcher = LocalLauncher::detached();
     let spec = SpawnSpec {
-        shard: shard(2),
-        region: ShardRegion::new(NodeRef::new(40, [0, 0, 0]), shard(2), addr(0)),
+        launch: LaunchId(2),
         cluster: "space-local".into(),
         control_addr: addr(7_900),
         host_port: 0,
+        secret: String::new(),
     };
     let handle = launcher.spawn(spec).await.expect("spawn");
     let endpoint = space_net::client_endpoint().expect("client endpoint");
@@ -715,8 +789,12 @@ async fn the_local_launcher_spawns_a_reachable_child_over_loopback() {
     )
     .await
     .expect("the spawned child answers a client");
-    assert_eq!(welcome.shard, shard(2));
+    assert_eq!(
+        welcome.shard,
+        shard(2),
+        "a detached shard runs as its launch's number"
+    );
     assert!(!conn.is_closed());
-    assert_eq!(launcher.poll(shard(2)).await.unwrap(), Poll::Alive);
-    launcher.kill(shard(2)).await.expect("kill");
+    assert_eq!(launcher.poll(LaunchId(2)).await.unwrap(), Poll::Alive);
+    launcher.kill(LaunchId(2)).await.expect("kill");
 }

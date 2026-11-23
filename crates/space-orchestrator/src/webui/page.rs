@@ -536,6 +536,35 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
         h.fact("shards are told to dial", s.control_addr);
     }
     h.fact("launcher", super::launcher_label(s.launcher));
+    h.fact(
+        "shards",
+        format_args!(
+            "{} kept running by the orchestrator, at most {}",
+            if s.min_shards == 0 {
+                "none".to_owned()
+            } else {
+                s.min_shards.to_string()
+            },
+            s.max_shards
+        ),
+    );
+    if s.starting > 0 {
+        h.fact("starting", format_args!("{} shard(s)", s.starting));
+    }
+    if let Some(wanted) = s.wanted {
+        h.fact(
+            "waiting for a shard",
+            format_args!("region {}", node_path(wanted)),
+        );
+    }
+    h.fact(
+        "shard registration",
+        if s.hello_auth_required {
+            "cluster secret required"
+        } else {
+            "no secret: loopback only"
+        },
+    );
     match info.build {
         Some(build) => h.fact(
             "version",
@@ -859,7 +888,6 @@ fn link_state(view: &ShardView) -> (&'static str, &'static str) {
         (true, _, _) => ("ok", "connected"),
         (false, true, _) => ("bad", "lost"),
         (false, false, ShardRole::ReservedRoot) => ("dim", "not claimed yet"),
-        (false, false, ShardRole::SplitChild) => ("info", "starting"),
         (false, false, _) => ("bad", "never registered"),
     }
 }
@@ -879,9 +907,13 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         let (class, label) = link_state(view);
         h.pill(class, label);
         match view.role {
-            ShardRole::SplitChild => {
+            ShardRole::Joining => {
                 h.raw(" ");
-                h.pill("info", "split child, epoch pending");
+                h.pill("info", "new, epoch pending");
+            }
+            ShardRole::Dead => {
+                h.raw(" ");
+                h.pill("bad", "dead, to be replaced");
             }
             ShardRole::Merging => {
                 h.raw(" ");

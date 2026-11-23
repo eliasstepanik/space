@@ -18,6 +18,28 @@
 //! an error rather than a setting that would silently lose. Shards wired
 //! together by hand with `--peer` should all be given the same `--scene`.
 //!
+//! # Orchestrated
+//!
+//! ```text
+//!   space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+//! ```
+//!
+//! With `--orchestrator` the shard starts **without an id and without a
+//! region** and is given both when it registers: the root while nobody owns
+//! it, otherwise a node the orchestrator carves for it. While the
+//! orchestrator is in the middle of another map change the shard is told "not
+//! yet" and asks again; any other refusal (another cluster, a wrong cluster
+//! secret, the cluster is full) is final and ends the process. A shard that
+//! loses its orchestrator stops and exits non-zero — it is replaced under a
+//! new id, and nothing is orphaned by an orchestrator restart
+//! ([`space_server::orchestrated`]).
+//!
+//! The **cluster secret** — needed when the orchestrator's control port is
+//! not on loopback — is read from the environment, never from the command
+//! line: `SPACE_CLUSTER_SECRET`, else the file `SPACE_CLUSTER_SECRET_FILE` or
+//! `--cluster-secret-file <path>` names. A shard the orchestrator starts
+//! itself is handed it that way.
+//!
 //! A region is the octree node a shard is authoritative for, written
 //! `depth:x:y:z` ([`NodeRef::new`]). The world map is assembled from the
 //! command line — this shard's own region plus one `--peer` per neighbour —
@@ -74,6 +96,9 @@ struct Options {
     claim_region: Option<NodeRef>,
     /// The cluster id forwarded in `ShardHello`.
     cluster: String,
+    /// A file holding the cluster secret (`--cluster-secret-file`); the
+    /// environment is looked at first ([`space_server::orchestrated::cluster_secret`]).
+    cluster_secret_file: Option<std::path::PathBuf>,
     /// The scene a standalone shard shows (`--scene`, default
     /// [`Scene::DEFAULT`]). Never set together with `orchestrator`: there the
     /// orchestrator says which scene it is.
@@ -84,8 +109,11 @@ struct Options {
 const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
                      [--scene demo-area|materials|solar|galaxy] \
-                     [--orchestrator <addr:port> [--claim-region <depth:x:y:z>] [--cluster <id>] \
-                     [--advertise <addr:port>]]";
+                     [--orchestrator <addr:port> [--cluster <id>] [--advertise <addr:port>] \
+                     [--cluster-secret-file <path>] [--claim-region <depth:x:y:z>]] \
+                     (with --orchestrator the id and the region are the orchestrator's to give; \
+                     the cluster secret is read from SPACE_CLUSTER_SECRET or the file \
+                     SPACE_CLUSTER_SECRET_FILE / --cluster-secret-file names)";
 
 /// The revision a standalone shard's scene is announced at.
 ///
@@ -105,6 +133,7 @@ impl Options {
         let mut orchestrator: Option<SocketAddr> = None;
         let mut claim_region: Option<NodeRef> = None;
         let mut cluster = "space-local".to_owned();
+        let mut cluster_secret_file: Option<std::path::PathBuf> = None;
         let mut scene: Option<Scene> = None;
 
         let mut i = 0;
@@ -152,6 +181,10 @@ impl Options {
                 "--cluster" => {
                     cluster = value("--cluster")?.clone();
                 }
+                "--cluster-secret-file" => {
+                    cluster_secret_file =
+                        Some(std::path::PathBuf::from(value("--cluster-secret-file")?));
+                }
                 "--scene" => {
                     let text = value("--scene")?;
                     scene = Some(text.parse::<Scene>().map_err(|e| format!("--scene: {e}"))?);
@@ -184,6 +217,11 @@ impl Options {
         if advertise.is_some() && !orchestrated {
             return Err(format!("--advertise requires --orchestrator\n{USAGE}"));
         }
+        if cluster_secret_file.is_some() && !orchestrated {
+            return Err(format!(
+                "--cluster-secret-file requires --orchestrator\n{USAGE}"
+            ));
+        }
         if scene.is_some() && orchestrated {
             return Err(format!(
                 "--scene is for a standalone shard; with --orchestrator the scene is the \
@@ -211,6 +249,7 @@ impl Options {
             orchestrator,
             claim_region,
             cluster,
+            cluster_secret_file,
             scene: scene.unwrap_or(Scene::DEFAULT),
         })
     }
@@ -226,14 +265,16 @@ fn space_orchestrator_root_depth() -> u8 {
 }
 
 impl Options {
-    /// The orchestrated-boot options this command line describes.
-    fn orchestrated(&self) -> space_server::orchestrated::OrchestratedOptions {
+    /// The orchestrated-boot options this command line describes, presenting
+    /// `secret` as the cluster secret.
+    fn orchestrated(&self, secret: String) -> space_server::orchestrated::OrchestratedOptions {
         space_server::orchestrated::OrchestratedOptions {
             shard: self.shard,
             bind: self.bind,
             advertise: self.advertise,
             claim_region: self.claim_region,
             cluster: self.cluster.clone(),
+            secret,
         }
     }
 }
@@ -370,10 +411,16 @@ async fn run(options: Options) -> Result<(), String> {
 }
 
 /// Serve as an orchestrated shard: register with the orchestrator, adopt the id,
-/// region and map it hands back, and follow every epoch it publishes. The boot
-/// itself lives in [`space_server::orchestrated`] so tests can run it in-process.
+/// region and map it hands back, and follow every epoch it publishes — until
+/// the orchestrator is lost, which ends the shard with an error (the process
+/// exits non-zero). The boot itself lives in [`space_server::orchestrated`] so
+/// tests can run it in-process.
 async fn run_orchestrated(options: Options, orch_addr: SocketAddr) -> Result<(), String> {
-    space_server::orchestrated::run_orchestrated(options.orchestrated(), orch_addr).await
+    let secret = space_server::orchestrated::cluster_secret(
+        options.cluster_secret_file.as_deref(),
+        &|name| std::env::var(name).ok(),
+    )?;
+    space_server::orchestrated::run_orchestrated(options.orchestrated(secret), orch_addr).await
 }
 
 #[cfg(test)]
@@ -494,7 +541,7 @@ mod tests {
     fn the_advertised_address_defaults_to_the_bound_address() {
         let options = parse(&["--orchestrator", "127.0.0.1:7900"]).expect("parses");
         let bound: SocketAddr = "127.0.0.1:41234".parse().unwrap();
-        assert_eq!(options.orchestrated().advertised(bound), bound);
+        assert_eq!(options.orchestrated(String::new()).advertised(bound), bound);
     }
 
     #[test]
@@ -510,7 +557,7 @@ mod tests {
         .expect("parses");
         let bound: SocketAddr = "0.0.0.0:7870".parse().unwrap();
         assert_eq!(
-            options.orchestrated().advertised(bound),
+            options.orchestrated(String::new()).advertised(bound),
             "10.0.0.5:7870".parse().unwrap()
         );
     }
@@ -527,6 +574,46 @@ mod tests {
         ])
         .is_err());
         assert!(parse(&["--orchestrator", "127.0.0.1:7900", "--advertise", "nope"]).is_err());
+    }
+
+    /// The secret is never an argument (it would show in the process list):
+    /// only the *file* it is in can be named, and only for an orchestrated
+    /// shard.
+    #[test]
+    fn the_cluster_secret_is_named_by_file_only_and_only_when_orchestrated() {
+        let options = parse(&[
+            "--orchestrator",
+            "127.0.0.1:7900",
+            "--cluster-secret-file",
+            "/run/secrets/cluster",
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.cluster_secret_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/cluster"))
+        );
+        assert_eq!(
+            options.orchestrated("s3cret".into()).secret,
+            "s3cret",
+            "what the environment or the file said is what the hello presents"
+        );
+        assert!(parse(&["--orchestrator", "127.0.0.1:7900"])
+            .expect("parses")
+            .cluster_secret_file
+            .is_none());
+        assert!(parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--cluster-secret-file",
+            "x"
+        ])
+        .is_err());
+        assert!(
+            parse(&["--orchestrator", "127.0.0.1:7900", "--cluster-secret", "x"]).is_err(),
+            "there is no flag that takes the secret itself"
+        );
     }
 
     #[test]

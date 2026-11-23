@@ -14,6 +14,8 @@
                     http://127.0.0.1:7980/) plus one shard (127.0.0.1:7777)
                     that registers with it and is given the root region.
                     Change the scene for every shard and client in the web UI.
+                    With -MinShards N the orchestrator starts the shards
+                    itself instead (see below).
       single        one standalone shard on 127.0.0.1:7777
       two-shards    two standalone shards that are neighbours along +X
                     (127.0.0.1:7777 owns cell 0, 127.0.0.1:7778 owns cell 1).
@@ -45,6 +47,15 @@
     runs a Lua script and makes its outcome this script's exit code, -OutDir
     DIR is where scripts write screenshots (default target\dev\harness-out).
 
+    -MinShards N (orchestrated only; default 0 = the one shard above, started
+    by this script): the orchestrator starts and keeps N shards running by
+    itself (space-orchestrator --launcher process --min-shards N), each a
+    space-server process on a port from 7870 up, logging to
+    target\dev\shard-<port>.log. With 4 the demo area lies in four shard
+    areas that meet at pos x = -6 / z = -4: walk across and the HUD's shard
+    number changes. A shard that dies is replaced. The client is pointed at the
+    shard that owns the spawn point.
+
     -PortOffset N adds N to every port (a second stack beside the first).
 
     Server logs go to target\dev\*.log.
@@ -57,6 +68,11 @@
 .EXAMPLE
     .\scripts\dev.ps1 -Topology two-shards
     Fly across the shard border: hold D until the HUD says "shard 2".
+
+.EXAMPLE
+    .\scripts\dev.ps1 -MinShards 4
+    The demo area on four shards the orchestrator starts itself. The web UI
+    (http://127.0.0.1:7980/) shows the four regions and their shards.
 
 .EXAMPLE
     .\scripts\dev.ps1 -Topology single -Scene solar -ConnectScreen
@@ -101,6 +117,11 @@ param(
     [string]$Glb = '',
     # Add this to every port.
     [int]$PortOffset = 0,
+    # Orchestrated only: let the orchestrator start this many shards itself.
+    # (8 is the orchestrator's own limit: the root's shard and one per layout
+    # cell; it refuses to start with more.)
+    [ValidateRange(0, 8)]
+    [int]$MinShards = 0,
     # Start the client on the connect screen instead of connecting at once.
     [switch]$ConnectScreen,
     # Present as fast as frames render instead of waiting for vsync.
@@ -124,20 +145,55 @@ $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path 
 $bin = Join-Path $target 'release'
 $devDir = Join-Path $target 'dev'
 $pidFile = Join-Path $devDir 'servers.pid'
+# The shards an orchestrator started itself (-MinShards): it keeps the pids of
+# those that are running here, in the directory it is told to log to (the file
+# is rewritten whenever one is started, stopped or seen to have exited, and
+# removed when none is left).
+$launchedPidFile = Join-Path $devDir 'launched-shards.pid'
 
-function Stop-DevServers {
-    if (-not (Test-Path $pidFile)) { return }
-    foreach ($line in Get-Content $pidFile) {
+# Whether the process is one of THIS checkout's binaries.
+#
+# A pid in a pid file is only a number: the process that had it may be gone,
+# and Windows may have given the number to anything since - another checkout's
+# space-server, for one. So the name is not enough: the executable must lie in
+# this checkout's release directory. A process whose path cannot be read
+# (another user's, an elevated one) is not ours either.
+function Test-OwnBinary {
+    param($Process)
+    if ($Process.ProcessName -notlike 'space-*') { return $false }
+    $path = $null
+    try { $path = $Process.Path } catch { }
+    if (-not $path) { return $false }
+    $ours = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($bin).TrimEnd('\', '/')
+    $theirs = [System.IO.Path]::GetDirectoryName($path).TrimEnd('\', '/')
+    return [string]::Equals($ours, $theirs, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Stop-DevProcesses {
+    param([string]$File)
+    if (-not (Test-Path $File)) { return }
+    foreach ($line in Get-Content $File) {
         $id = 0
         if (-not [int]::TryParse($line, [ref]$id)) { continue }
         $process = Get-Process -Id $id -ErrorAction SilentlyContinue
-        # Only ever stop our own binaries: a pid may have been reused.
-        if ($process -and $process.ProcessName -like 'space-*') {
+        if (-not $process) { continue }
+        if (Test-OwnBinary $process) {
             Stop-Process -Id $id -Force -Confirm:$false
             Write-Host "stopped $($process.ProcessName) (pid $id)"
+        } else {
+            Write-Host "left pid $id ($($process.ProcessName)) alone: it is not a binary of this checkout"
         }
     }
-    Remove-Item $pidFile -Confirm:$false
+    Remove-Item $File -Confirm:$false
+}
+
+function Stop-DevServers {
+    # What this script started first - the orchestrator among it, so that it
+    # cannot start a replacement for a shard stopped next - then the shards
+    # that orchestrator had started. (They would stop by themselves a few
+    # seconds after losing it; this does not wait for that.)
+    Stop-DevProcesses $pidFile
+    Stop-DevProcesses $launchedPidFile
 }
 
 function Start-DevServer {
@@ -167,6 +223,10 @@ if ($Stop) {
 New-Item -ItemType Directory -Force $devDir | Out-Null
 Stop-DevServers
 
+if ($MinShards -gt 0 -and $Topology -ne 'orchestrated') {
+    throw '-MinShards needs the orchestrated topology: it is the orchestrator that starts the shards'
+}
+
 if (-not $NoBuild) {
     Write-Host 'building release binaries (space-client, space-server, space-orchestrator)...'
     Push-Location $root
@@ -192,12 +252,48 @@ switch ($Topology) {
         if ($PSBoundParameters.ContainsKey('Scene')) {
             Remove-Item (Join-Path $devDir 'orchestrator.id.scene') -ErrorAction SilentlyContinue -Confirm:$false
         }
-        Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
-            '--bind', $orchestrator, '--state', 'orchestrator.id',
-            '--webui', $webui, '--scene', $Scene)
-        # A fixed bind address, so a restarted shard is recognised as the same one.
-        Start-DevServer 'shard-1' 'space-server.exe' @(
-            '--orchestrator', $orchestrator, '--bind', $shard1)
+        if ($MinShards -gt 0) {
+            # The orchestrator starts the shards itself: one space-server
+            # process each, on a port of this range, logging to target\dev.
+            $firstPort = 7870 + $PortOffset
+            $started = Get-Date
+            Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
+                '--bind', $orchestrator, '--state', 'orchestrator.id',
+                '--webui', $webui, '--scene', $Scene,
+                '--launcher', 'process', '--min-shards', "$MinShards",
+                '--host-port-range', "$firstPort-$(7899 + $PortOffset)",
+                '--shard-log-dir', $devDir)
+            # Wait until every shard has its region, and ask the orchestrator
+            # which one owns the spawn point: that is where a client joins.
+            $shard1 = ''
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not $shard1) {
+                Start-Sleep -Milliseconds 250
+                $state = $null
+                try { $state = Invoke-RestMethod -Uri "http://$webui/api/state" -TimeoutSec 5 } catch { }
+                if ($state) {
+                    $regions = @($state.map.regions)
+                    $live = @($state.shards | Where-Object { $_.connected -and $_.role -eq 'owner' })
+                    if ($regions.Count -ge $MinShards -and $live.Count -ge $MinShards -and -not $state.epoch_in_flight) {
+                        $shard1 = ($regions | Where-Object { $_.nesting -eq 0 } | Select-Object -First 1).endpoint
+                    }
+                }
+                if (-not $shard1 -and (Get-Date) -gt $deadline) {
+                    Get-Content (Join-Path $devDir 'orchestrator.out.log') -Tail 20 | ForEach-Object { Write-Host "  $_" }
+                    Stop-DevServers
+                    throw "the orchestrator did not bring up $MinShards shards within 60 s; see $devDir\orchestrator.out.log and shard-*.log"
+                }
+            }
+            $took = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+            Write-Host "$MinShards shards started by the orchestrator own $($regions.Count) regions after $took s"
+        } else {
+            Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
+                '--bind', $orchestrator, '--state', 'orchestrator.id',
+                '--webui', $webui, '--scene', $Scene)
+            # The shard registers without a region and is given the root.
+            Start-DevServer 'shard-1' 'space-server.exe' @(
+                '--orchestrator', $orchestrator, '--bind', $shard1)
+        }
     }
     'single' {
         Start-DevServer 'shard-1' 'space-server.exe' @(
@@ -215,6 +311,9 @@ switch ($Topology) {
 
 Write-Host ''
 Write-Host "  shard          $shard1 (QUIC; the address to type on the connect screen)"
+if ($MinShards -gt 0) {
+    Write-Host "                 (the shard that owns the spawn point; $MinShards shards on ports from $(7870 + $PortOffset), logs in shard-<port>.log)"
+}
 if ($Topology -eq 'two-shards') { Write-Host "  second shard   $shard2" }
 if ($Topology -eq 'orchestrated') {
     Write-Host "  web UI         http://$webui/  (scene, shards, players)"

@@ -15,29 +15,85 @@
 //!     report = load_reports()      => orch.handle_load_report(report),
 //!     ack    = control.acks()      => orch.handle_epoch_ack(shard, epoch),
 //!     hello  = control.hellos()    => orch.handle_shard_hello(hello),
-//!     _      = clock.tick()        => { orch.tick(); drain outbox; launcher.poll(); }
+//!     _      = clock.tick()        => { orch.tick(); drain outbox; launch; stop; poll; }
 //! }}
 //! ```
 //!
 //! [`Orchestrator::tick`] is the synchronous heart of that loop: it advances the
 //! orchestrator's own clock, runs the epoch deadline, feeds the autoscaler the
-//! latest report per shard, and on a `Split`/`Merge` computes a new topology,
-//! bumps the epoch through [`crate::epoch::EpochPublisher`] and stages the
-//! launcher work ([`Orchestrator::take_pending_spawn`] /
-//! [`Orchestrator::take_pending_kill`]) for the async layer to execute. A
-//! split's child is staged for launch when the split is proposed (it has to
-//! register and ack before the epoch can commit); a
-//! merged shard is staged for killing only when the merge **commits** — until
-//! then it still owns its region — and a child whose split aborts is staged for
-//! killing at the abort. The async [`Orchestrator::run`] wires those pieces
-//! together over real QUIC; the tests drive the synchronous half directly.
+//! latest report per shard, and stages the launcher work — the launch of every
+//! shard that is missing ([`Orchestrator::take_pending_spawn`]) and the
+//! stopping of every shard that has to go ([`Orchestrator::take_pending_kill`],
+//! [`Orchestrator::take_pending_launch_kill`]) — for the async layer to
+//! execute. The async [`Orchestrator::run`] wires those pieces together over
+//! real QUIC; the tests drive the synchronous half directly.
 //!
-//! A split is one case of a **carve**: [`Orchestrator::begin_carve`] gives any
-//! node inside an existing region — a child octant, or a single cell under
-//! the depth-40 root — to a newly launched shard, through exactly these
-//! steps. The split only adds the choice of the octant. Whichever it is, the
-//! prepare goes to **every shard of the map** and the new one, and all of
-//! them must ack before the map changes ([`crate::epoch`]).
+//! # The life of a shard (`docs/plan-sharding.md` §2)
+//!
+//! There is **one path for every shard**, started by a launcher or by hand: it
+//! starts without a region and without an id and is given both when it says
+//! hello ([`Orchestrator::handle_shard_hello`]) — the root while nobody owns
+//! it, else the regions of a shard that died, else the node a split asked
+//! for, else the next layout cell around the scene
+//! ([`topology::layout_cells`]). For everything but the root that is an epoch
+//! change, proposed **with the shard already connected**: the prepare goes to
+//! every shard of the map and to the new one, all of them must ack before the
+//! map changes ([`crate::epoch`]), and the 3 s ack deadline never has to cover
+//! the start of a process. (It used to: a split planned the change, launched
+//! a shard with the id and the node and waited for its hello inside the
+//! deadline.) A shard owns nothing before its epoch commits, and is stopped
+//! if it aborts.
+//!
+//! * **One change at a time.** A hello that arrives while a change is in
+//!   flight is told to wait ([`crate::control::HelloRefusal::Wait`]) and the
+//!   shard asks again. So is one that arrives while a shard of the map holds
+//!   no control link: every one of them has to acknowledge a change, so none
+//!   is proposed — and none asked for — while it is known that one cannot.
+//! * **Asking for a region.** A split ([`Orchestrator::begin_carve`] is its
+//!   general form) no longer proposes anything: it notes the node as *wanted*
+//!   and a shard is launched; whichever shard registers next takes it.
+//! * **The fleet.** [`Orchestrator::reconcile_launches`] stages a launch while
+//!   fewer shards are live or starting than there should be: `--min-shards`,
+//!   plus one for a wanted node and for every dead shard it replaces by a
+//!   launch, never more than `--max-shards`. With `--min-shards 0` (the
+//!   default) nothing is launched but a split's shard. A launch that is no
+//!   longer needed — a shard started by hand took what it was started for —
+//!   is stopped before it registers, and refused for good if its hello gets
+//!   there first: it is not given a region nobody asked for. A launch that
+//!   fails is followed by a pause that doubles (1 s to 30 s) until a launch's
+//!   shard owns a region again; a join that runs into its deadline is such a
+//!   failure.
+//! * **Supervision.** The run loop asks the launcher twice a second whether
+//!   what it started is alive, treats a registered shard whose control link
+//!   closed as dead too, and one that holds its link but lets
+//!   [`ACK_STRIKES`] map changes in a row run into their deadline
+//!   ([`Orchestrator::declare_dead`]). A dead shard's
+//!   regions go to the next shard that registers — a replacement launched for
+//!   it, or one started by hand — under a **new id** (H15: ids are never
+//!   reused; a process's guid serials start over, so the old id would mint
+//!   the same guids twice), through an epoch change the dead shard is not
+//!   asked to acknowledge, before any other change. When it commits the
+//!   scene's revision is raised, once, so every shard drops the scene's bodies
+//!   and the spawner builds them afresh — instead of half a scene, or some of
+//!   it twice.
+//!
+//! A merged shard is stopped only when the merge **commits** — until then it
+//! still owns its region. Stopping a shard is closing its control link (a
+//! shard does not run without its orchestrator) and, for one the orchestrator
+//! started, telling the launcher to stop its process.
+//!
+//! # Who is heard
+//!
+//! The cluster secret gates a hello, and the hello gates the connection
+//! ([`crate::control::Inbound`]): a connection whose hello was refused is
+//! closed and never read again, and one that was welcomed is taken to speak
+//! for the shard it was welcomed as — a load report or an ack reaches
+//! [`Orchestrator::handle_load_report_from`] and its siblings with that id,
+//! and is dropped if it names another. The plain handlers
+//! ([`Orchestrator::handle_load_report`], [`Orchestrator::handle_epoch_ack`],
+//! [`Orchestrator::handle_scene_ack`]) believe the name in the message: they
+//! are for callers that vouch for it, which the tests do and the run loop
+//! does not.
 //!
 //! # What the orchestrator believes about load
 //!
@@ -103,18 +159,24 @@
 //! revision to its ceiling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use space_protocol::control::{AdminCommand, AdminReply, LoadReport};
 use space_protocol::shard::{EpochAck, ShardId, ShardMap, ShardRegion};
 use space_protocol::{Message, Scene, SceneAck, SceneState, ShardHello, ShardWelcome};
+use space_world::NodeRef;
 
 use crate::autoscale::ScaleAction;
-use crate::config::{OrchestratorConfig, MIN_EPOCH_INTERVAL_TICKS, REPORT_EXPIRY_TICKS};
-use crate::control::ControlPlane;
+use crate::config::{
+    LauncherKind, OrchestratorConfig, LAUNCH_BACKOFF_MAX_TICKS, LAUNCH_BACKOFF_TICKS,
+    LAUNCH_REGISTER_TIMEOUT_TICKS, MIN_EPOCH_INTERVAL_TICKS, POLL_INTERVAL_TICKS,
+    REPORT_EXPIRY_TICKS, WANTED_TIMEOUT_TICKS,
+};
+use crate::control::{ControlPlane, HelloRefusal};
 use crate::epoch::{Outbound, Phase};
 use crate::events::{EventKind, EventLog, Severity};
-use crate::launcher::{Launcher, Poll, SpawnSpec};
+use crate::launcher::{LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
 use crate::ops::{OperatorCommand, OperatorReply, OperatorRequest, OpsHandle, OpsPort};
 use crate::scene::{MAX_REVISION_CATCH_UP, SCENE_RESEND_INTERVAL_TICKS};
 use crate::snapshot::{
@@ -149,34 +211,98 @@ enum Octant {
     Exactly(usize),
 }
 
-/// A carve that was started ([`Orchestrator::begin_carve`]): its epoch has
-/// been proposed and the new shard's launch is staged. Nothing is committed
-/// yet — the map changes when every recipient has acked, or not at all.
+/// A carve that was asked for ([`Orchestrator::begin_carve`]): the node is
+/// **wanted** for a new shard and one is being started. Nothing is proposed
+/// yet — the node's epoch is proposed when a shard has registered to take it
+/// (it is welcomed with the id allocated for it then), and the map changes
+/// when every recipient has acked, or not at all.
 ///
 /// Displayed, it is the sentence the event log and an operator's answer use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CarveStarted {
-    /// The node being carved out.
-    pub node: space_world::NodeRef,
-    /// The id allocated for its new owner.
-    pub shard: ShardId,
+pub struct CarveWanted {
+    /// The node to be carved out.
+    pub node: NodeRef,
     /// The owner of the enclosing region: who loses the node, and who gets it
     /// back if the carve is merged away.
     pub from: ShardId,
-    /// The epoch the carve was proposed as.
-    pub epoch: u64,
 }
 
-impl core::fmt::Display for CarveStarted {
+impl core::fmt::Display for CarveWanted {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "epoch {} proposed, region {} goes to new {}",
-            self.epoch,
+            "region {} is wanted for a new shard: one is being started, and the region is \
+             carved out of {}'s for it when it has registered",
             node_path(self.node),
-            self.shard
+            self.from
         )
     }
+}
+
+/// A node that waits for a shard to own it: what a split or a carve asked
+/// for. At most one at a time (one change at a time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Wanted {
+    /// The node to carve.
+    node: NodeRef,
+    /// The owner of the region it is carved out of.
+    from: ShardId,
+    /// What the change is, up to the new owner's name: `"split of shard 1,
+    /// region 41:… (octant 5, +x -y +z) goes to new"`.
+    what: String,
+    /// The tick it was asked for (it is given up after
+    /// [`WANTED_TIMEOUT_TICKS`]).
+    since: u64,
+}
+
+/// One launch the orchestrator asked its launcher for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Launch {
+    /// The host port handed to it (0: none, the in-process launcher).
+    host_port: u16,
+    /// The tick it was staged at.
+    since: u64,
+    /// Where its shard listens, once the launcher has said (its `spawn`
+    /// returned). Until then the launch is not polled.
+    endpoint: Option<SocketAddr>,
+    /// The shard it became, once known: **starting** while `None`.
+    shard: Option<ShardId>,
+}
+
+impl Launch {
+    /// Whether this launch's shard listens at `at`: the address its launcher
+    /// reported, or — before the launcher has said — the host port it was
+    /// handed (each launch has its own; the launcher binds it on the
+    /// orchestrator's host).
+    fn listens_at(&self, at: SocketAddr) -> bool {
+        match self.endpoint {
+            Some(endpoint) => endpoint == at,
+            None => self.host_port != 0 && self.host_port == at.port(),
+        }
+    }
+
+    /// Whether nothing is known yet about where this launch's shard listens:
+    /// no host port was handed to it (the in-process launcher binds one of
+    /// its own choosing) and its launcher has not reported.
+    fn address_unknown(&self) -> bool {
+        self.endpoint.is_none() && self.host_port == 0
+    }
+}
+
+/// How long after a shard registered it may still turn out to be a launch's
+/// (its launcher has not reported yet), in ticks (5 s). While such a shard
+/// exists no launch is stopped as surplus: it might be that very shard's
+/// process. A launcher reports within a beat or two, so this only has to be
+/// long enough never to be wrong.
+pub const LAUNCH_LIMBO_TICKS: u64 = 5 * crate::config::TICK_HZ;
+
+/// The shard the epoch in flight gives its first region(s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Join {
+    /// The shard that registered and was welcomed for the change.
+    shard: ShardId,
+    /// The dead shard whose regions it takes over, if this is a replacement.
+    replaces: Option<ShardId>,
 }
 
 /// The orchestrator: control plane + the launcher seam.
@@ -196,23 +322,68 @@ pub struct Orchestrator<L: Launcher> {
     latest: BTreeMap<ShardId, LoadReport>,
     /// The most recent tick each shard reported at (drives `activation_tick`).
     shard_ticks: BTreeMap<ShardId, u64>,
-    /// A child id whose shard the loop must spawn (staged by a split).
+    /// Launches the loop must hand to the launcher (staged by
+    /// [`Self::reconcile_launches`]: a shard is missing).
     pending_spawn: Vec<SpawnSpec>,
-    /// A shard the loop must kill (staged by a committed merge, an aborted
-    /// split's child, or the admin verb).
+    /// Shards the loop must stop: close their control link (staged by a
+    /// committed merge, a change that aborted under its new shard, a death).
     pending_kill: Vec<ShardId>,
+    /// Launches the loop must tell the launcher to stop: the processes of the
+    /// shards above that it started, and launches that never registered.
+    pending_launch_kill: Vec<LaunchId>,
     /// The shard the merge **in flight** removes. It is killed when that epoch
     /// commits and left alone when it aborts: until the commit it still owns its
     /// region, so killing it any earlier leaves the map naming a dead owner.
     pending_merge: Option<ShardId>,
-    /// The child the split or carve **in flight** launched. If that epoch
-    /// aborts the child owns nothing and is killed, instead of running on
+    /// The shard the carve or replacement **in flight** gives its region(s).
+    /// It is registered and connected, and owns nothing until that epoch
+    /// commits; if it aborts, the shard is stopped instead of running on
     /// unowned.
-    pending_split: Option<ShardId>,
+    pending_join: Option<Join>,
+    /// The node a split or a carve asked for, waiting for a shard to register
+    /// and take it.
+    wanted: Option<Wanted>,
+    /// Shards known to be dead that still own regions of the published map,
+    /// each with whether the orchestrator had launched it. Their regions go to
+    /// the next shards that register, before anything else changes.
+    dead: BTreeMap<ShardId, bool>,
+    /// Everything the launcher was asked to start and still runs (or is
+    /// starting).
+    launches: BTreeMap<LaunchId, Launch>,
+    /// The last launch id handed out.
+    last_launch: u64,
+    /// Where the search for a free host port starts next (an offset into the
+    /// range): ports are handed out round robin, so the port of a shard that
+    /// just died is not the next one used.
+    next_port: u32,
+    /// Launches that failed in a row (drives the pause before the next one).
+    /// Reset when **a launch's shard comes to own a region** — not merely
+    /// because some other launched shard is registered.
+    launch_failures_in_a_row: u32,
+    /// No launch is staged before this tick (the pause after a failure).
+    launch_backoff_until: u64,
     /// Messages the async layer must deliver, keyed by destination shard.
     outbox: Vec<(ShardId, Message)>,
     /// The endpoints learned from each shard's `ShardHello` (for spawn specs).
     endpoints: BTreeMap<ShardId, std::net::SocketAddr>,
+    /// The tick each registered shard said hello at. A launch is only ever
+    /// matched to a shard that registered **after** the launch was staged
+    /// ([`Self::attribute_launches`]).
+    registered_at: BTreeMap<ShardId, u64>,
+    /// How many map changes in a row each shard has let run into their
+    /// deadline without acknowledging them ([`ACK_STRIKES`] make it dead).
+    ack_strikes: BTreeMap<ShardId, u32>,
+    /// The reason of the last "wait" that will not pass by itself and was
+    /// logged ([`Self::stuck`]): the same reason is not logged again until a
+    /// hello has been served in between.
+    logged_wait: Option<String>,
+    /// Set by [`Self::stuck`] while a hello is being decided: the "wait" it
+    /// is answered with is worth a line in the log, and whether its text is
+    /// the peer's to choose.
+    noted_wait: Option<(String, bool)>,
+    /// Reports and acks the run loop dropped because they did not name the
+    /// shard their connection was admitted as.
+    misattributed: u64,
 
     // ---- what follows is for the operator view; no decision reads it, with
     // the one exception of `autoscaler_paused`, which an operator sets.
@@ -228,9 +399,10 @@ pub struct Orchestrator<L: Launcher> {
     last_decision: Option<Decision>,
     /// What the epoch in flight is, in words.
     in_flight: Option<String>,
-    /// Launches that failed, reported by their tasks and logged on the next
-    /// beat (a launch runs outside the loop, so it cannot write the log).
-    launch_failures: Arc<std::sync::Mutex<Vec<(ShardId, String)>>>,
+    /// What became of the launches the loop started, reported by their tasks
+    /// and taken in on the next beat (a launch runs outside the loop, so it
+    /// cannot touch the orchestrator).
+    launch_results: Arc<std::sync::Mutex<Vec<LaunchOutcome>>>,
     /// The operator port, once a front end is attached.
     ops: Option<OpsPort>,
     /// The event log's revision when the last snapshot was published.
@@ -255,12 +427,52 @@ pub struct Orchestrator<L: Launcher> {
     scene_raise_wanted: Option<u64>,
     /// The tick the revision was last raised to get above a shard's.
     scene_raised_tick: Option<u64>,
+    /// A replacement committed and the scene's revision could not be raised
+    /// for it ([`Self::respawn_scene`]): tried again once a second by
+    /// [`Self::reconcile_scene`] until it — or any other raise — succeeds.
+    scene_respawn_wanted: Option<Respawn>,
     /// An operator asked for the committed map to be sent again; done once,
     /// when the outbox is next drained, however often it was asked for.
     map_push_pending: bool,
     /// The standard-output budget for peer-caused entries.
     peer_prints: PeerPrintBudget,
 }
+
+/// What a launch task reports back: the launch, and the launcher's handle or
+/// why it could not start the shard.
+type LaunchOutcome = (LaunchId, Result<ShardHandle, String>);
+
+/// A scene re-issue that is still owed after a replacement
+/// ([`Orchestrator::respawn_scene`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Respawn {
+    /// The shard that was replaced.
+    dead: ShardId,
+    /// Its replacement.
+    new: ShardId,
+    /// The revision the scene had when the raise failed: once it is above
+    /// that, by whatever cause, the scene's bodies have been rebuilt.
+    at_revision: u64,
+}
+
+/// Why an epoch in flight was aborted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortCause {
+    /// Its deadline passed with acks missing.
+    Deadline,
+    /// A shard that had to acknowledge it is gone.
+    Gone(ShardId),
+}
+
+/// How many map changes in a row a connected shard may let run into their
+/// deadline without acknowledging them before it is taken for dead.
+///
+/// A shard whose link is up but which does not answer holds up every change
+/// of the map (every shard of it must ack), and with `--min-shards` every
+/// join it spoils is launched again. One missed deadline can be a hiccup;
+/// three in a row — nine seconds of not answering — is a shard that is stuck,
+/// and it is replaced like any other dead one.
+pub const ACK_STRIKES: u32 = 3;
 
 /// How many peer-caused event-log entries (refused hellos) may still be
 /// written to standard output, and how many were not.
@@ -294,17 +506,30 @@ impl<L: Launcher> Orchestrator<L> {
             shard_ticks: BTreeMap::new(),
             pending_spawn: Vec::new(),
             pending_kill: Vec::new(),
+            pending_launch_kill: Vec::new(),
             pending_merge: None,
-            pending_split: None,
+            pending_join: None,
+            wanted: None,
+            dead: BTreeMap::new(),
+            launches: BTreeMap::new(),
+            last_launch: 0,
+            next_port: 0,
+            launch_failures_in_a_row: 0,
+            launch_backoff_until: 0,
             outbox: Vec::new(),
             endpoints: BTreeMap::new(),
+            registered_at: BTreeMap::new(),
+            ack_strikes: BTreeMap::new(),
+            logged_wait: None,
+            noted_wait: None,
+            misattributed: 0,
             events,
             last_heard: BTreeMap::new(),
             connected: BTreeSet::new(),
             autoscaler_paused: false,
             last_decision: None,
             in_flight: None,
-            launch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
+            launch_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             ops: None,
             published_revision: 0,
             printed_event: 0,
@@ -313,6 +538,7 @@ impl<L: Launcher> Orchestrator<L> {
             scene_changed_tick: None,
             scene_raise_wanted: None,
             scene_raised_tick: None,
+            scene_respawn_wanted: None,
             map_push_pending: false,
             peer_prints: PeerPrintBudget::default(),
         }
@@ -358,15 +584,78 @@ impl<L: Launcher> Orchestrator<L> {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Drain the spawn specs the loop staged this tick (a split's child).
+    /// Drain the launches staged since the last drain: the shards the
+    /// launcher has to start ([`Self::reconcile_launches`]).
     pub fn take_pending_spawn(&mut self) -> Vec<SpawnSpec> {
         std::mem::take(&mut self.pending_spawn)
     }
 
-    /// Drain the shard ids the loop staged for killing (a committed merge's
-    /// child, the child of a split that aborted, an admin kill).
+    /// Drain the shards staged for stopping — the loop closes their control
+    /// links — each once: a committed merge's shard, the shard of a change
+    /// that aborted, a shard found dead.
     pub fn take_pending_kill(&mut self) -> Vec<ShardId> {
+        let mut seen = BTreeSet::new();
         std::mem::take(&mut self.pending_kill)
+            .into_iter()
+            .filter(|shard| seen.insert(*shard))
+            .collect()
+    }
+
+    /// Drain the launches the launcher has to stop: the processes behind the
+    /// shards of [`Self::take_pending_kill`] that the orchestrator had
+    /// started, and launches that never registered.
+    pub fn take_pending_launch_kill(&mut self) -> Vec<LaunchId> {
+        std::mem::take(&mut self.pending_launch_kill)
+    }
+
+    /// The node that is waiting for a shard to register and take it, if a
+    /// split or a carve asked for one.
+    #[must_use]
+    pub fn wanted_node(&self) -> Option<NodeRef> {
+        self.wanted.as_ref().map(|wanted| wanted.node)
+    }
+
+    /// The shards known to be dead whose regions have not been given to a
+    /// replacement yet.
+    #[must_use]
+    pub fn dead_shards(&self) -> Vec<ShardId> {
+        self.dead.keys().copied().collect()
+    }
+
+    /// The launch that became `shard`, if the orchestrator started it.
+    #[must_use]
+    pub fn launch_of(&self, shard: ShardId) -> Option<LaunchId> {
+        self.launches
+            .iter()
+            .find(|(_, launch)| launch.shard == Some(shard))
+            .map(|(id, _)| *id)
+    }
+
+    /// How many launches have not become a registered shard yet.
+    #[must_use]
+    pub fn starting(&self) -> usize {
+        self.launches
+            .values()
+            .filter(|launch| launch.shard.is_none())
+            .count()
+    }
+
+    /// The shards that are alive as far as the orchestrator knows: they hold a
+    /// control link and are not known to be dead.
+    #[must_use]
+    pub fn live_shards(&self) -> BTreeSet<ShardId> {
+        self.connected
+            .iter()
+            .copied()
+            .filter(|shard| !self.dead.contains_key(shard))
+            .collect()
+    }
+
+    /// The address `shard` advertised in its hello — where clients and other
+    /// shards dial it — if it has registered.
+    #[must_use]
+    pub fn endpoint_of(&self, shard: ShardId) -> Option<SocketAddr> {
+        self.endpoints.get(&shard).copied()
     }
 
     /// The shard the merge in flight will remove once its epoch commits.
@@ -383,19 +672,78 @@ impl<L: Launcher> Orchestrator<L> {
 
     // ------------------------------------------------------------- ingestion
 
-    /// Handle a `ShardHello`: allocate/confirm the id and region, remember the
-    /// endpoint, and return the `ShardWelcome` to send back.
+    /// Handle a `ShardHello`: decide what the shard gets, remember where it
+    /// is, and return the `ShardWelcome` to send back.
     ///
-    /// This is the orchestrator-owns-allocation path (closes Phase-2 MAJOR 3):
-    /// the id comes from [`crate::ids`], never from argv.
-    pub fn handle_shard_hello(&mut self, hello: &ShardHello) -> Result<ShardWelcome, String> {
-        match self.control.handle_shard_hello(hello) {
+    /// This is the one way a shard comes into the cluster, launched or started
+    /// by hand (`docs/plan-sharding.md` §2): it says hello **without an id and
+    /// without a region** and is given, in this order,
+    ///
+    /// 1. **the root**, while nobody has claimed it — under the id reserved at
+    ///    startup, with no map change (the map already names that id);
+    /// 2. **the regions of a dead shard**, if one is waiting to be replaced —
+    ///    under a new id, through an epoch change the dead shard is not asked
+    ///    to acknowledge;
+    /// 3. **the node a split or a carve asked for** ([`Self::begin_carve`]);
+    /// 4. otherwise **the next free layout cell** around the scene
+    ///    ([`topology::layout_cells`]).
+    ///
+    /// For 2 to 4 the id is allocated here and the change is proposed here,
+    /// **with the shard already connected**: the prepare is in the outbox for
+    /// every recipient, the new shard included, and the 3 s ack deadline never
+    /// has to cover a process start. The welcome carries the published map,
+    /// in which the shard does not own its region yet — it owns it when the
+    /// epoch commits, and is stopped if it aborts.
+    ///
+    /// # Errors
+    ///
+    /// [`HelloRefusal::Wait`] — the one refusal that is not final — when the
+    /// hello cannot be served *yet*: an epoch change is in flight (one at a
+    /// time), or a shard that would have to acknowledge the change is not
+    /// connected. The shard asks again. Final: another cluster, a missing or
+    /// wrong cluster secret, `--max-shards` (or `--max-regions`) reached, no
+    /// region left to give, a claim the published map does not support
+    /// ([`ControlPlane::handle_shard_hello`]).
+    ///
+    /// This form takes the hello as coming **from the address it advertises**
+    /// (a test playing the shard; an in-process caller). The run loop, which
+    /// knows where a hello's connection really comes from, uses
+    /// [`Self::handle_shard_hello_from`].
+    pub fn handle_shard_hello(&mut self, hello: &ShardHello) -> Result<ShardWelcome, HelloRefusal> {
+        self.handle_shard_hello_from(hello, hello.endpoint.ip())
+    }
+
+    /// [`Self::handle_shard_hello`] for a hello whose control connection
+    /// comes from `seen_from`.
+    ///
+    /// The address matters for one decision only: a hello that advertises the
+    /// address of a **live** registered shard takes that shard's place only
+    /// when it comes from that address's host (`take_over_in_place`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::handle_shard_hello`].
+    pub fn handle_shard_hello_from(
+        &mut self,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        self.noted_wait = None;
+        match self.admit(hello, seen_from) {
             Ok(welcome) => {
-                self.endpoints.insert(welcome.shard, hello.endpoint);
-                self.heard(welcome.shard, HeardKind::Hello);
-                // A shard that (re-)registers starts without a scene: whatever
-                // it confirmed before is void until it confirms again.
-                self.scene_confirmed.remove(&welcome.shard);
+                let shard = welcome.shard;
+                self.endpoints.insert(shard, hello.endpoint);
+                self.registered_at.insert(shard, self.tick);
+                // A hello arrives over a live control link by definition; the
+                // run loop corrects this on every beat from what it sees.
+                self.connected.insert(shard);
+                self.heard(shard, HeardKind::Hello);
+                // A shard that registers starts without a scene: nothing is
+                // confirmed until it confirms.
+                self.scene_confirmed.remove(&shard);
+                // Whatever a hello was waiting for has passed.
+                self.logged_wait = None;
+                self.attribute_launches();
                 self.log(
                     EventKind::Shard,
                     Severity::Good,
@@ -408,19 +756,967 @@ impl<L: Launcher> Orchestrator<L> {
                 );
                 Ok(welcome)
             }
-            Err(reason) => {
-                // Anybody who can reach the control port can cause this entry,
-                // with any text: it goes into the ring kept for such entries so
-                // it can never push out an operator's or an epoch's.
-                self.events.push_peer_caused(
-                    self.tick,
-                    EventKind::Shard,
-                    Severity::Warn,
-                    format!("hello from {} refused: {reason}", hello.endpoint),
-                );
-                Err(reason)
+            Err(refusal) => {
+                // A final refusal is worth a line. Anybody who can reach the
+                // control port can cause one, with any text, so it goes into
+                // the ring kept for such entries and can never push out an
+                // operator's or an epoch's.
+                if refusal.is_final() {
+                    self.events.push_peer_caused(
+                        self.tick,
+                        EventKind::Shard,
+                        Severity::Warn,
+                        format!("hello from {} refused: {refusal}", hello.endpoint),
+                    );
+                } else if let Some((why, peers_text)) = self.noted_wait.take() {
+                    // "Not yet" is not worth a line while it passes by itself
+                    // (a change in flight, a shard that is not connected yet):
+                    // the shard asks again a few times a second until it is
+                    // served. One that does **not** pass by itself is — once
+                    // per reason, or the operator sees nothing but a launch
+                    // that "did not register".
+                    if self.logged_wait.as_deref() != Some(why.as_str()) {
+                        let text = format!(
+                            "the shard at {} is told to wait, and that will not pass by itself: \
+                             {why}",
+                            hello.endpoint
+                        );
+                        if peers_text {
+                            self.events.push_peer_caused(
+                                self.tick,
+                                EventKind::Shard,
+                                Severity::Warn,
+                                text,
+                            );
+                        } else {
+                            self.log(EventKind::Shard, Severity::Warn, text);
+                        }
+                        self.logged_wait = Some(why);
+                    }
+                }
+                Err(refusal)
             }
         }
+    }
+
+    /// A "wait" that does not pass by itself: the answer for the shard, noted
+    /// so that [`Self::handle_shard_hello_from`] writes it to the event log
+    /// (once per reason). `peers_text` says the reason contains text of the
+    /// peer's choosing, which goes to the bounded ring for such entries.
+    fn stuck(&mut self, why: String, peers_text: bool) -> HelloRefusal {
+        self.noted_wait = Some((why.clone(), peers_text));
+        HelloRefusal::Wait(why)
+    }
+
+    /// Decide what `hello` gets (see [`Self::handle_shard_hello`]).
+    fn admit(
+        &mut self,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        self.control.check_credentials(hello)?;
+        if hello.shard != ShardId::NONE || hello.region.is_some() {
+            // A claim on what the map already says. An id is confirmed once:
+            // a shard that comes back is a new process, whose guid counter
+            // starts over, so it is given a new id like any other shard.
+            if hello.shard != ShardId::NONE && self.endpoints.contains_key(&hello.shard) {
+                return Err(HelloRefusal::Refused(format!(
+                    "{} has already registered: an id is used by one process, once. Start \
+                     the shard without an id and it is given a new one (and the regions of \
+                     the one it replaces)",
+                    hello.shard
+                )));
+            }
+            return self
+                .control
+                .handle_shard_hello(hello)
+                .map_err(HelloRefusal::Refused);
+        }
+        self.assign(hello, seen_from)
+    }
+
+    /// Give a shard that registered with neither id nor region its place.
+    fn assign(
+        &mut self,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        // 1. The root, while nobody has claimed it: the id reserved at startup
+        //    and no map change.
+        if self.control.unclaimed_root_owner().is_some() {
+            return self
+                .control
+                .handle_shard_hello(hello)
+                .map_err(HelloRefusal::Refused);
+        }
+        // One change at a time. This comes before everything below: a hello
+        // that has to wait changes nothing — in particular it makes nobody
+        // dead.
+        if let Phase::Preparing { epoch, .. } = self.control.publisher.phase() {
+            return Err(HelloRefusal::Wait(format!(
+                "epoch {epoch} is still in flight; one change at a time"
+            )));
+        }
+        // A shard at the very address a registered, live shard advertises.
+        let at_its_address = self
+            .endpoints
+            .iter()
+            .find(|(shard, endpoint)| {
+                **endpoint == hello.endpoint && !self.dead.contains_key(shard)
+            })
+            .map(|(shard, _)| *shard);
+        if let Some(old) = at_its_address {
+            return self.take_over_in_place(old, hello, seen_from);
+        }
+        // 2. A dead shard's regions go first: until they have an owner again
+        //    nothing else can change (the dead shard cannot acknowledge it).
+        if let Some(dead) = self.dead.keys().next().copied() {
+            return self.replace(dead, hello, seen_from);
+        }
+        // A shard the orchestrator started, for something that is no longer
+        // missing (see `unneeded_launch`): it is not given a region nobody
+        // asked for.
+        if let Some(refusal) = self.unneeded_launch(hello) {
+            return Err(refusal);
+        }
+        // Room for one more shard?
+        let owners = self.owner_count();
+        let limit = self.control.config.max_shards;
+        if owners >= limit {
+            return Err(HelloRefusal::Full(format!(
+                "the cluster already has {owners} shard(s) and the limit is {limit} \
+                 (--max-shards)"
+            )));
+        }
+        if let Some(full) = self.region_limit_refusal() {
+            return Err(HelloRefusal::Full(full));
+        }
+        // Everybody who has to acknowledge the change must be there to do it.
+        if let Some(absent) = self.absent_recipient(&BTreeSet::new()) {
+            return Err(HelloRefusal::Wait(not_connected(absent)));
+        }
+        // 3. The node somebody asked for, 4. else the next layout cell.
+        let (node, what) = match &self.wanted {
+            Some(wanted) => (wanted.node, wanted.what.clone()),
+            None => {
+                let root = self.control.config.root_node();
+                let Some(cell) = topology::next_layout_cell(self.control.map(), root) else {
+                    return Err(HelloRefusal::Refused(
+                        "there is no region left to give a new shard: every layout cell \
+                         around the scene has an owner"
+                            .into(),
+                    ));
+                };
+                (cell, format!("layout cell {} goes to new", node_path(cell)))
+            }
+        };
+        // Whatever becomes of it, the request is served by this hello or not
+        // at all: a node that can no longer be carved is not asked for again.
+        let asked_for = self.wanted.take().is_some();
+        match self.carve(node, &what, hello.endpoint) {
+            Ok(welcome) => Ok(welcome),
+            Err(why) if asked_for => {
+                self.log(
+                    EventKind::Epoch,
+                    Severity::Warn,
+                    format!("not carried out: {what} shard ({why})"),
+                );
+                Err(HelloRefusal::Wait(why))
+            }
+            // Nothing the next hello would not run into as well (the id
+            // counter cannot be written, the plan does not validate): said in
+            // the log, once, not only to the shard.
+            Err(why) => Err(self.stuck(why, false)),
+        }
+    }
+
+    /// A hello from the address the **live** registered shard `old`
+    /// advertises: `old`'s process is gone (two cannot listen on one address)
+    /// and this is the process that came back in its place — or `old` itself,
+    /// saying hello a second time because it never saw its welcome. Either
+    /// way it is not handed the old id: `old` is taken for dead and the hello
+    /// is given its regions under a new one, like any replacement.
+    ///
+    /// Three things keep that from being a way to knock a healthy shard out:
+    ///
+    /// * **Only when the hello is going to be served.** The caller has made
+    ///   sure no change is in flight; here everybody who has to acknowledge
+    ///   the replacement must be connected. A hello that is told to wait has
+    ///   made nobody dead.
+    /// * **Only from that address's own host.** A hello whose connection
+    ///   comes from another IP than the one it advertises is told to wait:
+    ///   if `old` really is gone its own link closes (at the latest when the
+    ///   transport's idle timeout runs out) and the hello is then served as
+    ///   an ordinary replacement; if it is not, nothing happens to it.
+    /// * **The process is kept.** If the orchestrator launched `old`, the
+    ///   launch is the process now saying hello: it is taken off the old id
+    ///   (and matched to the new one by its address) instead of being killed.
+    ///
+    /// No launch is staged for `old` either (see [`Self::mark_dead`]): its
+    /// regions are being taken by this very hello.
+    fn take_over_in_place(
+        &mut self,
+        old: ShardId,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        if seen_from.to_canonical() != hello.endpoint.ip().to_canonical() {
+            return Err(self.stuck(
+                format!(
+                    "{old} is registered at {} and holds a control link; this hello names that \
+                     address but comes from {seen_from}. It is served when {old}'s own link has \
+                     closed",
+                    hello.endpoint
+                ),
+                true,
+            ));
+        }
+        let mut absent: BTreeSet<ShardId> = self.dead.keys().copied().collect();
+        absent.insert(old);
+        if let Some(missing) = self.absent_recipient(&absent) {
+            return Err(HelloRefusal::Wait(not_connected(missing)));
+        }
+        let launch = self.launch_of(old);
+        if let Some(entry) = launch.and_then(|launch| self.launches.get_mut(&launch)) {
+            // Starting again, from now: the shard it became is gone, the
+            // process is the one saying hello.
+            entry.shard = None;
+            entry.since = self.tick;
+        }
+        self.mark_dead(
+            old,
+            "a new shard registered from its address",
+            launch.is_some(),
+            false,
+        );
+        if self.dead.contains_key(&old) {
+            self.replace(old, hello, seen_from)
+        } else {
+            // It owned nothing, so there is nothing to take over.
+            self.assign(hello, seen_from)
+        }
+    }
+
+    /// The refusal for a hello from **a shard the orchestrator started** that
+    /// finds nothing it was started for: the root is taken, no shard is dead,
+    /// no node is wanted, and the cluster has the shards it is to keep
+    /// running. `None` for every other hello.
+    ///
+    /// A launch is staged for something that is missing — a dead shard, a
+    /// wanted node, a shard short of `--min-shards`. If a shard started by
+    /// hand takes that first, the launch is one too many; given the next
+    /// layout cell it would be a shard (and a region) nobody asked for, and
+    /// one more on every repeat. So it is refused for good and stopped.
+    /// [`Self::reconcile_launches`] stops such a launch before it registers
+    /// when it can; this is for the hello that gets there first.
+    ///
+    /// A shard started by hand still gets the next layout cell — that is the
+    /// rule "a shard that registers is assigned a region". The two are told
+    /// apart by the address the hello advertises, which the orchestrator
+    /// knows for a launch that was handed a host port (`process`). The
+    /// in-process launcher binds a port of its own choosing, so its hello
+    /// cannot be told from a hand-started shard's: while such a launch is
+    /// still starting and nothing is missing, the hello is told to wait —
+    /// within a beat or two the launch is either matched to the shard it
+    /// became or stopped as surplus, and whoever asks again is served.
+    fn unneeded_launch(&mut self, hello: &ShardHello) -> Option<HelloRefusal> {
+        let (owners, min) = (self.owner_count(), self.control.config.min_shards);
+        if self.wanted.is_some() || owners < min {
+            return None;
+        }
+        if let Some(launch) = self.launch_saying(hello) {
+            let port = self
+                .launches
+                .remove(&launch)
+                .map_or(0, |entry| entry.host_port);
+            self.pending_launch_kill.push(launch);
+            self.log(
+                EventKind::Launcher,
+                Severity::Info,
+                format!(
+                    "the shard of {launch}{} registered when nothing was left for it to take \
+                     (the cluster has the {owners} shard(s) it is to have): it is stopped",
+                    on_port(port)
+                ),
+            );
+            return Some(HelloRefusal::Refused(
+                "this shard was started for a region that another shard has taken since; the \
+                 cluster has the shards it is to keep running, so it is not needed"
+                    .into(),
+            ));
+        }
+        let unplaced = self
+            .launches
+            .values()
+            .any(|launch| launch.shard.is_none() && launch.address_unknown());
+        unplaced.then(|| {
+            HelloRefusal::Wait(
+                "a shard the orchestrator started is still registering, and nothing else is \
+                 missing"
+                    .into(),
+            )
+        })
+    }
+
+    /// The launch whose shard is saying `hello`, if it is one the orchestrator
+    /// started and has not matched to a shard yet: the one that listens where
+    /// the hello says its shard does — the address its launcher reported, or,
+    /// before that, the host port it was handed.
+    fn launch_saying(&self, hello: &ShardHello) -> Option<LaunchId> {
+        self.launches
+            .iter()
+            .find(|(_, launch)| launch.shard.is_none() && launch.listens_at(hello.endpoint))
+            .map(|(id, _)| *id)
+    }
+
+    /// Plan the carve of `node` for the shard that just said hello from
+    /// `endpoint`: allocate its id, propose the epoch to every shard of the
+    /// map and to it, and build its welcome. `what` words the change up to
+    /// the new owner's name.
+    ///
+    /// The id is allocated only once a valid plan exists: a carve that cannot
+    /// happen burns no id and writes nothing to the counter file.
+    fn carve(
+        &mut self,
+        node: NodeRef,
+        what: &str,
+        endpoint: SocketAddr,
+    ) -> Result<ShardWelcome, String> {
+        // Planned once with a placeholder owner (the owner is irrelevant to
+        // whether a plan validates), so a carve that cannot happen burns no id.
+        topology::carve_plan(self.control.map(), node, ShardId::NONE)
+            .map_err(|err| err.to_string())?;
+        // The id space may be exhausted, or the counter cannot be written:
+        // then nobody can be given a region.
+        let new_id = self.control.ids.allocate().map_err(|err| err.to_string())?;
+        let plan = topology::carve_plan(self.control.map(), node, new_id)
+            .map_err(|err| err.to_string())?;
+        let observer_ticks: Vec<(ShardId, u64)> =
+            self.shard_ticks.iter().map(|(s, t)| (*s, *t)).collect();
+        // (`None`: lost the race to an in-flight epoch — the caller's check
+        // said Idle but the publisher disagreed.)
+        let prepare = self
+            .control
+            .publisher
+            .propose(
+                plan.map.clone(),
+                vec![plan.change],
+                &observer_ticks,
+                self.tick,
+            )
+            .ok_or_else(|| String::from("the publisher refused the proposal"))?;
+        self.queue_outbound(&prepare);
+        self.pending_join = Some(Join {
+            shard: new_id,
+            replaces: None,
+        });
+        self.in_flight = Some(format!("{what} {new_id}"));
+        // The shard losing the node is on the autoscaler's cooldown, like the
+        // parent of a split.
+        self.control.autoscaler.note_action(plan.from, self.tick);
+        Ok(ShardWelcome {
+            shard: new_id,
+            region: ShardRegion::new(plan.node, new_id, endpoint),
+            // The published map: the node is not the new shard's yet.
+            shard_map: self.control.map().clone(),
+            peer_token: self.control.peer_token.expose().to_owned(),
+        })
+    }
+
+    /// Give the regions of the dead shard `dead` to the shard that just said
+    /// hello: a new id, and one epoch change that moves every region `dead`
+    /// owns to it. No shard known to be dead is asked to acknowledge it.
+    fn replace(
+        &mut self,
+        dead: ShardId,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        let absent: BTreeSet<ShardId> = self.dead.keys().copied().collect();
+        if let Some(missing) = self.absent_recipient(&absent) {
+            return Err(HelloRefusal::Wait(not_connected(missing)));
+        }
+        let mut regions: Vec<NodeRef> = self
+            .control
+            .map()
+            .regions
+            .iter()
+            .filter(|region| region.shard == dead)
+            .map(|region| region.node)
+            .collect();
+        // The shallowest first: it is the region the welcome names.
+        regions.sort_by_key(|node| node.depth);
+        let Some(first) = regions.first().copied() else {
+            // It owns nothing (any more): nothing to take over.
+            self.dead.remove(&dead);
+            self.forget_shard(dead);
+            return self.assign(hello, seen_from);
+        };
+        // (Each of the three failures below would meet the next hello too:
+        // they are said in the log, not only to the shard.)
+        let new_id = match self.control.ids.allocate() {
+            Ok(id) => id,
+            Err(err) => return Err(self.stuck(err.to_string(), false)),
+        };
+        let mut map = self.control.map().clone();
+        map.epoch += 1;
+        for region in &mut map.regions {
+            if region.shard == dead {
+                region.shard = new_id;
+                region.endpoint = hello.endpoint;
+            }
+        }
+        if let Err(why) = topology::validate(&map) {
+            return Err(self.stuck(why, false));
+        }
+        let changes: Vec<_> = regions.iter().map(|node| (*node, new_id)).collect();
+        let observer_ticks: Vec<(ShardId, u64)> =
+            self.shard_ticks.iter().map(|(s, t)| (*s, *t)).collect();
+        let Some(prepare) = self.control.publisher.propose_without(
+            map,
+            changes,
+            &observer_ticks,
+            self.tick,
+            &absent,
+        ) else {
+            return Err(self.stuck("the publisher refused the proposal".into(), false));
+        };
+        self.queue_outbound(&prepare);
+        self.pending_join = Some(Join {
+            shard: new_id,
+            replaces: Some(dead),
+        });
+        let paths: Vec<String> = regions.iter().map(|node| node_path(*node)).collect();
+        self.in_flight = Some(format!(
+            "replacement of {dead}: region {} goes to new {new_id}",
+            paths.join(", ")
+        ));
+        Ok(ShardWelcome {
+            shard: new_id,
+            region: ShardRegion::new(first, new_id, hello.endpoint),
+            shard_map: self.control.map().clone(),
+            peer_token: self.control.peer_token.expose().to_owned(),
+        })
+    }
+
+    /// How many shards own a region of the published map.
+    fn owner_count(&self) -> usize {
+        self.control
+            .map()
+            .regions
+            .iter()
+            .map(|region| region.shard)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// A shard of the published map that could not acknowledge a change right
+    /// now: it holds no control link. `except` are shards left out of the
+    /// question — the dead ones a replacement is not sent to. `None` when
+    /// every recipient is there.
+    ///
+    /// Every shard of the map must ack a change ([`crate::epoch`]), so one
+    /// that is not there would hold it up until the deadline and abort it.
+    /// Nothing is proposed while that is known in advance.
+    fn absent_recipient(&self, except: &BTreeSet<ShardId>) -> Option<ShardId> {
+        self.control
+            .map()
+            .regions
+            .iter()
+            .map(|region| region.shard)
+            .find(|shard| !except.contains(shard) && !self.connected.contains(shard))
+    }
+
+    // ------------------------------------------------------------- supervision
+
+    /// `shard` is gone: its process exited, its control link closed, a new
+    /// shard came up at its address, or an operator said so. `why` words it
+    /// for the log.
+    ///
+    /// Nothing about the map changes here. The shard stops counting as a
+    /// recipient of any change, an epoch in flight that waits for it is
+    /// aborted at once instead of at its deadline, what is left of the shard is
+    /// staged for stopping, and — if it owns regions — it is remembered as
+    /// **dead**: the next shard that registers is given its regions under a
+    /// new id ([`Self::handle_shard_hello`]), before any other change, and one
+    /// is launched for that if the orchestrator runs a launcher for the
+    /// cluster ([`Self::reconcile_launches`]).
+    pub fn declare_dead(&mut self, shard: ShardId, why: &str) {
+        let managed = self.launch_of(shard).is_some();
+        self.mark_dead(shard, why, managed, true);
+    }
+
+    /// [`Self::declare_dead`] with its two decisions made by the caller:
+    /// whether the orchestrator had launched `shard` (`managed`: it is then
+    /// replaced by a launch even with `--min-shards 0`), and whether to look
+    /// at once for what is missing now (`reconcile`).
+    ///
+    /// `reconcile` is false in exactly one case — the hello that makes the
+    /// shard dead is about to take its regions ([`Self::take_over_in_place`]).
+    /// Staging a launch for it there would start a shard for regions that
+    /// have an owner again a few lines later; the next tick looks instead.
+    fn mark_dead(&mut self, shard: ShardId, why: &str, managed: bool, reconcile: bool) {
+        if self.dead.contains_key(&shard) || !self.knows(shard) {
+            return;
+        }
+        self.connected.remove(&shard);
+        // A dead shard reports nothing more; its last report must not go on
+        // driving the autoscaler.
+        self.forget_reports(shard);
+        self.ack_strikes.remove(&shard);
+        self.stage_kill(shard);
+        if self.owns_a_region(shard) {
+            self.dead.insert(shard, managed);
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!(
+                    "{shard} lost: {why}. Its region(s) go to a replacement under a new id; \
+                     no other map change until then"
+                ),
+            );
+        } else {
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!("{shard} lost: {why}. It owned no region"),
+            );
+            self.forget_shard(shard);
+        }
+        // An epoch it would have to acknowledge can never commit.
+        let waits_for_it = matches!(
+            self.control.publisher.phase(),
+            Phase::Preparing { recipients, .. } if recipients.contains(&shard)
+        );
+        if waits_for_it {
+            let missing = self.missing_acks();
+            if let Some(abort) = self.control.publisher.abort() {
+                self.settle_abort(&abort, AbortCause::Gone(shard), &missing);
+            }
+        }
+        if reconcile {
+            self.reconcile_launches();
+        }
+    }
+
+    /// Whether `shard` is anybody to this orchestrator: it owns a region, has
+    /// registered, or holds a control link.
+    fn knows(&self, shard: ShardId) -> bool {
+        self.connected.contains(&shard)
+            || self.endpoints.contains_key(&shard)
+            || self.owns_a_region(shard)
+    }
+
+    /// Stage `shard` for stopping: the loop closes its control link, and
+    /// tells the launcher to stop its process if the orchestrator started it.
+    /// From here on it does not count as a shard of the cluster: stopped on
+    /// purpose is not a link that was "lost".
+    fn stage_kill(&mut self, shard: ShardId) {
+        self.connected.remove(&shard);
+        self.pending_kill.push(shard);
+        if let Some(launch) = self.launch_of(shard) {
+            self.launches.remove(&launch);
+            self.pending_launch_kill.push(launch);
+        }
+    }
+
+    /// Take in what a launch task reported: the launcher's handle for the
+    /// shard it started, or why it could not start one.
+    ///
+    /// The handle is how a launch is matched to the shard it became — by the
+    /// id when the launcher knows it, otherwise by the address the shard
+    /// listens on, which is the address its hello advertises
+    /// ([`crate::launcher`]). The run loop calls this for every launch it
+    /// started; a test that plays the launcher calls it too.
+    pub fn note_launch_result(&mut self, launch: LaunchId, result: Result<ShardHandle, String>) {
+        match result {
+            Ok(handle) => {
+                let Some(entry) = self.launches.get_mut(&launch) else {
+                    // Given up on meanwhile (it took too long, or its shard was
+                    // stopped): whatever came up must not stay up.
+                    self.pending_launch_kill.push(launch);
+                    return;
+                };
+                entry.endpoint = Some(handle.endpoint);
+                if handle.shard.is_some() {
+                    // The launcher knows which shard it became.
+                    entry.shard = handle.shard;
+                } else if entry
+                    .shard
+                    .is_some_and(|guess| self.endpoints.get(&guess) != Some(&handle.endpoint))
+                {
+                    // Matched by the host port alone, before the launcher
+                    // had said where the shard listens — and that shard
+                    // turns out to listen elsewhere.
+                    entry.shard = None;
+                }
+                let became = entry.shard;
+                self.attribute_launches();
+                if became.is_some_and(|shard| self.owns_a_region(shard)) {
+                    // This launch's shard owns a region: launching works.
+                    self.launch_failures_in_a_row = 0;
+                }
+            }
+            Err(why) => {
+                if self.launches.remove(&launch).is_some() {
+                    self.log(
+                        EventKind::Launcher,
+                        Severity::Warn,
+                        format!("launching a shard failed ({launch}): {why}"),
+                    );
+                    self.launch_failed();
+                }
+            }
+        }
+    }
+
+    /// The launcher says what `launch` started is no longer alive.
+    ///
+    /// A registered shard whose process is gone is dead
+    /// ([`Self::declare_dead`]); a launch that died before it ever registered
+    /// failed, and the next one waits a little. Either way **the launch is
+    /// gone from the table afterwards**, and its host port free again: a
+    /// launch whose shard is already known to be dead, or is no longer known
+    /// at all (it was stopped when its join aborted), is simply removed and
+    /// reaped.
+    pub fn note_launch_dead(&mut self, launch: LaunchId) {
+        let Some(entry) = self.launches.get(&launch) else {
+            return;
+        };
+        match entry.shard {
+            Some(shard) if self.dead.contains_key(&shard) || !self.knows(shard) => {
+                self.launches.remove(&launch);
+                self.pending_launch_kill.push(launch);
+            }
+            Some(shard) => self.declare_dead(shard, "its process exited"),
+            None => {
+                let port = entry.host_port;
+                self.launches.remove(&launch);
+                // Reap it.
+                self.pending_launch_kill.push(launch);
+                self.log(
+                    EventKind::Launcher,
+                    Severity::Warn,
+                    format!(
+                        "the shard of {launch}{} exited before it registered (its log says why)",
+                        on_port(port)
+                    ),
+                );
+                self.launch_failed();
+            }
+        }
+    }
+
+    /// The launches whose shard the launcher can be asked about: those it has
+    /// reported a handle for.
+    #[must_use]
+    pub fn launches_to_poll(&self) -> Vec<LaunchId> {
+        self.launches
+            .iter()
+            .filter(|(_, launch)| launch.endpoint.is_some())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Match launches to the shards they became: a launch whose shard is not
+    /// known yet, and a registered shard that advertises the address that
+    /// launch listens on ([`Launch::listens_at`]).
+    ///
+    /// Two shards at that address are **never** the launch's:
+    ///
+    /// * one that is **dead** — its endpoint is kept while it still owns
+    ///   regions, and a replacement launched for it may be handed the very
+    ///   port it had;
+    /// * one that **registered before the launch was staged** — whoever it
+    ///   is, it is not the process this launch started.
+    ///
+    /// Matched to either, a launch would be tied to a shard that is not its
+    /// process: the death of that process would be put down to the wrong
+    /// shard (or to none, with the launch and its port kept for ever), and a
+    /// launch that fails would take a healthy shard with it.
+    fn attribute_launches(&mut self) {
+        let mut taken: BTreeSet<ShardId> = self
+            .launches
+            .values()
+            .filter_map(|launch| launch.shard)
+            .collect();
+        let mut matched = Vec::new();
+        for launch in self.launches.values_mut() {
+            if launch.shard.is_some() {
+                continue;
+            }
+            let found = self
+                .endpoints
+                .iter()
+                .find(|(shard, at)| {
+                    launch.listens_at(**at)
+                        && !taken.contains(shard)
+                        && !self.dead.contains_key(shard)
+                        && self
+                            .registered_at
+                            .get(shard)
+                            .is_some_and(|at| *at >= launch.since)
+                })
+                .map(|(shard, _)| *shard);
+            if let Some(shard) = found {
+                launch.shard = Some(shard);
+                taken.insert(shard);
+                matched.push(shard);
+            }
+        }
+        if matched.iter().any(|shard| self.owns_a_region(*shard)) {
+            // A launch's shard owns a region: launching works. (Not "some
+            // launched shard is registered": with three healthy shards and a
+            // fourth that keeps dying, the pause would never grow.)
+            self.launch_failures_in_a_row = 0;
+        }
+    }
+
+    /// A launch failed: pause before the next one, longer every time in a row.
+    fn launch_failed(&mut self) {
+        self.launch_failures_in_a_row = self.launch_failures_in_a_row.saturating_add(1);
+        let doublings = self.launch_failures_in_a_row.saturating_sub(1).min(16);
+        let pause = LAUNCH_BACKOFF_TICKS
+            .saturating_mul(1 << doublings)
+            .min(LAUNCH_BACKOFF_MAX_TICKS);
+        self.launch_backoff_until = self.tick + pause;
+    }
+
+    /// Give up on what has waited too long: a launch that has not registered
+    /// within [`LAUNCH_REGISTER_TIMEOUT_TICKS`] is stopped, and a node that
+    /// has been wanted for [`WANTED_TIMEOUT_TICKS`] without a shard taking it
+    /// is no longer wanted.
+    fn expire_lifecycle(&mut self) {
+        let now = self.tick;
+        let overdue: Vec<(LaunchId, u16)> = self
+            .launches
+            .iter()
+            .filter(|(_, launch)| {
+                launch.shard.is_none()
+                    && now.saturating_sub(launch.since) > LAUNCH_REGISTER_TIMEOUT_TICKS
+            })
+            .map(|(id, launch)| (*id, launch.host_port))
+            .collect();
+        for (launch, port) in overdue {
+            self.launches.remove(&launch);
+            self.pending_launch_kill.push(launch);
+            self.log(
+                EventKind::Launcher,
+                Severity::Warn,
+                format!(
+                    "the shard of {launch}{} did not register within {} s and is stopped",
+                    on_port(port),
+                    LAUNCH_REGISTER_TIMEOUT_TICKS / crate::config::TICK_HZ
+                ),
+            );
+            self.launch_failed();
+        }
+        let given_up = self
+            .wanted
+            .as_ref()
+            .filter(|wanted| now.saturating_sub(wanted.since) > WANTED_TIMEOUT_TICKS)
+            .map(|wanted| wanted.what.clone());
+        if let Some(what) = given_up {
+            self.wanted = None;
+            self.log(
+                EventKind::Epoch,
+                Severity::Warn,
+                format!(
+                    "not carried out: {what} shard (no shard registered to take the region \
+                     within {} s)",
+                    WANTED_TIMEOUT_TICKS / crate::config::TICK_HZ
+                ),
+            );
+        }
+    }
+
+    /// Stage a launch for every shard that is missing.
+    ///
+    /// The cluster should have `--min-shards` shards, one for every dead shard
+    /// it is replacing by a launch, and one for the node a split asked for;
+    /// it has the live ones and the launches that are still starting. While
+    /// it has fewer than it should — and fewer than `--max-shards` — a launch
+    /// is staged ([`Self::take_pending_spawn`]). With `--min-shards 0`, the
+    /// default, that only ever happens for a split and for the replacement of
+    /// a shard the orchestrator had launched itself: nothing else is started.
+    ///
+    /// Until the root is claimed only one launch is in flight: the shard that
+    /// registers first gets the root, and with it the scene's spawn point —
+    /// that is the first one launched, on the first port of the range.
+    ///
+    /// **And it stops what is no longer missing.** A launch is started for
+    /// something — a dead shard, a wanted node, a shard short of
+    /// `--min-shards` — and that can be gone before the launch has
+    /// registered: a shard started by hand took the dead shard's regions, the
+    /// wanted node was given up or taken. Such a launch would register, find
+    /// nothing, and be given the next layout cell: one shard more than asked
+    /// for, and one more on every repeat. So when there are more live and
+    /// starting shards than there should be, the launches that have not
+    /// registered yet are stopped, newest first (`stop_surplus_launches`).
+    ///
+    /// Called on every tick and whenever something changed what is missing;
+    /// it stages nothing twice.
+    pub fn reconcile_launches(&mut self) {
+        let config = &self.control.config;
+        let (min, max) = (config.min_shards, config.max_shards);
+        let live = self.live_shards();
+        let owners: BTreeSet<ShardId> = self
+            .control
+            .map()
+            .regions
+            .iter()
+            .map(|region| region.shard)
+            .filter(|shard| live.contains(shard))
+            .collect();
+        // A dead shard is replaced by a launch when the orchestrator launched
+        // it, or runs the cluster's shards anyway.
+        let replacing = self
+            .dead
+            .values()
+            .filter(|managed| **managed || min > 0)
+            .count();
+        let want = min
+            .max(owners.len() + replacing + usize::from(self.wanted.is_some()))
+            .min(max);
+        self.stop_surplus_launches(live.len(), want);
+        if self.tick < self.launch_backoff_until {
+            return;
+        }
+        let root_unclaimed = self.control.unclaimed_root_owner().is_some();
+        loop {
+            let starting = self.starting();
+            let have = live.len() + starting;
+            if have >= want || (root_unclaimed && starting >= 1) {
+                return;
+            }
+            if !self.stage_launch() {
+                return;
+            }
+        }
+    }
+
+    /// Stop the launches that are one too many: with `live` shards connected
+    /// and `want` wanted, every launch beyond that which has **not registered
+    /// yet** — newest first.
+    ///
+    /// A launch whose shard has registered is never stopped here, whatever
+    /// the count says. That is easy to tell for a launch that was handed a
+    /// host port: its shard is matched to it the moment it says hello. The
+    /// in-process launcher's shard is only matched when the launcher reports
+    /// back, a beat or two after the hello — until then the shard counts
+    /// twice, as live and as starting. So while a shard that registered a
+    /// moment ago is matched to no launch and such a launch is waiting to be
+    /// matched ([`Self::launch_in_limbo`]), nothing is stopped: the next tick
+    /// looks again.
+    fn stop_surplus_launches(&mut self, live: usize, want: usize) {
+        let surplus = (live + self.starting()).saturating_sub(want);
+        if surplus == 0 || self.starting() == 0 || self.launch_in_limbo() {
+            return;
+        }
+        let stopped: Vec<(LaunchId, u16)> = self
+            .launches
+            .iter()
+            .rev()
+            .filter(|(_, launch)| launch.shard.is_none())
+            .take(surplus)
+            .map(|(id, launch)| (*id, launch.host_port))
+            .collect();
+        for (launch, port) in stopped {
+            self.launches.remove(&launch);
+            self.pending_launch_kill.push(launch);
+            self.log(
+                EventKind::Launcher,
+                Severity::Info,
+                format!(
+                    "the shard of {launch}{} is no longer needed (what it was started for has \
+                     an owner again, or is no longer wanted) and is stopped before it registers",
+                    on_port(port)
+                ),
+            );
+        }
+    }
+
+    /// Whether a shard that registered within the last
+    /// [`LAUNCH_LIMBO_TICKS`] is matched to no launch while a launch whose
+    /// address is not known is still waiting to be matched: that shard may be
+    /// that launch's (see [`Self::stop_surplus_launches`]).
+    fn launch_in_limbo(&self) -> bool {
+        let waiting = self
+            .launches
+            .values()
+            .any(|launch| launch.shard.is_none() && launch.address_unknown());
+        if !waiting {
+            return false;
+        }
+        let matched: BTreeSet<ShardId> = self
+            .launches
+            .values()
+            .filter_map(|launch| launch.shard)
+            .collect();
+        self.registered_at.iter().any(|(shard, at)| {
+            self.tick.saturating_sub(*at) <= LAUNCH_LIMBO_TICKS
+                && self.connected.contains(shard)
+                && !matched.contains(shard)
+        })
+    }
+
+    /// Stage one launch. `false` when no host port is free.
+    fn stage_launch(&mut self) -> bool {
+        let config = &self.control.config;
+        // The in-process launcher binds an ephemeral port by itself.
+        let host_port = if config.launcher == LauncherKind::Local {
+            0
+        } else {
+            let Some(port) = self.free_host_port() else {
+                let (lo, hi) = self.control.config.host_port_range;
+                self.log(
+                    EventKind::Launcher,
+                    Severity::Warn,
+                    format!("no shard can be started: every host port from {lo} to {hi} is in use"),
+                );
+                self.launch_failed();
+                return false;
+            };
+            port
+        };
+        self.last_launch += 1;
+        let launch = LaunchId(self.last_launch);
+        self.launches.insert(
+            launch,
+            Launch {
+                host_port,
+                since: self.tick,
+                endpoint: None,
+                shard: None,
+            },
+        );
+        let config = &self.control.config;
+        self.pending_spawn.push(SpawnSpec {
+            launch,
+            cluster: config.cluster.clone(),
+            control_addr: config.control_addr(),
+            host_port,
+            secret: self.control.cluster_secret().expose().to_owned(),
+        });
+        true
+    }
+
+    /// The next host port of the configured range that no launch holds,
+    /// counting round from where the last search ended.
+    fn free_host_port(&mut self) -> Option<u16> {
+        let (lo, hi) = self.control.config.host_port_range;
+        let span = u32::from(hi.checked_sub(lo)?) + 1;
+        let used: BTreeSet<u16> = self.launches.values().map(|l| l.host_port).collect();
+        (0..span)
+            .map(|step| (self.next_port + step) % span)
+            .find_map(|offset| {
+                let port = lo + u16::try_from(offset).ok()?;
+                (!used.contains(&port)).then_some((offset, port))
+            })
+            .map(|(offset, port)| {
+                self.next_port = (offset + 1) % span;
+                port
+            })
     }
 
     /// Append an entry to the event log, stamped with the current tick.
@@ -439,6 +1735,53 @@ impl<L: Launcher> Orchestrator<L> {
         );
     }
 
+    // ------------------------------------------------- who a message is from
+    //
+    // A report and both kinds of ack name their own sender. The three
+    // handlers below this block believe that name: they are what a test (or
+    // any caller that vouches for the sender) uses. The run loop does not
+    // vouch — it knows which shard each control connection was admitted as,
+    // and goes through the `_from` forms, which drop what does not name that
+    // shard.
+
+    /// A `LoadReport` that arrived on the control connection admitted as
+    /// `from`: taken in ([`Self::handle_load_report`]) only if it is about
+    /// `from` itself.
+    pub fn handle_load_report_from(&mut self, from: ShardId, report: &LoadReport) {
+        if report.shard == from {
+            self.handle_load_report(report);
+        } else {
+            self.misattributed += 1;
+        }
+    }
+
+    /// An `EpochAck` that arrived on the control connection admitted as
+    /// `from`: counted ([`Self::handle_epoch_ack`]) only as `from`'s own.
+    pub fn handle_epoch_ack_from(&mut self, from: ShardId, ack: &EpochAck) {
+        if ack.shard == from {
+            self.handle_epoch_ack(from, ack.epoch);
+        } else {
+            self.misattributed += 1;
+        }
+    }
+
+    /// A `SceneAck` that arrived on the control connection admitted as
+    /// `from`: believed ([`Self::handle_scene_ack`]) only about `from`.
+    pub fn handle_scene_ack_from(&mut self, from: ShardId, ack: &SceneAck) {
+        if ack.shard == from {
+            self.handle_scene_ack(ack);
+        } else {
+            self.misattributed += 1;
+        }
+    }
+
+    /// How many reports and acks were dropped by the three `_from` handlers
+    /// because they named another shard than their connection's.
+    #[must_use]
+    pub fn misattributed(&self) -> u64 {
+        self.misattributed
+    }
+
     /// Ingest a `LoadReport`: remember it as the shard's latest and record the
     /// orchestrator tick it arrived at (its freshness, and the observer tick an
     /// epoch's `activation_tick` is derived from).
@@ -447,6 +1790,9 @@ impl<L: Launcher> Orchestrator<L> {
     /// dropped: it is from a shard that was merged away or killed (its last
     /// reports can still be in flight), or from nobody the cluster knows. Kept,
     /// it would be replayed to the autoscaler every tick and acted on.
+    ///
+    /// The report is believed to be from the shard it names: see
+    /// [`Self::handle_load_report_from`] for a report off the wire.
     pub fn handle_load_report(&mut self, report: &LoadReport) {
         if !self.owns_a_region(report.shard) {
             return;
@@ -469,11 +1815,14 @@ impl<L: Launcher> Orchestrator<L> {
         self.control.autoscaler.forget(shard);
     }
 
-    /// `shard` has left the cluster (merged away, or a child whose split
-    /// aborted): forget its load and where it was reachable.
+    /// `shard` has left the cluster (merged away, replaced, or stopped when
+    /// the change that would have given it a region aborted): forget its load
+    /// and where it was reachable.
     fn forget_shard(&mut self, shard: ShardId) {
         self.forget_reports(shard);
         self.endpoints.remove(&shard);
+        self.registered_at.remove(&shard);
+        self.ack_strikes.remove(&shard);
         self.last_heard.remove(&shard);
         self.scene_confirmed.remove(&shard);
     }
@@ -506,6 +1855,8 @@ impl<L: Launcher> Orchestrator<L> {
         if self.endpoints.contains_key(&shard) || self.owns_a_region(shard) {
             self.heard(shard, HeardKind::Ack);
         }
+        // It answers: whatever deadlines it let pass before are forgotten.
+        self.ack_strikes.remove(&shard);
         if let Some(commit) = self.control.publisher.ack(shard, epoch, self.tick) {
             let what = self.in_flight.take().unwrap_or_else(|| "map change".into());
             self.log(
@@ -513,10 +1864,16 @@ impl<L: Launcher> Orchestrator<L> {
                 Severity::Good,
                 format!("epoch {epoch} committed: {what}"),
             );
-            // The epoch in flight settled as a commit: a split's child is now a
-            // region owner like any other, and a merge's child owns nothing.
-            self.pending_split = None;
+            // The epoch in flight settled as a commit: the shard it gave a
+            // region is now an owner like any other, and a merge's shard owns
+            // nothing.
+            let joined = self.pending_join.take();
             let merged = self.pending_merge.take();
+            if joined.is_some_and(|join| self.launch_of(join.shard).is_some()) {
+                // A shard the orchestrator launched owns a region now:
+                // launching works.
+                self.launch_failures_in_a_row = 0;
+            }
             self.queue_outbound(&commit);
             // Then push the committed map with every known shard's real endpoint
             // (plan §3.3, F9). The commit names ownership only; this is what lets
@@ -535,17 +1892,107 @@ impl<L: Launcher> Orchestrator<L> {
             self.queue_outbound(&push);
             if let Some(gone) = merged {
                 // The merged shard is not in the new map, so the fan-out above
-                // skipped it. Tell it too (it had the prepare staged; now it
-                // learns it owns nothing), and only *then* stage its kill: the
-                // loop delivers the outbox before it runs the launcher work.
+                // skipped it. Queue the commit for it too (it had the prepare
+                // staged; with this it learns it owns nothing), and only
+                // *then* stage its kill: the loop offers the outbox to the
+                // shards' queues before it closes any link. That is an order,
+                // not a guarantee — the link is closed in the same beat, and a
+                // close does not wait for what was queued to be written. A
+                // shard whose link closes stops either way.
                 self.outbox.push((gone, commit.message.clone()));
                 self.outbox.push((gone, push.message.clone()));
-                self.pending_kill.push(gone);
+                self.stage_kill(gone);
                 self.forget_shard(gone);
+            }
+            if let Some(Join {
+                shard: new,
+                replaces: Some(dead),
+            }) = joined
+            {
+                // The dead shard is out of the map: nothing waits for it any
+                // more, and nothing is remembered about it.
+                self.dead.remove(&dead);
+                self.forget_shard(dead);
+                self.respawn_scene(dead, new);
             }
             // The epoch settled: the publisher returns to Idle so the next
             // change can be proposed after the minimum interval.
             self.control.publisher.reset();
+        }
+    }
+
+    /// Raise the scene's revision — the scene itself stays — after `new` took
+    /// over the regions of the dead `dead`, so that every shard builds the
+    /// scene's bodies **once, afresh**.
+    ///
+    /// The bodies the dead shard simulated went with it, the ones it had
+    /// handed to its neighbours are still there, and if it owned the
+    /// shallowest region its replacement is the new spawner of the scene's
+    /// bodies, with new guids: without a new revision the world would keep
+    /// half a scene, with one it would have some of it twice. A new revision
+    /// makes every shard drop the scene's bodies and the spawner build them
+    /// all again (`space-server`'s `ensure_scene`). It goes out behind the
+    /// commit and the map push, so the replacement already owns its regions
+    /// when it hears it.
+    ///
+    /// The raise is a write to the scene file and can fail. Then it is
+    /// **owed** ([`Self::scene_respawn_wanted`]) and tried again once a
+    /// second ([`Self::retry_scene_respawn`]) until it succeeds — or until
+    /// the revision rises for another reason, which rebuilds the bodies just
+    /// as well.
+    fn respawn_scene(&mut self, dead: ShardId, new: ShardId) {
+        let before = self.scene();
+        match self.control.scene.raise_above(before.revision) {
+            Ok(now) => {
+                self.scene_respawn_wanted = None;
+                self.scene_changed_tick = Some(self.tick);
+                self.scene_push_pending = true;
+                self.log(
+                    EventKind::Scene,
+                    Severity::Info,
+                    format!(
+                        "{new} replaced {dead}: the scene {} is re-issued as revision {} \
+                         (it was {}) so that its bodies are built once, afresh",
+                        now.scene, now.revision, before.revision
+                    ),
+                );
+            }
+            Err(err) => {
+                let owed = Respawn {
+                    dead,
+                    new,
+                    at_revision: before.revision,
+                };
+                // Said once, not once a second.
+                if self.scene_respawn_wanted.replace(owed) != Some(owed) {
+                    self.log(
+                        EventKind::Scene,
+                        Severity::Warn,
+                        format!(
+                            "{new} replaced {dead}, but the scene's revision could not be \
+                             raised ({err}): the scene's bodies are not rebuilt until it can \
+                             (tried again every second) or the scene is switched"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Try again to raise the scene's revision for a replacement that is
+    /// still owed one ([`Self::respawn_scene`]), once per
+    /// [`SCENE_RESEND_INTERVAL_TICKS`]. Nothing is owed any more once the
+    /// revision is above what it was when the raise failed.
+    fn retry_scene_respawn(&mut self) {
+        let Some(owed) = self.scene_respawn_wanted else {
+            return;
+        };
+        if self.scene().revision > owed.at_revision {
+            self.scene_respawn_wanted = None;
+            return;
+        }
+        if self.tick.is_multiple_of(SCENE_RESEND_INTERVAL_TICKS) {
+            self.respawn_scene(owed.dead, owed.new);
         }
     }
 
@@ -643,12 +2090,14 @@ impl<L: Launcher> Orchestrator<L> {
         }
     }
 
-    /// The once-a-beat upkeep of the scene: first get above a revision a shard
-    /// reported (the rule of the module docs, "The orchestrator's revision is
-    /// never below a shard's"), then remind whoever has not confirmed
-    /// ([`Self::remind_scene_laggards`]). The run loop calls this on every
-    /// beat.
+    /// The once-a-beat upkeep of the scene: first the raise a replacement is
+    /// still owed ([`Self::retry_scene_respawn`]), then get above a revision
+    /// a shard reported (the rule of the module docs, "The orchestrator's
+    /// revision is never below a shard's"), then remind whoever has not
+    /// confirmed ([`Self::remind_scene_laggards`]). The run loop calls this
+    /// on every beat.
     pub fn reconcile_scene(&mut self) {
+        self.retry_scene_respawn();
         self.catch_up_scene_revision();
         self.remind_scene_laggards();
     }
@@ -807,11 +2256,16 @@ impl<L: Launcher> Orchestrator<L> {
             AdminCommand::ForceSplit(shard) => self.begin_split(*shard, Octant::From(0)),
             AdminCommand::ForceMerge(shard) => self.begin_merge(*shard),
             AdminCommand::KillShard(shard) => {
-                self.pending_kill.push(*shard);
-                // A killed shard reports nothing more; its last report must not
-                // go on driving the autoscaler.
-                self.forget_reports(*shard);
-                Ok(format!("{shard} is staged for killing"))
+                // The same path a death takes: the shard is stopped, and its
+                // regions (if it owns any) go to a replacement under a new id.
+                if self.dead.contains_key(shard) {
+                    Ok(format!("{shard} is already known to be dead"))
+                } else if self.knows(*shard) {
+                    self.declare_dead(*shard, "killed by the admin verb");
+                    Ok(format!("{shard} is staged for killing"))
+                } else {
+                    Err(format!("{shard} is not a shard of this cluster"))
+                }
             }
             other => return self.control.handle_admin(other),
         };
@@ -843,7 +2297,9 @@ impl<L: Launcher> Orchestrator<L> {
     // ----------------------------------------------------------------- tick
 
     /// Advance the orchestrator's clock by one tick and run the control beat:
-    /// the epoch deadline, then the autoscaler over the latest report per shard.
+    /// the epoch deadline, the autoscaler over the latest report per shard,
+    /// then the fleet — what has waited too long is given up, and a launch is
+    /// staged for every shard that is missing.
     ///
     /// This is the synchronous heart of the loop (plan §3.6). It never touches a
     /// socket or a wall clock, so a test drives it with a `for` loop.
@@ -853,31 +2309,104 @@ impl<L: Launcher> Orchestrator<L> {
         // (Who still owed an ack is read first, for the log only.)
         let missing = self.missing_acks();
         if let Some(abort) = self.control.publisher.timeout(self.tick) {
-            self.queue_outbound(&abort);
-            self.control.publisher.reset();
-            let what = self.in_flight.take().unwrap_or_else(|| "map change".into());
-            let epoch = self.control.map().epoch + 1;
-            self.log(
-                EventKind::Epoch,
-                Severity::Warn,
-                format!(
-                    "epoch {epoch} aborted at its deadline, the map is unchanged: {what}; \
-                     no ack from {}",
-                    list_shards(&missing)
-                ),
-            );
-            // Nothing the aborted epoch planned happened. A merge's shard still
-            // owns its region, so it is *not* killed; a split's child owns
-            // nothing, so it is — after the abort above has been delivered.
-            self.pending_merge = None;
-            if let Some(child) = self.pending_split.take() {
-                self.pending_kill.push(child);
-                self.forget_shard(child);
-            }
+            self.settle_abort(&abort, AbortCause::Deadline, &missing);
         }
         // 2. Autoscaler: feed the latest *fresh* report per shard, get at most
         // one action.
         self.expire_stale_reports();
+        self.run_autoscaler();
+        // 3. The fleet.
+        self.expire_lifecycle();
+        self.reconcile_launches();
+    }
+
+    /// Carry out an abort the publisher produced: tell every recipient, free
+    /// the publisher, log it, and undo what the aborted change had staged.
+    /// `cause` is why it aborted, `missing` who still owed an ack.
+    ///
+    /// # What an abort at the deadline costs
+    ///
+    /// The shard the change had welcomed is stopped (below), and with
+    /// `--min-shards` the next one is launched. Left at that, a join that
+    /// cannot commit is a loop without an end and without a pause — launch,
+    /// hello, new id, prepare, abort, kill — burning an id every three
+    /// seconds. Two things end it:
+    ///
+    /// * **the joiner was the orchestrator's launch**: the launch failed, and
+    ///   the next one waits like after any failed launch — longer every time
+    ///   in a row ([`Self::launch_failed`]);
+    /// * **a shard of the map did not acknowledge**: that is counted per
+    ///   shard, and [`ACK_STRIKES`] deadlines missed in a row make it dead —
+    ///   its link is closed and it is replaced like any dead shard. (An ack
+    ///   for any change clears the count.)
+    fn settle_abort(&mut self, abort: &Outbound, cause: AbortCause, missing: &[ShardId]) {
+        self.queue_outbound(abort);
+        self.control.publisher.reset();
+        let what = self.in_flight.take().unwrap_or_else(|| "map change".into());
+        let epoch = self.control.map().epoch + 1;
+        let when = match cause {
+            AbortCause::Deadline => "at its deadline".to_owned(),
+            AbortCause::Gone(shard) => format!("because {shard} is gone"),
+        };
+        self.log(
+            EventKind::Epoch,
+            Severity::Warn,
+            format!(
+                "epoch {epoch} aborted {when}, the map is unchanged: {what}; no ack from {}",
+                list_shards(missing)
+            ),
+        );
+        // Nothing the aborted epoch planned happened. A merge's shard still
+        // owns its region, so it is *not* stopped. The shard a carve or a
+        // replacement had welcomed owns nothing, so it is: the abort above is
+        // queued for it first, and its link is closed in the same beat —
+        // whether it still reads the abort is not guaranteed, and does not
+        // matter (a shard stops when its link closes). A shard started by
+        // hand therefore exits and has to be started again. (A dead shard it
+        // was to replace is still dead and still waiting: the next shard that
+        // registers is given its regions.)
+        self.pending_merge = None;
+        let joiner = self.pending_join.take().map(|join| join.shard);
+        if let Some(joiner) = joiner {
+            if cause == AbortCause::Deadline && self.launch_of(joiner).is_some() {
+                self.launch_failed();
+            }
+            self.stage_kill(joiner);
+            self.forget_shard(joiner);
+        }
+        if cause != AbortCause::Deadline {
+            return;
+        }
+        // Who let the deadline pass, and who did not.
+        let mut stuck = Vec::new();
+        for shard in &abort.to {
+            if Some(*shard) == joiner {
+                continue; // stopped above
+            }
+            if missing.contains(shard) {
+                let strikes = self.ack_strikes.entry(*shard).or_insert(0);
+                *strikes += 1;
+                if *strikes >= ACK_STRIKES {
+                    stuck.push(*shard);
+                }
+            } else {
+                self.ack_strikes.remove(shard);
+            }
+        }
+        for shard in stuck {
+            self.declare_dead(
+                shard,
+                &format!(
+                    "it holds a control link but did not acknowledge {ACK_STRIKES} map changes \
+                     in a row"
+                ),
+            );
+        }
+    }
+
+    /// Feed the autoscaler the latest fresh report per shard and carry out
+    /// the one action it may decide on.
+    fn run_autoscaler(&mut self) {
         if self.autoscaler_paused {
             // An operator paused it: reports are still kept (and expired) and
             // shown, but none is fed, so no dwell accrues and nothing fires.
@@ -933,9 +2462,8 @@ impl<L: Launcher> Orchestrator<L> {
 
     // ------------------------------------------------- autoscale -> topology
 
-    /// Turn a split decision into a topology plan + epoch proposal + a staged
-    /// child spawn: the carve ([`Self::begin_carve`]) of one child octant of
-    /// `shard`'s region.
+    /// Turn a split decision into a **wanted node** and a staged launch: the
+    /// carve ([`Self::begin_carve`]) of one child octant of `shard`'s region.
     ///
     /// `which` says where the search for an octant to carve starts:
     /// [`Octant::FromCentre`] means the region's centre octant (where a shard
@@ -948,9 +2476,11 @@ impl<L: Launcher> Orchestrator<L> {
     /// [`Octant::Exactly`] is an operator naming one octant: that one is carved
     /// or the split is refused, never a different octant than the one asked for.
     ///
-    /// The child's id is allocated only once a valid plan exists: a split that
-    /// cannot happen (region too small, nothing left to carve) burns no id and
-    /// writes nothing to the counter file.
+    /// Nothing is proposed and no id is allocated here: the octant is noted
+    /// as wanted, a shard is launched, and the epoch is proposed — with a
+    /// freshly allocated id — when a shard registers to take it
+    /// ([`Self::handle_shard_hello`]). A split that cannot happen (region too
+    /// small, nothing left to carve) launches nothing.
     ///
     /// Returns what was started, in words.
     ///
@@ -967,21 +2497,28 @@ impl<L: Launcher> Orchestrator<L> {
         {
             return Err("an epoch change is in flight or was committed too recently".into());
         }
+        if let Some(waiting) = self.wanted_refusal() {
+            return Err(waiting);
+        }
         let outcome = self.split_octant(shard, which);
         // Started or not, the shard is on cooldown from here: a split that was
-        // proposed must settle first, and one that cannot happen (the map is
-        // full, the region too small, nothing left to carve, no id to give) is
-        // not helped by retrying every tick.
+        // asked for must settle first, and one that cannot happen (the map is
+        // full, the region too small, nothing left to carve) is not helped by
+        // retrying every tick.
         self.control.autoscaler.note_action(shard, self.tick);
         outcome
     }
 
-    /// The part of [`Self::begin_split`] behind its first check: pick the
-    /// octant, then carve its node like any other ([`Self::carve`]).
+    /// The part of [`Self::begin_split`] behind its first checks: pick the
+    /// octant, then ask for its node like for any other ([`Self::want`]).
     fn split_octant(&mut self, shard: ShardId, which: Octant) -> Result<String, String> {
-        // The map is full: no split, whoever asks (the autoscaler included).
-        // Said before an octant is looked for, so that is the reason given.
+        // The map or the cluster is full: no split, whoever asks (the
+        // autoscaler included). Said before an octant is looked for, so that
+        // is the reason given.
         if let Some(full) = self.region_limit_refusal() {
+            return Err(full);
+        }
+        if let Some(full) = self.shard_limit_refusal() {
             return Err(full);
         }
         let map = self.control.map();
@@ -998,116 +2535,83 @@ impl<L: Launcher> Orchestrator<L> {
         .map_err(|err| err.to_string())?;
         let child = topology::octant_node(map, shard, octant).map_err(|err| err.to_string())?;
         let signs = octant_signs(u8::try_from(octant % 8).unwrap_or(0));
-        let started = self.carve(child, |new_id| {
+        let wanted = self.want(
+            child,
             format!(
-                "split of {shard}, region {} (octant {octant}, {signs}) goes to new {new_id}",
+                "split of {shard}, region {} (octant {octant}, {signs}) goes to new",
                 node_path(child)
-            )
-        })?;
-        Ok(started.to_string())
+            ),
+        )?;
+        Ok(wanted.to_string())
     }
 
-    /// Carve `node` out of the region that encloses it, for a **new shard**:
-    /// the general form of a split, and the one entry point through which a
-    /// region comes into being.
+    /// Ask for `node` to be carved out of the region that encloses it, for a
+    /// **new shard**: the general form of a split, and the one entry point
+    /// through which somebody asks for a region to come into being.
     ///
     /// `node` may be any octree node inside an existing region of the
     /// published map that is not a region itself — a child octant, or a single
     /// cell (depth 64) under the depth-40 root; see [`topology::carve_plan`].
     /// What happens is what happens for a split, step for step: the plan is
-    /// made and validated, a fresh id is allocated for the node's new owner,
-    /// the change is proposed as **one epoch** to every shard of the map plus
-    /// the new one, and the new shard's launch is staged
-    /// ([`Self::take_pending_spawn`]) — it registers with the id and the node,
-    /// is handed the prepare it owes an ack for, and the carve commits when
-    /// everybody has acked, or aborts at the deadline (and the launched shard
-    /// is stopped). The shard losing the node is put on the autoscaler's
-    /// cooldown, like the parent of a split.
+    /// checked now, the node is noted as **wanted**, and a shard is launched
+    /// for it ([`Self::take_pending_spawn`]). When a shard has registered —
+    /// that one, or any other that says hello without a region first — a
+    /// fresh id is allocated for it and the change is proposed as **one
+    /// epoch** to every shard of the map plus the new one
+    /// ([`Self::handle_shard_hello`]); it commits when everybody has acked, or
+    /// aborts at the deadline (and the new shard is stopped). If no shard
+    /// registers within [`WANTED_TIMEOUT_TICKS`] the request is given up.
     ///
-    /// The id is allocated only once a valid plan exists: a carve that cannot
-    /// happen burns no id and writes nothing to the counter file. A refusal
-    /// changes nothing at all.
+    /// A refusal changes nothing at all.
     ///
-    /// Returns what was started ([`CarveStarted`]; it reads as a sentence).
+    /// Returns what was asked for ([`CarveWanted`]; it reads as a sentence).
     ///
     /// # Errors
     ///
     /// Why the carve was not started: an epoch change is in flight or was
-    /// committed less than [`MIN_EPOCH_INTERVAL_TICKS`] ago, the map already
-    /// holds [`OrchestratorConfig::max_regions`], the node cannot be carved
-    /// ([`topology::TopologyError`]), or no id could be allocated.
-    pub fn begin_carve(&mut self, node: space_world::NodeRef) -> Result<CarveStarted, String> {
+    /// committed less than [`MIN_EPOCH_INTERVAL_TICKS`] ago, another node is
+    /// still waiting for its shard, the map already holds
+    /// [`OrchestratorConfig::max_regions`] or the cluster
+    /// [`OrchestratorConfig::max_shards`], a shard of the map is not
+    /// connected (it could not acknowledge the change), or the node cannot be
+    /// carved ([`topology::TopologyError`]).
+    pub fn begin_carve(&mut self, node: NodeRef) -> Result<CarveWanted, String> {
         if let Some(busy) = self.proposal_refusal() {
             return Err(busy);
         }
         if let Some(full) = self.region_limit_refusal() {
             return Err(full);
         }
-        let started = self.carve(node, |new_id| {
-            format!("carve of region {} for new {new_id}", node_path(node))
-        })?;
-        self.control.autoscaler.note_action(started.from, self.tick);
-        Ok(started)
+        if let Some(full) = self.shard_limit_refusal() {
+            return Err(full);
+        }
+        let wanted = self.want(node, format!("carve of region {} for new", node_path(node)))?;
+        self.control.autoscaler.note_action(wanted.from, self.tick);
+        Ok(wanted)
     }
 
-    /// Plan the carve of `node`, allocate its owner's id, propose the epoch
-    /// and stage the launch. `describe` words the change for the operator
-    /// view once the new id is known. The callers have checked that an epoch
-    /// may be proposed and that the map has room.
-    fn carve(
-        &mut self,
-        node: space_world::NodeRef,
-        describe: impl FnOnce(ShardId) -> String,
-    ) -> Result<CarveStarted, String> {
-        // Planned once with a placeholder owner (the owner is irrelevant to
-        // whether a plan validates), so a carve that cannot happen burns no id.
-        topology::carve_plan(self.control.map(), node, ShardId::NONE)
+    /// Note `node` as wanted for a new shard and stage the launch of one.
+    /// `what` words the change up to the new owner's name. The callers have
+    /// checked that a change may be asked for and that there is room.
+    fn want(&mut self, node: NodeRef, what: String) -> Result<CarveWanted, String> {
+        // Planned with a placeholder owner (the owner is irrelevant to whether
+        // a plan validates): a carve that cannot happen is refused here.
+        let plan = topology::carve_plan(self.control.map(), node, ShardId::NONE)
             .map_err(|err| err.to_string())?;
-        // The id space may be exhausted, or the counter cannot be written:
-        // then nothing can be launched.
-        let new_id = self.control.ids.allocate().map_err(|err| err.to_string())?;
-        let plan = topology::carve_plan(self.control.map(), node, new_id)
-            .map_err(|err| err.to_string())?;
-        let observer_ticks: Vec<(ShardId, u64)> =
-            self.shard_ticks.iter().map(|(s, t)| (*s, *t)).collect();
-        // (`None`: lost the race to an in-flight epoch — the callers' check
-        // said Idle but the publisher disagreed.)
-        let prepare = self
-            .control
-            .publisher
-            .propose(
-                plan.map.clone(),
-                vec![plan.change],
-                &observer_ticks,
-                self.tick,
-            )
-            .ok_or_else(|| String::from("the publisher refused the proposal"))?;
-        self.queue_outbound(&prepare);
-        // Stage the new shard's launch: the async layer runs the launcher and
-        // the shard then registers with its own ShardHello (and is handed the
-        // prepare it still owes an ack for). The endpoint in the spec is only
-        // a placeholder, as it was for a split: a launcher binds its own
-        // address, and the map names the new region with the un-dialable
-        // sentinel until its shard has said hello.
-        let placeholder = self
-            .endpoints
-            .get(&plan.from)
-            .copied()
-            .unwrap_or(plan.map.regions[0].endpoint);
-        self.pending_spawn.push(SpawnSpec {
-            shard: new_id,
-            region: space_protocol::shard::ShardRegion::new(plan.node, new_id, placeholder),
-            cluster: self.control.config.cluster.clone(),
-            control_addr: self.control.config.control_addr(),
-            host_port: 0,
-        });
-        self.pending_split = Some(new_id);
-        self.in_flight = Some(describe(new_id));
-        Ok(CarveStarted {
-            node: plan.node,
-            shard: new_id,
+        // And one that nobody could acknowledge is not asked for either.
+        if let Some(absent) = self.absent_recipient(&BTreeSet::new()) {
+            return Err(not_connected(absent));
+        }
+        self.wanted = Some(Wanted {
+            node,
             from: plan.from,
-            epoch: plan.map.epoch,
+            what,
+            since: self.tick,
+        });
+        self.reconcile_launches();
+        Ok(CarveWanted {
+            node,
+            from: plan.from,
         })
     }
 
@@ -1142,6 +2646,18 @@ impl<L: Launcher> Orchestrator<L> {
             .can_propose(self.tick, MIN_EPOCH_INTERVAL_TICKS)
         {
             return Err("an epoch change is in flight or was committed too recently".into());
+        }
+        if let Some(waiting) = self.wanted_refusal() {
+            return Err(waiting);
+        }
+        // A merge takes a shard away; `--min-shards` says how many stay.
+        if let Some(needed) = self.min_shards_refusal(shard) {
+            self.control.autoscaler.note_action(shard, self.tick);
+            return Err(needed);
+        }
+        // Every shard of the map has to acknowledge a merge too.
+        if let Some(absent) = self.absent_recipient(&BTreeSet::new()) {
+            return Err(not_connected(absent));
         }
         let players = self.latest.get(&shard).map(|report| report.players);
         if players != Some(0) {
@@ -1215,23 +2731,26 @@ impl<L: Launcher> Orchestrator<L> {
     /// Tell the orchestrator which shards' control links are open right now.
     ///
     /// The run loop calls this on every beat with what its front end sees
-    /// ([`crate::control::ControlServer::connected`]). A shard that was
-    /// connected and no longer is gets a "lost" entry in the event log; that is
-    /// all — losing a link changes no ownership and proposes nothing (H15's
-    /// reassignment is a later slice). The set is also what
-    /// [`Self::split_refusal`] reads to turn down a split whose shard could
-    /// not acknowledge it.
+    /// ([`crate::control::ControlServer::connected`]). **A shard that was
+    /// connected and no longer is, is dead** ([`Self::declare_dead`]): a shard
+    /// registers once and stops itself when it loses the orchestrator, so a
+    /// closed link is not something that comes back. Nothing about the map
+    /// changes here — the dead shard's regions go to the next shard that
+    /// registers, through an epoch change. The set is also what every "could
+    /// this shard acknowledge a change?" question reads.
     pub fn note_connected(&mut self, live: impl IntoIterator<Item = ShardId>) {
         let live: BTreeSet<ShardId> = live.into_iter().collect();
         let lost: Vec<ShardId> = self.connected.difference(&live).copied().collect();
+        self.connected = live
+            .into_iter()
+            .filter(|shard| !self.dead.contains_key(shard))
+            .collect();
         for shard in lost {
-            self.log(
-                EventKind::Shard,
-                Severity::Warn,
-                format!("{shard} lost: its control link closed"),
-            );
+            // (Still in `connected` as far as `declare_dead` can tell would
+            // be wrong: put it back for the one call that takes it out.)
+            self.connected.insert(shard);
+            self.declare_dead(shard, "its control link closed");
         }
-        self.connected = live;
     }
 
     /// Why an operator's split of `shard` would be refused right now, or
@@ -1280,15 +2799,18 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(full) = self.region_limit_refusal() {
             return Some(full);
         }
+        if let Some(full) = self.shard_limit_refusal() {
+            return Some(full);
+        }
         if let Some(busy) = self.proposal_refusal() {
             return Some(busy);
         }
+        // The shard being split first (it is the one the operator named), then
+        // everybody else: every shard of the map has to acknowledge a change.
         if !self.connected.contains(&shard) {
-            return Some(format!(
-                "{shard} is not connected to the orchestrator, so it could not acknowledge the change"
-            ));
+            return Some(not_connected(shard));
         }
-        None
+        self.absent_recipient(&BTreeSet::new()).map(not_connected)
     }
 
     /// Why an operator's merge of `shard` would be refused right now, or
@@ -1306,6 +2828,9 @@ impl<L: Launcher> Orchestrator<L> {
         if let Err(err) = topology::merge_target(self.control.map(), shard) {
             return Some(err.to_string());
         }
+        if let Some(needed) = self.min_shards_refusal(shard) {
+            return Some(needed);
+        }
         match self.latest.get(&shard).map(|report| report.players) {
             Some(0) => {}
             Some(players) => {
@@ -1320,6 +2845,45 @@ impl<L: Launcher> Orchestrator<L> {
             }
         }
         self.proposal_refusal()
+            .or_else(|| self.absent_recipient(&BTreeSet::new()).map(not_connected))
+    }
+
+    /// Why the cluster cannot take one more shard, if it cannot: it already
+    /// has [`OrchestratorConfig::max_shards`].
+    fn shard_limit_refusal(&self) -> Option<String> {
+        let (shards, limit) = (self.owner_count(), self.control.config.max_shards);
+        (shards >= limit).then(|| {
+            format!(
+                "the cluster already has {shards} shard(s) and the limit is {limit} \
+                 (--max-shards): merge a region away first, or restart the orchestrator with \
+                 a higher limit"
+            )
+        })
+    }
+
+    /// Why `shard` may not be merged away, if it may not: the cluster has no
+    /// more shards than the orchestrator is to keep running (`--min-shards`).
+    /// The merge would commit, the shard be stopped — and the reconciler
+    /// start one in its place at once, which is given the next layout cell.
+    fn min_shards_refusal(&self, shard: ShardId) -> Option<String> {
+        let (shards, min) = (self.owner_count(), self.control.config.min_shards);
+        (shards <= min).then(|| {
+            format!(
+                "the cluster has {shards} shard(s) and is to keep {min} running (--min-shards): \
+                 with {shard} merged away the orchestrator would only start another one"
+            )
+        })
+    }
+
+    /// Why no further region can be asked for right now, if none can: one is
+    /// still waiting for its shard (one change at a time).
+    fn wanted_refusal(&self) -> Option<String> {
+        self.wanted.as_ref().map(|wanted| {
+            format!(
+                "region {} is still waiting for its new shard to register; one change at a time",
+                node_path(wanted.node)
+            )
+        })
     }
 
     /// Why the map cannot take one more region, if it cannot: it already holds
@@ -1338,12 +2902,15 @@ impl<L: Launcher> Orchestrator<L> {
         })
     }
 
-    /// Why no epoch change can be proposed at this tick, if one cannot.
+    /// Why no map change can be asked for at this tick, if none can.
     fn proposal_refusal(&self) -> Option<String> {
         if let Phase::Preparing { epoch, .. } = self.control.publisher.phase() {
             return Some(format!(
                 "epoch {epoch} is still in flight; one change at a time"
             ));
+        }
+        if let Some(waiting) = self.wanted_refusal() {
+            return Some(waiting);
         }
         if self
             .control
@@ -1526,6 +3093,11 @@ impl<L: Launcher> Orchestrator<L> {
             last_commit_tick: self.control.publisher.last_commit_tick(),
             regions: self.region_views(map),
             max_regions: config.max_regions,
+            min_shards: config.min_shards,
+            max_shards: config.max_shards,
+            hello_auth_required: self.control.secret_required(),
+            starting: self.starting(),
+            wanted: self.wanted.as_ref().map(|wanted| wanted.node),
             shards: self.shard_views(map),
             in_flight: self.in_flight_view(),
             autoscaler: AutoscalerView {
@@ -1612,13 +3184,15 @@ impl<L: Launcher> Orchestrator<L> {
         }
     }
 
-    /// Every shard the orchestrator knows of: the map's owners, the child of a
-    /// split in flight, and anyone who said hello or holds a control link.
+    /// Every shard the orchestrator knows of: the map's owners, the shard the
+    /// change in flight gives a region, and anyone who said hello or holds a
+    /// control link.
     fn shard_views(&self, map: &ShardMap) -> Vec<ShardView> {
+        let joining = self.pending_join.map(|join| join.shard);
         let mut ids: BTreeSet<ShardId> = map.regions.iter().map(|r| r.shard).collect();
         ids.extend(self.endpoints.keys().copied());
         ids.extend(self.connected.iter().copied());
-        ids.extend(self.pending_split);
+        ids.extend(joining);
         ids.into_iter()
             .map(|shard| {
                 let regions: Vec<_> = map
@@ -1627,8 +3201,10 @@ impl<L: Launcher> Orchestrator<L> {
                     .filter(|r| r.shard == shard)
                     .map(|r| r.node)
                     .collect();
-                let role = if self.pending_split == Some(shard) {
-                    ShardRole::SplitChild
+                let role = if joining == Some(shard) {
+                    ShardRole::Joining
+                } else if self.dead.contains_key(&shard) {
+                    ShardRole::Dead
                 } else if self.pending_merge == Some(shard) {
                     ShardRole::Merging
                 } else if self.control.unclaimed_root_owner() == Some(shard) {
@@ -1656,6 +3232,7 @@ impl<L: Launcher> Orchestrator<L> {
                     report,
                     scale: self.control.autoscaler.state_of(shard),
                     scene: self.scene_confirmed.get(&shard).copied(),
+                    launched: self.launch_of(shard).is_some(),
                 }
             })
             .collect()
@@ -1745,13 +3322,17 @@ impl<L: Launcher> Orchestrator<L> {
     }
 
     /// A liveness probe over the launcher (H15's launcher half): report whether
-    /// `shard` is still running. Exposed so the loop (and tests) can reconcile.
+    /// the process behind `shard` is still running. A shard the orchestrator
+    /// did not launch has no process it could ask about: `Dead`.
     ///
     /// # Errors
     ///
     /// A launcher-specific failure.
     pub async fn poll(&self, shard: ShardId) -> Result<Poll, crate::launcher::LaunchError> {
-        self.launcher.poll(shard).await
+        match self.launch_of(shard) {
+            Some(launch) => self.launcher.poll(launch).await,
+            None => Ok(Poll::Dead),
+        }
     }
 }
 
@@ -1802,12 +3383,21 @@ impl<L: Launcher + 'static> Orchestrator<L> {
             tokio::select! {
                 inbound = server.next_inbound() => {
                     match inbound {
-                        Some(Inbound::Hello { hello, reply }) => {
-                            self.answer_hello(&server, &hello, &reply).await;
+                        Some(Inbound::Hello { hello, reply, conn, verdict }) => {
+                            self.answer_hello(&server, &hello, reply, conn, verdict).await;
                         }
-                        Some(Inbound::Report(report)) => self.handle_load_report(&report),
-                        Some(Inbound::Ack(ack)) => self.handle_epoch_ack_message(&ack),
-                        Some(Inbound::SceneAck(ack)) => self.handle_scene_ack(&ack),
+                        // What a connection says after its hello is taken as
+                        // said by the shard it was admitted as — never by
+                        // whoever the message names.
+                        Some(Inbound::Report { from, report }) => {
+                            self.handle_load_report_from(from, &report);
+                        }
+                        Some(Inbound::Ack { from, ack }) => {
+                            self.handle_epoch_ack_from(from, &ack);
+                        }
+                        Some(Inbound::SceneAck { from, ack }) => {
+                            self.handle_scene_ack_from(from, &ack);
+                        }
                         None => break, // every sender gone
                     }
                 }
@@ -1829,117 +3419,136 @@ impl<L: Launcher + 'static> Orchestrator<L> {
         Ok(())
     }
 
-    /// Answer one `ShardHello` on the connection it arrived on.
+    /// Answer one `ShardHello` on the connection it arrived on, and tell that
+    /// connection's task the verdict.
     ///
     /// `reply` is that connection's own outbound queue, created empty a moment
     /// ago, so offering the answer to it never waits and never fails for lack
-    /// of room.
+    /// of room. A welcomed shard's queue and connection are registered under
+    /// its id **before** this returns: the prepare of the change that gives it
+    /// its region is already in the outbox, and the next beat delivers it —
+    /// behind the welcome, on the same queue.
+    ///
+    /// The verdict is what opens the connection or ends it
+    /// ([`crate::control::Inbound`]): welcomed, it is admitted as the id of
+    /// the welcome and may from then on report and acknowledge **as that
+    /// shard**; refused, its task delivers the reason and closes it — nothing
+    /// else it sent is ever read.
     async fn answer_hello(
         &mut self,
         server: &crate::control::ControlServer,
         hello: &ShardHello,
-        reply: &tokio::sync::mpsc::Sender<Message>,
+        reply: tokio::sync::mpsc::Sender<Message>,
+        conn: space_net::Conn,
+        verdict: tokio::sync::oneshot::Sender<crate::control::Admission>,
     ) {
-        match self.handle_shard_hello(hello) {
+        let seen_from = conn.remote_address().ip();
+        match self.handle_shard_hello_from(hello, seen_from) {
             Ok(welcome) => {
                 let shard = welcome.shard;
-                server.register(shard, reply.clone()).await;
-                self.connected.insert(shard);
                 let _ = reply.try_send(Message::ShardWelcome(welcome));
                 // The cluster's scene, right behind the welcome: a shard that
-                // registers (or re-registers) is never left to guess, and never
-                // has to wait for the next change to learn the current one.
+                // registers is never left to guess, and never has to wait for
+                // the next change to learn the current one.
                 let _ = reply.try_send(self.scene_message());
-                // A split names its child as a prepare recipient before the
-                // child exists, so the prepare published at propose time never
-                // reached it. Now that it has registered, hand it the prepare it
-                // still owes an ack for (behind the welcome, on the same FIFO) —
-                // without this no split could ever collect its last ack.
-                if let Some(prepare) = self.control.publisher.outstanding_prepare_for(shard) {
-                    let _ = reply.try_send(prepare);
-                }
+                server.register_link(shard, reply, conn).await;
+                // (If the connection's task is gone, so is the connection:
+                // the next beat finds the link closed.)
+                let _ = verdict.send(Ok(shard));
             }
-            Err(reason) => {
-                // Say why, on the hello connection, with the existing `Reject`
-                // message (no protocol change): the shard fails fast with the
-                // reason instead of timing out. (The refusal is in the event
-                // log, which is what reaches standard output — at a bounded
-                // rate, because anybody can cause it.)
-                let _ = reply.try_send(Message::Reject(space_protocol::Reject {
-                    reason: space_protocol::RejectReason::Other(reason),
-                }));
+            Err(refusal) => {
+                // The connection's task says why, with the existing `Reject`
+                // message — "not yet" as `Draining` (the shard asks again, on
+                // a new connection), everything else as what it is (the shard
+                // stops, with the reason) — and closes the connection. A
+                // final refusal is in the event log, which is what reaches
+                // standard output — at a bounded rate, because anybody can
+                // cause it.
+                let _ = verdict.send(Err(refusal.reject_reason()));
             }
         }
     }
 
     /// One tick beat: the synchronous [`Self::tick`], then its consequences in
-    /// order — epoch messages out, launches started, kills carried out.
+    /// order — epoch messages out, launches started, stops carried out, and
+    /// what the launcher and the front end know about who is alive taken in.
     async fn beat(&mut self, server: &crate::control::ControlServer) {
         self.tick();
         // The scene's upkeep: get above a revision a shard reported, and (once
         // a second) say the scene again to whoever has not confirmed it.
         self.reconcile_scene();
-        // Deliver the epoch messages the tick (and the inbound handlers since
-        // the last beat) produced. Before the kills below: a shard that is about
-        // to be killed is told the outcome of its epoch first.
+        // Offer the epoch messages the tick (and the inbound handlers since
+        // the last beat) produced to the shards' queues. Before the stops
+        // below, so that the outcome of its epoch is queued for a shard that
+        // is about to be stopped — queued, not delivered: its link is closed
+        // a few lines down, and a close does not wait for the queue to be
+        // written. (The shard stops when its link closes, whichever of the
+        // two it sees.)
         for (to, message) in self.drain_outbox() {
             server.send_to(to, message).await;
         }
-        // Launch the children a split staged, each in its own task (see
-        // `run_with`). The child boots, registers with its own ShardHello, is
-        // handed the outstanding prepare and acks it; a launch that fails
-        // leaves the prepare un-acked, so the epoch aborts at its deadline.
+        // Start the shards that are missing, each in its own task (see
+        // `run_with`). A launched shard registers with its own ShardHello and
+        // is given its region then; a launch that fails is reported back and
+        // the next one waits a little.
         for mut spec in self.take_pending_spawn() {
             if spec.control_addr.port() == 0 {
-                // The control endpoint was bound on port 0 ("any"): the child
+                // The control endpoint was bound on port 0 ("any"): the shard
                 // has to dial the port that was actually bound.
                 if let Ok(bound) = server.local_addr() {
                     spec.control_addr.set_port(bound.port());
                 }
             }
             let launcher = Arc::clone(&self.launcher);
-            let failures = Arc::clone(&self.launch_failures);
+            let results = Arc::clone(&self.launch_results);
             tokio::spawn(async move {
-                let shard = spec.shard;
-                if let Err(err) = launcher.spawn(spec).await {
-                    eprintln!("space-orchestrator: spawn {shard} failed: {err}");
-                    // For the event log; the loop picks it up on its next beat.
-                    if let Ok(mut failures) = failures.lock() {
-                        failures.push((shard, err.to_string()));
-                    }
+                let launch = spec.launch;
+                let result = launcher.spawn(spec).await.map_err(|err| err.to_string());
+                // For the orchestrator; the loop takes it in on its next beat.
+                if let Ok(mut results) = results.lock() {
+                    results.push((launch, result));
                 }
             });
         }
-        // Kill the shards a committed merge, an aborted split or the admin verb
-        // staged.
+        // Stop the shards a committed merge, an aborted change or a death
+        // staged: close their links (a shard does not run without one), and
+        // have the launcher stop the processes it started.
         for shard in self.take_pending_kill() {
-            if let Err(err) = self.launcher.kill(shard).await {
-                eprintln!("space-orchestrator: kill {shard} failed: {err}");
-                self.log(
-                    EventKind::Launcher,
-                    Severity::Warn,
-                    format!("stopping {shard} failed: {err}"),
-                );
-            }
-            server.unregister(shard).await;
+            server.close_link(shard).await;
             // Stopped on purpose: not a link that was "lost".
             self.connected.remove(&shard);
             self.scene_confirmed.remove(&shard);
         }
-        // What follows is for the operator view only.
-        let failed = self
-            .launch_failures
-            .lock()
-            .map(|mut failures| std::mem::take(&mut *failures))
-            .unwrap_or_default();
-        for (shard, why) in failed {
-            self.log(
-                EventKind::Launcher,
-                Severity::Warn,
-                format!("launching {shard} failed: {why}"),
-            );
+        for launch in self.take_pending_launch_kill() {
+            if let Err(err) = self.launcher.kill(launch).await {
+                eprintln!("space-orchestrator: stopping the shard of {launch} failed: {err}");
+                self.log(
+                    EventKind::Launcher,
+                    Severity::Warn,
+                    format!("stopping the shard of {launch} failed: {err}"),
+                );
+            }
         }
+        // What the launches did, and whether what was launched is still alive.
+        let reported = self
+            .launch_results
+            .lock()
+            .map(|mut results| std::mem::take(&mut *results))
+            .unwrap_or_default();
+        for (launch, result) in reported {
+            self.note_launch_result(launch, result);
+        }
+        if self.tick.is_multiple_of(POLL_INTERVAL_TICKS) {
+            for launch in self.launches_to_poll() {
+                if let Ok(Poll::Dead) = self.launcher.poll(launch).await {
+                    self.note_launch_dead(launch);
+                }
+            }
+        }
+        // Whose control link is open: a registered shard whose link closed is
+        // dead.
         self.note_connected(server.connected().await);
+        // What follows is for the operator view only.
         self.print_new_events();
         self.publish(false);
     }
@@ -2029,6 +3638,20 @@ async fn next_operator_request(ops: &mut Option<OpsPort>) -> Option<OperatorRequ
     }
 }
 
+/// Why a change is not made while `shard` holds no control link.
+fn not_connected(shard: ShardId) -> String {
+    format!("{shard} is not connected to the orchestrator, so it could not acknowledge the change")
+}
+
+/// `" on port 7870"`, or nothing for a launch without a host port.
+fn on_port(port: u16) -> String {
+    if port == 0 {
+        String::new()
+    } else {
+        format!(" on port {port}")
+    }
+}
+
 /// `shards` as "shard 1, shard 2" ("nobody" when empty).
 fn list_shards(shards: &[ShardId]) -> String {
     if shards.is_empty() {
@@ -2058,7 +3681,7 @@ mod tests {
     /// A launcher that records calls and never touches a process.
     #[derive(Debug, Default)]
     struct MockLauncher {
-        spawned: std::sync::Mutex<Vec<ShardId>>,
+        spawned: std::sync::Mutex<Vec<LaunchId>>,
     }
 
     impl Launcher for MockLauncher {
@@ -2067,19 +3690,20 @@ mod tests {
         async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
             // The lock is taken and released with no await point in between, so
             // the future stays `Send`.
-            self.spawned.lock().unwrap().push(spec.shard);
+            self.spawned.lock().unwrap().push(spec.launch);
             Ok(ShardHandle {
-                shard: spec.shard,
-                endpoint: spec.region.endpoint,
+                launch: spec.launch,
+                shard: None,
+                endpoint: launched_at(spec.launch),
                 process: "mock".into(),
             })
         }
 
-        async fn kill(&self, _shard: ShardId) -> Result<(), LaunchError> {
+        async fn kill(&self, _launch: LaunchId) -> Result<(), LaunchError> {
             Ok(())
         }
 
-        async fn poll(&self, _shard: ShardId) -> Result<Poll, LaunchError> {
+        async fn poll(&self, _launch: LaunchId) -> Result<Poll, LaunchError> {
             Ok(Poll::Alive)
         }
     }
@@ -2102,6 +3726,8 @@ mod tests {
         }
     }
 
+    /// The root owned by shard 1, which has never said hello and holds no
+    /// control link (see [`live`]).
     fn orchestrator() -> Orchestrator<MockLauncher> {
         orchestrator_with_first_id(1)
     }
@@ -2131,6 +3757,15 @@ mod tests {
         let map = ShardMap::new(1, regions);
         let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
         Orchestrator::new(control, std::sync::Arc::new(MockLauncher::default()))
+    }
+
+    /// `orch` with every owner of its map holding a control link: a cluster
+    /// in which a map change can be made (every shard of the map has to
+    /// acknowledge one, so none is asked for while one of them is not there).
+    fn live(mut orch: Orchestrator<MockLauncher>) -> Orchestrator<MockLauncher> {
+        let owners: Vec<ShardId> = orch.map().regions.iter().map(|r| r.shard).collect();
+        orch.note_connected(owners);
+        orch
     }
 
     /// Root (depth 40) owned by shard 1 with octant 0 carved out for shard 2.
@@ -2180,6 +3815,104 @@ mod tests {
         recipients.len()
     }
 
+    /// The hello of a shard that just started, listening on `endpoint`: no
+    /// id, no region — what every shard says, launched or started by hand.
+    fn fresh_hello(endpoint: SocketAddr) -> ShardHello {
+        ShardHello {
+            cluster: OrchestratorConfig::default().cluster,
+            shard: ShardId::NONE,
+            endpoint,
+            region: None,
+            secret: String::new(),
+        }
+    }
+
+    /// Where the shard of `launch` listens in these tests.
+    fn launched_at(launch: LaunchId) -> SocketAddr {
+        addr(9_500 + u16::try_from(launch.0).expect("a small launch number"))
+    }
+
+    /// Play the launcher for `spec`: its shard says hello and the launcher
+    /// reports the handle. Returns the hello's outcome.
+    fn hello_of(
+        orch: &mut Orchestrator<MockLauncher>,
+        spec: &SpawnSpec,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        let endpoint = launched_at(spec.launch);
+        let outcome = orch.handle_shard_hello(&fresh_hello(endpoint));
+        orch.note_launch_result(
+            spec.launch,
+            Ok(ShardHandle {
+                launch: spec.launch,
+                shard: None,
+                endpoint,
+                process: "mock".into(),
+            }),
+        );
+        outcome
+    }
+
+    /// Play the **`process`** launcher for `spec`: its shard listens on the
+    /// host port the launch was handed, says hello from there, and the
+    /// launcher reports where it listens (it does not know the shard's id).
+    fn process_hello_of(
+        orch: &mut Orchestrator<MockLauncher>,
+        spec: &SpawnSpec,
+    ) -> Result<ShardWelcome, HelloRefusal> {
+        let endpoint = addr(spec.host_port);
+        let outcome = orch.handle_shard_hello(&fresh_hello(endpoint));
+        orch.note_launch_result(spec.launch, Ok(process_handle(spec)));
+        outcome
+    }
+
+    /// What the `process` launcher reports for `spec`.
+    fn process_handle(spec: &SpawnSpec) -> ShardHandle {
+        ShardHandle {
+            launch: spec.launch,
+            shard: None,
+            endpoint: addr(spec.host_port),
+            process: "pid of a mock".into(),
+        }
+    }
+
+    /// An orchestrator as `boot` leaves it that starts its shards as
+    /// processes on the host ports `ports` and keeps `min_shards` running.
+    fn process_cluster(min_shards: usize, ports: (u16, u16)) -> Orchestrator<MockLauncher> {
+        fresh_cluster(OrchestratorConfig {
+            min_shards,
+            launcher: LauncherKind::Process,
+            host_port_range: ports,
+            ..OrchestratorConfig::default()
+        })
+    }
+
+    /// Bring `process_cluster`'s shards up, one after the other: each launch
+    /// registers and its epoch (none for the root) commits. Returns the
+    /// `(launch, shard)` pairs in the order they came up.
+    fn bring_up(orch: &mut Orchestrator<MockLauncher>, count: usize) -> Vec<(SpawnSpec, ShardId)> {
+        let mut up = Vec::new();
+        while up.len() < count {
+            orch.tick();
+            for spec in orch.take_pending_spawn() {
+                let welcome = process_hello_of(orch, &spec).expect("a launched shard is welcomed");
+                ack_the_prepare(orch);
+                up.push((spec, welcome.shard));
+            }
+            assert!(orch.current_tick() < 1_000, "the shards never came up");
+        }
+        let _ = (orch.drain_outbox(), orch.take_pending_kill());
+        up
+    }
+
+    /// Play the launcher for the launch the orchestrator staged (exactly one):
+    /// its shard registers and is welcomed.
+    fn join(orch: &mut Orchestrator<MockLauncher>) -> ShardWelcome {
+        let mut staged = orch.take_pending_spawn();
+        assert_eq!(staged.len(), 1, "exactly one launch is staged: {staged:?}");
+        let spec = staged.pop().expect("one");
+        hello_of(orch, &spec).expect("the launched shard is welcomed")
+    }
+
     fn accepted(reply: &AdminReply) -> bool {
         matches!(reply, AdminReply::Accepted { .. })
     }
@@ -2198,17 +3931,18 @@ mod tests {
     /// and the hot shard can never be relieved again.
     #[test]
     fn a_region_can_be_split_again_and_each_split_carves_a_new_octant() {
-        let mut orch = orchestrator_with_first_id(100);
+        let mut orch = live(orchestrator_with_first_id(100));
         let root = orch.config().root_node();
         let kids = space_world::octree::children(root).expect("root splits");
         let mut carved = Vec::new();
         for round in 0..3u64 {
             let reply = orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)));
             assert!(accepted(&reply), "split {round} is accepted: {reply:?}");
-            let spec = orch.take_pending_spawn().pop().expect("a child is staged");
+            // A shard is launched for it, registers, and is given the octant.
+            let welcome = join(&mut orch);
             assert!(ack_the_prepare(&mut orch) > 0, "a prepare went out");
             assert_eq!(orch.map().epoch, 2 + round, "split {round} committed");
-            carved.push(spec.region.node);
+            carved.push(welcome.region.node);
             for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
                 orch.tick();
             }
@@ -2224,7 +3958,7 @@ mod tests {
     /// joining ships spawn — not at octant 0, the far corner.
     #[test]
     fn an_autoscaler_split_carves_the_centre_octant_first() {
-        let mut orch = orchestrator_with_first_id(100);
+        let mut orch = live(orchestrator_with_first_id(100));
         let root = orch.config().root_node();
         let mut staged = None;
         for _ in 0..=(crate::autoscale::SPLIT_DWELL_TICKS + 1) {
@@ -2235,14 +3969,17 @@ mod tests {
                 break;
             }
         }
-        let spec = staged.expect("a shard hot for the dwell is split");
+        let spec = staged.expect("a shard hot for the dwell is split: one is launched");
         let kids = space_world::octree::children(root).expect("root splits");
         assert_eq!(
-            spec.region.node, kids[7],
-            "the carved octant is the one holding the region centre"
+            orch.wanted_node(),
+            Some(kids[7]),
+            "the octant asked for is the one holding the region centre"
         );
+        let welcome = hello_of(&mut orch, &spec).expect("the launched shard is welcomed");
+        assert_eq!(welcome.region.node, kids[7]);
         assert!(space_world::octree::contains(
-            spec.region.node,
+            welcome.region.node,
             root.center()
         ));
     }
@@ -2260,15 +3997,16 @@ mod tests {
         let root = config.root_node();
         let ids =
             PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
-        let mut orch = orchestrator_over(
+        let mut orch = live(orchestrator_over(
             config,
             vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
             ids,
-        );
+        ));
         let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
         assert!(why.contains("split floor"), "{why}");
         assert_eq!(orch.control.ids.peek(), 100, "no id was allocated");
-        assert!(orch.take_pending_spawn().is_empty());
+        assert!(orch.take_pending_spawn().is_empty(), "nothing is launched");
+        assert_eq!(orch.wanted_node(), None, "nothing is wanted");
         assert!(orch.drain_outbox().is_empty(), "no prepare was published");
 
         // The autoscaler path refuses the same way: hot for several dwells, and
@@ -2279,6 +4017,7 @@ mod tests {
         }
         assert_eq!(orch.control.ids.peek(), 100, "a refused split burns no id");
         assert_eq!(orch.map().epoch, 1);
+        assert!(orch.take_pending_spawn().is_empty());
 
         // A shard the map does not know is refused too, again without an id.
         let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(9))));
@@ -2297,30 +4036,55 @@ mod tests {
         }
     }
 
-    /// Mutation this catches: the `expect` on the counter write. A split with a
-    /// full disk took the whole orchestrator down; it must be a refused split.
+    /// Mutation this catches: the `expect` on the counter write. With a full
+    /// disk no id can be given to the shard that registers for a split; that
+    /// took the whole orchestrator down, and must be a split that is not
+    /// carried out. (The id is allocated when the shard registers, so that is
+    /// where it shows: the split itself is asked for without one.)
     #[test]
-    fn a_split_with_an_unwritable_counter_is_refused_not_a_panic() {
+    fn a_split_with_an_unwritable_counter_is_not_carried_out_not_a_panic() {
         let config = OrchestratorConfig::default();
         let root = config.root_node();
         let ids = PersistentShardIdAllocator::with_sink(100, Box::new(BrokenSink));
-        let mut orch = orchestrator_over(
+        let mut orch = live(orchestrator_over(
             config,
             vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
             ids,
-        );
+        ));
         let before = orch.map().clone();
-        let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
-        assert!(why.contains("could not be persisted"), "{why}");
-        assert!(orch.take_pending_spawn().is_empty(), "nothing is launched");
+        assert!(accepted(
+            &orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)))
+        ));
+        let spec = orch
+            .take_pending_spawn()
+            .pop()
+            .expect("a shard is launched");
+        let refused = hello_of(&mut orch, &spec).expect_err("there is no id to give it");
+        assert!(
+            matches!(&refused, HelloRefusal::Wait(why) if why.contains("could not be persisted")),
+            "{refused:?}"
+        );
         assert!(orch.drain_outbox().is_empty(), "no prepare was published");
         assert_eq!(orch.map(), &before);
+        assert_eq!(orch.wanted_node(), None, "the split is given up");
+        assert!(orch.snapshot().in_flight.is_none());
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("not carried out: split of shard 1")
+                    && t.contains("could not be persisted")),
+            "{texts:?}"
+        );
         // The same through the autoscaler: it logs and carries on ticking.
         for _ in 0..=(crate::autoscale::SPLIT_DWELL_TICKS + 1) {
             orch.handle_load_report(&report(1, 90));
             orch.tick();
+            for spec in orch.take_pending_spawn() {
+                let _ = hello_of(&mut orch, &spec);
+            }
         }
-        assert!(orch.take_pending_spawn().is_empty());
+        assert!(orch.drain_outbox().is_empty());
         assert_eq!(orch.map(), &before);
     }
 
@@ -2330,7 +4094,7 @@ mod tests {
     /// does not name. It was replayed to the autoscaler every tick and acted on.
     #[test]
     fn a_report_from_a_shard_outside_the_map_is_ignored() {
-        let mut orch = orchestrator_with_first_id(100);
+        let mut orch = live(orchestrator_with_first_id(100));
         for _ in 0..(2 * crate::autoscale::SPLIT_DWELL_TICKS) {
             orch.handle_load_report(&report(77, 95));
             orch.tick();
@@ -2341,6 +4105,7 @@ mod tests {
             orch.drain_outbox().is_empty(),
             "nothing was proposed for it"
         );
+        assert!(orch.take_pending_spawn().is_empty(), "nothing was launched");
         assert_eq!(orch.control.ids.peek(), 100, "and no id was spent on it");
     }
 
@@ -2349,7 +4114,7 @@ mod tests {
     /// anyway, a hundred ticks after it went silent.
     #[test]
     fn a_stale_report_expires_and_never_completes_a_dwell() {
-        let mut orch = orchestrator_with_first_id(100);
+        let mut orch = live(orchestrator_with_first_id(100));
         let dwell = crate::autoscale::SPLIT_DWELL_TICKS;
         for _ in 0..(dwell * 2 / 3) {
             orch.handle_load_report(&report(1, 95));
@@ -2370,6 +4135,7 @@ mod tests {
             "and the autoscaler has forgotten the shard"
         );
         assert!(orch.take_pending_spawn().is_empty(), "nothing was split");
+        assert_eq!(orch.wanted_node(), None);
         assert!(orch.drain_outbox().is_empty());
         assert_eq!(orch.map().epoch, 1);
         // A report that keeps arriving within the expiry is still believed: one
@@ -2396,7 +4162,7 @@ mod tests {
     /// owner for its region.
     #[test]
     fn a_merge_kills_the_child_only_once_the_epoch_commits() {
-        let mut orch = orchestrator_with_a_child();
+        let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         orch.handle_load_report(&report(2, 0));
         let reply = orch.handle_admin(&AdminCommand::ForceMerge(child));
@@ -2450,7 +4216,7 @@ mod tests {
     /// owns its region.
     #[test]
     fn a_merge_that_aborts_kills_nobody_and_is_forgotten() {
-        let mut orch = orchestrator_with_a_child();
+        let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         orch.handle_load_report(&report(2, 0));
         assert!(accepted(
@@ -2475,7 +4241,7 @@ mod tests {
         assert!(accepted(
             &orch.handle_admin(&AdminCommand::ForceSplit(child))
         ));
-        let grandchild = orch.take_pending_spawn().pop().expect("staged").shard;
+        let grandchild = join(&mut orch).shard;
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2, "the split committed");
         assert!(orch.map().regions.iter().any(|r| r.shard == grandchild));
@@ -2490,7 +4256,7 @@ mod tests {
     /// step that hands its players to anyone.
     #[test]
     fn only_a_shard_known_to_be_empty_is_merged() {
-        let mut orch = orchestrator_with_a_child();
+        let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         // No report at all: not known to be empty.
         let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
@@ -2526,26 +4292,35 @@ mod tests {
 
     // ------------------------------------------------- finding 2 (the abort)
 
-    /// A split whose epoch aborts leaves a launched child that owns nothing: it
-    /// is staged for killing (it used to run on, unowned, for ever), and the
-    /// abort reaches every recipient of the prepare.
+    /// A split whose epoch aborts leaves a registered shard that owns nothing:
+    /// it is staged for stopping (it used to run on, unowned, for ever) — its
+    /// control link, and its process — and the abort reaches every recipient
+    /// of the prepare.
     #[test]
     fn a_split_that_aborts_stages_the_kill_of_its_child() {
-        let mut orch = orchestrator_with_first_id(100);
+        let mut orch = live(orchestrator_with_first_id(100));
         assert!(accepted(
             &orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)))
         ));
-        let child = orch.take_pending_spawn().pop().expect("staged").shard;
+        let child = join(&mut orch).shard;
+        let launch = orch.launch_of(child).expect("the launch that became it");
         let told: Vec<ShardId> = prepares(&orch.drain_outbox())
             .into_iter()
             .map(|(to, _)| to)
             .collect();
+        assert_eq!(told, vec![ShardId::new(1), child]);
         assert!(orch.take_pending_kill().is_empty());
         for _ in 0..=crate::config::EPOCH_ACK_TIMEOUT_TICKS {
             orch.tick();
         }
         assert_eq!(orch.map().epoch, 1, "the split aborted");
         assert_eq!(orch.take_pending_kill(), vec![child]);
+        assert_eq!(orch.take_pending_launch_kill(), vec![launch]);
+        assert_eq!(
+            orch.launch_of(child),
+            None,
+            "and it is no longer supervised"
+        );
         let aborted: Vec<ShardId> = orch
             .drain_outbox()
             .into_iter()
@@ -2553,14 +4328,113 @@ mod tests {
             .map(|(to, _)| to)
             .collect();
         assert_eq!(aborted, told, "everyone who got the prepare gets the abort");
-        // A committed split, by contrast, kills nobody.
+        // A committed split, by contrast, kills nobody. (The shard of the
+        // aborted one was a launch that came to nothing: the next launch
+        // waits the pause a failed launch earns.)
         assert!(accepted(
             &orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)))
         ));
-        let _ = orch.take_pending_spawn();
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "not before the pause is over"
+        );
+        for _ in 0..LAUNCH_BACKOFF_TICKS {
+            orch.tick();
+        }
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
         assert!(orch.take_pending_kill().is_empty());
+        assert!(orch.take_pending_launch_kill().is_empty());
+    }
+
+    /// A split asks for a node and launches a shard; nothing is proposed until
+    /// a shard has registered to take it — and if none ever does, the request
+    /// is given up and the launch is stopped. No id is spent, no prepare is
+    /// sent, the map never moves.
+    ///
+    /// Mutation this catches: a request that waits for ever (no other change
+    /// could be asked for again), or one that proposes its epoch at once — the
+    /// order this replaced, in which the 3 s ack deadline had to cover the
+    /// start of a process.
+    #[test]
+    fn a_split_whose_shard_never_registers_is_given_up() {
+        let mut orch = live(orchestrator_with_first_id(100));
+        let before = orch.map().clone();
+        assert!(accepted(
+            &orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)))
+        ));
+        let staged = orch.take_pending_spawn();
+        assert_eq!(staged.len(), 1, "one shard is launched for it");
+        assert!(orch.wanted_node().is_some());
+        assert_eq!(orch.starting(), 1);
+        assert!(orch.snapshot().in_flight.is_none(), "nothing is proposed");
+        assert!(orch.drain_outbox().is_empty(), "no prepare without a shard");
+        assert_eq!(orch.control.ids.peek(), 100, "and no id either");
+
+        // While it waits no other change is asked for.
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
+        assert!(why.contains("still waiting for its new shard"), "{why}");
+
+        // The launch never registers: stopped after its patience...
+        for _ in 0..=LAUNCH_REGISTER_TIMEOUT_TICKS {
+            orch.tick();
+        }
+        assert_eq!(orch.take_pending_launch_kill(), vec![staged[0].launch]);
+        assert_eq!(orch.starting(), 0);
+        // ...and another one is tried while the node is still wanted, after
+        // the pause a failed launch earns.
+        for _ in 0..=LAUNCH_BACKOFF_TICKS {
+            orch.tick();
+        }
+        let second = orch.take_pending_spawn();
+        assert_eq!(second.len(), 1, "a second launch");
+        // Then the request itself is given up — and with it, in the same
+        // beat, the launch that was started for it: left running, it would
+        // register a little later, find nothing wanted and be given a layout
+        // cell nobody asked for.
+        let asked_at = orch.current_tick();
+        while orch.wanted_node().is_some() {
+            orch.tick();
+            assert!(
+                orch.current_tick() - asked_at <= WANTED_TIMEOUT_TICKS,
+                "the request is given up"
+            );
+        }
+        assert_eq!(
+            orch.take_pending_launch_kill(),
+            vec![second[0].launch],
+            "stopped with the request it was started for"
+        );
+        assert_eq!(orch.starting(), 0);
+        assert!(
+            event_texts(&orch)
+                .iter()
+                .any(|t| t.contains("is no longer needed") && t.contains("stopped")),
+            "{:?}",
+            event_texts(&orch)
+        );
+        assert_eq!(orch.wanted_node(), None);
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("not carried out: split of shard 1")
+                    && t.contains("no shard registered")),
+            "{texts:?}"
+        );
+        assert_eq!(orch.map(), &before);
+        assert!(orch.drain_outbox().is_empty(), "nothing was ever proposed");
+        assert_eq!(orch.control.ids.peek(), 100);
+        // And a new request is accepted again.
+        let _ = orch.take_pending_spawn();
+        let _ = orch.take_pending_launch_kill();
+        for _ in 0..=(2 * LAUNCH_REGISTER_TIMEOUT_TICKS) {
+            orch.tick();
+        }
+        assert!(accepted(
+            &orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)))
+        ));
     }
 
     #[test]
@@ -2575,18 +4449,21 @@ mod tests {
     fn a_commit_is_followed_by_a_map_push_carrying_every_real_endpoint() {
         // Ids start above the root's so the child is a distinct shard.
         let mut orch = orchestrator_with_first_id(100);
-        let hello = |shard: ShardId, port: u16, region| ShardHello {
+        orch.handle_shard_hello(&ShardHello {
             cluster: OrchestratorConfig::default().cluster,
-            shard,
-            endpoint: addr(port),
-            region,
-        };
-        orch.handle_shard_hello(&hello(ShardId::new(1), 9_001, None))
-            .expect("root shard registers");
+            shard: ShardId::new(1),
+            endpoint: addr(9_001),
+            region: None,
+            secret: String::new(),
+        })
+        .expect("root shard registers");
         orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)));
-        let spec = orch.take_pending_spawn().pop().expect("a child is staged");
-        orch.handle_shard_hello(&hello(spec.shard, 9_002, Some(spec.region.clone())))
-            .expect("child registers");
+        let _ = orch.take_pending_spawn();
+        // The shard for the split registers from its own address, with no id.
+        let child = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect("the new shard registers and is given the octant")
+            .shard;
         let outbox = orch.drain_outbox();
         let epoch = outbox
             .iter()
@@ -2596,13 +4473,13 @@ mod tests {
             })
             .expect("the prepare went out");
         let recipients: Vec<ShardId> = outbox.into_iter().map(|(to, _)| to).collect();
-        assert!(!recipients.is_empty(), "the prepare went out");
+        assert_eq!(recipients, vec![ShardId::new(1), child]);
         for shard in recipients {
             orch.handle_epoch_ack(shard, epoch);
         }
 
         let out = orch.drain_outbox();
-        for shard in [ShardId::new(1), spec.shard] {
+        for shard in [ShardId::new(1), child] {
             let kinds: Vec<&Message> = out
                 .iter()
                 .filter(|(to, _)| *to == shard)
@@ -2624,73 +4501,15 @@ mod tests {
                     .map(|r| r.endpoint)
             };
             assert_eq!(endpoint_of(ShardId::new(1)), Some(addr(9_001)));
-            assert_eq!(endpoint_of(spec.shard), Some(addr(9_002)));
+            assert_eq!(endpoint_of(child), Some(addr(9_002)));
         }
         // The orchestrator's own published map carries the same addresses.
         assert!(orch
             .map()
             .regions
             .iter()
-            .any(|r| r.shard == spec.shard && r.endpoint == addr(9_002)));
-    }
-
-    #[test]
-    fn a_child_that_never_registered_stays_at_the_sentinel_in_the_pushed_map() {
-        let mut orch = orchestrator_with_first_id(100);
-        orch.handle_shard_hello(&ShardHello {
-            cluster: OrchestratorConfig::default().cluster,
-            shard: ShardId::new(1),
-            endpoint: addr(9_001),
-            region: None,
-        })
-        .expect("root shard registers");
-        orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1)));
-        let spec = orch.take_pending_spawn().pop().expect("a child is staged");
-        // The child is never spawned/registered: nobody tells the orchestrator
-        // its address. Ack the prepare from whoever it went to.
-        let outbox = orch.drain_outbox();
-        let epoch = outbox
-            .iter()
-            .find_map(|(_, m)| match m {
-                Message::EpochPrepare(p) => Some(p.epoch),
-                _ => None,
-            })
-            .expect("the prepare went out");
-        let recipients: Vec<ShardId> = outbox.into_iter().map(|(to, _)| to).collect();
-        assert!(!recipients.is_empty(), "the prepare went out");
-        for shard in recipients {
-            orch.handle_epoch_ack(shard, epoch);
-        }
-
-        let out = orch.drain_outbox();
-        let pushes: Vec<&space_protocol::DirectoryReply> = out
-            .iter()
-            .filter_map(|(_, m)| match m {
-                Message::DirectoryReply(push) => Some(push),
-                _ => None,
-            })
-            .collect();
-        assert!(!pushes.is_empty(), "the commit is followed by a map push");
-        for push in pushes {
-            let child = push
-                .shard_map
-                .regions
-                .iter()
-                .find(|r| r.shard == spec.shard)
-                .expect("the child's region is in the pushed map");
-            assert_eq!(
-                child.endpoint,
-                ShardRegion::UNRESOLVED_ENDPOINT,
-                "an unregistered child must not inherit the parent's address"
-            );
-            let parent = push
-                .shard_map
-                .regions
-                .iter()
-                .find(|r| r.shard == ShardId::new(1))
-                .expect("parent region");
-            assert_eq!(parent.endpoint, addr(9_001));
-        }
+            .any(|r| r.shard == child && r.endpoint == addr(9_002)));
+        assert_eq!(orch.endpoint_of(child), Some(addr(9_002)));
     }
 
     #[test]
@@ -2699,22 +4518,15 @@ mod tests {
         // acceptance tests rely on this).
         let launcher = MockLauncher::default();
         let spec = SpawnSpec {
-            shard: ShardId::new(1),
-            region: ShardRegion::new(
-                OrchestratorConfig::default().root_node(),
-                ShardId::new(1),
-                addr(7_001),
-            ),
+            launch: LaunchId(1),
             cluster: "space-local".into(),
             control_addr: addr(7_900),
             host_port: 7_870,
+            secret: String::new(),
         };
         let handle = block_on(launcher.spawn(spec)).expect("spawn");
-        assert_eq!(handle.shard, ShardId::new(1));
-        assert_eq!(
-            block_on(launcher.poll(ShardId::new(1))).unwrap(),
-            Poll::Alive
-        );
+        assert_eq!(handle.launch, LaunchId(1));
+        assert_eq!(block_on(launcher.poll(LaunchId(1))).unwrap(), Poll::Alive);
     }
 
     // ------------------------------------------------------ the operator path
@@ -2736,9 +4548,7 @@ mod tests {
 
     /// Root owned by shard 1, which holds a control link; ids start at 100.
     fn connected_orchestrator() -> Orchestrator<MockLauncher> {
-        let mut orch = orchestrator_with_first_id(100);
-        orch.note_connected([ShardId::new(1)]);
-        orch
+        live(orchestrator_with_first_id(100))
     }
 
     fn event_texts(orch: &Orchestrator<MockLauncher>) -> Vec<String> {
@@ -2748,12 +4558,14 @@ mod tests {
             .collect()
     }
 
-    /// An operator's split is an ordinary epoch change: proposed, acked by
-    /// every recipient, committed — and it carves exactly the octant named.
+    /// An operator's split is an ordinary epoch change: asked for, proposed
+    /// when its shard has registered, acked by every recipient, committed —
+    /// and it carves exactly the octant named.
     ///
     /// Mutation this catches: an operator path that writes the map itself
     /// (the map would change before the acks), or that treats the octant as a
-    /// starting point like the admin verb does.
+    /// starting point like the admin verb does; and proposing (or allocating
+    /// the id) before a shard is there to take the octant.
     #[test]
     fn an_operator_split_carves_the_octant_asked_for_through_the_epoch_protocol() {
         let mut orch = connected_orchestrator();
@@ -2761,16 +4573,38 @@ mod tests {
 
         let reply = orch.handle_operator(&split(1, Some(5)));
         assert!(reply.accepted, "{reply:?}");
-        assert!(reply.message.contains("epoch 2 proposed"), "{reply:?}");
-        // Proposed is not published: no shard may see the map before the commit (H10).
+        assert!(
+            reply.message.contains(&format!(
+                "region {} is wanted for a new shard",
+                node_path(kids[5])
+            )),
+            "{reply:?}"
+        );
+        // Asked for is not proposed, let alone published: the octant waits for
+        // a shard, no id is allocated, nobody is told anything.
         assert_eq!(orch.map().epoch, 1);
         assert_eq!(orch.map().regions.len(), 1);
-        let spec = orch
-            .take_pending_spawn()
-            .pop()
-            .expect("the child is staged");
-        assert_eq!(spec.region.node, kids[5], "exactly the octant asked for");
-        assert_eq!(spec.shard, ShardId::new(100), "a freshly allocated id (H9)");
+        assert_eq!(
+            orch.wanted_node(),
+            Some(kids[5]),
+            "exactly the octant asked for"
+        );
+        let snapshot = orch.snapshot();
+        assert!(snapshot.in_flight.is_none());
+        assert_eq!(snapshot.wanted, Some(kids[5]));
+        assert_eq!(snapshot.starting, 1, "a shard is being started for it");
+        assert_eq!(orch.control.ids.peek(), 100);
+        assert!(orch.drain_outbox().is_empty());
+
+        // The launched shard registers — without an id, without a region — and
+        // is welcomed with a freshly allocated id (H9) for exactly that octant.
+        // The map it is handed is the published one: not its octant yet (H10).
+        let welcome = join(&mut orch);
+        assert_eq!(welcome.shard, ShardId::new(100));
+        assert_eq!(welcome.region.node, kids[5]);
+        assert_eq!(&welcome.shard_map, orch.map());
+        assert_eq!(welcome.shard_map.epoch, 1);
+        assert_eq!(orch.wanted_node(), None, "served");
 
         let snapshot = orch.snapshot();
         let flight = snapshot.in_flight.expect("the change is in flight");
@@ -2781,15 +4615,16 @@ mod tests {
             vec![(ShardId::new(1), false), (ShardId::new(100), false)],
             "everyone who must ack, nobody has yet"
         );
-        assert!(snapshot
-            .shards
-            .iter()
-            .any(|s| s.shard == ShardId::new(100) && s.role == ShardRole::SplitChild));
+        assert!(snapshot.shards.iter().any(|s| s.shard == ShardId::new(100)
+            && s.role == ShardRole::Joining
+            && s.connected
+            && s.launched));
         assert_eq!(
             snapshot.regions.len(),
             1,
             "the snapshot shows the committed map"
         );
+        assert_eq!(snapshot.starting, 0);
 
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
@@ -2828,19 +4663,19 @@ mod tests {
         let mut orch = connected_orchestrator();
         let kids = space_world::octree::children(orch.config().root_node()).expect("splits");
         assert!(orch.handle_operator(&split(1, None)).accepted);
-        let spec = orch.take_pending_spawn().pop().expect("staged");
-        assert_eq!(spec.region.node, kids[7]);
+        assert_eq!(orch.wanted_node(), Some(kids[7]));
+        assert_eq!(join(&mut orch).region.node, kids[7]);
     }
 
     /// Mutation this catches: letting an operator's mistake go through
     /// `begin_split`'s refusal path, which cools the shard down and makes the
-    /// autoscaler "busy" — or worse, allocating the child's id first.
+    /// autoscaler "busy" — or worse, launching a shard for it.
     #[test]
     fn a_refused_operator_request_changes_nothing_at_all() {
         let mut orch = connected_orchestrator();
         // Carve octant 3 for shard 100 and let the minimum interval pass.
         assert!(orch.handle_operator(&split(1, Some(3))).accepted);
-        let _ = orch.take_pending_spawn();
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
             orch.tick();
@@ -2854,6 +4689,8 @@ mod tests {
                 orch.control.ids.peek(),
                 orch.control.autoscaler.busy_until(),
                 orch.control.autoscaler.tracks(ShardId::new(1)),
+                orch.wanted_node(),
+                orch.starting(),
             )
         };
         let before = state(&orch);
@@ -2866,7 +4703,6 @@ mod tests {
             (split(1, Some(3)), "already carved out"),
             (split(1, Some(9)), "does not exist"),
             (split(42, Some(0)), "no region owned by shard 42"),
-            (split(100, Some(0)), "shard 100 is not connected"),
             (stale, "the map changed"),
             (merge(1), "no enclosing region to merge into"),
             (merge(42), "no region owned by shard 42"),
@@ -2890,13 +4726,23 @@ mod tests {
         assert!(orch.snapshot().in_flight.is_none());
     }
 
-    /// One change at a time (H12): a second request while a prepare is
-    /// outstanding is refused, not queued, and burns no id. When the first one
-    /// aborts, the log says who did not ack and the next request is accepted.
+    /// One change at a time (H12): a second request while a region is waiting
+    /// for its shard, or while its prepare is outstanding, is refused, not
+    /// queued, and burns no id. When the first one aborts, the log says who did
+    /// not ack and the next request is accepted.
     #[test]
-    fn an_operator_request_while_an_epoch_is_in_flight_is_refused_not_queued() {
+    fn an_operator_request_while_a_change_is_under_way_is_refused_not_queued() {
         let mut orch = connected_orchestrator();
         assert!(orch.handle_operator(&split(1, Some(0))).accepted);
+        // Waiting for its shard: nothing else is asked for.
+        let reply = orch.handle_operator(&split(1, Some(1)));
+        assert!(!reply.accepted);
+        assert!(
+            reply.message.contains("still waiting for its new shard"),
+            "{reply:?}"
+        );
+        // The shard registers: the prepare is outstanding.
+        let _ = join(&mut orch);
         let ids = orch.control.ids.peek();
         let reply = orch.handle_operator(&split(1, Some(1)));
         assert!(!reply.accepted);
@@ -2905,10 +4751,9 @@ mod tests {
             "{reply:?}"
         );
         assert_eq!(orch.control.ids.peek(), ids, "no id was burned");
-        assert_eq!(
-            orch.take_pending_spawn().len(),
-            1,
-            "only the first split's child"
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "only the first split launched a shard"
         );
         let prepared = prepares(&orch.drain_outbox());
         assert!(prepared.iter().all(|(_, epoch)| *epoch == 2));
@@ -2937,6 +4782,7 @@ mod tests {
         }
         assert!(orch.drain_outbox().is_empty());
         assert!(orch.take_pending_spawn().is_empty());
+        assert_eq!(orch.wanted_node(), None);
         // ...and asking again now is accepted.
         let reply = orch.handle_operator(&split(1, Some(1)));
         assert!(reply.accepted, "{reply:?}");
@@ -2990,21 +4836,11 @@ mod tests {
         space_world::NodeRef::new(64, [k[0] + d[0], k[1] + d[1], k[2] + d[2]])
     }
 
-    fn hello_of_a_launched_shard(shard: u32, node: space_world::NodeRef) -> ShardHello {
-        let endpoint = addr(9_000 + shard as u16);
-        ShardHello {
-            cluster: OrchestratorConfig::default().cluster,
-            shard: ShardId::new(shard),
-            endpoint,
-            region: Some(ShardRegion::new(node, ShardId::new(shard), endpoint)),
-        }
-    }
-
     /// `begin_carve` is a split whose node is named: one cell, twenty-four
-    /// levels below the root, goes to a newly launched shard through the same
-    /// steps — plan, id, one epoch to **every** shard of the map and the new
-    /// one, launch, hello, acks, commit — and the merge that undoes it gives
-    /// the cell back to the root's owner.
+    /// levels below the root, goes to a new shard through the same steps —
+    /// asked for, a shard launched, its hello, the id, one epoch to **every**
+    /// shard of the map and the new one, acks, commit — and the merge that
+    /// undoes it gives the cell back to the root's owner.
     ///
     /// Mutations this catches: a carve path that writes the map itself; a
     /// recipient rule that misses the shards of a deep carve; a merge that
@@ -3018,31 +4854,39 @@ mod tests {
         let inside = cell.center();
         assert_eq!(orch.map().lookup(&inside), Some(one));
 
-        let started = orch
+        let wanted = orch
             .begin_carve(cell)
             .expect("the cell lies inside the root");
         assert_eq!(
-            started,
-            CarveStarted {
+            wanted,
+            CarveWanted {
                 node: cell,
-                shard: first,
-                from: one,
-                epoch: 2
+                from: one
             }
         );
-        assert_eq!(
-            started.to_string(),
-            format!(
-                "epoch 2 proposed, region {} goes to new shard 100",
+        assert!(
+            wanted.to_string().starts_with(&format!(
+                "region {} is wanted for a new shard",
                 node_path(cell)
-            )
+            )),
+            "{wanted}"
         );
-        // Proposed is not published (H10), and the new shard's launch is staged
-        // with the id and the node it must say hello with.
+        // Asked for is not proposed (H10): nothing is in flight, nobody is
+        // told, no id is allocated — a shard is launched and the cell waits.
         assert_eq!(orch.map().epoch, 1);
         assert_eq!(orch.map().lookup(&inside), Some(one));
-        let spec = orch.take_pending_spawn().pop().expect("a launch is staged");
-        assert_eq!((spec.shard, spec.region.node), (first, cell));
+        assert_eq!(orch.wanted_node(), Some(cell));
+        assert!(orch.snapshot().in_flight.is_none());
+        assert!(orch.drain_outbox().is_empty());
+        assert_eq!(orch.control.ids.peek(), 100);
+        // The shard losing the cell is on the autoscaler's cooldown.
+        assert!(orch.control.autoscaler.busy_until() > orch.current_tick());
+
+        // The launched shard says hello with neither id nor region and is
+        // given both; the map it is handed still gives the cell to the root.
+        let welcome = join(&mut orch);
+        assert_eq!((welcome.shard, welcome.region.node), (first, cell));
+        assert_eq!(welcome.shard_map.lookup(&inside), Some(one));
         let snapshot = orch.snapshot();
         let in_flight = snapshot.in_flight.expect("the carve is in flight");
         assert_eq!(in_flight.changes, vec![(cell, first)]);
@@ -3058,25 +4902,18 @@ mod tests {
                 .find(|s| s.shard == shard)
                 .map(|s| s.role)
         };
-        assert_eq!(role(&orch, first), Some(ShardRole::SplitChild));
-        // The shard losing the cell is on the autoscaler's cooldown.
-        assert!(orch.control.autoscaler.busy_until() > orch.current_tick());
+        assert_eq!(role(&orch, first), Some(ShardRole::Joining));
 
-        // The prepare went to the root's owner and to the shard that does not
-        // exist yet; the launched shard is handed it when it registers.
+        // The prepare went to the root's owner and to the new shard, which is
+        // connected already.
         assert_eq!(prepares(&orch.drain_outbox()), vec![(one, 2), (first, 2)]);
         orch.handle_epoch_ack(one, 2);
         assert_eq!(orch.map().epoch, 1, "the new shard has not acked");
-        let welcome = orch
-            .handle_shard_hello(&hello_of_a_launched_shard(100, cell))
-            .expect("the id was allocated for this node");
-        assert_eq!((welcome.shard, welcome.region.node), (first, cell));
-        assert!(orch
-            .control
-            .publisher
-            .outstanding_prepare_for(first)
-            .is_some());
-        orch.note_connected([one, first]);
+        assert_eq!(
+            orch.map().lookup(&inside),
+            Some(one),
+            "not before the commit"
+        );
         orch.handle_epoch_ack(first, 2);
 
         // Committed: the cell is the new shard's, at its real address, and
@@ -3094,7 +4931,10 @@ mod tests {
             .iter()
             .find(|r| r.shard == first)
             .expect("published");
-        assert_eq!((published.node, published.endpoint), (cell, addr(9_100)));
+        assert_eq!(
+            (published.node, published.endpoint),
+            (cell, welcome.region.endpoint)
+        );
         let sent = orch.drain_outbox();
         for to in [one, first] {
             assert!(sent
@@ -3135,19 +4975,14 @@ mod tests {
             orch.tick();
         }
         let other = cell_at_the_centre(&orch, [-1, 0, 0]);
-        let started = orch.begin_carve(other).expect("the second cell");
-        assert_eq!(
-            (started.shard, started.from, started.epoch),
-            (second, one, 3)
-        );
-        let _ = orch.take_pending_spawn();
+        let wanted = orch.begin_carve(other).expect("the second cell");
+        assert_eq!((wanted.node, wanted.from), (other, one));
+        let welcome = join(&mut orch);
+        assert_eq!((welcome.shard, welcome.region.node), (second, other));
         assert_eq!(
             prepares(&orch.drain_outbox()),
             vec![(one, 3), (first, 3), (second, 3)]
         );
-        orch.handle_shard_hello(&hello_of_a_launched_shard(101, other))
-            .expect("registers");
-        orch.note_connected([one, first, second]);
         for shard in [one, first, second] {
             assert_eq!(orch.map().epoch, 2);
             orch.handle_epoch_ack(shard, 3);
@@ -3211,8 +5046,8 @@ mod tests {
     }
 
     /// What `begin_carve` refuses, and that a refusal has no side effect: no
-    /// id is allocated, nothing is published or staged, nobody is put on
-    /// cooldown.
+    /// id is allocated, nothing is published, staged or launched, nobody is
+    /// put on cooldown.
     #[test]
     fn a_carve_that_cannot_happen_changes_nothing_and_says_why() {
         let config = OrchestratorConfig {
@@ -3222,17 +5057,19 @@ mod tests {
         let root = config.root_node();
         let ids =
             PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
-        let mut orch = orchestrator_over(
+        let mut orch = live(orchestrator_over(
             config,
             vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
             ids,
-        );
+        ));
         let state = |orch: &Orchestrator<MockLauncher>| {
             (
                 orch.map().clone(),
                 orch.control.ids.peek(),
                 orch.control.autoscaler.busy_until(),
                 orch.snapshot().in_flight,
+                orch.wanted_node(),
+                orch.starting(),
             )
         };
         let before = state(&orch);
@@ -3261,15 +5098,22 @@ mod tests {
             assert!(orch.drain_outbox().is_empty());
         }
 
-        // One at a time (H12): while the first carve is in flight a second is
-        // refused, and so is one right after its commit.
-        orch.begin_carve(cell).expect("the first carve starts");
-        let in_flight = state(&orch);
+        // One at a time (H12): while the first carve waits for its shard a
+        // second is refused, while its epoch is in flight too, and so is one
+        // right after its commit.
+        orch.begin_carve(cell)
+            .expect("the first carve is asked for");
+        let waiting = state(&orch);
         let other = cell_at_the_centre(&orch, [-1, 0, 0]);
+        let err = orch.begin_carve(other).expect_err("one change at a time");
+        assert!(err.contains("still waiting for its new shard"), "{err}");
+        assert_eq!(state(&orch), waiting);
+        let _ = join(&mut orch);
+        let in_flight = state(&orch);
         let err = orch.begin_carve(other).expect_err("one change at a time");
         assert!(err.contains("epoch 2 is still in flight"), "{err}");
         assert_eq!(state(&orch), in_flight);
-        assert_eq!(orch.take_pending_spawn().len(), 1, "only the first one's");
+        assert!(orch.take_pending_spawn().is_empty(), "only the first one's");
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
         let err = orch
@@ -3286,22 +5130,27 @@ mod tests {
         assert!(orch.take_pending_spawn().is_empty());
     }
 
-    /// A carve whose new shard never registers aborts at the deadline like a
-    /// split: the map is untouched and the launched shard is stopped.
+    /// A carve whose prepare is not acked aborts at the deadline like a
+    /// split: the map is untouched and the shard that had registered for it
+    /// is stopped.
     #[test]
     fn a_carve_nobody_acks_aborts_and_its_shard_is_stopped() {
         let mut orch = connected_orchestrator();
         let cell = cell_at_the_centre(&orch, [-1, 0, -1]);
         let before = orch.map().clone();
-        let started = orch.begin_carve(cell).expect("starts");
-        let _ = orch.take_pending_spawn();
+        orch.begin_carve(cell).expect("asked for");
+        let new = join(&mut orch).shard;
         let _ = orch.drain_outbox();
-        orch.handle_epoch_ack(ShardId::new(1), started.epoch);
+        orch.handle_epoch_ack(ShardId::new(1), 2);
         for _ in 0..=crate::config::EPOCH_ACK_TIMEOUT_TICKS {
             orch.tick();
         }
         assert_eq!(orch.map(), &before, "byte-identical after the abort (H10)");
-        assert_eq!(orch.take_pending_kill(), vec![started.shard]);
+        assert_eq!(orch.take_pending_kill(), vec![new]);
+        assert!(
+            !orch.live_shards().contains(&new),
+            "it is no longer counted as a shard of the cluster"
+        );
         let texts = event_texts(&orch);
         let aborted = texts
             .iter()
@@ -3318,7 +5167,7 @@ mod tests {
             .filter(|(_, m)| matches!(m, Message::EpochAbort(_)))
             .map(|(to, _)| to)
             .collect();
-        assert_eq!(aborts, vec![ShardId::new(1), started.shard]);
+        assert_eq!(aborts, vec![ShardId::new(1), new]);
     }
 
     /// Mutation this catches: a pause that only hides the autoscaler's
@@ -3386,6 +5235,7 @@ mod tests {
                 .accepted
         );
         assert!(orch.handle_operator(&split(1, Some(2))).accepted);
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
     }
@@ -3397,7 +5247,7 @@ mod tests {
     fn an_operator_change_right_after_a_commit_waits_for_the_minimum_interval() {
         let mut orch = connected_orchestrator();
         assert!(orch.handle_operator(&split(1, Some(0))).accepted);
-        let _ = orch.take_pending_spawn();
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
 
@@ -3431,6 +5281,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            secret: String::new(),
         })
         .expect("the root owner registers");
         orch.note_connected([ShardId::new(1)]);
@@ -3445,6 +5296,10 @@ mod tests {
         assert_eq!(snapshot.last_commit_tick, None);
         assert!(snapshot.in_flight.is_none());
         assert!(!snapshot.autoscaler.paused);
+        // The fleet: nothing is kept running by the orchestrator by default.
+        assert_eq!((snapshot.min_shards, snapshot.max_shards), (0, 8));
+        assert_eq!((snapshot.starting, snapshot.wanted), (0, None));
+        assert!(!snapshot.hello_auth_required, "a loopback control port");
 
         // Regions: the enclosing one first, then the one carved out of it.
         let root = orch.config().root_node();
@@ -3458,7 +5313,14 @@ mod tests {
             "the address the map holds for a claimed region"
         );
         assert_eq!(outer.free_octants, vec![1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(outer.split_refusal, None, "connected and idle: possible");
+        assert!(
+            outer
+                .split_refusal
+                .as_deref()
+                .is_some_and(|why| why.contains("shard 2 is not connected")),
+            "every shard of the map has to acknowledge a change, and shard 2 is not there: {:?}",
+            outer.split_refusal
+        );
         assert!(outer
             .merge_refusal
             .as_deref()
@@ -3482,6 +5344,7 @@ mod tests {
         let (one, two) = (&snapshot.shards[0], &snapshot.shards[1]);
         assert_eq!((one.shard, one.role), (ShardId::new(1), ShardRole::Owner));
         assert!(one.connected && one.registered);
+        assert!(!one.launched, "it was started by hand");
         assert_eq!(one.advertised, Some(addr(9_001)));
         assert_eq!(one.regions, vec![root]);
         let report = one.report.expect("shard 1 reported");
@@ -3513,8 +5376,16 @@ mod tests {
         assert_eq!(orch.snapshot().shards[0].report, None);
     }
 
+    /// A registered shard whose control link closed is **dead** — a shard
+    /// registers once and stops itself without its orchestrator, so a closed
+    /// link does not come back. That is said once, the shard is stopped and
+    /// waits to be replaced; the map itself only changes when a replacement
+    /// has registered and its epoch committed.
+    ///
+    /// (This used to be "is logged once and changes no ownership", full stop:
+    /// the dead owner stayed in the map for good.)
     #[test]
-    fn a_lost_control_link_is_logged_once_and_changes_no_ownership() {
+    fn a_lost_control_link_is_logged_once_and_makes_the_shard_dead() {
         let mut orch = orchestrator_with_first_id(100);
         orch.note_connected([ShardId::new(1)]);
         let before = orch.events().len();
@@ -3524,23 +5395,38 @@ mod tests {
             before,
             "still connected: nothing to say"
         );
+        assert!(orch.dead_shards().is_empty());
 
         orch.note_connected([]);
         let texts = event_texts(&orch);
-        assert!(texts[0].starts_with("shard 1 lost"), "{texts:?}");
+        assert!(
+            texts[0].starts_with("shard 1 lost: its control link closed"),
+            "{texts:?}"
+        );
+        assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+        assert_eq!(orch.take_pending_kill(), vec![ShardId::new(1)]);
         orch.note_connected([]);
         assert_eq!(
             orch.events().len(),
             before + 1,
             "it is lost once, not every beat"
         );
+        assert!(orch.take_pending_kill().is_empty(), "and stopped once");
 
         assert_eq!(orch.map().epoch, 1);
         assert_eq!(orch.map().regions.len(), 1, "losing a link moves no region");
+        assert_eq!(orch.map().regions[0].shard, ShardId::new(1));
         assert!(orch.drain_outbox().is_empty());
-        assert!(!orch.snapshot().shards[0].connected);
+        let view = orch.snapshot().shards[0].clone();
+        assert!(!view.connected);
+        assert_eq!(view.role, ShardRole::Dead);
+        assert!(orch.live_shards().is_empty());
         let reply = orch.handle_operator(&split(1, Some(0)));
         assert!(reply.message.contains("not connected"), "{reply:?}");
+        // It was started by hand and the orchestrator runs no shards itself
+        // (`--min-shards 0`): nothing is launched for it. The shard that
+        // registers next is given its region.
+        assert!(orch.take_pending_spawn().is_empty());
     }
 
     /// Mutation this catches: remembering whoever an ack *claims* to be from.
@@ -3570,6 +5456,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            secret: String::new(),
         };
         orch.handle_shard_hello(&hello(&OrchestratorConfig::default().cluster))
             .expect("registers");
@@ -3598,6 +5485,7 @@ mod tests {
             shard: ShardId::new(2),
             endpoint: addr(9_002),
             region: Some(ShardRegion::new(child, ShardId::new(2), addr(9_002))),
+            secret: String::new(),
         })
         .expect("a known owner registers");
         let owners =
@@ -3650,6 +5538,8 @@ mod tests {
         orch.note_connected([]);
         orch.publish(false);
         assert_eq!(handle.snapshot().tick, SNAPSHOT_INTERVAL_TICKS + 1);
+        // Neither the peer token (it is "secret" in this fixture) nor anything
+        // called a secret is part of a snapshot.
         assert!(!format!("{:?}", handle.snapshot()).contains("secret"));
     }
 
@@ -3681,7 +5571,7 @@ mod tests {
 
         // Below the limit a split is an ordinary epoch change.
         assert!(orch.handle_operator(&split(1, Some(0))).accepted);
-        let _ = orch.take_pending_spawn();
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().regions.len(), 2);
         for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
@@ -3882,8 +5772,10 @@ mod tests {
         for _ in 0..50 {
             assert!(orch.handle_operator(&OperatorCommand::PushMap).accepted);
         }
-        // An epoch change is proposed in the same beat, after the requests.
+        // An epoch change is proposed in the same beat, after the requests
+        // (a split, as soon as its shard has registered).
         assert!(orch.handle_operator(&split(1, Some(5))).accepted);
+        let _ = join(&mut orch);
         let out = orch.drain_outbox();
         let pushes = out
             .iter()
@@ -3929,6 +5821,7 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                secret: String::new(),
             };
             assert!(orch.handle_shard_hello(&hello).is_err());
         };
@@ -3988,6 +5881,1953 @@ mod tests {
         assert!(orch.new_event_lines().is_empty());
     }
 
+    // ------------------------------------------------------------ the lifecycle
+
+    /// An orchestrator as `boot` leaves it: the root reserved for shard 1 and
+    /// claimed by nobody yet; ids from 2.
+    fn fresh_cluster(config: OrchestratorConfig) -> Orchestrator<MockLauncher> {
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                config.bind,
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(MemoryCounterSink::default()));
+        let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+        control.set_unclaimed_root_owner(ShardId::new(1));
+        Orchestrator::new(control, std::sync::Arc::new(MockLauncher::default()))
+    }
+
+    /// The owner of the point `(x, z)` metres from the scene's spawn point.
+    fn owner_at(orch: &Orchestrator<MockLauncher>, x: f64, z: f64) -> Option<ShardId> {
+        let anchor = space_scene::scene_anchor(orch.map()).expect("a map has an anchor");
+        orch.map()
+            .lookup(&space_world::WorldPos::from_f64_metres_around(
+                anchor,
+                [x, 0.0, z],
+            ))
+    }
+
+    /// `--min-shards 4`: the orchestrator launches shards until four are
+    /// live. The first is alone until it has the root (the shard that owns
+    /// the spawn point is the first one launched); the other three are
+    /// launched together and given the first three layout cells, one epoch
+    /// each, one at a time, each proposed with its shard already connected.
+    /// The scene then lies in four quadrants with four owners, meeting at
+    /// scene x = -6 / z = -4, and nothing more is launched.
+    ///
+    /// Mutations this catches: launching nothing (the default before); a
+    /// launch per tick for as long as one is starting; the old order (plan,
+    /// launch with an id, wait for the hello inside the 3 s deadline); giving
+    /// away the spawn cell or the cells in another order.
+    #[test]
+    fn min_shards_4_ends_with_four_regions_owned_by_four_live_shards() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 4,
+            ..OrchestratorConfig::default()
+        });
+        let root = orch.config().root_node();
+        let cells = topology::layout_cells(root);
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "nothing before a tick"
+        );
+
+        // Until the root has an owner: one launch, however long it takes.
+        orch.tick();
+        let first = orch.take_pending_spawn();
+        assert_eq!(first.len(), 1);
+        for _ in 0..30 {
+            orch.tick();
+        }
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "one at a time until the root is claimed"
+        );
+        assert_eq!(orch.starting(), 1);
+        let welcome = hello_of(&mut orch, &first[0]).expect("the first shard is welcomed");
+        assert_eq!(
+            (welcome.shard, welcome.region.node),
+            (ShardId::new(1), root),
+            "the reserved id, the root"
+        );
+        assert_eq!(
+            welcome.shard_map.lookup(&root.center()),
+            Some(ShardId::new(1))
+        );
+        assert!(
+            orch.drain_outbox().is_empty(),
+            "the root needs no epoch change"
+        );
+        assert_eq!(orch.map().epoch, 1);
+        assert_eq!(owner_at(&orch, 0.0, 0.0), Some(ShardId::new(1)));
+
+        // Now the other three, together...
+        orch.tick();
+        let rest = orch.take_pending_spawn();
+        assert_eq!(rest.len(), 3);
+        assert_eq!(orch.starting(), 3);
+        // ...served one at a time: while one's epoch is in flight the others
+        // are told to wait, and the next is served as soon as it has committed
+        // (no pause between these changes).
+        let mut given = Vec::new();
+        for (n, spec) in rest.iter().enumerate() {
+            let welcome = hello_of(&mut orch, spec).expect("served in turn");
+            assert_eq!(
+                &welcome.shard_map,
+                orch.map(),
+                "welcomed with the published map: not the owner yet"
+            );
+            assert_eq!(
+                orch.map().lookup(&welcome.region.node.center()),
+                Some(ShardId::new(1))
+            );
+            for later in &rest[n + 1..] {
+                let refused = hello_of(&mut orch, later).expect_err("one change at a time");
+                assert!(matches!(refused, HelloRefusal::Wait(_)), "{refused:?}");
+            }
+            let recipients = prepares(&orch.drain_outbox());
+            assert!(recipients.contains(&(welcome.shard, orch.map().epoch + 1)));
+            assert_eq!(
+                recipients.len(),
+                n + 2,
+                "every shard of the map and the new one"
+            );
+            for (shard, epoch) in recipients {
+                orch.handle_epoch_ack(shard, epoch);
+            }
+            given.push((welcome.shard, welcome.region.node));
+        }
+        assert_eq!(
+            given,
+            vec![
+                (ShardId::new(2), cells[0]),
+                (ShardId::new(3), cells[1]),
+                (ShardId::new(4), cells[2]),
+            ]
+        );
+        assert_eq!(orch.map().epoch, 4, "one epoch per cell");
+        assert_eq!(orch.map().regions.len(), 4);
+        crate::topology::validate(orch.map()).expect("valid (H11)");
+
+        // Four quadrants, four owners, meeting at scene x = -6 / z = -4.
+        assert_eq!(owner_at(&orch, 0.0, 0.0), Some(ShardId::new(1)));
+        assert_eq!(owner_at(&orch, -5.0, -3.0), Some(ShardId::new(1)));
+        assert_eq!(owner_at(&orch, -5.0, -5.0), Some(ShardId::new(2)));
+        assert_eq!(owner_at(&orch, -7.0, -3.0), Some(ShardId::new(3)));
+        assert_eq!(owner_at(&orch, -7.0, -5.0), Some(ShardId::new(4)));
+        assert_eq!(owner_at(&orch, 300.0, -300.0), Some(ShardId::new(2)));
+        assert_eq!(owner_at(&orch, -300.0, 300.0), Some(ShardId::new(3)));
+
+        // Four live shards, each launched and none still starting; nothing
+        // more is launched, however long it runs.
+        let snapshot = orch.snapshot();
+        assert_eq!(orch.live_shards().len(), 4);
+        assert_eq!(orch.starting(), 0);
+        assert_eq!(snapshot.shards.len(), 4);
+        assert!(snapshot
+            .shards
+            .iter()
+            .all(|s| s.role == ShardRole::Owner && s.connected && s.launched));
+        for _ in 0..(2 * LAUNCH_REGISTER_TIMEOUT_TICKS) {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty());
+        assert!(orch.take_pending_launch_kill().is_empty());
+        assert!(orch.take_pending_kill().is_empty());
+        assert_eq!(orch.map().epoch, 4);
+    }
+
+    /// Shards started by hand, three of them saying hello at once: one is
+    /// served, the other two are told to wait — not refused for good, not
+    /// logged, no id spent — and each is served when it asks again after the
+    /// change before it has committed.
+    ///
+    /// Mutation this catches: refusing a hello for good while a change is in
+    /// flight (the shard exited: every shard after the second would have to
+    /// be started again by hand), or serving two at once (two prepares
+    /// outstanding).
+    #[test]
+    fn hellos_while_a_change_is_in_flight_are_told_to_wait_and_served_in_turn() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let cells = topology::layout_cells(orch.config().root_node());
+        let hello = |port: u16| fresh_hello(addr(port));
+        let root = orch.handle_shard_hello(&hello(9_001)).expect("the root");
+        assert_eq!(root.shard, ShardId::new(1));
+
+        let a = orch.handle_shard_hello(&hello(9_002)).expect("served");
+        assert_eq!((a.shard, a.region.node), (ShardId::new(2), cells[0]));
+        let (ids, events) = (orch.control.ids.peek(), orch.events().len());
+        for port in [9_003, 9_004, 9_003] {
+            let refused = orch
+                .handle_shard_hello(&hello(port))
+                .expect_err("a change is in flight");
+            assert_eq!(
+                refused,
+                HelloRefusal::Wait("epoch 2 is still in flight; one change at a time".into())
+            );
+            assert!(!refused.is_final());
+            assert_eq!(
+                refused.reject_reason(),
+                space_protocol::RejectReason::Draining,
+                "on the wire: ask again"
+            );
+        }
+        assert_eq!(
+            orch.control.ids.peek(),
+            ids,
+            "a hello that waits burns no id"
+        );
+        assert_eq!(orch.events().len(), events, "and is not worth a log line");
+        assert_eq!(
+            prepares(&orch.drain_outbox()).len(),
+            2,
+            "one prepare, two recipients"
+        );
+        assert!(orch.snapshot().in_flight.is_some());
+
+        // The change commits; whoever asks next is served, at once.
+        orch.handle_epoch_ack(ShardId::new(1), 2);
+        orch.handle_epoch_ack(ShardId::new(2), 2);
+        assert_eq!(orch.map().epoch, 2);
+        let c = orch.handle_shard_hello(&hello(9_004)).expect("served next");
+        assert_eq!((c.shard, c.region.node), (ShardId::new(3), cells[1]));
+        let refused = orch
+            .handle_shard_hello(&hello(9_003))
+            .expect_err("its turn is next");
+        assert!(
+            matches!(&refused, HelloRefusal::Wait(why) if why.contains("epoch 3")),
+            "{refused:?}"
+        );
+        assert!(ack_the_prepare(&mut orch) > 0);
+        let b = orch.handle_shard_hello(&hello(9_003)).expect("served last");
+        assert_eq!((b.shard, b.region.node), (ShardId::new(4), cells[2]));
+        assert!(ack_the_prepare(&mut orch) > 0);
+
+        assert_eq!(orch.map().epoch, 4);
+        assert_eq!(orch.map().regions.len(), 4);
+        assert_eq!(
+            orch.control.ids.peek(),
+            5,
+            "ids 2, 3 and 4, in the order served"
+        );
+        assert_eq!(owner_at(&orch, -7.0, -3.0), Some(ShardId::new(3)));
+        // Started by hand, and `--min-shards` is 0: nothing was launched.
+        assert!(orch.take_pending_spawn().is_empty());
+        assert!(orch.snapshot().shards.iter().all(|s| !s.launched));
+    }
+
+    /// `--max-shards`: a shard that registers when the cluster has as many as
+    /// it may is refused **for good** (`Full` on the wire), the orchestrator
+    /// launches none beyond it, and a split is refused too.
+    ///
+    /// Mutation this catches: telling the extra shard to wait (it would ask
+    /// for ever), or a limit the reconciler does not know (it would keep
+    /// launching shards that are then refused).
+    #[test]
+    fn max_shards_refuses_a_further_shard_for_good() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            max_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        orch.tick();
+        let root = join(&mut orch);
+        assert_eq!(root.shard, ShardId::new(1));
+        orch.tick();
+        let second = join(&mut orch);
+        assert_eq!(second.shard, ShardId::new(2));
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 2);
+        let _ = orch.drain_outbox();
+
+        let ids = orch.control.ids.peek();
+        let refused = orch
+            .handle_shard_hello(&fresh_hello(addr(9_900)))
+            .expect_err("the cluster is full");
+        assert!(
+            matches!(&refused, HelloRefusal::Full(why)
+                if why.contains("already has 2 shard(s)") && why.contains("--max-shards")),
+            "{refused:?}"
+        );
+        assert!(refused.is_final());
+        assert_eq!(refused.reject_reason(), space_protocol::RejectReason::Full);
+        assert_eq!(orch.control.ids.peek(), ids, "no id was allocated");
+        assert!(orch.drain_outbox().is_empty(), "nothing was proposed");
+        assert!(orch.snapshot().in_flight.is_none());
+        assert!(
+            event_texts(&orch)[0].starts_with("hello from 127.0.0.1:9900 refused:"),
+            "a final refusal is logged"
+        );
+
+        // Nothing is launched beyond the limit, and a split is refused.
+        for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty());
+        let reply = orch.handle_operator(&split(1, Some(0)));
+        assert!(
+            !reply.accepted && reply.message.contains("--max-shards"),
+            "{reply:?}"
+        );
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
+        assert!(why.contains("--max-shards"), "{why}");
+        assert!(orch.take_pending_spawn().is_empty());
+        assert_eq!(orch.snapshot().max_shards, 2);
+    }
+
+    /// Supervision: a launched shard whose process exits is dead. Nothing
+    /// else changes while it is; a replacement is launched, registers, and is
+    /// given the dead shard's region under a **new id**, through an epoch the
+    /// dead shard is not asked to acknowledge. When that commits the scene's
+    /// revision is raised — once — so that its bodies are built afresh.
+    ///
+    /// Mutations this catches: reusing the dead shard's id (its guid serials
+    /// start over with the process, so guids would be minted twice); counting
+    /// the dead shard as a recipient (the change that replaces it could never
+    /// commit — the state before this change, for every change); leaving the
+    /// revision alone (half a scene) or raising it on every tick.
+    #[test]
+    fn a_dead_shard_is_replaced_under_a_new_id_and_the_scene_revision_rises_once() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        let cell = topology::layout_cells(orch.config().root_node())[0];
+        orch.tick();
+        assert_eq!(join(&mut orch).shard, ShardId::new(1));
+        orch.tick();
+        let dead = join(&mut orch).shard;
+        assert_eq!(dead, ShardId::new(2));
+        assert!(ack_the_prepare(&mut orch) > 0);
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        let _ = orch.drain_outbox();
+        let before = orch.scene();
+        let map_before = orch.map().clone();
+        for shard in [1, 2] {
+            orch.handle_scene_ack(&scene_ack(shard, before));
+        }
+
+        // Its process exits: the launcher says so on the next poll.
+        let launch = orch.launch_of(dead).expect("the orchestrator launched it");
+        assert_eq!(orch.launches_to_poll().len(), 2);
+        orch.note_launch_dead(launch);
+        assert_eq!(orch.dead_shards(), vec![dead]);
+        assert!(!orch.live_shards().contains(&dead));
+        assert_eq!(orch.map(), &map_before, "nothing about the map changes yet");
+        assert_eq!(orch.take_pending_kill(), vec![dead]);
+        assert_eq!(orch.take_pending_launch_kill(), vec![launch]);
+        let texts = event_texts(&orch);
+        assert!(
+            texts[0].starts_with("shard 2 lost: its process exited"),
+            "{texts:?}"
+        );
+        let role = |orch: &Orchestrator<MockLauncher>, shard| {
+            orch.snapshot()
+                .shards
+                .iter()
+                .find(|s| s.shard == shard)
+                .map(|s| s.role)
+        };
+        assert_eq!(role(&orch, dead), Some(ShardRole::Dead));
+        // Saying it again changes nothing.
+        orch.note_launch_dead(launch);
+        orch.declare_dead(dead, "again");
+        assert!(orch.take_pending_kill().is_empty());
+
+        // No other change while a shard of the map cannot acknowledge one.
+        let reply = orch.handle_operator(&split(1, Some(0)));
+        assert!(
+            !reply.accepted && reply.message.contains("shard 2 is not connected"),
+            "{reply:?}"
+        );
+
+        // The replacement is launched at once (no pause: nothing failed)...
+        let welcome = join(&mut orch);
+        let new = welcome.shard;
+        assert_eq!(new, ShardId::new(3), "a new id, never the dead one's");
+        assert_eq!(welcome.region.node, cell, "the dead shard's region");
+        assert_eq!(
+            welcome.shard_map.lookup(&cell.center()),
+            Some(dead),
+            "not the owner before the commit"
+        );
+        // ...and the change goes to the live shards only.
+        let flight = orch.snapshot().in_flight.expect("in flight");
+        assert_eq!(
+            flight.what,
+            format!(
+                "replacement of shard 2: region {} goes to new shard 3",
+                node_path(cell)
+            )
+        );
+        assert_eq!(flight.changes, vec![(cell, new)]);
+        assert_eq!(
+            flight.recipients,
+            vec![(ShardId::new(1), false), (new, false)],
+            "the dead shard is not asked"
+        );
+        assert_eq!(role(&orch, new), Some(ShardRole::Joining));
+        assert_eq!(
+            prepares(&orch.drain_outbox()),
+            vec![(ShardId::new(1), 3), (new, 3)]
+        );
+        assert_eq!(orch.scene(), before, "not before the commit");
+        orch.handle_epoch_ack(ShardId::new(1), 3);
+        orch.handle_epoch_ack(new, 3);
+
+        // Committed.
+        assert_eq!(orch.map().epoch, 3);
+        assert_eq!(orch.map().regions.len(), 2);
+        assert_eq!(orch.map().lookup(&cell.center()), Some(new));
+        assert_eq!(owner_at(&orch, 0.0, 0.0), Some(ShardId::new(1)));
+        crate::topology::validate(orch.map()).expect("valid");
+        assert!(orch.dead_shards().is_empty());
+        assert_eq!(role(&orch, dead), None, "nothing is kept of the dead shard");
+        assert_eq!(role(&orch, new), Some(ShardRole::Owner));
+        assert_eq!(orch.endpoint_of(dead), None);
+
+        // The scene: the same scene, one revision up, told to every live
+        // shard behind the commit and the map.
+        let raised = SceneState::new(before.scene, before.revision + 1);
+        assert_eq!(orch.scene(), raised);
+        let out = orch.drain_outbox();
+        assert_eq!(
+            scene_sets(&out),
+            vec![(ShardId::new(1), raised), (new, raised)]
+        );
+        let first_scene = out
+            .iter()
+            .position(|(_, m)| matches!(m, Message::SceneSet(_)))
+            .expect("a scene message");
+        assert!(
+            out[..first_scene].iter().any(|(to, m)| *to == new
+                && matches!(m, Message::DirectoryReply(r) if r.shard_map == *orch.map())),
+            "the replacement has the committed map before it hears the new revision"
+        );
+        assert_eq!(
+            sync_of(&orch, 1),
+            SceneSync::Behind,
+            "it has to confirm again"
+        );
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("shard 3 replaced shard 2: the scene")
+                    && t.contains("revision 2")),
+            "{texts:?}"
+        );
+        // Once: the revision does not move again by itself.
+        for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+            orch.tick();
+            orch.reconcile_scene();
+        }
+        assert_eq!(orch.scene(), raised);
+        assert!(orch.take_pending_spawn().is_empty(), "two shards, as asked");
+        // The next id is above every id ever issued (H9).
+        assert_eq!(orch.control.ids.peek(), 4);
+    }
+
+    /// The same when the dead shard was started by hand and its link closes,
+    /// with nobody else in the cluster: the shard that registers next — from
+    /// any address — is given the root under a new id; the change has one
+    /// recipient, the new shard itself.
+    #[test]
+    fn the_only_shard_of_a_cluster_is_replaced_by_the_next_one_that_registers() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let root = orch.config().root_node();
+        orch.handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let before = orch.scene();
+        orch.note_connected([]); // its control link closed
+        assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "started by hand, and no shard is run by the orchestrator: none is launched"
+        );
+
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_007)))
+            .expect("welcomed in its place");
+        assert_eq!(
+            (welcome.shard, welcome.region.node),
+            (ShardId::new(2), root)
+        );
+        assert_eq!(prepares(&orch.drain_outbox()), vec![(ShardId::new(2), 2)]);
+        orch.handle_epoch_ack(ShardId::new(2), 2);
+        assert_eq!(orch.map().epoch, 2);
+        assert_eq!(orch.map().regions.len(), 1);
+        assert_eq!(orch.map().regions[0].shard, ShardId::new(2));
+        assert_eq!(orch.map().regions[0].endpoint, addr(9_007));
+        assert_eq!(orch.scene().revision, before.revision + 1);
+        assert!(orch.dead_shards().is_empty());
+    }
+
+    /// A shard that comes back at the address a registered shard advertises
+    /// **is** that shard's replacement: the old process is gone (two cannot
+    /// listen on one address) even if its control link has not closed yet. It
+    /// is not handed the old id. But only a hello that is going to be served
+    /// makes anybody dead: while a change is in flight the hello waits like
+    /// any other, and the old shard is left alone.
+    ///
+    /// Mutation this catches: taking the old shard for dead *before* the
+    /// checks that can still say "wait" (the state before: a hello that was
+    /// then told to wait had already knocked a shard out — and with it the
+    /// change in flight and the shard that change was for).
+    #[test]
+    fn a_shard_that_comes_back_at_its_address_replaces_itself_once_it_can_be_served() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let root = orch.config().root_node();
+        let cells = topology::layout_cells(root);
+        orch.handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let second = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect("a cell")
+            .shard;
+        assert!(ack_the_prepare(&mut orch) > 0);
+        // A third is being given its cell — the root's shard has not acked —
+        // when the root's process restarts and says hello again.
+        let third = orch
+            .handle_shard_hello(&fresh_hello(addr(9_003)))
+            .expect("another cell")
+            .shard;
+        assert_eq!(prepares(&orch.drain_outbox()).len(), 3);
+        orch.handle_epoch_ack(second, 3);
+        orch.handle_epoch_ack(third, 3);
+        assert_eq!(orch.map().epoch, 2, "shard 1 has not acked");
+
+        // A change is in flight: the hello waits, and nothing happens to
+        // anybody — not to shard 1, not to the change, not to its shard.
+        let refused = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect_err("one change at a time");
+        assert_eq!(
+            refused,
+            HelloRefusal::Wait("epoch 3 is still in flight; one change at a time".into())
+        );
+        assert!(orch.dead_shards().is_empty(), "nobody was made dead");
+        assert!(orch.take_pending_kill().is_empty());
+        assert!(orch.snapshot().in_flight.is_some(), "the change goes on");
+        assert!(orch.live_shards().contains(&ShardId::new(1)));
+
+        // The change runs into its deadline (shard 1's process is gone and
+        // never acks); its shard is stopped, as after any abort.
+        for _ in 0..=crate::config::EPOCH_ACK_TIMEOUT_TICKS {
+            orch.tick();
+        }
+        assert_eq!(orch.map().epoch, 2);
+        assert_eq!(orch.take_pending_kill(), vec![third]);
+        assert!(
+            orch.dead_shards().is_empty(),
+            "one missed deadline is not death"
+        );
+        let _ = orch.drain_outbox();
+
+        // Now the hello can be served, and it is: as shard 1's replacement.
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the restarted shard is served");
+        let new = welcome.shard;
+        assert_eq!(new, ShardId::new(4), "not the old id");
+        assert_eq!(welcome.region.node, root);
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("shard 1 lost: a new shard registered from its address")),
+            "{texts:?}"
+        );
+        assert_eq!(orch.take_pending_kill(), vec![ShardId::new(1)]);
+        // The replacement is the change in flight now, to the live shards.
+        assert_eq!(
+            orch.snapshot().in_flight.expect("in flight").recipients,
+            vec![(second, false), (new, false)]
+        );
+        orch.handle_epoch_ack(second, 3);
+        orch.handle_epoch_ack(new, 3);
+        assert_eq!(orch.map().epoch, 3);
+        assert_eq!(orch.map().lookup(&root.center()), Some(new));
+        assert_eq!(orch.map().lookup(&cells[0].center()), Some(second));
+        assert_eq!(
+            orch.map().regions.len(),
+            2,
+            "the aborted cell was not carved"
+        );
+        assert_eq!(orch.endpoint_of(new), Some(addr(9_001)));
+        // Started by hand, `--min-shards` 0: nothing was launched for any of it.
+        for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty());
+    }
+
+    /// The other half of the same rule: a replacement that somebody would
+    /// have to acknowledge who is not connected is not started either — the
+    /// hello waits, and the shard at whose address it arrived is not dead.
+    #[test]
+    fn a_hello_at_a_live_shards_address_waits_while_another_shard_could_not_ack() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        orch.handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let second = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect("a cell")
+            .shard;
+        assert!(ack_the_prepare(&mut orch) > 0);
+        let third = orch
+            .handle_shard_hello(&fresh_hello(addr(9_003)))
+            .expect("a cell")
+            .shard;
+        assert!(ack_the_prepare(&mut orch) > 0);
+        let _ = orch.drain_outbox();
+        // The third shard holds no control link at this moment (the front end
+        // has not seen it, or it is about to be found dead).
+        orch.connected.remove(&third);
+
+        let refused = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect_err("the replacement could not be acknowledged");
+        assert!(
+            matches!(&refused, HelloRefusal::Wait(why) if why.contains("shard 3 is not connected")),
+            "{refused:?}"
+        );
+        assert!(orch.dead_shards().is_empty(), "shard 2 is not dead for it");
+        assert!(orch.take_pending_kill().is_empty());
+        assert!(orch.live_shards().contains(&second));
+        assert!(orch.snapshot().in_flight.is_none());
+    }
+
+    /// A hello may **name** any address. It takes a live shard's place only
+    /// when its connection really comes from that address's host: from
+    /// anywhere else it waits, the shard it named is untouched, and the
+    /// operator is told (once). If that shard's own link then closes, the
+    /// same hello is served as an ordinary replacement.
+    ///
+    /// Mutation this catches: believing the advertised address (anybody who
+    /// may register could take any shard's regions, and have its process
+    /// killed, by naming its address).
+    #[test]
+    fn a_hello_naming_a_live_shards_address_from_elsewhere_harms_nobody() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let root = orch.config().root_node();
+        orch.handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let elsewhere: IpAddr = "10.0.0.9".parse().expect("an address");
+        let impostor = fresh_hello(addr(9_001));
+        let events = orch.events().len();
+        for _ in 0..3 {
+            let refused = orch
+                .handle_shard_hello_from(&impostor, elsewhere)
+                .expect_err("not from that address");
+            assert!(
+                matches!(&refused, HelloRefusal::Wait(why)
+                    if why.contains("shard 1 is registered at 127.0.0.1:9001")
+                        && why.contains("comes from 10.0.0.9")),
+                "{refused:?}"
+            );
+            assert!(!refused.is_final(), "it may ask again");
+        }
+        assert!(orch.dead_shards().is_empty(), "shard 1 is not dead for it");
+        assert!(orch.take_pending_kill().is_empty());
+        assert!(orch.take_pending_launch_kill().is_empty());
+        assert!(orch.drain_outbox().is_empty(), "nothing was proposed");
+        assert_eq!(orch.control.ids.peek(), 2, "and no id was spent");
+        assert_eq!(
+            orch.events().len(),
+            events + 1,
+            "said once, however often it asks"
+        );
+        let said = &event_texts(&orch)[0];
+        assert!(
+            said.contains("is told to wait, and that will not pass by itself")
+                && said.contains("comes from 10.0.0.9"),
+            "{said}"
+        );
+        assert!(
+            orch.events().newest_first().next().expect("it").peer_caused,
+            "the text is partly the peer's: it goes to the bounded ring"
+        );
+
+        // Shard 1's own link closes: it is dead by the usual rule, and the
+        // hello — from wherever — replaces it like any shard that registers.
+        orch.note_connected([]);
+        assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+        let welcome = orch
+            .handle_shard_hello_from(&impostor, elsewhere)
+            .expect("an ordinary replacement now");
+        assert_eq!(
+            (welcome.shard, welcome.region.node),
+            (ShardId::new(2), root)
+        );
+        orch.handle_epoch_ack(ShardId::new(2), 2);
+        assert_eq!(orch.map().regions[0].shard, ShardId::new(2));
+        // ...and that one, restarting in place, is recognised when its
+        // address is seen in its IPv4-mapped IPv6 form too: the same host.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().expect("an address");
+        let again = orch
+            .handle_shard_hello_from(&impostor, mapped)
+            .expect("the same host");
+        assert_eq!(again.shard, ShardId::new(3));
+    }
+
+    /// A shard the orchestrator **launched** that says hello a second time —
+    /// it did not see its welcome within its handshake timeout — is the very
+    /// process of the launch: it gets a new id and the old one's regions, and
+    /// **the process is kept**. No second shard is launched for the regions
+    /// it is taking itself.
+    ///
+    /// Mutations this catches: staging the kill of the old shard's launch
+    /// (the orchestrator would kill the process that is saying hello), and
+    /// reconciling the fleet in the middle of the hello (a launch would be
+    /// staged for regions that have an owner again a moment later — one shard
+    /// too many, every time).
+    #[test]
+    fn a_launched_shard_that_says_hello_twice_keeps_its_process() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 1,
+            launcher: LauncherKind::Process,
+            host_port_range: (7_000, 7_001),
+            ..OrchestratorConfig::default()
+        });
+        let root = orch.config().root_node();
+        orch.tick();
+        let spec = orch.take_pending_spawn().pop().expect("one launch");
+        let first = process_hello_of(&mut orch, &spec).expect("the root");
+        assert_eq!(first.shard, ShardId::new(1));
+        assert_eq!(orch.launch_of(first.shard), Some(spec.launch));
+
+        // The same process, the same address, a second hello.
+        let again = orch
+            .handle_shard_hello(&fresh_hello(addr(spec.host_port)))
+            .expect("served: it replaces itself");
+        let new = again.shard;
+        assert_eq!(new, ShardId::new(2), "a new id");
+        assert_eq!(again.region.node, root);
+        assert_eq!(
+            orch.take_pending_kill(),
+            vec![first.shard],
+            "the old id's link is closed"
+        );
+        assert!(
+            orch.take_pending_launch_kill().is_empty(),
+            "the process is the one saying hello: it is not killed"
+        );
+        assert_eq!(
+            orch.launch_of(new),
+            Some(spec.launch),
+            "the launch is the new shard's now"
+        );
+        assert_eq!(orch.launch_of(first.shard), None);
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "nothing is launched for regions this hello is taking"
+        );
+        assert_eq!(prepares(&orch.drain_outbox()), vec![(new, 2)]);
+        // While the replacement is in flight, and after it committed: one
+        // shard, as asked, and its process supervised.
+        for _ in 0..10 {
+            orch.tick();
+            assert!(orch.take_pending_spawn().is_empty());
+        }
+        orch.handle_epoch_ack(new, 2);
+        assert_eq!(orch.map().regions[0].shard, new);
+        for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty());
+        assert!(orch.take_pending_launch_kill().is_empty());
+        assert_eq!(orch.launches_to_poll(), vec![spec.launch]);
+        let view = orch.snapshot();
+        assert_eq!(view.shards.len(), 1);
+        assert!(view.shards[0].launched && view.shards[0].role == ShardRole::Owner);
+    }
+
+    /// The same for a shard **started by hand** that restarts in place while
+    /// the orchestrator keeps `--min-shards` running: it takes its old
+    /// regions itself, so nothing is launched for them.
+    ///
+    /// Mutation this catches: `declare_dead` reconciling the fleet from
+    /// inside the hello — the launch staged there registered a moment later,
+    /// found nothing dead and was given the next layout cell: N+1 shards, and
+    /// one more on every restart.
+    #[test]
+    fn a_hand_started_shard_restarting_in_place_does_not_cause_a_launch() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        // The root's shard is started by hand, before the orchestrator's
+        // first beat; the orchestrator launches the one that is missing.
+        let by_hand = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        orch.tick();
+        let launched = join(&mut orch).shard;
+        assert!(ack_the_prepare(&mut orch) > 0);
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty(), "two shards, as asked");
+        let _ = (orch.drain_outbox(), orch.take_pending_kill());
+
+        for round in 0..3u32 {
+            let old = orch.map().regions[0].shard;
+            let welcome = orch
+                .handle_shard_hello(&fresh_hello(addr(9_001)))
+                .expect("it replaces itself");
+            assert_ne!(welcome.shard, old, "round {round}");
+            assert!(
+                orch.take_pending_spawn().is_empty(),
+                "round {round}: nothing is launched for regions the hello takes itself"
+            );
+            assert!(ack_the_prepare(&mut orch) > 0);
+            for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+                orch.tick();
+                assert!(orch.take_pending_spawn().is_empty(), "round {round}");
+            }
+            assert_eq!(orch.map().regions.len(), 2, "round {round}: still two");
+            assert_eq!(orch.live_shards().len(), 2, "round {round}");
+            assert_eq!(orch.starting(), 0);
+        }
+        assert!(orch.live_shards().contains(&launched));
+        assert_ne!(orch.map().regions[0].shard, by_hand.shard);
+    }
+
+    /// A replacement is handed **the very port of the shard it replaces**
+    /// (the range is exactly as large as the fleet) — while that dead shard
+    /// is still known at that address, because it still owns its regions.
+    /// The launch must not be put down to the dead shard: it becomes the
+    /// replacement, and when *that* dies the launcher's word is enough to
+    /// notice, and the port comes free again.
+    ///
+    /// Mutation this catches: matching a launch to any registered shard at
+    /// its address. The replacement launch was tied to the dead shard, the
+    /// replacement itself was supervised by nobody, its death was only
+    /// noticed when its link timed out, and the launch — and its port — were
+    /// kept for ever: with a range as large as the fleet no shard could be
+    /// launched again.
+    #[test]
+    fn a_replacement_on_the_port_of_the_shard_it_replaces_is_supervised_like_any_other() {
+        let mut orch = process_cluster(2, (7_000, 7_001));
+        let up = bring_up(&mut orch, 2);
+        let (root_launch, root) = (up[0].0.launch, up[0].1);
+        let mut current = (up[1].0.clone(), up[1].1);
+        assert_eq!(current.0.host_port, 7_001);
+        let cell = topology::layout_cells(orch.config().root_node())[0];
+
+        // The second shard is replaced three times over, each time on the
+        // only port there is, and each death is seen through the launcher.
+        for round in 0..3u32 {
+            let (spec, shard) = current.clone();
+            assert_eq!(orch.launch_of(shard), Some(spec.launch), "round {round}");
+            orch.note_launch_dead(spec.launch);
+            assert_eq!(
+                orch.dead_shards(),
+                vec![shard],
+                "round {round}: the launcher's word is enough"
+            );
+            assert_eq!(orch.take_pending_launch_kill(), vec![spec.launch]);
+            assert_eq!(orch.take_pending_kill(), vec![shard]);
+
+            // Its replacement is launched at once — on the same port.
+            let next = orch.take_pending_spawn().pop().expect("a replacement");
+            assert_eq!(next.host_port, 7_001, "round {round}: the only free port");
+            // The launcher reports before the shard has said hello: the dead
+            // shard still advertises this address, and is not the launch's.
+            orch.note_launch_result(next.launch, Ok(process_handle(&next)));
+            assert_eq!(
+                orch.launch_of(shard),
+                None,
+                "round {round}: not the dead one"
+            );
+            assert_eq!(orch.starting(), 1, "round {round}: still starting");
+            let welcome = orch
+                .handle_shard_hello(&fresh_hello(addr(next.host_port)))
+                .expect("the replacement is welcomed");
+            assert!(welcome.shard > shard, "round {round}: a new id");
+            assert_eq!(welcome.region.node, cell);
+            assert_eq!(
+                orch.launch_of(welcome.shard),
+                Some(next.launch),
+                "round {round}: the launch became the replacement"
+            );
+            assert_eq!(orch.starting(), 0);
+            assert!(ack_the_prepare(&mut orch) > 0);
+            assert_eq!(orch.map().lookup(&cell.center()), Some(welcome.shard));
+            assert!(orch.dead_shards().is_empty());
+            for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+                orch.tick();
+            }
+            assert!(orch.take_pending_spawn().is_empty(), "round {round}");
+            assert_eq!(
+                orch.launches_to_poll(),
+                vec![root_launch, next.launch],
+                "round {round}: two launches, no leftover"
+            );
+            let _ = orch.drain_outbox();
+            current = (next, welcome.shard);
+        }
+        assert_eq!(
+            orch.map().lookup(&orch.config().root_node().center()),
+            Some(root)
+        );
+        assert_eq!(orch.live_shards().len(), 2);
+        assert_eq!(orch.map().regions.len(), 2);
+    }
+
+    /// A launch whose shard is **no longer anybody** — it was stopped when
+    /// its join aborted, before its launcher had reported — or is **already
+    /// known to be dead**: when its process is gone the launch is removed and
+    /// reaped, nothing else. It is never left in the table (holding its host
+    /// port), and nobody is declared dead a second time.
+    #[test]
+    fn a_dead_launch_whose_shard_is_gone_or_already_dead_is_just_removed() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        orch.tick();
+        let root = join(&mut orch).shard;
+        orch.tick();
+        // The second shard registers, and its join runs into the deadline
+        // before the in-process launcher has reported which shard it became.
+        let spec = orch.take_pending_spawn().pop().expect("the second launch");
+        let joiner = orch
+            .handle_shard_hello(&fresh_hello(launched_at(spec.launch)))
+            .expect("welcomed")
+            .shard;
+        while orch.snapshot().in_flight.is_some() {
+            orch.tick();
+        }
+        assert!(orch.take_pending_kill().contains(&joiner), "stopped");
+        assert!(orch.endpoint_of(joiner).is_none(), "and forgotten");
+        // Now the launcher reports — naming a shard nobody knows any more —
+        // and then that the process is gone.
+        let handle = |shard| ShardHandle {
+            launch: spec.launch,
+            shard: Some(shard),
+            endpoint: launched_at(spec.launch),
+            process: "mock".into(),
+        };
+        orch.note_launch_result(spec.launch, Ok(handle(joiner)));
+        assert_eq!(orch.launch_of(joiner), Some(spec.launch));
+        let _ = orch.take_pending_launch_kill();
+        orch.note_launch_dead(spec.launch);
+        assert_eq!(orch.take_pending_launch_kill(), vec![spec.launch], "reaped");
+        assert_eq!(orch.launch_of(joiner), None, "and gone from the table");
+        assert!(orch.dead_shards().is_empty());
+        assert!(orch.live_shards().contains(&root));
+
+        // The same for a launch tied to a shard that is already dead.
+        let root_launch = orch.launch_of(root).expect("launched");
+        orch.note_launch_dead(root_launch);
+        assert_eq!(orch.dead_shards(), vec![root]);
+        let _ = (orch.take_pending_kill(), orch.take_pending_launch_kill());
+        let events = orch.events().len();
+        let next = orch.take_pending_spawn().pop().expect("a replacement");
+        orch.note_launch_result(
+            next.launch,
+            Ok(ShardHandle {
+                launch: next.launch,
+                shard: Some(root),
+                endpoint: launched_at(next.launch),
+                process: "mock".into(),
+            }),
+        );
+        orch.note_launch_dead(next.launch);
+        assert_eq!(orch.take_pending_launch_kill(), vec![next.launch]);
+        assert_eq!(orch.launch_of(root), None);
+        assert_eq!(orch.dead_shards(), vec![root], "still dead, once");
+        assert_eq!(orch.events().len(), events, "nothing new to say about it");
+    }
+
+    /// A shard that registered **before** a launch was staged is never that
+    /// launch's, whatever address it advertises: a shard started by hand on a
+    /// port of the host port range is not tied to the launch that is then
+    /// handed that port — and that launch failing (it cannot bind) does not
+    /// take the healthy shard with it.
+    #[test]
+    fn a_shard_started_by_hand_on_a_port_of_the_range_is_not_taken_for_a_launch() {
+        let mut orch = process_cluster(2, (7_000, 7_001));
+        // Started by hand, on the first port of the range, before any launch.
+        let by_hand = orch
+            .handle_shard_hello(&fresh_hello(addr(7_000)))
+            .expect("the root")
+            .shard;
+        orch.tick();
+        let spec = orch.take_pending_spawn().pop().expect("the second shard");
+        assert_eq!(spec.host_port, 7_000, "no launch holds it");
+        orch.note_launch_result(spec.launch, Ok(process_handle(&spec)));
+        assert_eq!(
+            orch.launch_of(by_hand),
+            None,
+            "it registered before the launch was staged"
+        );
+        assert_eq!(orch.starting(), 1);
+        // The launch's process cannot bind the port and exits.
+        orch.note_launch_dead(spec.launch);
+        assert!(
+            orch.dead_shards().is_empty(),
+            "the healthy shard is untouched"
+        );
+        assert!(orch.live_shards().contains(&by_hand));
+        assert_eq!(orch.take_pending_launch_kill(), vec![spec.launch], "reaped");
+        assert!(orch.take_pending_kill().is_empty());
+        assert!(event_texts(&orch)[0].contains("on port 7000 exited before it registered"));
+    }
+
+    /// The pause after a failed launch doubles, up to 30 s, **also while
+    /// other launched shards are registered and healthy**: three shards up,
+    /// and the fourth exits every time before it registers.
+    ///
+    /// Mutation this catches: forgetting the failures whenever *any* launch
+    /// has a shard — with healthy launched shards in the cluster the pause
+    /// stayed at one second, and a shard that could not start was started
+    /// again every second or two for ever.
+    #[test]
+    fn the_pause_between_failing_launches_grows_whoever_else_is_healthy() {
+        let mut orch = process_cluster(4, (7_000, 7_009));
+        // Three come up; the fourth launch is staged with them, and fails.
+        let mut up = Vec::new();
+        let mut failing = None;
+        while up.len() < 3 {
+            orch.tick();
+            for spec in orch.take_pending_spawn() {
+                if up.len() == 3 {
+                    failing = Some(spec);
+                    continue;
+                }
+                process_hello_of(&mut orch, &spec).expect("welcomed");
+                ack_the_prepare(&mut orch);
+                up.push(spec);
+            }
+        }
+        assert_eq!(orch.map().regions.len(), 3);
+        assert_eq!(orch.live_shards().len(), 3);
+        let mut failing = failing.expect("a fourth launch was staged");
+
+        let mut pauses = Vec::new();
+        for _ in 0..8 {
+            // Its process starts (the launcher reports it) and exits before
+            // it registers.
+            orch.note_launch_result(failing.launch, Ok(process_handle(&failing)));
+            orch.note_launch_dead(failing.launch);
+            assert_eq!(orch.take_pending_launch_kill(), vec![failing.launch]);
+            let failed_at = orch.current_tick();
+            let next = loop {
+                orch.tick();
+                if let Some(spec) = orch.take_pending_spawn().pop() {
+                    break spec;
+                }
+                assert!(
+                    orch.current_tick() - failed_at <= LAUNCH_BACKOFF_MAX_TICKS,
+                    "no launch within the longest pause"
+                );
+            };
+            pauses.push(orch.current_tick() - failed_at);
+            failing = next;
+        }
+        let second = LAUNCH_BACKOFF_TICKS;
+        assert_eq!(
+            pauses,
+            vec![
+                second,
+                2 * second,
+                4 * second,
+                8 * second,
+                16 * second,
+                LAUNCH_BACKOFF_MAX_TICKS,
+                LAUNCH_BACKOFF_MAX_TICKS,
+                LAUNCH_BACKOFF_MAX_TICKS,
+            ],
+            "1 s, doubling, 30 s at most"
+        );
+        assert_eq!(
+            orch.live_shards().len(),
+            3,
+            "the healthy ones are untouched"
+        );
+
+        // When a launch does get its shard a region, the count starts over:
+        // the next failure is followed by the short pause again.
+        process_hello_of(&mut orch, &failing).expect("welcomed at last");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 4);
+        let fourth = orch.map().regions[3].shard;
+        orch.note_launch_dead(orch.launch_of(fourth).expect("launched"));
+        let again = orch.take_pending_spawn().pop().expect("replaced at once");
+        orch.note_launch_result(again.launch, Ok(process_handle(&again)));
+        orch.note_launch_dead(again.launch);
+        let failed_at = orch.current_tick();
+        while orch.take_pending_spawn().is_empty() {
+            orch.tick();
+        }
+        assert_eq!(
+            orch.current_tick() - failed_at,
+            LAUNCH_BACKOFF_TICKS,
+            "one second again, not thirty"
+        );
+    }
+
+    /// A launch is started for something that is missing. When a shard
+    /// **started by hand** takes that first, the launch is one too many: it
+    /// is stopped before it registers — and if its hello gets there first, it
+    /// is refused for good and stopped, not given a layout cell. A shard
+    /// started by hand that registers with nothing missing still gets the
+    /// next cell.
+    ///
+    /// Mutation this catches: leaving the launch alone. It registered, found
+    /// nothing dead, and was given the next layout cell: a shard and a region
+    /// nobody asked for, and one more every time it happened.
+    #[test]
+    fn a_launch_whose_purpose_a_hand_started_shard_took_is_stopped_not_given_a_cell() {
+        for hello_gets_there_first in [false, true] {
+            let mut orch = process_cluster(2, (7_000, 7_003));
+            let up = bring_up(&mut orch, 2);
+            let (victim_launch, victim) = (up[1].0.launch, up[1].1);
+            let cells = topology::layout_cells(orch.config().root_node());
+
+            // The second shard dies; a replacement is launched...
+            orch.note_launch_dead(victim_launch);
+            assert_eq!(orch.dead_shards(), vec![victim]);
+            let _ = (orch.take_pending_kill(), orch.take_pending_launch_kill());
+            let replacement = orch.take_pending_spawn().pop().expect("launched");
+            orch.note_launch_result(replacement.launch, Ok(process_handle(&replacement)));
+            // ...but a shard started by hand registers first and takes the
+            // dead shard's region.
+            let by_hand = orch
+                .handle_shard_hello(&fresh_hello(addr(9_900)))
+                .expect("it replaces the dead shard");
+            assert_eq!(by_hand.region.node, cells[0]);
+            let ids = orch.control.ids.peek();
+            // The launch's shard asks meanwhile: it waits its turn.
+            let waiting = orch
+                .handle_shard_hello(&fresh_hello(addr(replacement.host_port)))
+                .expect_err("a change is in flight");
+            assert!(matches!(waiting, HelloRefusal::Wait(_)), "{waiting:?}");
+
+            if hello_gets_there_first {
+                // The replacement commits and the launch's shard asks again
+                // before the orchestrator's next beat.
+                assert!(ack_the_prepare(&mut orch) > 0);
+                let refused = orch
+                    .handle_shard_hello(&fresh_hello(addr(replacement.host_port)))
+                    .expect_err("nothing is left for it");
+                assert!(
+                    matches!(&refused, HelloRefusal::Refused(why) if why.contains("not needed")),
+                    "{refused:?}"
+                );
+                assert!(refused.is_final(), "it does not ask again");
+            } else {
+                // The orchestrator's next beat sees one shard too many.
+                orch.tick();
+                assert!(ack_the_prepare(&mut orch) > 0);
+            }
+            assert_eq!(
+                orch.take_pending_launch_kill(),
+                vec![replacement.launch],
+                "hello first: {hello_gets_there_first}: the launch is stopped"
+            );
+            assert_eq!(orch.starting(), 0);
+            assert_eq!(orch.control.ids.peek(), ids, "and it was given no id");
+            assert_eq!(orch.map().regions.len(), 2, "no region nobody asked for");
+            assert_eq!(orch.map().lookup(&cells[0].center()), Some(by_hand.shard));
+            let texts = event_texts(&orch);
+            assert!(
+                texts.iter().any(|t| t.starts_with(&format!(
+                    "the shard of {} on port {}",
+                    replacement.launch, replacement.host_port
+                )) && t.contains("stopped")),
+                "{texts:?}"
+            );
+            // It stays that way.
+            for _ in 0..(2 * LAUNCH_REGISTER_TIMEOUT_TICKS) {
+                orch.tick();
+            }
+            assert!(orch.take_pending_spawn().is_empty());
+            assert_eq!(orch.map().regions.len(), 2);
+            assert_eq!(orch.live_shards().len(), 2);
+
+            // A shard started by hand, with nothing missing, is still given
+            // the next layout cell.
+            let extra = orch
+                .handle_shard_hello(&fresh_hello(addr(9_901)))
+                .expect("a hand-started shard is assigned a region");
+            assert_eq!(extra.region.node, cells[1]);
+        }
+    }
+
+    /// The in-process launcher's shards cannot be told from hand-started
+    /// ones by their hello (the launcher binds a port of its own choosing).
+    /// So a launch that is one too many is found by counting — and never
+    /// while a shard that registered a moment ago might be that very launch,
+    /// not yet matched to it.
+    ///
+    /// Mutation this catches: stopping the newest unmatched launch whenever
+    /// the count is over (the launch of a shard that had just registered was
+    /// killed under it: with `--min-shards 4` the fourth shard, every time).
+    #[test]
+    fn a_surplus_in_process_launch_is_stopped_but_never_one_whose_shard_just_registered() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        orch.tick();
+        assert_eq!(join(&mut orch).shard, ShardId::new(1));
+        orch.tick();
+        // The second shard registers; its launcher has not reported yet.
+        let spec = orch.take_pending_spawn().pop().expect("the second launch");
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(launched_at(spec.launch)))
+            .expect("welcomed");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.launch_of(welcome.shard), None, "not matched yet");
+        assert_eq!((orch.live_shards().len(), orch.starting()), (2, 1));
+        // Counted, that is three where two are wanted. Nothing is stopped: the
+        // shard that just registered may be the launch — and it is.
+        for _ in 0..10 {
+            orch.tick();
+            assert!(orch.take_pending_launch_kill().is_empty());
+        }
+        // A shard started by hand that asks meanwhile is told to wait, not
+        // given a cell and not sent away.
+        let refused = orch
+            .handle_shard_hello(&fresh_hello(addr(9_900)))
+            .expect_err("a launch is still being matched");
+        assert!(matches!(refused, HelloRefusal::Wait(_)), "{refused:?}");
+        orch.note_launch_result(
+            spec.launch,
+            Ok(ShardHandle {
+                launch: spec.launch,
+                shard: Some(welcome.shard),
+                endpoint: launched_at(spec.launch),
+                process: "mock".into(),
+            }),
+        );
+        assert_eq!(orch.launch_of(welcome.shard), Some(spec.launch));
+        assert_eq!(orch.starting(), 0);
+        let cells = topology::layout_cells(orch.config().root_node());
+        let extra = orch
+            .handle_shard_hello(&fresh_hello(addr(9_900)))
+            .expect("served once the launch is matched");
+        assert_eq!(extra.region.node, cells[1]);
+        assert!(ack_the_prepare(&mut orch) > 0);
+
+        // Now a real surplus: the second shard dies, a launch is staged, and
+        // the shard started by hand... is already there: three live owners
+        // would be more than enough, but a dead one is replaced all the same
+        // — unless a shard started by hand takes its region first.
+        let launch = orch.launch_of(welcome.shard).expect("launched");
+        orch.note_launch_dead(launch);
+        let _ = (orch.take_pending_kill(), orch.take_pending_launch_kill());
+        let staged = orch.take_pending_spawn().pop().expect("a replacement");
+        let by_hand = orch
+            .handle_shard_hello(&fresh_hello(addr(9_901)))
+            .expect("it takes the dead shard's region");
+        assert_eq!(by_hand.region.node, cells[0]);
+        assert!(ack_the_prepare(&mut orch) > 0);
+        // The shard started by hand registered a moment ago and is matched
+        // to no launch: it might be the launch. Not yet, then.
+        orch.tick();
+        assert!(orch.take_pending_launch_kill().is_empty());
+        assert_eq!(orch.starting(), 1);
+        // Once that moment has passed it cannot be: the launch is surplus.
+        for _ in 0..=LAUNCH_LIMBO_TICKS {
+            orch.tick();
+        }
+        assert_eq!(orch.take_pending_launch_kill(), vec![staged.launch]);
+        assert_eq!(orch.starting(), 0);
+        assert_eq!(orch.map().regions.len(), 3);
+        assert!(orch.take_pending_spawn().is_empty());
+    }
+
+    /// A join that cannot commit must not turn into a loop: launch, hello,
+    /// new id, prepare, abort at the deadline, kill, launch again — an id
+    /// every three seconds, for ever. The launch that came to nothing is
+    /// followed by a pause that grows, and the shard that keeps letting the
+    /// deadline pass — connected, but not answering — is taken for dead after
+    /// three in a row and replaced.
+    ///
+    /// Mutation this catches: an abort that only stops the joiner (the loop
+    /// above), or counting the joiner's own missed ack against a healthy
+    /// shard.
+    #[test]
+    fn a_join_that_keeps_missing_its_deadline_backs_off_and_the_silent_shard_is_replaced() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        let root = orch.config().root_node();
+        orch.tick();
+        let silent = join(&mut orch).shard;
+        assert_eq!(silent, ShardId::new(1));
+        let silent_launch = orch.launch_of(silent).expect("launched");
+        orch.tick();
+
+        // Three joiners in a row: each acks, the root's shard never does.
+        let mut pauses = Vec::new();
+        for round in 1..=ACK_STRIKES {
+            let joiner = join(&mut orch).shard;
+            let launch = orch.launch_of(joiner).expect("launched");
+            let epoch = orch.map().epoch + 1;
+            assert_eq!(
+                prepares(&orch.drain_outbox()),
+                vec![(silent, epoch), (joiner, epoch)]
+            );
+            orch.handle_epoch_ack(joiner, epoch);
+            let proposed_at = orch.current_tick();
+            while orch.snapshot().in_flight.is_some() {
+                orch.tick();
+            }
+            let aborted_at = orch.current_tick();
+            assert_eq!(
+                aborted_at - proposed_at,
+                crate::config::EPOCH_ACK_TIMEOUT_TICKS,
+                "round {round}: at the deadline"
+            );
+            assert_eq!(orch.map().epoch, 1, "round {round}: the map is unchanged");
+            let stopped = orch.take_pending_kill();
+            let reaped = orch.take_pending_launch_kill();
+            assert!(stopped.contains(&joiner), "round {round}: {stopped:?}");
+            assert!(reaped.contains(&launch), "round {round}: {reaped:?}");
+            if round < ACK_STRIKES {
+                assert!(
+                    orch.dead_shards().is_empty(),
+                    "round {round}: not dead for {round} missed deadline(s)"
+                );
+                assert_eq!(stopped, vec![joiner]);
+                assert_eq!(reaped, vec![launch]);
+            } else {
+                assert_eq!(orch.dead_shards(), vec![silent], "three in a row");
+                assert!(stopped.contains(&silent), "its link is closed");
+                assert!(reaped.contains(&silent_launch), "and its process stopped");
+            }
+            // The next launch waits: the pause a failed launch earns.
+            loop {
+                orch.tick();
+                if !orch.pending_spawn.is_empty() {
+                    break;
+                }
+            }
+            pauses.push(orch.current_tick() - aborted_at);
+        }
+        assert_eq!(
+            pauses,
+            vec![
+                LAUNCH_BACKOFF_TICKS,
+                2 * LAUNCH_BACKOFF_TICKS,
+                4 * LAUNCH_BACKOFF_TICKS
+            ],
+            "the pause grows with every join that came to nothing"
+        );
+        let texts = event_texts(&orch);
+        assert!(
+            texts.iter().any(|t| t.starts_with(
+                "shard 1 lost: it holds a control link but did not acknowledge 3 map changes in \
+                 a row"
+            )),
+            "{texts:?}"
+        );
+
+        // Both shards are missing now, and both are launched. The first that
+        // registers replaces the silent one; nobody else has to ack.
+        let staged = orch.take_pending_spawn();
+        assert_eq!(staged.len(), 2, "{staged:?}");
+        let _ = orch.drain_outbox();
+        let heir = hello_of(&mut orch, &staged[0]).expect("welcomed");
+        assert_eq!(heir.region.node, root, "the silent shard's region");
+        assert_eq!(
+            prepares(&orch.drain_outbox()),
+            vec![(heir.shard, 2)],
+            "the dead shard is not asked"
+        );
+        orch.handle_epoch_ack(heir.shard, 2);
+        assert_eq!(orch.map().epoch, 2);
+        assert_eq!(orch.map().regions[0].shard, heir.shard);
+        // ...and the second is given its cell, as if nothing had happened.
+        let second = hello_of(&mut orch, &staged[1]).expect("welcomed");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 2);
+        assert_eq!(orch.live_shards().len(), 2);
+        assert!(orch.live_shards().contains(&second.shard));
+        for _ in 0..(2 * MIN_EPOCH_INTERVAL_TICKS) {
+            orch.tick();
+        }
+        assert!(orch.take_pending_spawn().is_empty(), "two shards, as asked");
+        assert!(orch.dead_shards().is_empty());
+    }
+
+    /// An ack — for any change — clears the count: three missed deadlines
+    /// have to be **in a row**.
+    #[test]
+    fn a_shard_that_answers_again_is_not_taken_for_dead() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let slow = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root")
+            .shard;
+        let miss_a_deadline = |orch: &mut Orchestrator<MockLauncher>, port: u16| {
+            let joiner = orch
+                .handle_shard_hello(&fresh_hello(addr(port)))
+                .expect("a cell")
+                .shard;
+            orch.handle_epoch_ack(joiner, orch.map().epoch + 1);
+            while orch.snapshot().in_flight.is_some() {
+                orch.tick();
+            }
+        };
+        miss_a_deadline(&mut orch, 9_010);
+        miss_a_deadline(&mut orch, 9_011);
+        assert!(orch.dead_shards().is_empty(), "two are not three");
+        // It answers this time: the change commits.
+        orch.handle_shard_hello(&fresh_hello(addr(9_012)))
+            .expect("a cell");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 2);
+        // Two more missed deadlines are again only two.
+        miss_a_deadline(&mut orch, 9_013);
+        miss_a_deadline(&mut orch, 9_014);
+        assert!(orch.dead_shards().is_empty(), "the count started over");
+        assert!(orch.live_shards().contains(&slow));
+        // The third in a row is the one.
+        miss_a_deadline(&mut orch, 9_015);
+        assert!(orch.dead_shards().contains(&slow));
+    }
+
+    /// A report and both kinds of ack name their own sender. Off the wire
+    /// they are taken only from the control connection that was admitted as
+    /// that shard — the run loop hands them over with that id, and what names
+    /// another shard is dropped.
+    ///
+    /// Mutation this catches: believing the message. A registered shard — or,
+    /// before the connection was gated at all, anybody who could reach the
+    /// control port — could report load for another shard (and have it split
+    /// or merged), acknowledge an epoch on its behalf (and commit a change it
+    /// never saw), or confirm a scene for it.
+    #[test]
+    fn a_report_or_an_ack_is_only_taken_from_the_shard_it_names() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let one = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root")
+            .shard;
+        let two = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect("a cell")
+            .shard;
+        let epoch = orch.map().epoch + 1;
+        let _ = orch.drain_outbox();
+        let ack = |shard: ShardId| EpochAck { shard, epoch };
+
+        // Shard 2's connection acknowledging for shard 1: dropped. The change
+        // does not commit on shard 2's word alone.
+        orch.handle_epoch_ack_from(two, &ack(one));
+        orch.handle_epoch_ack_from(two, &ack(two));
+        assert_eq!(orch.map().epoch, epoch - 1, "shard 1 has not acked");
+        assert_eq!(
+            orch.snapshot().in_flight.expect("in flight").recipients,
+            vec![(one, false), (two, true)]
+        );
+        // Shard 2's connection reporting for shard 1: dropped.
+        orch.handle_load_report_from(two, &report(one.0, 99));
+        assert!(orch.load_report(one).is_none());
+        // Shard 2's connection confirming a scene for shard 1: dropped (it
+        // would otherwise re-issue the scene above revision 9).
+        let ahead = SceneState::new(orch.scene().scene, 9);
+        orch.handle_scene_ack_from(
+            two,
+            &SceneAck {
+                shard: one,
+                applied: ahead,
+            },
+        );
+        assert_eq!(orch.scene_confirmed_by(one), None);
+        orch.tick();
+        orch.reconcile_scene();
+        assert_eq!(orch.scene().revision, 1, "nothing was raised");
+        assert_eq!(orch.misattributed(), 3, "each one is counted");
+
+        // Each shard speaking for itself is heard.
+        orch.handle_epoch_ack_from(one, &ack(one));
+        assert_eq!(
+            orch.map().epoch,
+            epoch,
+            "committed on both shards' own acks"
+        );
+        orch.handle_load_report_from(one, &report(one.0, 7));
+        assert_eq!(orch.load_report(one).map(|r| r.players), Some(7));
+        let current = orch.scene();
+        orch.handle_scene_ack_from(
+            two,
+            &SceneAck {
+                shard: two,
+                applied: current,
+            },
+        );
+        assert_eq!(orch.scene_confirmed_by(two), Some(current));
+        assert_eq!(orch.misattributed(), 3);
+    }
+
+    /// The orchestrator holds the cluster's two secrets and derives `Debug`:
+    /// neither shows in a print of it.
+    #[test]
+    fn the_orchestrator_never_prints_a_secret() {
+        let config = OrchestratorConfig {
+            cluster_secret: Some(crate::config::Secret::new(
+                "do-not-print-the-cluster-secret",
+            )),
+            ..OrchestratorConfig::default()
+        };
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                addr(7_001),
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(MemoryCounterSink::default()));
+        let control = ControlPlane::new(
+            config,
+            ids,
+            EpochPublisher::new(map),
+            "do-not-print-the-peer-token".into(),
+        );
+        let orch = Orchestrator::new(control, std::sync::Arc::new(MockLauncher::default()));
+        let printed = format!("{orch:?}");
+        assert!(!printed.contains("do-not-print"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    /// A merge takes a shard away, and `--min-shards` says how many the
+    /// orchestrator keeps running: at or below that number a merge is
+    /// refused, whoever asks — it would commit, the shard be stopped, and one
+    /// be started in its place at once.
+    #[test]
+    fn a_merge_that_would_go_below_min_shards_is_refused() {
+        let with_min = |min_shards: usize| {
+            let config = OrchestratorConfig {
+                min_shards,
+                ..OrchestratorConfig::default()
+            };
+            let root = config.root_node();
+            let child = space_world::octree::children(root).expect("root splits")[0];
+            let ids =
+                PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+            let mut orch = live(orchestrator_over(
+                config,
+                vec![
+                    ShardRegion::new(root, ShardId::new(1), addr(7_001)),
+                    ShardRegion::new(child, ShardId::new(2), addr(7_002)),
+                ],
+                ids,
+            ));
+            orch.handle_load_report(&report(2, 0));
+            orch
+        };
+        // Two shards, two to keep: no merge.
+        let mut orch = with_min(2);
+        let reply = orch.handle_operator(&merge(2));
+        assert!(
+            !reply.accepted
+                && reply.message.contains("--min-shards")
+                && reply
+                    .message
+                    .contains("has 2 shard(s) and is to keep 2 running"),
+            "{reply:?}"
+        );
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(ShardId::new(2))));
+        assert!(why.contains("--min-shards"), "{why}");
+        assert!(orch
+            .snapshot()
+            .regions
+            .iter()
+            .filter(|region| region.shard == ShardId::new(2))
+            .all(|region| region
+                .merge_refusal
+                .as_deref()
+                .is_some_and(|why| why.contains("--min-shards"))));
+        // The autoscaler: cold and empty for well past the dwell, and nothing.
+        for _ in 0..(2 * crate::autoscale::MERGE_DWELL_TICKS) {
+            orch.handle_load_report(&report(2, 0));
+            orch.handle_load_report(&report(1, 0));
+            orch.tick();
+        }
+        assert_eq!(orch.pending_merge(), None);
+        assert!(orch.drain_outbox().is_empty());
+        assert_eq!(orch.map().regions.len(), 2);
+
+        // Two shards, one to keep: the merge goes ahead as ever.
+        let mut orch = with_min(1);
+        let reply = orch.handle_operator(&merge(2));
+        assert!(reply.accepted, "{reply:?}");
+        assert_eq!(orch.pending_merge(), Some(ShardId::new(2)));
+    }
+
+    /// A counter that cannot be written.
+    #[derive(Debug)]
+    struct BrokenCounterSink;
+
+    impl crate::ids::CounterSink for BrokenCounterSink {
+        fn persist(&mut self, _next: u64) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk full"))
+        }
+    }
+
+    /// "Wait" is not worth a log line while it passes by itself — a change in
+    /// flight, a shard that is not connected yet. One that does not pass by
+    /// itself is: the id counter cannot be written, so no shard can ever be
+    /// given a region. It is said once, not on every hello.
+    ///
+    /// Mutation this catches: saying nothing (the operator saw a launched
+    /// shard that "did not register within 30 s", again and again, and no
+    /// reason anywhere).
+    #[test]
+    fn a_wait_that_will_not_pass_by_itself_is_logged_once() {
+        let config = OrchestratorConfig::default();
+        let root = config.root_node();
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(BrokenCounterSink));
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ids,
+        ));
+        let events = orch.events().len();
+        for _ in 0..5 {
+            let refused = orch
+                .handle_shard_hello(&fresh_hello(addr(9_100)))
+                .expect_err("no id can be allocated");
+            assert!(
+                matches!(&refused, HelloRefusal::Wait(why) if why.contains("disk full")),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(orch.events().len(), events + 1, "said once");
+        let said = &event_texts(&orch)[0];
+        assert!(
+            said.contains("the shard at 127.0.0.1:9100 is told to wait")
+                && said.contains("will not pass by itself")
+                && said.contains("disk full"),
+            "{said}"
+        );
+        assert!(
+            !orch.events().newest_first().next().expect("it").peer_caused,
+            "the orchestrator's own trouble: an ordinary entry"
+        );
+        // The same for a replacement: a dead shard, and no id for its heir.
+        orch.note_connected([]);
+        assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+        let before = orch.events().len();
+        for _ in 0..3 {
+            assert!(orch.handle_shard_hello(&fresh_hello(addr(9_100))).is_err());
+        }
+        assert_eq!(
+            orch.events().len(),
+            before,
+            "the same reason: not said again"
+        );
+    }
+
+    /// The scene's revision is raised when a replacement commits — a write
+    /// to the scene file, which can fail. Then it is owed: tried again once a
+    /// second until it succeeds, so that the scene's bodies are rebuilt
+    /// without an operator having to switch the scene.
+    ///
+    /// Mutation this catches: logging the failure and leaving it at that
+    /// (half a scene until somebody noticed).
+    #[test]
+    fn a_scene_raise_that_fails_after_a_replacement_is_tried_again_until_it_succeeds() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        orch.handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let before = orch.scene();
+        orch.note_connected([]);
+        orch.control.scene =
+            crate::scene::SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSceneSink));
+        let heir = orch
+            .handle_shard_hello(&fresh_hello(addr(9_002)))
+            .expect("the replacement")
+            .shard;
+        orch.handle_epoch_ack(heir, 2);
+        assert_eq!(
+            orch.map().regions[0].shard,
+            heir,
+            "the replacement committed"
+        );
+        assert_eq!(orch.scene(), before, "the raise failed");
+        let warned = |orch: &Orchestrator<MockLauncher>| {
+            event_texts(orch)
+                .iter()
+                .filter(|t| t.contains("the scene's revision could not be raised"))
+                .count()
+        };
+        assert_eq!(warned(&orch), 1);
+        let _ = orch.drain_outbox();
+
+        // It keeps failing: tried once a second, said once.
+        for _ in 0..(3 * SCENE_RESEND_INTERVAL_TICKS) {
+            orch.tick();
+            orch.reconcile_scene();
+        }
+        assert_eq!(orch.scene(), before);
+        assert_eq!(warned(&orch), 1, "not once a second");
+        assert!(scene_sets(&orch.drain_outbox())
+            .iter()
+            .all(|(_, state)| *state == before));
+
+        // The file can be written again: within a second the revision rises,
+        // once, and every shard is told.
+        orch.control.scene = crate::scene::SceneStore::in_memory(Scene::DemoArea);
+        for _ in 0..SCENE_RESEND_INTERVAL_TICKS {
+            orch.tick();
+            orch.reconcile_scene();
+        }
+        let raised = SceneState::new(before.scene, before.revision + 1);
+        assert_eq!(orch.scene(), raised);
+        assert!(scene_sets(&orch.drain_outbox()).contains(&(heir, raised)));
+        let texts = event_texts(&orch);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("replaced shard 1: the scene") && t.contains("revision 2")),
+            "{texts:?}"
+        );
+        for _ in 0..(3 * SCENE_RESEND_INTERVAL_TICKS) {
+            orch.tick();
+            orch.reconcile_scene();
+        }
+        assert_eq!(orch.scene(), raised, "once");
+    }
+
+    /// Every shard of the map has to acknowledge a change, so none is asked
+    /// for — by an operator, the admin verb or the autoscaler — and none is
+    /// proposed for a shard that registers, while one of them holds no control
+    /// link. A shard that registers meanwhile is told to wait, not sent away.
+    ///
+    /// Mutation this catches: checking only the shard being split (the state
+    /// before: with a third shard disconnected a split was accepted, its shard
+    /// launched, and the epoch rolled back at the deadline).
+    #[test]
+    fn no_change_is_proposed_while_a_recipient_is_not_connected() {
+        let mut orch = orchestrator_with_a_child();
+        // Shard 1 is there; shard 2 owns its octant and has never registered.
+        orch.note_connected([ShardId::new(1)]);
+        assert!(orch.dead_shards().is_empty(), "not connected is not dead");
+        let state = |orch: &Orchestrator<MockLauncher>| {
+            (
+                orch.map().clone(),
+                orch.control.ids.peek(),
+                orch.wanted_node(),
+                orch.starting(),
+                orch.snapshot().in_flight,
+            )
+        };
+        let before = state(&orch);
+
+        let reply = orch.handle_operator(&split(1, Some(3)));
+        assert!(
+            !reply.accepted && reply.message.contains("shard 2 is not connected"),
+            "{reply:?}"
+        );
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
+        assert!(why.contains("shard 2 is not connected"), "{why}");
+        orch.handle_load_report(&report(2, 0));
+        let reply = orch.handle_operator(&merge(2));
+        assert!(
+            !reply.accepted && reply.message.contains("shard 2 is not connected"),
+            "{reply:?}"
+        );
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(ShardId::new(2))));
+        assert!(why.contains("shard 2 is not connected"), "{why}");
+        let cell = cell_at_the_centre(&orch, [0, 0, -1]);
+        let err = orch
+            .begin_carve(cell)
+            .expect_err("nobody could acknowledge it");
+        assert!(err.contains("shard 2 is not connected"), "{err}");
+
+        // A shard that registers is told to wait.
+        let refused = orch
+            .handle_shard_hello(&fresh_hello(addr(9_700)))
+            .expect_err("not yet");
+        assert!(
+            matches!(&refused, HelloRefusal::Wait(why) if why.contains("shard 2 is not connected")),
+            "{refused:?}"
+        );
+        assert!(!refused.is_final());
+        assert_eq!(
+            state(&orch),
+            before,
+            "nothing was asked for, nothing proposed"
+        );
+        assert!(orch.drain_outbox().is_empty());
+        assert!(orch.take_pending_spawn().is_empty());
+
+        // The autoscaler: hot for well past the dwell, and still nothing.
+        for _ in 0..(2 * crate::autoscale::SPLIT_DWELL_TICKS) {
+            orch.handle_load_report(&report(1, 95));
+            orch.tick();
+        }
+        assert!(orch.drain_outbox().is_empty());
+        assert!(orch.take_pending_spawn().is_empty());
+        assert_eq!(orch.map().epoch, 1);
+
+        // Once shard 2 is there, the same hello is served: to all three.
+        orch.note_connected([ShardId::new(1), ShardId::new(2)]);
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_700)))
+            .expect("served now");
+        assert_eq!(welcome.shard, ShardId::new(100));
+        assert_eq!(
+            prepares(&orch.drain_outbox()),
+            vec![
+                (ShardId::new(1), 2),
+                (ShardId::new(2), 2),
+                (ShardId::new(100), 2)
+            ]
+        );
+    }
+
+    /// What the launcher is asked for: one launch per missing shard, each with
+    /// a host port of the range (round robin: the port of a shard that just
+    /// went is not the next one used) and the cluster secret; a launch that
+    /// fails is followed by a pause that doubles; when no port is free nothing
+    /// is launched, and that is said.
+    #[test]
+    fn launches_get_a_host_port_each_and_a_failed_launch_is_followed_by_a_pause() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 4,
+            launcher: LauncherKind::Process,
+            host_port_range: (7_000, 7_002),
+            ..OrchestratorConfig::default()
+        });
+        orch.control
+            .set_generated_secret(crate::config::Secret::new("generated-for-the-shards"));
+        orch.tick();
+        let first = orch.take_pending_spawn().pop().expect("one launch");
+        assert_eq!(first.host_port, 7_000);
+        assert_eq!(first.launch, LaunchId(1));
+        assert_eq!(first.cluster, orch.config().cluster);
+        assert_eq!(first.control_addr, orch.config().control_addr());
+        assert_eq!(first.secret, "generated-for-the-shards");
+
+        // The launcher could not start it.
+        orch.note_launch_result(first.launch, Err("spawn failed: no such file".into()));
+        assert_eq!(orch.starting(), 0);
+        assert!(event_texts(&orch)[0].starts_with("launching a shard failed (launch 1)"));
+        for _ in 0..(LAUNCH_BACKOFF_TICKS - 1) {
+            orch.tick();
+            assert!(
+                orch.take_pending_spawn().is_empty(),
+                "not before the pause is over"
+            );
+        }
+        orch.tick();
+        let second = orch.take_pending_spawn().pop().expect("tried again");
+        assert_eq!(second.host_port, 7_001, "the next port, not the same one");
+        // It starts, and exits before it ever registers: twice as long a pause.
+        orch.note_launch_result(
+            second.launch,
+            Ok(ShardHandle {
+                launch: second.launch,
+                shard: None,
+                endpoint: addr(7_001),
+                process: "pid 1".into(),
+            }),
+        );
+        assert_eq!(orch.launches_to_poll(), vec![second.launch]);
+        orch.note_launch_dead(second.launch);
+        assert_eq!(
+            orch.take_pending_launch_kill(),
+            vec![second.launch],
+            "reaped"
+        );
+        assert!(event_texts(&orch)[0].contains("on port 7001 exited before it registered"));
+        for _ in 0..(2 * LAUNCH_BACKOFF_TICKS - 1) {
+            orch.tick();
+            assert!(orch.take_pending_spawn().is_empty());
+        }
+        orch.tick();
+        let third = orch.take_pending_spawn().pop().expect("tried again");
+        assert_eq!(third.host_port, 7_002);
+
+        // This one registers: the root. It is found by the address it
+        // advertises — at once, by the host port the launch was handed, even
+        // before the launcher has reported where its shard listens.
+        let endpoint = addr(third.host_port);
+        let root = orch
+            .handle_shard_hello(&fresh_hello(endpoint))
+            .expect("the root");
+        assert_eq!(
+            orch.launch_of(root.shard),
+            Some(third.launch),
+            "matched by its host port, the launcher's report or not"
+        );
+        assert_eq!(orch.starting(), 0);
+        orch.note_launch_result(
+            third.launch,
+            Ok(ShardHandle {
+                launch: third.launch,
+                shard: None,
+                endpoint,
+                process: "pid 2".into(),
+            }),
+        );
+        assert_eq!(orch.launch_of(root.shard), Some(third.launch));
+        assert_eq!(orch.starting(), 0);
+
+        // Three more are wanted and two ports are free: two launches, and the
+        // third is said to be impossible.
+        orch.tick();
+        let more = orch.take_pending_spawn();
+        let ports: Vec<u16> = more.iter().map(|spec| spec.host_port).collect();
+        assert_eq!(ports, vec![7_000, 7_001]);
+        assert!(
+            event_texts(&orch)
+                .iter()
+                .any(|t| t.contains("every host port from 7000 to 7002 is in use")),
+            "{:?}",
+            event_texts(&orch)
+        );
+        // The in-process launcher needs no port.
+        let mut local = fresh_cluster(OrchestratorConfig {
+            min_shards: 1,
+            host_port_range: (7_000, 7_000),
+            ..OrchestratorConfig::default()
+        });
+        local.tick();
+        assert_eq!(local.take_pending_spawn()[0].host_port, 0);
+    }
+
+    /// The admin verb's kill takes the path a death takes: the shard is
+    /// stopped and, if it owns a region, replaced.
+    #[test]
+    fn a_shard_killed_by_the_admin_verb_is_replaced() {
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 1,
+            ..OrchestratorConfig::default()
+        });
+        orch.tick();
+        let first = join(&mut orch).shard;
+        let launch = orch.launch_of(first).expect("launched");
+        assert!(accepted(
+            &orch.handle_admin(&AdminCommand::KillShard(first))
+        ));
+        assert_eq!(orch.take_pending_kill(), vec![first]);
+        assert_eq!(orch.take_pending_launch_kill(), vec![launch]);
+        assert_eq!(orch.dead_shards(), vec![first]);
+        let replacement = join(&mut orch);
+        assert_ne!(replacement.shard, first);
+        assert_eq!(replacement.region.node, orch.config().root_node());
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions[0].shard, replacement.shard);
+    }
+
     // -------------------------------------------------------------- the scene
 
     use crate::snapshot::SceneSync;
@@ -4037,6 +7877,7 @@ mod tests {
                 shard: ShardId::new(shard),
                 endpoint: addr(port),
                 region,
+                secret: String::new(),
             })
             .expect("a known owner registers");
         }
@@ -4167,6 +8008,7 @@ mod tests {
 
         // An epoch change is prepared and nobody has acked it yet.
         assert!(orch.handle_operator(&split(1, Some(5))).accepted);
+        let new = join(&mut orch).shard;
         let in_flight = orch.snapshot().in_flight.expect("epoch 2 is in flight");
         assert_eq!(in_flight.epoch, 2);
 
@@ -4177,11 +8019,14 @@ mod tests {
         let out = orch.drain_outbox();
         let prepared = prepares(&out);
         assert!(!prepared.is_empty(), "the prepare is still going out");
+        // Everybody who has registered is told, the shard of the split
+        // included (it is connected; it only owns nothing yet).
         assert_eq!(
             scene_sets(&out),
             vec![
                 (ShardId::new(1), at(Scene::Galaxy, 2)),
-                (ShardId::new(2), at(Scene::Galaxy, 2))
+                (ShardId::new(2), at(Scene::Galaxy, 2)),
+                (new, at(Scene::Galaxy, 2))
             ]
         );
         // The scene messages are behind the epoch traffic in the same batch.
@@ -4229,6 +8074,7 @@ mod tests {
         }
         let _ = orch.drain_outbox();
         assert!(orch.handle_operator(&split(1, Some(6))).accepted);
+        let _ = join(&mut orch);
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 3);
         assert_eq!(
@@ -4396,6 +8242,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            secret: String::new(),
         })
         .expect("the shard registers");
         orch.note_connected([ShardId::new(1)]);
@@ -4613,26 +8460,61 @@ mod tests {
         assert_eq!(orch.scene(), at(Scene::Solar, 2), "and it changes no scene");
     }
 
-    /// A shard that registers again (it restarted) has confirmed nothing yet,
-    /// whatever its previous incarnation said; a shard that left the cluster is
-    /// forgotten.
+    /// A shard that comes back (it restarted) is a new shard: it has confirmed
+    /// nothing yet, whatever its previous incarnation said, and nothing is kept
+    /// about the old one; a shard that left the cluster is forgotten too.
+    ///
+    /// (A restarted shard used to register again under its old id. It is now
+    /// its own replacement, under a new one.)
     #[test]
-    fn a_shard_that_registers_again_has_to_confirm_again() {
+    fn a_shard_that_comes_back_has_to_confirm_again() {
         let mut orch = two_registered_shards();
         orch.handle_scene_ack(&scene_ack(1, at(Scene::DemoArea, 1)));
         assert_eq!(sync_of(&orch, 1), SceneSync::InSync);
-        orch.handle_shard_hello(&ShardHello {
-            cluster: OrchestratorConfig::default().cluster,
-            shard: ShardId::new(1),
-            endpoint: addr(9_001),
-            region: None,
-        })
-        .expect("the owner registers again");
-        assert_eq!(sync_of(&orch, 1), SceneSync::Unconfirmed);
+        // Its old id is not something it can register under a second time.
+        let refused = orch
+            .handle_shard_hello(&ShardHello {
+                cluster: OrchestratorConfig::default().cluster,
+                shard: ShardId::new(1),
+                endpoint: addr(9_001),
+                region: None,
+                secret: String::new(),
+            })
+            .expect_err("an id is used by one process, once");
+        assert!(refused.is_final(), "{refused:?}");
+        assert!(
+            refused.to_string().contains("has already registered"),
+            "{refused}"
+        );
+        assert_eq!(sync_of(&orch, 1), SceneSync::InSync, "nothing changed");
+
+        // Without an id, from its old address: it replaces itself.
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the restarted shard is welcomed");
+        let new = welcome.shard;
+        assert_eq!(new, ShardId::new(100), "a new id");
+        assert_eq!(welcome.region.node, orch.config().root_node());
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions[0].shard, new);
+        assert_eq!(sync_of(&orch, 100), SceneSync::Unconfirmed);
         assert!(orch.scene_confirmed_by(ShardId::new(1)).is_none());
+        assert!(
+            !orch
+                .snapshot()
+                .shards
+                .iter()
+                .any(|s| s.shard == ShardId::new(1)),
+            "the old id is gone from the cluster"
+        );
 
         // Shard 2 is merged away: nothing about it is kept.
-        orch.handle_scene_ack(&scene_ack(2, at(Scene::DemoArea, 1)));
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        let _ = orch.drain_outbox();
+        orch.handle_scene_ack(&scene_ack(2, orch.scene()));
+        assert!(orch.scene_confirmed_by(ShardId::new(2)).is_some());
         orch.handle_load_report(&report(2, 0));
         assert!(orch.handle_operator(&merge(2)).accepted);
         assert!(ack_the_prepare(&mut orch) > 0);

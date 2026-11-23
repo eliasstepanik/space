@@ -19,5 +19,9 @@ space-server = { path = "../space-server" }
 quinn = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+# The layout cells are checked against the scene's anchor rule (topology.rs).
+space-scene = { workspace = true }
+
 [lints]
 workspace = true

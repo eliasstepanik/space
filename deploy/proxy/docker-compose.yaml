@@ -24,14 +24,22 @@
 # so a compose `command:` would only become ignored positional args to that
 # script. Env vars verified against the Dockerfiles:
 #   orchestrator: ORCHESTRATOR_BIND, ORCHESTRATOR_CONTROL_ADDR (required), SPACE_CLUSTER,
-#                 SPACE_ORCHESTRATOR_SCENE, SPACE_ORCHESTRATOR_WEBUI[_TOKEN] (read by the binary)
-#   shard:        ORCHESTRATOR_ADDR (required), SHARD_BIND, SHARD_ADVERTISE (required), SPACE_CLUSTER
+#                 SPACE_ORCHESTRATOR_SCENE, SPACE_ORCHESTRATOR_WEBUI[_TOKEN] (read by the binary),
+#                 SPACE_CLUSTER_SECRET (read by the binary; REQUIRED: the control port is not on
+#                 loopback - it binds the container's wildcard address, reachable from the
+#                 compose network only - so the orchestrator refuses to start without it)
+#   shard:        ORCHESTRATOR_ADDR (required), SHARD_BIND, SHARD_ADVERTISE (required), SPACE_CLUSTER,
+#                 SPACE_CLUSTER_SECRET (read by the binary; the same value, or its hello is refused)
 #   client:       STREAM_BIND (-> --stream), SPACE_SERVER (-> --server), CLIENT_ARGS (extra flags)
 #
 #   docker compose up -d        # orchestrator + shard-a + client
 
 x-cluster: &cluster
   SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
+  # The cluster secret (.env; at least 16 characters): what a shard's hello must
+  # carry. No default on purpose: with it empty the orchestrator refuses to
+  # start and says why.
+  SPACE_CLUSTER_SECRET: ${SPACE_CLUSTER_SECRET:-}
 
 services:
   orchestrator:
@@ -53,7 +61,10 @@ services:
     volumes:
       - ./state:/var/lib/space
     ports:
-      - "${ORCHESTRATOR_PORT:-7900}:7900/udp"
+      # The control port (7900/udp) is NOT published: only the shards use it,
+      # over the `space` network. Whoever can reach it can try to register as
+      # a shard, so it is not reachable from outside this host's containers.
+      #
       # The web UI is plain HTTP with Basic auth, so it is published on the
       # host's LOOPBACK only. Reach it through an SSH tunnel:
       #   ssh -L 7980:127.0.0.1:7980 <host>     then http://127.0.0.1:7980/

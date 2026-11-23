@@ -14,13 +14,16 @@ All builds use the **repository root** as context.
 ```sh
 docker build -t space/ci .                                         # runs CI
 docker build -f deploy/Dockerfile.shard -t space/shard .
+export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"              # required: no default
 docker compose -f deploy/docker-compose.yaml up --build            # orchestrator + shard-a
 docker compose -f deploy/docker-compose.yaml --profile stream up --build   # + client
 ```
 
 Fixed IPs on the `172.31.0.0/24` bridge (addresses are parsed as socket
 addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
-`.12:8099`.
+`.12:8099`. The orchestrator's control port, `7900/udp`, is **not published on
+the host** by either compose file: only the shards use it, and they reach it
+over the compose network.
 
 ## Publishing pipeline
 
@@ -56,6 +59,45 @@ several commits pushed together, the head is the one that is built.
   (`.github/scripts/check_yaml.py`), because GitHub silently drops a workflow
   with invalid YAML.
 
+## Shards and the cluster secret
+
+A shard registers with neither id nor region and is given both: the first the
+root, each further one the next layout cell beside the scene's spawn point (up
+to `--max-shards`, default 8). A shard that restarts at the same address is its
+own replacement, under a **new id**; one that loses the orchestrator exits (and
+compose's `restart: unless-stopped` starts a fresh one). The orchestrator image
+runs `--launcher local`; `--min-shards` / `--launcher process` (the orchestrator
+starts the shards itself) are for a host without containers.
+
+In a container the control port binds `0.0.0.0`, and **a control port that is
+not on loopback takes a shard's hello only with the cluster secret, and the
+orchestrator refuses to start without one**. Both compose files therefore give
+the orchestrator and the shard `SPACE_CLUSTER_SECRET` (read by both binaries,
+never passed on a command line), and **neither has a default: the repository
+holds no secret.** Set at least 16 random characters:
+
+- **local stack** (`docker-compose.yaml`): in your shell
+  (`export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"`, PowerShell:
+  `$env:SPACE_CLUSTER_SECRET = ...`) or in a `deploy/.env` file that you do not
+  check in (`SPACE_CLUSTER_SECRET=...`). Without it `docker compose` stops
+  before it starts anything and says which variable is missing.
+- **`proxy/`**: in `.env` (see `.env.example`); with it empty the orchestrator
+  stays down and says why in its log.
+
+The secret gates the hello, and the hello gates the rest: a connection whose
+hello is refused is told why and closed, and one that is welcomed may report
+and acknowledge only for the shard it was welcomed as. **The control port is
+not published** by either file (it was, on every host interface, before this
+change): nothing outside the compose network has any business with it. If you
+do publish it for shards on another host, the cluster secret is all that stands
+between that port and anybody who can reach it - see
+`docs/security-notes.md`.
+
+**A host that runs the proxy stack has to get the `.env` line and the new
+compose file before it pulls images built from this change** (Watchtower only
+swaps the image: with the old compose file the new orchestrator would refuse to
+start).
+
 ## Scene and the orchestrator web UI
 
 **The scene is server state.** The orchestrator owns it, every shard runs it and
@@ -67,7 +109,7 @@ scene: one chosen at run time is saved next to the id counter
 volume and delete that file to make `--scene` apply again. A shard run without
 an orchestrator takes `space-server --scene NAME`; give hand-wired `--peer`
 shards the same one. Client, shard and orchestrator must come from the same
-build (wire protocol 4) - the pipelines above build them from one commit.
+build (wire protocol 6) - the pipelines above build them from one commit.
 
 **The web UI** is part of the `space-orchestrator` binary (server-rendered HTML,
 no JavaScript): cluster, map, shards, autoscaler, id allocator, recent events,
@@ -133,6 +175,13 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
   scene switching, a second client, the Lua smoke script, the harness API.
 
 **Not run**
+- Neither compose file since the cluster secret was added to them (shard
+  lifecycle change, wire protocol 6), nor since the control port stopped being
+  published and the local file's default secret was removed: the
+  `SPACE_CLUSTER_SECRET` lines (`${...:?...}` in the local file) and the
+  `ports:` lists are correct by inspection and YAML-checked
+  (`.github/scripts/check_yaml.py`) only. The "run and passing" list above is
+  the state before those changes.
 - `proxy/docker-compose.yaml` on the host (checked with `docker compose config`
   against `.env.example` only) and `redeploy.sh`; the web UI behind a real TLS
   proxy; the root `Dockerfile` (CI's `docker` job builds it).

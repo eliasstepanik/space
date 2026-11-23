@@ -3,45 +3,135 @@
 This file records what the cluster does **not** protect against today. It
 describes current behaviour, not intent.
 
-## Peer (shard↔shard) authentication: current behaviour
+## Shard registration and peers: current behaviour
 
 * **Transport.** QUIC with a self-signed certificate (`space-net/src/crypto.rs`)
   and no certificate pinning. A dialler cannot verify which process it reached,
-  and an acceptor requests no client certificate.
-* **Hello.** `space_protocol::check_hello` checks the protocol version only.
-  A peer identifies itself with the plain string `shard:<id>`
-  (`space-server/src/net.rs`, `peer_shard_id`); any client can type it.
-* **Orchestrator.** `ControlPlane::handle_shard_hello` checks the cluster name
-  only. It *issues* a `peer_token` in `ShardWelcome`, but that token is never
-  presented on peer connections and never verified anywhere.
-* **Shard.** `Shard::peer_message` checks only that the claimed shard id is in
-  the shard's own map (and a commit must come from the shard that staged the
-  transfer). A party that can reach a shard's port and guesses a valid
-  neighbour id can speak the handoff protocol as that neighbour — and send
-  `GhostUpdate`s as it (ghosts are kinematic copies the receiver's bodies
-  collide with; their component lists are decoded with the same strict,
-  total decoders as a handoff's; a ghost never replaces a body the receiver
-  simulates, and a removal is honoured only from the shard that sent it).
-* **Control port.** The orchestrator's control endpoint binds to `127.0.0.1` by
-  default. That is the only mitigation for the items below.
+  and an acceptor requests no client certificate. Nothing below changes that.
+* **Registration (shard → orchestrator).** `ShardHello` carries the **cluster
+  secret** (protocol 6). `ControlPlane::check_credentials` checks — when a
+  secret is required — the secret first, in constant time; a wrong or missing
+  one is a final refusal (`Unauthorized`) that says nothing else, in
+  particular not what the cluster is called, and is logged without the
+  secret. Only then is the cluster name compared. A secret is required when
+  one was configured (`--cluster-secret[-file]`, `SPACE_CLUSTER_SECRET[_FILE]`)
+  and always when the control port is not on loopback. Off loopback the
+  orchestrator refuses to start without a secret a shard could present: a
+  configured one of at least 16 characters, or — with `--min-shards` 1 or
+  more — one it generates (from the web UI form token's source, see below)
+  and hands to the shards it starts **in their environment**, never on a
+  command line. On a loopback control port with nothing configured a hello
+  needs no secret: that trusts every local process, like the tokenless web UI
+  and harness. **"Loopback" is the bind address, not who can reach it:** a
+  loopback control port that a same-host UDP forwarder points at, or that a
+  host-network container shares, takes hellos from remote peers without a
+  secret — configure a cluster secret before doing either.
+* **The hello gates the connection.** A control connection's task hands the
+  `ShardHello` to the run loop and reads nothing more until the verdict is
+  in (`control.rs`, `Inbound`). Refused — for good or "not yet" — the reason
+  is delivered and the connection **closed**; a shard that asks again dials a
+  new one. Welcomed, the connection is admitted as **one shard id** for its
+  life: a `LoadReport`, `EpochAck` or `SceneAck` is passed on only if it names
+  that id (others are dropped, counted and — a few times per ten seconds —
+  written to standard error), and the run loop takes the sender from the
+  connection, never from the message. So nobody who has not been welcomed is
+  heard at all, and a welcomed shard speaks for itself only.
+* **Peers (shard ↔ shard).** The orchestrator issues a **peer token** in
+  `ShardWelcome`: one it generates at start, or a configured one
+  (`--peer-token[-file]`, `SPACE_ORCHESTRATOR_PEER_TOKEN[_FILE]`) of at least
+  16 characters — a shorter or empty one is refused at startup, because an
+  empty token is what a shard takes for "no peer token" and it then lets every
+  peer in. A shard presents the token in every hello to another shard
+  (`shard:<id>:<token>` in the hello's token field) and refuses a peer hello
+  without it before reading a peer message (`space-server/src/net.rs`,
+  `peer_token_admits`; `Unauthorized`; counted, and written to the shard's log
+  at most three times per ten seconds — anybody who reaches the game port can
+  cause it). A shard that holds none — standalone shards wired with `--peer` —
+  accepts peers on the `shard:<id>` string alone. `Shard::peer_message` still
+  checks that the claimed id is in the shard's own map, and a commit must come
+  from the shard that staged the transfer.
+* **Ids and regions are the orchestrator's.** A hello names neither; a region
+  is given through an epoch change, never claimed, and an id is used by one
+  process, once (a shard that restarts replaces itself under a new id). A
+  hello that advertises the address of a **live** registered shard takes that
+  shard's place only if its control connection comes from the IP it
+  advertises, and only when the replacement can be carried out at once;
+  otherwise it waits, and the live shard is untouched until its own link
+  closes.
+* **Secrets are not printed.** Both secrets are held in `space_net::Secret`,
+  whose `Debug` shows `<redacted>` — so do the structs that hold one and derive
+  `Debug`: the orchestrator's config, `ControlPlane` and `Orchestrator`, a
+  shard's `ShardNet` and `RunningShard`. The messages that carry one have a
+  hand-written `Debug`: `ShardHello`, `ShardWelcome`, and `Hello` — whose token
+  field is the peer token between shards (`shard:<id>:<redacted>`) and a
+  player's token otherwise, and which an endpoint prints when it is sent one
+  it did not expect. The launcher's `SpawnSpec` and a shard's
+  `OrchestratedOptions` print whether there is a secret, not the secret. Each
+  of those structs and messages has a test that prints it and looks for the
+  secret. The event log, the snapshot and `/api/state` hold neither secret (a
+  snapshot — which carries the event log — is checked for the cluster secret
+  in `tests/lifecycle.rs`). What this does **not** cover: a secret given
+  as a command-line flag shows in the process list (use the environment or a
+  file), and anything that formats `Secret::expose()` or the fields of a wire
+  message by hand.
 
 ## Deferred items
 
-1. **`peer_token` enforcement in `Shard::peer_message`.** Shards should present
-   the token they were issued, and receivers should verify it before acting on
-   a peer message. Today the field is a wire slot with no consumer.
-2. **Per-shard hello credentials.** The hello should carry a credential bound to
-   one shard id (and be checked by the orchestrator), instead of a bare
-   `shard:<id>` string, plus certificate pinning or a separate ALPN for peer
-   traffic. A signed handoff ticket would additionally stop a legitimate shard
-   forging handoffs for entities it does not own.
-3. **Endpoint-table poisoning via claimed shard ids.** The orchestrator records
-   the endpoint a `ShardHello` names for the shard id it claims, and pushes
-   those endpoints to every shard in a `DirectoryReply`. A party that can reach
-   the control port can register under a claimed id and redirect peer traffic
-   or client redirects. This is mitigated today only by the loopback-default
-   control bind; exposing the control port on a non-loopback address removes
-   that mitigation.
+1. **The peer token is one secret for the whole cluster.** It says "a shard of
+   this cluster", not which one: a shard that holds it — or anybody who learns
+   it — can claim a neighbour's id, speak the handoff protocol as that
+   neighbour and send `GhostUpdate`s as it (ghosts are kinematic copies the
+   receiver's bodies collide with; their component lists are decoded with the
+   same strict, total decoders as a handoff's; a ghost never replaces a body
+   the receiver simulates, and a removal is honoured only from the shard that
+   sent it). A credential bound to one shard id, certificate pinning or a
+   separate ALPN for peer traffic, and a signed handoff ticket are not built.
+2. **Both secrets cross the network in clear inside QUIC/TLS to an unverified
+   peer.** The channel is encrypted but, with no pinning, not authenticated: a
+   party that can intercept a shard's first packets to the orchestrator
+   (on-path, same L2) can terminate the handshake itself and read the cluster
+   secret. Keep the control port and the shard ports on a network you trust,
+   or tunnel them.
+3. **The secret is as strong as its source.** A configured secret is the
+   operator's; a generated one comes from `webui::auth::random_token` (128
+   bits built on the standard library's `RandomState` keys — see its docs for
+   what that does and does not promise).
+4. **A registered shard is believed about itself.** It advertises its own
+   address, which the orchestrator publishes to every shard and (through
+   redirects) to clients; its load reports, its epoch acks and what it says
+   about its scene are taken at its word — a `SceneAck` naming a revision a
+   little ahead of the cluster's makes the orchestrator re-issue the scene
+   above it (at most once a second, never further than
+   `MAX_REVISION_CATCH_UP`), and a shard that acknowledges a map change it did
+   not apply lets it commit. A party that holds the cluster secret can register
+   and do all of that. What it cannot do any more is speak **for another
+   shard**: a report or an ack that names a shard other than the one its
+   connection was admitted as is dropped. Two things remain between shards of
+   one host: a hello that names a live shard's address is believed when it
+   comes from the same IP (every shard on loopback, or several behind one
+   address), so one registered party there can take another's regions by
+   naming its address; and a late `EpochAck` carrying the number of an epoch
+   that was aborted and proposed again still counts (`epoch.rs`, "Known
+   limit").
+5. **Children of the `process` launcher inherit the orchestrator's
+   environment, less what is the orchestrator's own**: every variable named
+   `SPACE_ORCHESTRATOR_*` (the web UI token, the peer token, their file forms)
+   and `SPACE_HARNESS_TOKEN` are taken out, and the cluster secret is set to
+   the one the launch is handed (or removed). Anything else that is in the
+   environment the orchestrator was started from — another program's
+   credentials, say — still reaches every shard: start it from a clean
+   environment. The executable is started by its absolute path (never looked
+   up in `PATH`). The pid file and the per-shard logs are written where
+   `--shard-log-dir` says, with the process's default permissions; the pid
+   file lists the processes that are running, and a stop script must still
+   check what a pid is before it stops it (the dev scripts compare the
+   process's executable path with the checkout's own).
+6. **A map change waits for everybody, and three strikes take a while.** A
+   shard that holds its control link but does not acknowledge map changes
+   holds each of them up for its 3 s deadline and is only taken for dead —
+   and replaced — after three in a row. Whoever can register can therefore
+   stall map changes for about nine seconds per registration, each costing a
+   shard id.
 
 ## Orchestrator web UI (`space-orchestrator --webui`)
 
@@ -72,11 +162,15 @@ autoscaler, re-send the map and switch the scene on every shard. Off by default.
   action at a time, 250 ms apart (429 otherwise); `--max-regions` (default 64)
   bounds how far splits can grow the map. A token holder can still churn the
   256-entry event log at that rate.
-* **`SceneAck` is unauthenticated** like the rest of the control port: a peer
-  that can reach it can fake "shard N confirmed the scene" (display only; it
-  cannot change the scene). Same for register/lost pairs in the event log by a
-  peer that knows the cluster name. Both need control-port authentication
-  (deferred item 2).
+* **`SceneAck` names its own sender**, like a load report and an epoch ack, and
+  is taken only from the control connection that was admitted as that shard:
+  what the page shows as "shard N confirmed the scene" is shard N's own word.
+  That word is not checked — a registered shard (on a loopback control port
+  without a secret: any local process that registers) can claim any scene
+  state **for itself**, which changes what the page shows for it and, for a
+  revision a little ahead, makes the orchestrator re-issue the scene one
+  above it; it cannot choose the scene. See "Shard registration and peers"
+  above.
 * **Scene delivery to clients** is repeated periodically by the shard, so a
   dropped `SceneUpdate` heals without a reconnect.
 

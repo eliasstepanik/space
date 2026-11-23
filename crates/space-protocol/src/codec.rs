@@ -68,7 +68,16 @@ use crate::messages::Message;
 /// now a per-tick batch of border ghosts between shards; and a handoff's state
 /// may describe an unowned body. None of it is readable by a v4 peer, so the
 /// version bumps and such a peer is refused at the hello.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// **Version 6** (shard lifecycle): [`crate::ShardHello`] carries the cluster
+/// secret as a new last field. That changes the layout of an existing message,
+/// so the version bumps: a v5 orchestrator would fail to decode a v6 shard's
+/// hello mid-handshake instead of refusing it with a reason. With it a hello
+/// names neither id nor region (the orchestrator assigns both), a
+/// [`crate::RejectReason::Draining`] answer to it means "ask again", and a
+/// shard-to-shard [`crate::Hello`] carries the peer token behind the shard id
+/// in its existing token field (`shard:<id>:<token>`).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Largest accepted frame payload, in bytes (1 MiB).
 ///

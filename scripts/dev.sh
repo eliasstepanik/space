@@ -12,7 +12,8 @@
 #       orchestrated  the orchestrator (127.0.0.1:7900, web UI on
 #                     http://127.0.0.1:7980/) plus one shard (127.0.0.1:7777)
 #                     that registers with it. Change the scene for every shard
-#                     and client in the web UI.
+#                     and client in the web UI. With --min-shards N the
+#                     orchestrator starts the shards itself instead (below).
 #       single        one standalone shard on 127.0.0.1:7777
 #       two-shards    two standalone shards that are neighbours along +X
 #                     (7777 owns cell 0, 7778 owns cell 1): fly +X (hold D for
@@ -38,6 +39,15 @@
 #                        (default target/dev/harness-out)
 #   --stream ADDR        where the stream client serves viewers
 #   --size WxH  --quality high|medium|low|ci  --glb FILE  --no-vsync
+#   --min-shards N       orchestrated only (default 0 = the one shard above,
+#                        started by this script): the orchestrator starts and
+#                        keeps N shards running by itself (space-orchestrator
+#                        --launcher process --min-shards N), each a space-server
+#                        process on a port from 7870 up, logging to
+#                        target/dev/shard-<port>.log. With 4 the demo area lies
+#                        in four shard areas that meet at pos x = -6 / z = -4.
+#                        A shard that dies is replaced. The client is pointed
+#                        at the shard that owns the spawn point. Needs curl.
 #   --port-offset N      add N to every port (a second stack beside the first)
 #   --no-build           use the release binaries that are already built
 #   --servers-only       start the server side and return (stop with --stop)
@@ -46,6 +56,7 @@
 # Examples:
 #   scripts/dev.sh
 #   scripts/dev.sh --topology two-shards
+#   scripts/dev.sh --min-shards 4
 #   scripts/dev.sh --client headless --script scripts/harness/smoke.lua
 #   scripts/dev.sh --client headless        # then: curl http://127.0.0.1:8098/state
 #   scripts/dev.sh -- --frames 600 --no-vsync
@@ -60,6 +71,11 @@ target="${CARGO_TARGET_DIR:-$root/target}"
 bin="$target/release"
 dev_dir="$target/dev"
 pid_file="$dev_dir/servers.pid"
+# The shards an orchestrator started itself (--min-shards): it keeps the pids
+# of those that are running here, in the directory it is told to log to (the
+# file is rewritten whenever one is started, stopped or seen to have exited,
+# and removed when none is left).
+launched_pid_file="$dev_dir/launched-shards.pid"
 exe=""
 case "$(uname -s)" in
     MINGW* | MSYS* | CYGWIN*) exe=".exe" ;;
@@ -77,6 +93,7 @@ size=""
 quality="high"
 glb=""
 port_offset=0
+min_shards=0
 connect_screen=0
 no_vsync=0
 no_build=0
@@ -111,6 +128,7 @@ while [ "$#" -gt 0 ]; do
         --quality) need_value "$@"; quality="$2"; shift 2 ;;
         --glb) need_value "$@"; glb="$2"; shift 2 ;;
         --port-offset) need_value "$@"; port_offset="$2"; shift 2 ;;
+        --min-shards) need_value "$@"; min_shards="$2"; shift 2 ;;
         --connect-screen) connect_screen=1; shift ;;
         --no-vsync) no_vsync=1; shift ;;
         --no-build) no_build=1; shift ;;
@@ -142,6 +160,15 @@ esac
 case "$port_offset" in
     '' | *[!0-9]*) die "--port-offset must be a number (got '$port_offset')" ;;
 esac
+case "$min_shards" in
+    # 8 is the orchestrator's own limit: the root's shard and one per layout
+    # cell (it refuses to start with more).
+    [0-8]) ;;
+    *) die "--min-shards must be a number from 0 to 8 (got '$min_shards')" ;;
+esac
+if [ "$min_shards" -gt 0 ] && [ "$topology" != orchestrated ]; then
+    die "--min-shards needs the orchestrated topology: it is the orchestrator that starts the shards"
+fi
 
 # The name of the program running as `pid`, or nothing.
 process_name() {
@@ -153,25 +180,82 @@ process_name() {
     fi
 }
 
-stop_servers() {
-    [ -f "$pid_file" ] || return 0
+# The directory the executable running as `pid` lies in, or nothing when this
+# shell cannot tell (no /proc, as on macOS and the BSDs; a process of another
+# user).
+process_dir() {
+    local path=""
+    if [ -n "$exe" ]; then
+        # Git Bash: the last column of ps -W is the executable's full Windows
+        # path, which may contain spaces.
+        path="$(ps -W 2> /dev/null | awk -v pid="$1" '$4 == pid && match($0, /[A-Za-z]:\\.*$/) { print substr($0, RSTART) }')"
+        [ -n "$path" ] || return 0
+        path="$(cygpath -u "$path" 2> /dev/null || true)"
+    elif [ -e "/proc/$1/exe" ]; then
+        path="$(readlink "/proc/$1/exe" 2> /dev/null || true)"
+        # A binary that was rebuilt while the process ran.
+        path="${path% (deleted)}"
+    fi
+    [ -n "$path" ] || return 0
+    (cd "$(dirname "$path")" 2> /dev/null && pwd -P) || true
+}
+
+# is_ours PID NAME: whether the process is one of THIS checkout's binaries.
+#
+# A pid in a pid file is only a number: the process that had it may be gone,
+# and the system may have given the number to anything since - another
+# checkout's space-server, for one. So the name is not enough: the executable
+# must lie in this checkout's release directory.
+is_ours() {
+    case "$2" in space-*) ;; *) return 1 ;; esac
+    local dir ours
+    dir="$(process_dir "$1")"
+    if [ -z "$dir" ]; then
+        # This shell cannot tell where the executable lies (see process_dir):
+        # the name is all there is to go by.
+        return 0
+    fi
+    ours="$(cd "$bin" 2> /dev/null && pwd -P || true)"
+    if [ -n "$exe" ]; then
+        # Windows paths do not distinguish case.
+        dir="$(printf '%s' "$dir" | tr '[:upper:]' '[:lower:]')"
+        ours="$(printf '%s' "$ours" | tr '[:upper:]' '[:lower:]')"
+    fi
+    [ -n "$ours" ] && [ "$dir" = "$ours" ]
+}
+
+# stop_processes FILE: stop every process listed in FILE (one pid a line) that
+# is one of this checkout's binaries, then remove FILE.
+stop_processes() {
+    local file="$1"
+    [ -f "$file" ] || return 0
     local id name
     while read -r id; do
+        id="${id%$'\r'}"
         case "$id" in '' | *[!0-9]*) continue ;; esac
         name="$(process_name "$id")"
-        # Only ever stop our own binaries: a pid may have been reused.
-        case "$name" in
-            space-*)
-                if [ -n "$exe" ]; then
-                    taskkill //PID "$id" //F > /dev/null 2>&1 || true
-                else
-                    kill "$id" 2> /dev/null || true
-                fi
-                echo "stopped $name (pid $id)"
-                ;;
-        esac
-    done < "$pid_file"
-    rm -f "$pid_file"
+        [ -n "$name" ] || continue
+        if is_ours "$id" "$name"; then
+            if [ -n "$exe" ]; then
+                taskkill //PID "$id" //F > /dev/null 2>&1 || true
+            else
+                kill "$id" 2> /dev/null || true
+            fi
+            echo "stopped $name (pid $id)"
+        else
+            echo "left pid $id ($name) alone: it is not a binary of this checkout"
+        fi
+    done < "$file"
+    rm -f "$file"
+}
+
+stop_servers() {
+    # What this script started first - the orchestrator among it, so that it
+    # cannot start a replacement for a shard stopped next - then the shards
+    # that orchestrator had started. (They would stop by themselves a few
+    # seconds after losing it; this does not wait for that.)
+    stop_processes "$pid_file"
+    stop_processes "$launched_pid_file"
 }
 
 # start_server NAME EXE ARGS...: run a server in the background, logging to
@@ -225,11 +309,47 @@ case "$topology" in
         if [ "$scene_given" = 1 ]; then
             rm -f "$dev_dir/orchestrator.id.scene"
         fi
-        start_server orchestrator space-orchestrator \
-            --bind "$orchestrator" --state orchestrator.id \
-            --webui "$webui" --scene "$scene"
-        # A fixed bind address, so a restarted shard is recognised as the same one.
-        start_server shard-1 space-server --orchestrator "$orchestrator" --bind "$shard1"
+        if [ "$min_shards" -gt 0 ]; then
+            # The orchestrator starts the shards itself: one space-server
+            # process each, on a port of this range, logging to target/dev.
+            first_port=$((7870 + port_offset))
+            started=$(date +%s)
+            start_server orchestrator space-orchestrator \
+                --bind "$orchestrator" --state orchestrator.id \
+                --webui "$webui" --scene "$scene" \
+                --launcher process --min-shards "$min_shards" \
+                --host-port-range "$first_port-$((7899 + port_offset))" \
+                --shard-log-dir "$dev_dir"
+            # Wait until every shard has its region, and ask the orchestrator
+            # which one owns the spawn point: that is where a client joins.
+            shard1=""
+            tries=0
+            while [ -z "$shard1" ]; do
+                sleep 0.25
+                state="$(curl -s --max-time 5 "http://$webui/api/state" || true)"
+                regions="$(printf '%s' "$state" | grep -o '"nesting":' | wc -l | tr -d ' ')"
+                live="$(printf '%s' "$state" | grep -o '"role":"owner","connected":true' | wc -l | tr -d ' ')"
+                if [ "$regions" -ge "$min_shards" ] && [ "$live" -ge "$min_shards" ] &&
+                    printf '%s' "$state" | grep -q '"epoch_in_flight":null'; then
+                    # The one region nested in no other is the root.
+                    shard1="$(printf '%s' "$state" | sed -n 's/.*"endpoint":"\([^"]*\)","nesting":0.*/\1/p')"
+                fi
+                tries=$((tries + 1))
+                if [ -z "$shard1" ] && [ "$tries" -ge 240 ]; then
+                    tail -n 20 "$dev_dir/orchestrator.out.log" | sed 's/^/  /'
+                    stop_servers
+                    echo "dev.sh: the orchestrator did not bring up $min_shards shards within 60 s; see $dev_dir/orchestrator.out.log and shard-*.log" >&2
+                    exit 1
+                fi
+            done
+            echo "$min_shards shards started by the orchestrator own $regions regions after $(($(date +%s) - started)) s"
+        else
+            start_server orchestrator space-orchestrator \
+                --bind "$orchestrator" --state orchestrator.id \
+                --webui "$webui" --scene "$scene"
+            # The shard registers without a region and is given the root.
+            start_server shard-1 space-server --orchestrator "$orchestrator" --bind "$shard1"
+        fi
         ;;
     single)
         start_server shard-1 space-server \
@@ -247,6 +367,9 @@ esac
 
 echo
 echo "  shard          $shard1 (QUIC; the address to type on the connect screen)"
+if [ "$min_shards" -gt 0 ]; then
+    echo "                 (the shard that owns the spawn point; $min_shards shards on ports from $((7870 + port_offset)), logs in shard-<port>.log)"
+fi
 if [ "$topology" = two-shards ]; then
     echo "  second shard   $shard2"
 fi

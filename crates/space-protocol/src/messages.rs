@@ -400,7 +400,10 @@ pub enum RejectReason {
     Unauthorized,
     /// The shard is at capacity; retry elsewhere.
     Full,
-    /// The shard is draining for a split/merge or shutdown.
+    /// Not now: the shard is draining for a split/merge or shutdown — or, from
+    /// the orchestrator to a shard's [`ShardHello`], a map change is in flight
+    /// and the hello cannot be served yet. The one refusal that is **not
+    /// final**: a shard told this asks again after a short pause.
     Draining,
     /// Anything else; for logs only.
     Other(String),
@@ -414,12 +417,51 @@ pub struct Reject {
 }
 
 /// First message on every connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` does not print the token (see the impl): a hello ends up in log
+/// lines — "the first message must be a Hello, got ..." — and its token is a
+/// credential, a player's or, between shards, the cluster's peer token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     /// Protocol version the client speaks.
     pub protocol: u32,
-    /// Opaque player token the server authenticates.
+    /// Opaque player token the server authenticates. A shard dialling another
+    /// shard puts `shard:<id>` here, followed by `:<peer token>` when its
+    /// cluster has one.
     pub player_token: String,
+}
+
+impl core::fmt::Debug for Hello {
+    /// Everything but the secret part of the token: a player's token is not
+    /// printed at all, a peer hello keeps the shard id it names
+    /// (`shard:7:<redacted>`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Hello")
+            .field("protocol", &self.protocol)
+            .field("player_token", &RedactedToken(&self.player_token))
+            .finish()
+    }
+}
+
+/// A hello's token as `Debug` prints it (see [`Hello`]'s impl).
+struct RedactedToken<'a>(&'a str);
+
+impl core::fmt::Debug for RedactedToken<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `shard:<digits>[:<peer token>]` is a peer hello; the id is not a
+        // secret, what follows it is.
+        let peer = self.0.strip_prefix("shard:").and_then(|rest| {
+            let (id, secret) = rest
+                .split_once(':')
+                .map_or((rest, None), |(id, secret)| (id, Some(secret)));
+            (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some((id, secret))
+        });
+        match peer {
+            Some((id, None)) => write!(f, "shard:{id}"),
+            Some((id, Some(secret))) => write!(f, "shard:{id}:{}", redacted(secret)),
+            None => f.write_str(redacted(self.0)),
+        }
+    }
 }
 
 /// The connection is accepted.
@@ -437,13 +479,18 @@ pub struct Welcome {
 /// Shard → orchestrator: "give me an id and my map" (Phase 3, P3.1).
 ///
 /// The first message on a shard↔orchestrator control connection, after the
-/// ordinary [`Hello`] handshake. `shard` is [`ShardId::NONE`] when the shard
-/// has no id yet and wants one allocated (the normal orchestrated launch —
-/// Phase-2 MAJOR 3 is closed by the orchestrator owning the counter); a shard
-/// that restarts with a known id sends it and asks for its region back.
-/// `region` is `None` when the orchestrator should place the shard at its
-/// configured root region.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// ordinary [`Hello`] handshake. The normal hello names **neither an id nor a
+/// region** (`shard` is [`ShardId::NONE`], `region` is `None`): the
+/// orchestrator allocates the id and assigns the region — the root while
+/// nobody owns it, otherwise a node it carves for the shard through an epoch
+/// change. A hello that names an id or a region is a claim on what the
+/// published map already says (the reserved root owner's first registration);
+/// it never creates a region.
+///
+/// The answer is a [`ShardWelcome`], or a [`Reject`]: [`RejectReason::Draining`]
+/// means "not yet, ask again" (one map change at a time), anything else is
+/// final.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardHello {
     /// Cluster the shard is joining; must match the orchestrator's own id.
     pub cluster: String,
@@ -451,31 +498,71 @@ pub struct ShardHello {
     pub shard: ShardId,
     /// Where the shard is listening for peers and clients.
     pub endpoint: std::net::SocketAddr,
-    /// Region the shard claims, or `None` for "place me at the root".
+    /// Region the shard claims, or `None` for "assign me one".
     pub region: Option<ShardRegion>,
+    /// The cluster secret (protocol 6), empty when the shard was given none.
+    /// An orchestrator whose control port is not on loopback — or that was
+    /// given a secret explicitly — refuses a hello without the right one.
+    pub secret: String,
+}
+
+impl core::fmt::Debug for ShardHello {
+    /// Everything but the secret itself: a hello may end up in a log line.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShardHello")
+            .field("cluster", &self.cluster)
+            .field("shard", &self.shard)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("secret", &redacted(&self.secret))
+            .finish()
+    }
+}
+
+/// What a `Debug` impl prints in place of a secret.
+fn redacted(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<none>"
+    } else {
+        "<redacted>"
+    }
 }
 
 /// Orchestrator → shard: the id, region, map and peer token the shard runs on.
 ///
-/// The answer to [`ShardHello`]. `peer_token` is a secret the orchestrator
-/// *issues*, but **nothing enforces it today**: shards do not present it on peer
-/// connections, the orchestrator does not check it on `shard:<id>` hello tokens,
-/// and `Shard::peer_message` checks only that the claimed shard id is in its map.
-/// Peer transport is QUIC with a self-signed certificate and no pinning, and the
-/// hello handshake checks the protocol version only (the orchestrator
-/// additionally checks the cluster name). The field is the wire slot a future
-/// enforcement will use; see `docs/security-notes.md`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The answer to [`ShardHello`]. `region` is the region the shard is given;
+/// **it owns it only once the map says so**: for the root that is the map in
+/// this welcome, for a carved node the map of the epoch the orchestrator
+/// proposes right behind the welcome — until that commits `shard_map` names
+/// the node's previous owner and the shard owns nothing.
+///
+/// `peer_token` is the secret every shard of the cluster presents in its hello
+/// to another shard (`shard:<id>:<token>`); a shard that holds one refuses a
+/// peer hello without it. Empty = the orchestrator issues none and peers are
+/// accepted on map membership alone, as between standalone shards.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardWelcome {
     /// The id the orchestrator allocated (or confirmed).
     pub shard: ShardId,
-    /// The region the shard owns, with the endpoint the orchestrator recorded.
+    /// The region the shard is given, with the endpoint the orchestrator
+    /// recorded.
     pub region: ShardRegion,
     /// The current shard map, so the shard never runs on a stale routing table.
     pub shard_map: ShardMap,
-    /// Issued secret for shard↔shard and shard↔orchestrator authentication.
-    /// **Not enforced anywhere today** (see the type docs).
+    /// The secret shards present to each other (see the type docs).
     pub peer_token: String,
+}
+
+impl core::fmt::Debug for ShardWelcome {
+    /// Everything but the peer token itself.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShardWelcome")
+            .field("shard", &self.shard)
+            .field("region", &self.region)
+            .field("shard_map", &self.shard_map)
+            .field("peer_token", &redacted(&self.peer_token))
+            .finish()
+    }
 }
 
 /// Every message that crosses a socket.

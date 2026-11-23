@@ -242,6 +242,7 @@ fn all_messages() -> Vec<Message> {
             shard: ShardId::NONE,
             endpoint: addr(9),
             region: Some(region(40, [0, 0, 0], 1)),
+            secret: "cluster-secret".into(),
         }),
         Message::ShardWelcome(ShardWelcome {
             shard: shard(5),
@@ -1036,6 +1037,7 @@ impl Rng {
                 } else {
                     Some(ShardRegion::new(self.node(), self.shard(), self.addr()))
                 },
+                secret: self.string(),
             }),
             24 => Message::ShardWelcome(ShardWelcome {
                 shard: self.shard(),
@@ -1381,6 +1383,116 @@ fn scene_messages_have_a_pinned_wire_layout() {
         assert_eq!(payload_of(&frame), &expected[..], "{message:?}");
         assert_eq!(decode_frame(&frame), Ok(message));
     }
+}
+
+/// Protocol 6: a `ShardHello` carries the cluster secret as its **last**
+/// field (a length-prefixed string behind the optional region), and neither
+/// it nor the peer token of a `ShardWelcome` shows in a `Debug` print — a
+/// message may end up in a log line or a panic message.
+///
+/// Mutation this catches: adding the field anywhere but at the end (an
+/// orchestrator would read a v6 hello's region as garbage), leaving the
+/// version at 5 with the changed layout, or deriving `Debug` again.
+#[test]
+fn a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it() {
+    assert_eq!(
+        PROTOCOL_VERSION, 6,
+        "the hello's layout changed with protocol 6"
+    );
+    let hello = |secret: &str| {
+        Message::ShardHello(ShardHello {
+            cluster: "cluster-a".into(),
+            shard: ShardId::NONE,
+            endpoint: addr(9),
+            region: None,
+            secret: secret.into(),
+        })
+    };
+    let secret = "s3cr3t-of-the-cluster";
+    let (without, with) = (encode_frame(&hello("")), encode_frame(&hello(secret)));
+    let (without, with) = (payload_of(&without), payload_of(&with));
+    assert_eq!(hello("").wire_tag(), 23);
+    assert_eq!(&with[..4], &23u32.to_be_bytes());
+    // Everything before the secret is the same bytes; the secret is its
+    // length (u64, big endian) and then its bytes, and nothing follows.
+    let head = without.len() - 8;
+    assert_eq!(&with[..head], &without[..head]);
+    assert_eq!(&without[head..], &0u64.to_be_bytes());
+    let tail = [&(secret.len() as u64).to_be_bytes()[..], secret.as_bytes()].concat();
+    assert_eq!(&with[head..], &tail[..]);
+    assert_eq!(
+        decode_frame(&encode_frame(&hello(secret))),
+        Ok(hello(secret))
+    );
+
+    let printed = format!("{:?}", hello(secret));
+    assert!(!printed.contains(secret), "{printed}");
+    assert!(printed.contains("<redacted>"), "{printed}");
+    assert!(
+        format!("{:?}", hello("")).contains("<none>"),
+        "an absent secret is said to be absent"
+    );
+    let welcome = Message::ShardWelcome(ShardWelcome {
+        shard: shard(5),
+        region: region(40, [0, 0, 0], 5),
+        shard_map: sample_map(),
+        peer_token: "peer-s3cr3t-token".into(),
+    });
+    let printed = format!("{welcome:?}");
+    assert!(!printed.contains("peer-s3cr3t-token"), "{printed}");
+    assert!(printed.contains("<redacted>"), "{printed}");
+}
+
+/// The first message on every connection carries a credential in its token
+/// field — a player's token, or between shards `shard:<id>:<peer token>` —
+/// and a hello is printed: an endpoint that expected something else logs
+/// "got {message:?}". Its `Debug` keeps what is not secret (the version, the
+/// shard id a peer names) and nothing else. The wire form is untouched.
+///
+/// Mutation this catches: deriving `Debug` on `Hello` again (a shard that is
+/// sent a stray hello would write the cluster's peer token to its log).
+#[test]
+fn a_hello_never_prints_its_token() {
+    let hello = |token: &str| {
+        Message::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            player_token: token.into(),
+        })
+    };
+    for (token, shown, hidden) in [
+        (
+            "shard:7:the-peer-token-of-the-cluster",
+            "shard:7:<redacted>",
+            "the-peer-token",
+        ),
+        (
+            "shard:12:with:colons:in:it",
+            "shard:12:<redacted>",
+            "colons",
+        ),
+        ("a-players-own-token", "<redacted>", "players-own"),
+        // Not a peer hello (no numeric id): nothing of it is shown.
+        ("shard:x:looks-like-a-peer", "<redacted>", "looks-like"),
+        ("shard::no-id-at-all", "<redacted>", "no-id-at-all"),
+    ] {
+        let printed = format!("{:?}", hello(token));
+        assert!(printed.contains(shown), "{token}: {printed}");
+        assert!(!printed.contains(hidden), "{token}: {printed}");
+        assert!(
+            printed.contains(&format!("protocol: {PROTOCOL_VERSION}")),
+            "{printed}"
+        );
+        // Printing is all that changed: the token still travels whole.
+        assert_eq!(decode_frame(&encode_frame(&hello(token))), Ok(hello(token)));
+    }
+    // A peer hello without a token has nothing to hide, and no token is said
+    // to be none.
+    let printed = format!("{:?}", hello("shard:3"));
+    assert!(
+        printed.contains("shard:3") && !printed.contains("redacted"),
+        "{printed}"
+    );
+    assert!(format!("{:?}", hello("")).contains("<none>"));
 }
 
 /// A scene id this build does not know is **not** a decode error: the frame

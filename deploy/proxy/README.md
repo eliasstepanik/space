@@ -7,7 +7,7 @@ auto-redeployed by Watchtower.
 | File | Purpose |
 |---|---|
 | `docker-compose.yaml` | pulls `space-orchestrator`, `space-shard`, `space-client`; all three carry the Watchtower opt-in label; `restart: unless-stopped` (except `client`: `restart: "no"`, see Client configuration); orchestrator state in `./state` |
-| `.env.example` | copy to `.env`: cluster name, host ports, image tag |
+| `.env.example` | copy to `.env`: cluster name, **cluster secret (required)**, host ports, image tag |
 | `redeploy.sh` | manual path only (used by `.github/workflows/deploy.yml`): `compose pull`, `up -d`, image prune |
 
 ## Install (one-time, on the host)
@@ -21,6 +21,23 @@ cp .env.example /home/proxy/stacks/space/.env     # then edit
 chmod a+rwx /home/proxy/stacks/space/state        # orchestrator runs as uid 10001
 cd /home/proxy/stacks/space && docker compose up -d
 ```
+
+`SPACE_CLUSTER_SECRET` in `.env` is **required**: at least 16 random characters
+(`openssl rand -hex 24`), written into `.env` on the host and nowhere else.
+Inside its container the orchestrator's control port binds the wildcard
+address, and a control port that is not on loopback takes a shard's hello only
+with the secret - the orchestrator refuses to start without one (its log says
+why). Orchestrator and shard read the same variable. An existing installation
+needs this `.env` line **and this compose file** before images built with the
+shard lifecycle change arrive - Watchtower swaps only the image, and with the
+old compose file the new orchestrator would not start.
+
+**The control port (`7900/udp`) is not published on the host.** Only `shard-a`
+uses it, over the compose network; `ORCHESTRATOR_PORT` is gone from
+`.env.example` (a line left in an existing `.env` is simply unused). An
+installation that was started from the earlier compose file has the port open
+on every interface until the stack is recreated from this one
+(`docker compose up -d`).
 
 ## How updates reach the host
 
