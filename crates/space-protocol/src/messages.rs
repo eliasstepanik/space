@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use space_ecs::ComponentId;
 
 use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+use crate::far::{FarInterest, FarUpdate};
 use crate::guid::EntityGuid;
 use crate::scene::{SceneAck, SceneClock, SceneState};
 use crate::shard::{
@@ -727,6 +728,12 @@ pub enum Message {
     /// that shard, dial it ([`JoinRedirect`]). The answer to a [`Hello`] in
     /// place of a [`Welcome`]; never sent unasked to a peer that is playing.
     JoinRedirect(JoinRedirect),
+    /// Shard -> shard: where my players are, so you can send me what they
+    /// should see of yours ([`FarInterest`], protocol 7).
+    FarInterest(FarInterest),
+    /// Shard -> shard: far replicas, what I simulate in view of your players
+    /// ([`FarUpdate`], protocol 7).
+    FarUpdate(FarUpdate),
 }
 
 impl Message {
@@ -736,7 +743,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 30;
+    pub const VARIANT_COUNT: u32 = 32;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -775,6 +782,8 @@ impl Message {
             Message::SceneUpdate(_) => 27,
             Message::SceneClock(_) => 28,
             Message::JoinRedirect(_) => 29,
+            Message::FarInterest(_) => 30,
+            Message::FarUpdate(_) => 31,
         }
     }
 

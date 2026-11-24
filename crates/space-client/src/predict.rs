@@ -398,6 +398,11 @@ impl OwnShip {
             if guid == self.key.guid || Some(guid) == replica.ship || self.refused.contains(&guid) {
                 continue;
             }
+            // A far replica is for seeing: it is in no solver, the
+            // prediction's included (its samples are sparse and late).
+            if tracked.source() == crate::link::Source::Far {
+                continue;
+            }
             let state = tracked.ship.state;
             let distance = WorldPos::distance(me, state.pos);
             let known = self.nearby.get(&guid).copied();

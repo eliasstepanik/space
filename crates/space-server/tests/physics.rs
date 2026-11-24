@@ -318,12 +318,22 @@ const FAR: i64 = 9_765_625_000;
 /// A ball flies across the border from shard 1 into shard 2. A client on
 /// each side watches it the whole time: on shard 1 it is first a body, then
 /// (after the handoff) a ghost of shard 2's body; on shard 2 a ghost, then a
-/// body. Neither client is ever told it went away while it is near, no frame
-/// shows it jump, and each side drops its ghost once the ball is past the
-/// ghost margin — shard 1's client is then told it left.
+/// body. Neither client is ever told it went away, no frame shows it jump,
+/// and each side drops its ghost once the ball is past the ghost margin —
+/// shard 1's client then goes on seeing it as a **far replica** (it used to
+/// be told the ball had left: what another shard simulates beyond its
+/// ghosts' reach was invisible).
+///
+/// (The watcher on shard 1 stands 20 m from the border, beside the ball's
+/// path: within 100 m a moving thing is sent every tick, further off less
+/// often — `space_protocol::far` — and this test is about every tick.)
 fn crossing(x0: i64) {
     let mut c = side_by_side(x0);
-    let (session_a, _) = join(c.shard_mut(1), "watcher-a");
+    let (session_a, watcher_a) = join(c.shard_mut(1), "watcher-a");
+    assert!(c.shard_mut(1).set_state(
+        watcher_a,
+        ShipState::at_rest(at_border(x0, [-20.0, 40.0, 10.0]))
+    ));
     // (Shard 1 owns the spawn point; shard 2's watcher is there already.)
     let (session_b, _) = resident(&mut c, 2, "watcher-b");
     let speed = 8.0f32;
@@ -403,21 +413,43 @@ fn crossing(x0: i64) {
         );
     }
     assert!(b.removed_at.is_empty(), "shard 2's client never lost it");
-    assert_eq!(
-        a.removed_at.len(),
-        1,
-        "shard 1's client was told once, when the ghost left the margin"
-    );
-    let removed = a.removed_at[0];
-    let last_seen_a = a.seen.last().expect("seen on shard 1").0;
-    assert!(last_seen_a <= removed);
-    // Every tick shard 1's client saw the ball until the removal.
-    let first_a = a.seen[0].0;
-    let seen_ticks: BTreeSet<u64> = a.seen.iter().map(|(t, _)| *t).collect();
     assert!(
-        seen_ticks.len() as u64 >= last_seen_a - first_a,
-        "shard 1's client missed ticks of a moving ball"
+        a.removed_at.is_empty(),
+        "shard 1's client never lost it either: past the ghost margin it is a far replica \
+         (removed at {:?})",
+        a.removed_at
     );
+    // Shard 1's client saw the ball every tick while it was within 100 m of
+    // the watcher (to 78 m past the border), and at the next step's rate
+    // — every third tick — after that: through the handoff, and through the
+    // change from ghost to far replica.
+    for w in a.seen.windows(2) {
+        let gap = w[1].0 - w[0].0;
+        let x = border_x(x0, w[1].1);
+        let most = if x < 70.0 { 1 } else { 4 };
+        assert!(
+            gap <= most,
+            "shard 1's client saw nothing of the moving ball for {gap} ticks, at {x:.1} m"
+        );
+    }
+    let last_x = border_x(x0, a.seen.last().expect("seen on shard 1").1);
+    assert!(last_x > 120.0, "seen to the end of the run: {last_x:.1} m");
+    assert_eq!(
+        c.shard(1)
+            .far_list()
+            .iter()
+            .filter(|far| far.guid == guid && far.from == ShardId::new(2))
+            .count(),
+        1,
+        "shard 1 holds shard 2's ball as a far replica"
+    );
+    let origin = a
+        .components
+        .iter()
+        .find(|(id, _)| *id == space_protocol::ORIGIN_COMPONENT)
+        .and_then(|(_, bytes)| space_protocol::Origin::decode(bytes))
+        .expect("the client is told what kind of copy it holds");
+    assert_eq!(origin.kind, space_protocol::OriginKind::Far);
 }
 
 #[test]
@@ -2186,13 +2218,17 @@ async fn over_quic_a_body_crosses_between_two_real_shards() {
         "a jump of {:.3} m per tick ({per_tick:.3} m of travel)",
         view.largest_step()
     );
-    // Every tick of shard 1's clock from the first sighting on: frames are
-    // datagrams and may be lost on a busy host, so allow a few.
+    // At the rate of its distance step from the first sighting on: the
+    // watcher stands on the spawn point, half a kilometre from the ball,
+    // where a moving thing is sent five times a second — every sixth tick
+    // (`space_protocol::far`; it was every tick while nothing was thinned).
+    // Frames are datagrams and may be lost on a busy host, so allow a few.
     let seen: BTreeSet<u64> = view.seen.iter().map(|(t, _)| *t).collect();
     let span = seen.last().expect("seen") - seen.first().expect("seen") + 1;
+    let every = space_protocol::far::interval(2);
     assert!(
-        seen.len() as u64 * 10 >= span * 9,
-        "seen on {} of {span} ticks",
+        seen.len() as u64 * every * 10 >= span * 9,
+        "seen on {} of {span} ticks, at one in {every}",
         seen.len()
     );
     drop(view);

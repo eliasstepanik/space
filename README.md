@@ -270,6 +270,20 @@ a body handed over in free flight goes on bit-identically; one handed over in
 contact — sliding, resting in a stack — within a millimetre, because the
 contact solver starts afresh on the shard that takes it.
 
+A border makes no difference to what a player **sees** either: every ship and
+body within 10 km is in the picture, whichever shard simulates it. What lies
+beyond the reach of a neighbour's ghosts (64 m from a border) arrives as a
+**far replica**: the shard that simulates it tells the other shards, each
+relays it to its own clients — a client keeps one play connection — and
+nothing collides with it. How often something's motion is sent falls with its
+distance, for far replicas and for everything else: every tick within 100 m,
+then 10, 5 and 1 times a second out to 250 m, 1 km and 10 km; what does not
+move is not sent. The client draws distant things a little further in the
+past and joins their sparse samples along their velocities
+(`crates/space-protocol/src/far.rs`, `crates/space-server/src/far.rs`). The
+harness says which copy of a thing a client holds: `source` (`local`, `ghost`,
+`far`), `step` and `sample_age_s` per body and per other player in `/state`.
+
 ## Test
 
 ```powershell

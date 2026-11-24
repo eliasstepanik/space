@@ -38,6 +38,8 @@
 //! * [`control`] — orchestrator load reports, directory and admin messages
 //! * [`scene`] — the scene catalogue ([`Scene`], [`SceneId`]) and the
 //!   revisioned [`SceneState`] the scene messages carry
+//! * [`far`] — the view range, the distance steps and the far-replica
+//!   messages ([`FarInterest`], [`FarUpdate`], [`Origin`])
 //! * [`codec`] — [`encode_frame`], [`decode_frame`], [`CodecError`]
 //! * [`snapshot`] — [`SnapshotBuilder`], the per-client byte budget
 //!
@@ -48,6 +50,7 @@
 
 pub mod codec;
 pub mod control;
+pub mod far;
 pub mod guid;
 pub mod messages;
 pub mod pos;
@@ -60,6 +63,7 @@ pub use codec::{
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 pub use control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+pub use far::{FarInterest, FarPlayer, FarUpdate, Origin, OriginKind, FAR_RANGE, ORIGIN_COMPONENT};
 pub use guid::EntityGuid;
 pub use messages::{
     Delta, EntitySnapshot, GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer,

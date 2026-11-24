@@ -496,6 +496,9 @@ impl Sim {
                 .sqrt(),
             parts: 1,
             in_view: true,
+            source: "local".into(),
+            step: 0,
+            sample_age_s: 0.0,
         }];
         self.state.bodies_in_view = 1;
     }

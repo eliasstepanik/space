@@ -89,11 +89,11 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::address::{dial, ServerAddress, DEFAULT_ADDRESS};
-use crate::bodies::{pose_at, BodyRenderer, Drawn, INTERPOLATION_DELAY};
+use crate::bodies::{draw_time, pose_at, BodyRenderer, Drawn, When, INTERPOLATION_DELAY};
 use crate::connect::Prompt;
 use crate::input::{CameraMode, Controls, Request, ScreenKind, KEY_HELP};
 use crate::kestrel::Detail;
-use crate::link::{OtherShip, Replica, ServerLink};
+use crate::link::{OtherShip, Replica, ServerLink, Source};
 use crate::predict::{Clock, OwnShip, Shown};
 use crate::scenes::{
     character_mesh, metres, relative, ship_mesh, Prop, SkyTime, World, EYE_HEIGHT,
@@ -102,6 +102,20 @@ use crate::ui::{self, ConnectView, HudView, Status};
 
 /// The most bodies [`ClientState::bodies`] lists (the nearest ones).
 pub const MAX_LISTED_BODIES: usize = 64;
+
+/// What one of the other players or ships the last frame drew is (for the
+/// harness: `ClientState::others`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OtherAbout {
+    /// A player flies it.
+    player: bool,
+    /// Which copy of it the shard sends.
+    source: Source,
+    /// How far it is from the own ship, metres.
+    distance: f64,
+    /// How old its newest sample is, ticks.
+    sample_age: f64,
+}
 
 /// The renderer draws at most this many point lights.
 const MAX_LIGHTS: usize = 8;
@@ -433,6 +447,8 @@ pub struct App {
     /// The other ships and players of the last frame as drawn: guid, and
     /// where in the scene (around the spawn point).
     drawn_others: Vec<(EntityGuid, WorldPos)>,
+    /// What each of `drawn_others` is, in the same order.
+    others_about: Vec<OtherAbout>,
 }
 
 impl std::fmt::Debug for App {
@@ -477,6 +493,7 @@ impl App {
             bodies: BodyRenderer::new(),
             drawn_bodies: Vec::new(),
             drawn_others: Vec::new(),
+            others_about: Vec::new(),
         };
         if config.server.is_some() {
             app.connect();
@@ -686,6 +703,7 @@ impl App {
         self.bodies.forget();
         self.drawn_bodies.clear();
         self.drawn_others.clear();
+        self.others_about.clear();
         match error {
             Some(error) => {
                 log::warn!("space-client: {error}");
@@ -1068,8 +1086,15 @@ impl App {
         let mut seen: Vec<EntityGuid> = Vec::new();
         let mut drawn_others = std::mem::take(&mut self.drawn_others);
         drawn_others.clear();
+        // Where the own ship is drawn, in the server's world.
+        let own = session.ship().map(|ship| ship.pos);
+        let mut others_about = std::mem::take(&mut self.others_about);
+        others_about.clear();
         for tracked in replica.other_ships() {
             let other = &tracked.ship;
+            // Further off, further in the past: far things are sent less
+            // often (`bodies::draw_time`).
+            let behind = behind.map(|t| draw_time(&tracked.history, t, own));
             let pos = behind
                 .and_then(|t| pose_at(&tracked.history, t))
                 .map_or(other.state.pos, |poses| poses[0].pos);
@@ -1078,6 +1103,12 @@ impl App {
             let place = scene_place(spawn, anchor, pos);
             seen.push(other.guid);
             drawn_others.push((other.guid, place));
+            others_about.push(OtherAbout {
+                player: tracked.is_player(),
+                source: tracked.source(),
+                distance: replica.distance_to(tracked),
+                sample_age: replica.sample_age(tracked),
+            });
             // A player (here or, as a ghost, on a neighbouring shard) is a
             // character; a ship nobody flies is the ship model.
             if !tracked.is_player() {
@@ -1099,15 +1130,19 @@ impl App {
         headings.retain(|(guid, _)| seen.contains(guid));
         self.headings = headings;
         self.drawn_others = drawn_others;
+        self.others_about = others_about;
         // The physics bodies, at the same moment.
         let t = behind.unwrap_or(replica.tick as f64);
         self.drawn_bodies = self.bodies.draw(
             replica,
-            t,
+            When {
+                t,
+                own,
+                carry: &|at, place| carry(at)(place),
+            },
             spawn,
             Instant::now(),
             &mut self.scene,
-            &carry(t),
         );
     }
 
@@ -1195,6 +1230,33 @@ impl App {
                 speed: f64::from(b.speed),
                 parts: u32::try_from(b.parts).unwrap_or(u32::MAX),
                 in_view: b.in_view,
+                source: b.source.name().to_owned(),
+                step: u32::from(space_protocol::far::step_for(b.distance)),
+                sample_age_s: b.sample_age * f64::from(space_sim::dt()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        out.truncate(MAX_LISTED_BODIES);
+        out
+    }
+
+    /// The other players and ships of the last frame as the harness lists
+    /// them: nearest first, at most [`MAX_LISTED_BODIES`].
+    fn other_states(&self, session: &Session) -> Vec<space_harness::OtherState> {
+        let eye = self.eye(session);
+        let spawn = self.world.spawn();
+        let mut out: Vec<space_harness::OtherState> = self
+            .drawn_others
+            .iter()
+            .zip(&self.others_about)
+            .map(|((guid, place), about)| space_harness::OtherState {
+                guid: format!("{guid}"),
+                player: about.player,
+                position: WorldPos::delta(spawn, *place),
+                distance: WorldPos::distance(eye, *place),
+                source: about.source.name().to_owned(),
+                step: u32::from(space_protocol::far::step_for(about.distance)),
+                sample_age_s: about.sample_age * f64::from(space_sim::dt()),
             })
             .collect();
         out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
@@ -1252,6 +1314,18 @@ impl App {
                     state.drawn_tick = Some(drawn.tick);
                 }
                 state.others_drawn = u32::try_from(self.drawn_others.len()).unwrap_or(u32::MAX);
+                state.others = self.other_states(session);
+                let far = self
+                    .drawn_bodies
+                    .iter()
+                    .filter(|b| b.source == Source::Far)
+                    .count()
+                    + self
+                        .others_about
+                        .iter()
+                        .filter(|o| o.source == Source::Far)
+                        .count();
+                state.far_drawn = u32::try_from(far).unwrap_or(u32::MAX);
                 let bodies = self.world.sky_bodies(&session.sky_time());
                 let eye = self.eye(session);
                 if let Some((body, surface)) = crate::scenes::nearest(&bodies, eye) {

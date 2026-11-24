@@ -100,7 +100,8 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        yaw_deg, pitch_deg, handoffs, scene, scene_revision, retry_in_s,
                        frame, width, height, fps,
                        gravity, landed, bodies (nearest first: guid, visual, visual_id,
-                       position, distance, speed, parts, in_view), bodies_in_view,
+                       position, distance, speed, parts, in_view, source
+                       (local|ghost|far), step, sample_age_s), bodies_in_view,
                        correction_m, correction_max_m,
                        shard_address (the shard being played on; address is the
                        entry address that was dialed, which may have sent the
@@ -109,7 +110,8 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        surface_m),
                        drawn_position, drawn_velocity, drawn_tick (the ship as the
                        last frame drew it: predicted, interpolated between ticks),
-                       others_drawn
+                       others_drawn, others (guid, player, position, distance,
+                       source, step, sample_age_s), far_drawn
 GET  /frame.png        the current picture, lossless PNG
 GET  /frame.jpg        the same as JPEG (?quality=1..100)
                        ?wait=1   block until the next frame

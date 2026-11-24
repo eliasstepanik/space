@@ -48,6 +48,12 @@ pub(super) struct GhostEntry {
     components: Components,
     /// Ticks it has been dead-reckoned since the last update.
     reckoned: u32,
+    /// The tick the ghost's state is the state **of**, on this shard's clock
+    /// (the cluster's): the tick its owner said with the update, then one
+    /// more with every tick it is moved on. `None` when the owner's ticks
+    /// are not ours (shards stepped by hand from different starts): the
+    /// ghost is then moved on a tick after every step, as it always was.
+    shown: Option<SimTick>,
     /// The island key its owner announced: `(lowest guid, home)`.
     island: Option<(EntityGuid, ShardId)>,
     /// The tick this shard handed the entity to `from` and kept this ghost
@@ -212,6 +218,13 @@ pub(super) fn replicated_of(
                     }
                 }
             }
+            // What a client is told this copy is (the harness says it; a
+            // ghost's samples are of the frame's own tick).
+            out.push((
+                space_protocol::ORIGIN_COMPONENT,
+                space_protocol::Origin::ghost(entry.from).encode(),
+            ));
+            out.sort_by_key(|(id, _)| *id);
             Some(out)
         }
         _ => replicate::replicated_components(sim, guid),
@@ -271,7 +284,7 @@ fn zero_owner(mut list: Components) -> Components {
 }
 
 /// `old` updated by the partial list `update` (an empty payload removes).
-fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
+pub(super) fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
     let mut out: Components = old.to_vec();
     for (id, bytes) in update {
         out.retain(|(i, _)| i != id);
@@ -285,7 +298,7 @@ fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
 
 /// What changed from `old` to `new`: new or different components, and an
 /// empty payload for each one that went away.
-fn diff(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> Components {
+pub(super) fn diff(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> Components {
     let mut out: Components = new
         .iter()
         .filter(|(id, bytes)| !old.iter().any(|(i, b)| i == id && b == bytes))
@@ -312,7 +325,7 @@ fn structure_differs(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> bool {
     shape(old) != shape(new)
 }
 
-fn component(list: &[(u16, Vec<u8>)], id: u16) -> Option<&[u8]> {
+pub(super) fn component(list: &[(u16, Vec<u8>)], id: u16) -> Option<&[u8]> {
     list.iter()
         .find(|(i, _)| *i == id)
         .map(|(_, b)| b.as_slice())
@@ -420,6 +433,7 @@ impl Shard {
                 Ok(entity) => {
                     self.guids.insert(body.guid, entity);
                     self.interest.upsert(body.guid, entity, pos);
+                    self.far.rescan = true;
                     spawned += 1;
                     // A body of another shard's ground goes there at once,
                     // however close to the border it lies.
@@ -448,26 +462,42 @@ impl Shard {
             return;
         }
         let mut now = self.stats();
-        // What the line is written for is a change in the counts; the tick
-        // and the clock's offset (never the same twice) ride along.
+        // What the line is written for is a change in the counts; the tick,
+        // the clock's offset (never the same twice) and the traffic of the
+        // last five seconds ride along.
         let offset_us = now.clock_offset_us;
+        let clients = now.clients;
+        let traffic = (now.far_bytes_out, now.far_bytes_in, now.client_bytes);
+        let before = std::mem::replace(&mut self.census_traffic, traffic);
+        let rate = |now: u64, before: u64| now.saturating_sub(before) / 5;
         now.tick = 0;
         now.clients = 0;
         now.clock_offset_us = 0;
-        if self.census == Some(now) {
+        now.far_bytes_out = 0;
+        now.far_bytes_in = 0;
+        now.client_bytes = 0;
+        // (`SPACE_CENSUS_ALWAYS`: every five seconds whether or not anything
+        // changed — for measuring the traffic of a quiet stack.)
+        if self.census == Some(now) && std::env::var_os("SPACE_CENSUS_ALWAYS").is_none() {
             return;
         }
         self.census = Some(now);
         println!(
-            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts; handoffs {} out, \
-             {} in, {} aborted; {} ticks jumped, {} caught up; clock offset {:+.1} ms",
+            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts, {} far; handoffs \
+             {} out, {} in, {} aborted; far {} B/s out, {} B/s in, {} B/s to {} clients; {} \
+             ticks jumped, {} caught up; clock offset {:+.1} ms",
             self.config.shard,
             now.ships,
             now.bodies,
             now.ghosts,
+            now.far,
             now.handed_off,
             now.received,
             now.aborted,
+            rate(traffic.0, before.0),
+            rate(traffic.1, before.1),
+            rate(traffic.2, before.2),
+            clients,
             now.skipped,
             now.caught_up,
             offset_us as f64 / 1e3
@@ -566,6 +596,7 @@ impl Shard {
         let guid = self.mint_guid();
         self.sim.spawn_body(guid, spawn)?;
         self.index_now(guid);
+        self.far.rescan = true;
         Ok(guid)
     }
 
@@ -1140,6 +1171,10 @@ impl Shard {
         match self.sim.import_entity(guid, &components) {
             Ok(_) => {
                 self.index_now(guid);
+                // Ours now: no far replica of it, and the other shards'
+                // players are told by us from here on.
+                self.far.claimed_by_the_world(guid);
+                self.far.rescan = true;
                 self.stats.received += 1;
                 self.note_sender_holds_ghost(pending.from, guid);
                 self.back_again(guid);
@@ -1188,6 +1223,7 @@ impl Shard {
                         player,
                         components: zero_owner(list),
                         reckoned: 0,
+                        shown: Some(self.sim.tick()),
                         island: None,
                         departed_at: Some(self.sim.tick()),
                     },
@@ -1205,7 +1241,7 @@ impl Shard {
     // ---------------------------------------------------------- ghosts in
 
     /// Drop the ghost `guid` (and, with `forget`, what clients were told).
-    fn drop_ghost(&mut self, guid: EntityGuid, forget: bool) {
+    pub(super) fn drop_ghost(&mut self, guid: EntityGuid, forget: bool) {
         let held = self.ghosts.remove(&guid).is_some();
         if self.sim.is_ghost(guid) {
             self.sim.despawn(guid);
@@ -1245,6 +1281,10 @@ impl Shard {
             return; // another map: wait for the next one
         }
         self.ghost_heard.insert(from, self.sim.tick());
+        // The tick these states are the states of, if the sender counts our
+        // ticks (see `reckon_ghosts`).
+        let shown = (update.tick.abs_diff(self.sim.tick()) <= border::GHOST_TICK_TOLERANCE)
+            .then_some(update.tick);
         let revision = self.scene.revision;
         let mut listed: HashSet<EntityGuid> = HashSet::new();
         for entity in update.entities {
@@ -1277,6 +1317,9 @@ impl Shard {
                     continue;
                 }
                 self.index_now(guid);
+                // A ghost of it is the nearer copy (see `far.rs`): a far
+                // replica of it becomes this ghost in place.
+                self.far.claimed_by_the_world(guid);
             } else {
                 let state = component(&merged, SHIP_STATE)
                     .and_then(|b| space_sim::wire::decode_ship_state(b).ok());
@@ -1297,14 +1340,19 @@ impl Shard {
                     player,
                     components: merged,
                     reckoned: 0,
+                    shown,
                     island,
                     departed_at: None,
                 },
             );
         }
+        // A ghost its owner withdraws has left the border margin, or that
+        // shard's hands: it is still there for whoever can see that far, so
+        // it is kept as a far replica until its shard confirms or the grace
+        // runs out (`far.rs`) — never a gap in between.
         for guid in update.removed {
             if self.ghosts.get(&guid).is_some_and(|e| e.from == from) {
-                self.remove_ghost(guid);
+                self.ghost_to_far(guid);
             }
         }
         if update.full {
@@ -1327,7 +1375,7 @@ impl Shard {
                 .map(|(g, _)| *g)
                 .collect();
             for guid in stale {
-                self.remove_ghost(guid);
+                self.ghost_to_far(guid);
             }
         }
         for key in update.islands {
@@ -1349,8 +1397,21 @@ impl Shard {
     /// starts from if no update arrives in between, the owner's state *now* —
     /// so a body crossing a border is not a tick behind on the side it enters,
     /// and does not jump by that tick when it arrives.
+    ///
+    /// **"Now" is a tick, not "one more than last time".** Two shards step at
+    /// the same instants, so whether the owner's update of tick `n` is here
+    /// before this shard's own step `n` or only after it is decided by
+    /// microseconds, and changes back and forth. A ghost that was moved on
+    /// one tick after every step, whatever its update said, therefore showed
+    /// the owner's state of this tick or of the next, a whole tick of motion
+    /// apart: a player flying past at 22 m/s was drawn to leap 0.75 m ahead
+    /// and wait there (seen on a live stack). So the ghost remembers the tick
+    /// its state is of ([`GhostEntry::shown`]) and is moved on only while
+    /// that is behind this shard's tick. Shards whose ticks do not agree
+    /// keep the old rule.
     pub(super) fn reckon_ghosts(&mut self) {
         let dt = f64::from(space_sim::dt());
+        let now = self.sim.tick();
         let step = |s: &ShipState| ShipState {
             pos: WorldPos::from_f64_metres_around(s.pos, s.vel.map(|v| f64::from(v) * dt)),
             ..*s
@@ -1360,6 +1421,11 @@ impl Shard {
             let Some(entry) = self.ghosts.get_mut(&guid) else {
                 continue;
             };
+            match entry.shown {
+                Some(at) if at >= now => continue, // already this tick's state
+                Some(at) => entry.shown = Some(at + 1),
+                None => {}
+            }
             if entry.reckoned >= border::GHOST_DEAD_RECKON_TICKS {
                 continue;
             }
@@ -1507,6 +1573,10 @@ impl Shard {
             removed.sort_unstable();
             for guid in &removed {
                 sent.remove(guid);
+            }
+            if !removed.is_empty() {
+                // What is no ghost there any more may be a far replica.
+                self.far.rescan = true;
             }
             self.ghost_sent.insert(n, sent);
             if full || !entities.is_empty() || !removed.is_empty() || !islands.is_empty() {

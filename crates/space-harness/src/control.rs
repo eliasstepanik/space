@@ -177,6 +177,36 @@ pub struct ClientState {
     /// drew.
     #[serde(default)]
     pub others_drawn: u32,
+    /// Those other players and ships, nearest first (at most 64): where each
+    /// was drawn and which copy of it the shard sends.
+    #[serde(default)]
+    pub others: Vec<OtherState>,
+    /// How many of the bodies and ships the last frame drew are **far
+    /// replicas**: simulated by another shard, beyond the reach of its border
+    /// ghosts, and relayed by the shard being played on.
+    #[serde(default)]
+    pub far_drawn: u32,
+}
+
+/// Another player's character or an unflown ship as the client draws it
+/// ([`ClientState::others`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OtherState {
+    /// The ship's guid, `"shard:serial"`.
+    pub guid: String,
+    /// Whether a player flies it (drawn as a character).
+    pub player: bool,
+    /// Where it is drawn, metres from the scene's spawn point.
+    pub position: [f64; 3],
+    /// How far that is from the ship (as drawn), metres.
+    pub distance: f64,
+    /// Which copy this is: `"local"`, `"ghost"` or `"far"` (see
+    /// [`BodyState::source`]).
+    pub source: String,
+    /// Its distance step ([`BodyState::step`]).
+    pub step: u32,
+    /// The age of its newest sample, seconds ([`BodyState::sample_age_s`]).
+    pub sample_age_s: f64,
 }
 
 /// One body of the solar system as the client draws it ([`ClientState::sky`]).
@@ -214,6 +244,24 @@ pub struct BodyState {
     pub parts: u32,
     /// Whether it is in the picture.
     pub in_view: bool,
+    /// Which copy of it the shard being played on sends: `"local"` (that
+    /// shard simulates it), `"ghost"` (a neighbour does, near the border: the
+    /// shard holds a ghost of it) or `"far"` (another shard does, further
+    /// off: a far replica, for seeing only).
+    #[serde(default)]
+    pub source: String,
+    /// Its distance step, 0 to 3: how often its motion is sent at this
+    /// distance (30, 10, 5, 1 times a second out to 100 m, 250 m, 1 km,
+    /// 10 km).
+    #[serde(default)]
+    pub step: u32,
+    /// How old its newest sample is, seconds: the newest tick heard minus
+    /// the tick that sample is the state of. Small for something that moves
+    /// (its step's spacing at most, plus a few ticks for a far replica);
+    /// it grows for as long as a body is at rest, because nothing is sent
+    /// for a body that does not change.
+    #[serde(default)]
+    pub sample_age_s: f64,
 }
 
 impl ClientState {
@@ -673,8 +721,21 @@ mod tests {
             speed: 0.25,
             parts: 1,
             in_view: true,
+            source: "far".into(),
+            step: 2,
+            sample_age_s: 0.2,
         }];
         state.bodies_in_view = 1;
+        state.far_drawn = 1;
+        state.others = vec![OtherState {
+            guid: "2:1".into(),
+            player: true,
+            position: [-200.0, 0.0, 0.0],
+            distance: 200.0,
+            source: "far".into(),
+            step: 1,
+            sample_age_s: 0.1,
+        }];
         state.correction_m = 0.002;
         state.fast = true;
         state.nearest = Some("Moon".into());
@@ -691,6 +752,11 @@ mod tests {
             serde_json::json!([12.0, -1.4, -1.6])
         );
         assert_eq!(json["bodies_in_view"], 1);
+        assert_eq!(json["bodies"][0]["source"], "far");
+        assert_eq!(json["bodies"][0]["step"], 2);
+        assert_eq!(json["far_drawn"], 1);
+        assert_eq!(json["others"][0]["source"], "far");
+        assert_eq!(json["others"][0]["player"], true);
         assert_eq!(json["correction_m"], 0.002);
         assert_eq!(json["screen"], "online");
         assert_eq!(json["error"], serde_json::Value::Null);
@@ -744,6 +810,8 @@ mod tests {
             "drawn_velocity",
             "drawn_tick",
             "others_drawn",
+            "others",
+            "far_drawn",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }

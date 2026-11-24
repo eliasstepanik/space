@@ -182,8 +182,9 @@ use std::time::{Duration, Instant};
 use space_ecs::{ComponentDef, ComponentId};
 use space_net::{client_endpoint_for, hello, join, Conn, Joined, NetError};
 use space_protocol::{
-    resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
-    PlayerInput, Redirect, SceneClock, SceneState, ShardId, ShardMap, Welcome,
+    far, resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
+    Origin, OriginKind, PlayerInput, Redirect, SceneClock, SceneState, ShardId, ShardMap, Welcome,
+    ORIGIN_COMPONENT,
 };
 use space_sim::articulation::{decode_articulation, decode_part_states};
 use space_sim::body::{decode_body, decode_residual, decode_visual};
@@ -385,9 +386,12 @@ pub fn map_anchor(map: &ShardMap) -> Option<WorldPos> {
 pub const HISTORY_TICKS: usize = 10;
 
 /// A gap between two updates of a *moving* entity longer than this, in
-/// ticks, is not interpolated across: the entity left the interest range and
-/// came back, or was moved by hand. Its history starts over.
-const MAX_INTERPOLATION_GAP: u64 = 15;
+/// ticks, is not interpolated across: its history starts over. Far things
+/// are sent as rarely as once a second (`space_protocol::far`), and a sample
+/// may be a tick late or wait a tick for room in a frame: two such spacings
+/// and a little is the longest gap that is still one motion. (It was 15
+/// ticks while everything was sent every tick.)
+const MAX_INTERPOLATION_GAP: u64 = 75;
 
 /// Below this speed (m/s) and spin (rad/s) an entity counts as resting: a
 /// shard sends nothing for a resting entity until it moves again, so the gap
@@ -567,6 +571,32 @@ struct ShipView {
     arriving: Option<(u64, Vec<EntityGuid>)>,
 }
 
+/// Which copy of an entity the shard being played on sends (its
+/// [`Origin`] component, or none).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+    /// The shard simulates it.
+    #[default]
+    Local,
+    /// A neighbouring shard does, near the border: the shard's ghost of it.
+    Ghost,
+    /// Another shard does, beyond its ghosts' reach: a far replica, relayed
+    /// for seeing only, its samples sparser with the distance.
+    Far,
+}
+
+impl Source {
+    /// `"local"`, `"ghost"` or `"far"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Source::Local => "local",
+            Source::Ghost => "ghost",
+            Source::Far => "far",
+        }
+    }
+}
+
 /// One entity a shard replicates — a ship or a physics body — as the client
 /// keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -584,9 +614,22 @@ pub struct Tracked {
     /// Its replicated component list as last received (what a prediction
     /// world builds its copy of the entity from).
     pub components: Arc<Vec<(ComponentId, Vec<u8>)>>,
+    /// Where its state is from when the shard does not simulate it itself
+    /// (`None`: it does).
+    pub origin: Option<Origin>,
 }
 
 impl Tracked {
+    /// Which copy of the entity this is.
+    #[must_use]
+    pub fn source(&self) -> Source {
+        match self.origin.map(|origin| origin.kind) {
+            None => Source::Local,
+            Some(OriginKind::Ghost) => Source::Ghost,
+            Some(OriginKind::Far) => Source::Far,
+        }
+    }
+
     /// Whether this is a physics body rather than a ship
     /// ([`Physical::is_body`]).
     #[must_use]
@@ -743,6 +786,15 @@ impl ShipView {
                 owner: owner_of(&entity).unwrap_or(0),
                 state,
             };
+            // The tick the state is the state of: the frame's — except for
+            // a far replica, whose sample was taken on the shard that
+            // simulates it a tick or two before this frame was built (never
+            // after it).
+            let origin = component(&entity, ORIGIN_COMPONENT).and_then(Origin::decode);
+            let at = match origin {
+                Some(origin) if origin.kind == OriginKind::Far => origin.tick.min(tick),
+                _ => tick,
+            };
             match held {
                 Some(i) => {
                     let seen = &mut self.ships[i];
@@ -750,7 +802,8 @@ impl ShipView {
                     let parts = seen.physics.as_ref().map_or(1, |p| p.part_count());
                     seen.ship = ship;
                     seen.tick = tick;
-                    seen.record(sample_of(&entity, state, tick, parts));
+                    seen.origin = origin;
+                    seen.record(sample_of(&entity, state, at, parts));
                     seen.components = Arc::new(entity.components);
                 }
                 None => {
@@ -762,8 +815,9 @@ impl ShipView {
                         physics,
                         history: VecDeque::new(),
                         components: Arc::new(Vec::new()),
+                        origin,
                     };
-                    seen.record(sample_of(&entity, state, tick, parts));
+                    seen.record(sample_of(&entity, state, at, parts));
                     seen.components = Arc::new(entity.components);
                     self.ships.push(seen);
                 }
@@ -1049,6 +1103,37 @@ impl Replica {
         self.ships.ships.iter().filter(move |seen| {
             Some(seen.ship.guid) != own && seen.ship.owner != session && !seen.is_body()
         })
+    }
+
+    /// How far `tracked` is from the own ship, metres (0 before the ship is
+    /// known): what its distance step and its draw delay follow.
+    #[must_use]
+    pub fn distance_to(&self, tracked: &Tracked) -> f64 {
+        self.state.map_or(0.0, |own| {
+            WorldPos::distance(own.pos, tracked.ship.state.pos)
+        })
+    }
+
+    /// How many ticks further in the past than the near range something as
+    /// far away as `tracked` is drawn (`space_protocol::far::draw_delay`):
+    /// things far away are sent less often, and are drawn far enough behind
+    /// to have the next sample in hand. A function of the distance alone, so
+    /// it does not step when an entity turns from a far replica into a ghost
+    /// and into an entity of the shard being played on. (The app takes the
+    /// distance to where it draws the two, `crate::bodies::draw_time`; this
+    /// is the same from the shard's last word on both.)
+    #[must_use]
+    pub fn extra_delay(&self, tracked: &Tracked) -> f64 {
+        far::draw_delay(self.distance_to(tracked)) - far::NEAR_DELAY
+    }
+
+    /// How old the newest sample of `tracked` is, ticks: the newest tick
+    /// heard minus the tick the sample is the state of.
+    #[must_use]
+    pub fn sample_age(&self, tracked: &Tracked) -> f64 {
+        tracked
+            .latest()
+            .map_or(0.0, |sample| self.tick.saturating_sub(sample.tick) as f64)
     }
 
     /// The ship's displacement from where it first appeared, metres.
@@ -2576,6 +2661,83 @@ mod tests {
     /// A ship marked with the player visual is a player whatever its owner
     /// (the ghost of a player on a neighbouring shard arrives with owner 0);
     /// one without it and without an owner is a ship nobody flies.
+    /// One entity, three copies in turn: a far replica (its samples at the
+    /// tick its origin names), the shard's ghost of it, an entity of the
+    /// shard itself — one history, in order, and a delay that depends on the
+    /// distance alone.
+    ///
+    /// Mutation this catches: taking a far sample for the state of the
+    /// frame's tick (it is the state of a tick or two earlier: the entity
+    /// would be drawn that much of its motion behind, and jump forward by
+    /// it when it becomes a ghost); reading the source off anything but the
+    /// newest word (an entity that was far once stays "far").
+    #[test]
+    fn a_far_replicas_samples_are_of_the_tick_its_origin_names() {
+        use space_protocol::Origin;
+        let shard = ShardId::new(1);
+        let other = ShardId::new(2);
+        let (me, it) = (EntityGuid::new(shard, 1), EntityGuid::new(other, 5));
+        let with = |x: f64, origin: Option<Origin>| {
+            let mut e = ship(it, 0, x);
+            e.components.retain(|(id, _)| *id == ShipState::ID);
+            match origin {
+                Some(origin) => e.components.push((ORIGIN_COMPONENT, origin.encode())),
+                // (A delta says a component went away with an empty payload.)
+                None => e.components.push((ORIGIN_COMPONENT, Vec::new())),
+            }
+            e
+        };
+        let mut r = Replica::new(7, shard);
+        r.apply(&frame(
+            100,
+            vec![ship(me, 7, 0.0), with(300.0, Some(Origin::far(other, 98)))],
+        ));
+        let seen = r.entity(it).expect("held");
+        assert_eq!(seen.source(), Source::Far);
+        assert_eq!(seen.latest().expect("a sample").tick, 98);
+        assert_eq!(seen.tick, 100, "the frame's tick still orders the frames");
+        assert_eq!(r.sample_age(seen), 2.0);
+        assert_eq!(r.distance_to(seen), 300.0);
+        assert_eq!(
+            r.extra_delay(seen),
+            far::draw_delay(300.0) - far::NEAR_DELAY
+        );
+        // The next sample, six ticks on; a far tick from the future is held
+        // to the frame's.
+        r.apply(&delta(
+            106,
+            vec![with(290.0, Some(Origin::far(other, 104)))],
+            vec![],
+        ));
+        r.apply(&delta(
+            107,
+            vec![with(289.0, Some(Origin::far(other, 900)))],
+            vec![],
+        ));
+        // It comes into the border margin: the shard's ghost of it; then it
+        // is handed over: the shard's own.
+        r.apply(&delta(
+            109,
+            vec![with(280.0, Some(Origin::ghost(other)))],
+            vec![],
+        ));
+        assert_eq!(r.entity(it).expect("held").source(), Source::Ghost);
+        r.apply(&delta(110, vec![with(279.0, None)], vec![]));
+        let seen = r.entity(it).expect("held");
+        assert_eq!(seen.source(), Source::Local);
+        assert!(seen
+            .components
+            .iter()
+            .all(|(id, _)| *id != ORIGIN_COMPONENT));
+        // (It is at rest in every sample, so the history also holds where it
+        // stood until each next one.)
+        let ticks: Vec<u64> = seen.history.iter().map(|s| s.tick).collect();
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]), "in order: {ticks:?}");
+        for tick in [98, 104, 107, 109, 110] {
+            assert!(ticks.contains(&tick), "one history: {ticks:?}");
+        }
+    }
+
     #[test]
     fn the_player_visual_makes_a_ghost_a_player() {
         use space_sim::Visual;
@@ -2608,7 +2770,13 @@ mod tests {
     /// A shard sends nothing for an entity at rest; when it moves again, the
     /// history holds its rest pose up to the tick before, so the move is not
     /// smeared back over the quiet ticks — and a long gap of a moving entity
-    /// starts the history over.
+    /// starts the history over. "Long" is longer than two spacings of the
+    /// coarsest distance step: something far off is sent once a second, and
+    /// 39 ticks between two of its samples are one motion (they were a
+    /// restart while everything was sent every tick).
+    ///
+    /// Mutation this catches: the old limit of 15 ticks — everything beyond
+    /// a kilometre would start over at every sample and be drawn in jumps.
     #[test]
     fn a_resting_entity_holds_until_it_moves() {
         let guid = EntityGuid::new(ShardId::new(1), 3);
@@ -2626,15 +2794,26 @@ mod tests {
         };
         moving.components[1].1 = space_sim::wire::encode_ship_state(&state);
         r.apply(&frame(21, vec![moving.clone()]));
-        r.apply(&frame(60, vec![moving]));
-        let ticks: Vec<u64> = r
-            .entity(guid)
-            .unwrap()
-            .history
-            .iter()
-            .map(|s| s.tick)
-            .collect();
-        assert_eq!(ticks, [60], "a moving entity's long gap starts over");
+        r.apply(&frame(60, vec![moving.clone()]));
+        let ticks = |r: &Replica| -> Vec<u64> {
+            r.entity(guid)
+                .unwrap()
+                .history
+                .iter()
+                .map(|s| s.tick)
+                .collect()
+        };
+        assert_eq!(
+            ticks(&r),
+            [10, 19, 20, 21, 60],
+            "39 ticks: a sparse sample of one motion"
+        );
+        r.apply(&frame(60 + MAX_INTERPOLATION_GAP + 1, vec![moving]));
+        assert_eq!(
+            ticks(&r),
+            [60 + MAX_INTERPOLATION_GAP + 1],
+            "a moving entity's long gap starts over"
+        );
     }
 
     /// The inputs the link sends are kept for the prediction, and the frame's

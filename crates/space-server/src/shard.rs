@@ -37,6 +37,16 @@ use crate::replicate::{
 mod physics;
 pub use physics::BodyInfo;
 
+// The far half: what the other shards simulate in view of this shard's
+// players, and what this shard tells them of its own.
+#[path = "far.rs"]
+mod far;
+pub use far::{
+    FarInfo, FAR_COMPONENTS, FAR_INTERESTS, FAR_INTEREST_STALE_TICKS, FAR_INTEREST_TICKS,
+    FAR_MAX_LAG, FAR_ORPHAN_TICKS, FAR_RECEIVE_BYTES, FAR_REFRESH_TICKS, FAR_SILENCE_TICKS,
+    MAX_FAR_ENTITY_BYTES, MAX_FAR_PER_PEER,
+};
+
 /// Hard cap on concurrent client sessions per shard (docs/plan.md U9).
 pub const MAX_PLAYERS_PER_SHARD: usize = 100;
 
@@ -159,6 +169,17 @@ pub struct ShardStats {
     /// Ticks this shard jumped over because it could not keep up with the
     /// cluster clock (see [`crate::clock`]).
     pub skipped: SimTick,
+    /// Far replicas of other shards' entities held here (`far.rs`).
+    pub far: usize,
+    /// Far messages of peers that were dropped: over a bound, or naming a
+    /// shard the connection is not.
+    pub far_refused: u64,
+    /// Bytes of far messages sent to other shards, in all.
+    pub far_bytes_out: u64,
+    /// Bytes of far updates taken from other shards, in all.
+    pub far_bytes_in: u64,
+    /// Bytes of frames built for clients, in all.
+    pub client_bytes: u64,
     /// Ticks handed-over entities were brought forward at their install
     /// because the commit arrived late (see [`crate::handoff`], guarantee 4).
     pub caught_up: SimTick,
@@ -309,6 +330,11 @@ pub struct Shard {
     next_group: u64,
     /// What the last census line said (see `Shard::report_census`).
     census: Option<ShardStats>,
+    /// The byte counters when the census last looked (far out, far in,
+    /// clients): what its rates are taken against.
+    census_traffic: (u64, u64, u64),
+    /// Far replicas: held, and sent (`far.rs`).
+    far: far::FarState,
     /// The transfers called off lately, newest last (see [`AbortNote`]).
     abort_notes: std::collections::VecDeque<AbortNote>,
     /// Abort lines written in the current window, and the tick it began at
@@ -361,6 +387,8 @@ impl Shard {
             sent_home: HashMap::new(),
             next_group: 0,
             census: None,
+            census_traffic: (0, 0, 0),
+            far: far::FarState::default(),
             abort_notes: std::collections::VecDeque::new(),
             abort_lines: (0, 0, 0),
             shard_map: map,
@@ -668,6 +696,7 @@ impl Shard {
         s.ships = self.sim.ship_count();
         s.clients = self.clients.len();
         s.ghosts = self.ghosts.len();
+        s.far = self.far.len();
         s.bodies = self
             .sim
             .bodies()
@@ -873,6 +902,7 @@ impl Shard {
         self.guids.insert(guid, entity);
         self.interest.upsert(guid, entity, pos);
         self.mark_player(guid, session);
+        self.far.rescan = true;
         guid
     }
 
@@ -1111,6 +1141,8 @@ impl Shard {
             Message::HandoffAbort(abort) => self.on_abort(abort),
             Message::NeighbourStatus(status) => self.on_neighbour_status(from, status),
             Message::GhostUpdate(update) => self.on_ghost_update(from, update),
+            Message::FarInterest(interest) => self.on_far_interest(from, interest),
+            Message::FarUpdate(update) => self.on_far_update(from, update),
             Message::StaleEpoch(stale) => {
                 // Our map is behind: any transfer we have in flight is invalid.
                 let stale_transfers: Vec<(EntityGuid, ShardId)> = self
@@ -1643,6 +1675,9 @@ impl Shard {
         self.border_pass();
         self.handoff_pass(tick);
         self.ghost_pass(tick);
+        // ... and, beyond the ghosts' reach, what the other shards' players
+        // can see of ours (`far.rs`).
+        self.far_pass(tick);
 
         // 5.5 The scene, again, for whoever missed it (see
         // [`SCENE_REANNOUNCE_TICKS`]). Before the frames, so a tick's last
@@ -1775,6 +1810,8 @@ impl Shard {
             self.interest
                 .upsert(pending.guid, entity, pending.state.pos);
             self.mark_player(pending.guid, pending.session);
+            self.far.claimed_by_the_world(pending.guid);
+            self.far.rescan = true;
             self.stats.received += 1;
             self.note_sender_holds_ghost(pending.from, pending.guid);
             // The inputs for the ticks to come are the simulation's now.
@@ -2170,6 +2207,8 @@ impl Shard {
                 physics::replicated_of(sim, ghosts, guid)
             });
         }
+        // ... and the far replicas whose sample is new.
+        self.record_far(self.sim.tick());
         let radius = self.config.interest_radius;
         let cx = replicate::FrameContext {
             shard: self.config.shard,
@@ -2190,7 +2229,7 @@ impl Shard {
             let Some(anchor) = self.sim.ship_state(ship).map(|s| s.pos) else {
                 continue;
             };
-            let visible = self.interest.visible(anchor, radius);
+            let (visible, distances) = self.interest.visible_at(anchor, radius);
             visible_set.clear();
             visible_set.extend(visible.iter().copied());
             let frame = replicate::build_frame(
@@ -2201,8 +2240,10 @@ impl Shard {
                 Visible {
                     ordered: &visible,
                     set: &visible_set,
+                    distances: &distances,
                 },
             );
+            self.stats.client_bytes += frame.wire_len() as u64;
             let message = match frame {
                 Frame::Snapshot(snapshot) => Message::Snapshot(snapshot),
                 Frame::Delta(delta) => Message::Delta(delta),

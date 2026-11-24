@@ -115,7 +115,8 @@ in metres from the scene's spawn point (what the HUD prints). The physics:
 weightless space), `landed` (standing on something in gravity), `bodies` (the
 physics bodies drawn, nearest first: `guid`, `visual` — `crate`, `ball`,
 `plank`, `door`, `chain`, `pendulum` — `position` in the frame of
-`scene_position`, `distance`, `speed`, `parts`, `in_view`), `bodies_in_view`,
+`scene_position`, `distance`, `speed`, `parts`, `in_view`, and which copy of
+it this is: `source`, `step`, `sample_age_s`, below), `bodies_in_view`,
 and `correction_m` / `correction_max_m` (how far the client's prediction of
 its own ship was from the shard's word). **What is drawn** is `drawn_position`
 (the frame of `scene_position`), `drawn_velocity` and `drawn_tick`: the own
@@ -123,8 +124,19 @@ ship as the last frame showed it — predicted ahead of the shard and
 interpolated between ticks, so it moves every frame, where `scene_position`
 is the shard's word and steps thirty times a second — and the fractional tick
 it was drawn at; `others_drawn` counts the other players and ships in the
-frame. Look at these, not at `scene_position`, for a step or a rubber band
-(section 4, "Seamless crossing"). `?wait=1` on a
+frame and `others` lists them (`guid`, `player`, `position`, `distance`,
+`source`, `step`, `sample_age_s`). Look at these, not at `scene_position`,
+for a step or a rubber band (section 4, "Seamless crossing").
+**Which copy of a thing the client holds**: `source` is `local` (the shard
+being played on simulates it), `ghost` (a neighbour does, within 64 m of a
+border: the shard's ghost of it) or `far` (another shard does, further off: a
+far replica, relayed for seeing only); `step` is its distance step, 0 to 3
+(its motion is sent 30, 10, 5, 1 times a second out to 100 m, 250 m, 1 km,
+10 km from the ship — whatever its source); `sample_age_s` is how old its
+newest sample is (the step's spacing at most while it moves, a few ticks
+more for a far replica; it **grows while a thing is at rest**: nothing is
+sent for what does not change); `far_drawn` counts the far replicas in the
+frame, bodies and ships. `?wait=1` on a
 frame blocks until the next one. `frame.jpg` is small and fine for looking;
 `frame.png` is lossless (and large) for pixel-exact checks. Input is
 the same vocabulary a person has: keys (`w a s d space shift`, `enter backspace
@@ -324,8 +336,33 @@ Check what your change touches, and one step either side of it.
   hop, jitter, vanish or be there twice; a second client on the neighbour's
   shard lists the same bodies at the same places (`bodies` is drawn state:
   two clients sampled a few milliseconds apart differ by that much motion,
-  and not at all at rest). A body knocked more than 64 m from every border
-  is missing for clients of the other shards — known, section 6.
+  and not at all at rest).
+- **Seeing across shards** (`docs/plan-sharding.md` §6; the repeatable
+  version is `crates/space-server/tests/far.rs`). A border makes no
+  difference to what is in `bodies` and `others`: every client lists the
+  same 35 bodies of the showcase, each once, whichever shard it is on, and
+  the count equals the one of a `-MinShards 1` stack. From the spawn point
+  none of them is `far`: the showcase lies within 64 m of the borders, so
+  the other shards' part of it arrives as ghosts (and a thing within 64 m
+  of *any* face of its cell counts as near the root's ground too —
+  `border::territory_distance` is a lower bound). To see far replicas put
+  something more than 64 m (plus three seconds of its motion) from both
+  border planes: a second client at `pos` -110 0 80 is `far` for one on the
+  spawn point (`others[1].source`, `far_drawn` 1); a zero-g crate knocked
+  south-west — rise half a metre, ram the one at -17.0 1.1 -1.5 along
+  (-0.8, 0, 0.6) — turns from `ghost` into `far` about 140 m out and stays
+  in every frame. Sample `others` / `bodies` as fast as `/state` answers
+  while the thing moves: its drawn position moves on by its speed times
+  the frame time, through the changes of `source` and `step` (a change of
+  the step from one frame to the next of more than a few centimetres at
+  40 m/s is a defect). Fly away in fast travel: the bodies stay listed to
+  10 km and are gone beyond it, and come back on the way in. Kill the
+  shard a far player is on (by pid, below): it is gone from `others`
+  within about three seconds. The census line of each shard says what
+  this costs: `N far` (replicas held), `far N B/s out, N B/s in` (to and
+  from the other shards) and `N B/s to N clients`; with
+  `SPACE_CENSUS_ALWAYS` set in the stack's environment it is written
+  every five seconds whether or not a count changed.
 - **Seamless crossing** (`docs/plan-sharding.md` §5): a change of shard
   shows in the HUD's shard number and in nothing else. Sample `/state` as
   fast as it answers while crossing and look at what is **drawn**:
@@ -378,8 +415,9 @@ Check what your change touches, and one step either side of it.
 - **Handoff:** `--topology two-shards`, fly across (the border is at HUD
   `pos` x = 512); the picture must not jump and the scene must stay where it
   was. Players and bodies within 64 m (plus 3 s of their motion) of a border
-  are seen from both sides (the neighbour's *ghosts*); further apart a
-  client sees its own shard's only.
+  are seen from both sides as the neighbour's *ghosts*, which the physics
+  of both sides collides with; further apart they are seen as *far
+  replicas*, out to 10 km ("Seeing across shards" above).
 - **Where the borders are:** a shard area is at least one cell (1024 m). In
   `two-shards` each shard is one cell and the scene sits in the middle of
   shard 1's, 512 m from every border. Under a root of more than one cell —

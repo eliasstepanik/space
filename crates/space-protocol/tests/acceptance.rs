@@ -265,13 +265,37 @@ fn all_messages() -> Vec<Message> {
         }),
         Message::SceneUpdate(SceneState::new(Scene::Materials.id(), 9)),
         Message::SceneClock(SceneClock::new(1234, 1_763_900_000_123_456)),
+        join_redirect_message(),
+        Message::FarInterest(space_protocol::FarInterest {
+            from: shard(4),
+            tick: 77,
+            players: vec![space_protocol::FarPlayer {
+                cell: [1, -2, 3],
+                local: [0.5, -100.0, 511.0],
+            }],
+            missing: vec![guid(4, 9)],
+        }),
         last_message(),
     ]
 }
 
-/// The last message in tag order (`JoinRedirect`, tag 29): the map names the
-/// shard to dial with a client endpoint of its own.
+/// The last message in tag order (`FarUpdate`, tag 31).
 fn last_message() -> Message {
+    Message::FarUpdate(space_protocol::FarUpdate {
+        from: shard(2),
+        tick: 31,
+        new: vec![entity(2, 5, 3)],
+        changed: vec![entity(2, 6, 1)],
+        removed: vec![guid(2, 7)],
+        refresh: true,
+        held: vec![guid(2, 5), guid(2, 6)],
+        more: false,
+    })
+}
+
+/// `JoinRedirect` (tag 29): the map names the shard to dial with a client
+/// endpoint of its own.
+fn join_redirect_message() -> Message {
     let mut map = sample_map();
     map.regions[1] = map.regions[1].clone().with_client_endpoint(any_host(7_002));
     Message::JoinRedirect(JoinRedirect {
@@ -294,7 +318,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 39);
+    assert_eq!(messages.len(), 41);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -468,13 +492,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 30, so the valid wire tags are `0..=29`.
-    // The boundary that matters is tag 30 — the first tag past the last variant.
+    // `Message::VARIANT_COUNT` is 32, so the valid wire tags are `0..=31`.
+    // The boundary that matters is tag 32 — the first tag past the last variant.
     // (An earlier revision tested the literals 28/29 while the count was 25:
     // unknown only incidentally, and "passing" for ever as variants were
     // appended — which is why the bound below is the count itself.)
-    assert_eq!(Message::VARIANT_COUNT, 30);
-    let first_invalid = Message::VARIANT_COUNT; // 30
+    assert_eq!(Message::VARIANT_COUNT, 32);
+    let first_invalid = Message::VARIANT_COUNT; // 32
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -486,7 +510,7 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (29, `JoinRedirect`) must decode, proving 30 is the
+    // The last valid tag (31, `FarUpdate`) must decode, proving 32 is the
     // first rejection and not an off-by-one that also drops the last variant.
     let last_valid = last_message();
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
@@ -892,7 +916,7 @@ impl Rng {
         }
     }
     fn message(&mut self) -> Message {
-        match self.below(30) {
+        match self.below(32) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -1092,9 +1116,30 @@ impl Rng {
             }),
             27 => Message::SceneUpdate(self.scene_state()),
             28 => Message::SceneClock(SceneClock::new(self.next_u64(), self.next_u64() as i64)),
-            _ => Message::JoinRedirect(JoinRedirect {
+            29 => Message::JoinRedirect(JoinRedirect {
                 shard: self.shard(),
                 shard_map: self.map(),
+            }),
+            30 => Message::FarInterest(space_protocol::FarInterest {
+                from: self.shard(),
+                tick: self.next_u64(),
+                players: (0..self.below(4))
+                    .map(|_| space_protocol::FarPlayer {
+                        cell: [self.next_u64() as i64, self.next_u64() as i64, 7],
+                        local: [self.below(500) as f32, -1.5, 0.0],
+                    })
+                    .collect(),
+                missing: (0..self.below(4)).map(|_| self.guid()).collect(),
+            }),
+            _ => Message::FarUpdate(space_protocol::FarUpdate {
+                from: self.shard(),
+                tick: self.next_u64(),
+                new: self.entities(),
+                changed: self.entities(),
+                removed: (0..self.below(4)).map(|_| self.guid()).collect(),
+                refresh: self.below(2) == 0,
+                held: (0..self.below(4)).map(|_| self.guid()).collect(),
+                more: self.below(2) == 0,
             }),
         }
     }
@@ -1590,17 +1635,16 @@ fn an_unknown_scene_id_decodes_and_the_receiver_can_fall_back() {
 // One address: join redirects and client endpoints (protocol 7)
 // ---------------------------------------------------------------------------
 
-/// `JoinRedirect` is the last message of the enum (tag 29), carries the shard
-/// to dial and the sender's map, and reports that map's epoch.
+/// `JoinRedirect` keeps tag 29 (the last message until the far replicas were
+/// appended behind it), carries the shard to dial and the sender's map, and
+/// reports that map's epoch.
 ///
-/// Mutation this catches: inserting the variant anywhere but at the end
-/// (every later tag moves), or dropping the map (the client would have no
-/// address to dial).
+/// Mutation this catches: inserting a variant before it (its tag moves), or
+/// dropping the map (the client would have no address to dial).
 #[test]
-fn a_join_redirect_round_trips_as_the_last_tag() {
-    let message = last_message();
+fn a_join_redirect_round_trips_at_tag_29() {
+    let message = join_redirect_message();
     assert_eq!(message.wire_tag(), 29);
-    assert_eq!(message.wire_tag(), Message::VARIANT_COUNT - 1);
     assert_eq!(message.epoch(), Some(sample_map().epoch));
     let frame = encode_frame(&message);
     assert_eq!(&payload_of(&frame)[..4], &29u32.to_be_bytes());

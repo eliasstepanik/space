@@ -286,6 +286,10 @@ pub const MAX_HOLD_DOUBLINGS: u32 = 4;
 pub const BODY_HANDOFF_LEAD: SimTick = 8;
 /// A full ghost refresh to every neighbour this often, ticks.
 pub const GHOST_REFRESH_TICKS: SimTick = space_sim::TICK_HZ as SimTick;
+/// A ghost update whose tick is within this many ticks of the receiver's own
+/// is taken to be on the receiver's clock (the cluster's): its states are
+/// then shown as the states of that tick (`Shard::reckon_ghosts`).
+pub const GHOST_TICK_TOLERANCE: SimTick = 4;
 /// A ghost with no update is dead-reckoned for at most this many ticks.
 pub const GHOST_DEAD_RECKON_TICKS: u32 = 10;
 /// A neighbour silent for this many ticks loses its ghosts here.

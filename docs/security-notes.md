@@ -307,6 +307,50 @@ by default.
 * **Never drive a client with OS-level input** (SendKeys, xdotool, clipboard):
   that is not a harness, it types into whatever has focus. See `AGENT.md`.
 
+## Far replicas between shards (`FarInterest`, `FarUpdate`)
+
+Since phase 5 (`docs/plan-sharding.md` §6) a shard tells the other shards of its map where its
+players are and is sent what they should see of those shards' entities beyond the border ghosts;
+it relays that to its clients. What is new on the wire and what bounds it
+(`space-server/src/far.rs`, "What a peer may do"; `space_protocol::far`):
+
+* **No new listener, no new credential.** Both messages ride the peer connections the handoff
+  uses: taken only after the peer hello was admitted (the cluster's peer token), only from a shard
+  the receiver's map names, and only as that shard — `from` is checked against the connection.
+  A client never sends or receives either message; what it gets of a far entity is an ordinary
+  replicated entity with an `Origin` component.
+* **Bounded on receipt.** A `FarUpdate` over 32 KiB of entities and names, more than 512 KiB of
+  updates a second from one shard, more than nine `FarInterest`s a second, an interest naming more
+  than 256 players or asking for more than 256 entities again, an entity of more than 16 KiB of
+  components, a 4097th far replica of one shard: each is dropped and counted
+  (`ShardStats::far_refused`). A refresh's list of names stops at 4096. The log line about a drop
+  goes through a `LogBudget` (three per ten seconds, the rest counted).
+* **A far message cannot write what a shard simulates or holds a ghost of**: a guid that is in the
+  receiver's world is skipped (`tests/far.rs`,
+  `what_a_peer_sends_is_bounded_and_cannot_overwrite_local_entities`). A far replica is in no
+  physics and no handoff, on the shard or on a client (a client's prediction does not copy one).
+* **Only what draws an entity crosses** (`FAR_COMPONENTS`: motion, shape, model, springs, joints,
+  part poses), cut down by the sender *and* by the receiver. A player's `Owner` (a session id),
+  its `ShipControls` and anything private to a handoff — the owner's token lives only there —
+  never leave the shard that simulates the ship. What does leave it is **where its players are**:
+  every other shard of the cluster learns their positions three times a second. They are shards of
+  one cluster on one host; a peer holding the token learns nothing a player near enough would not
+  see.
+* **A sample's tick is not trusted**: it is held to the receiver's own clock (at most 8 ticks
+  behind it, never ahead), so a peer cannot place a sample somewhere else on a client's timeline.
+* **What it does not cover.** One peer token for the whole cluster (above): a shard that holds it
+  can claim a neighbour's id, and can then show this shard's clients a wrong picture of that
+  neighbour's distant entities — a far replica is taken over from another shard by a newer sample.
+  It cannot move anything, and the picture is corrected or dropped within three seconds of the
+  real shard's next word. The bounds are per peer; eight peers at the bound are 4 MiB a second.
+
+## The census knob (`SPACE_CENSUS_ALWAYS`)
+
+A shard writes its census line every five seconds when its counts changed. With the environment
+variable `SPACE_CENSUS_ALWAYS` set (to anything) it writes it every five seconds regardless — for
+reading the traffic of a quiet stack off the log (`far N B/s out, N B/s in, N B/s to N clients`).
+It changes nothing but that log line; nothing sets it.
+
 ## The shard's stall hook (`SPACE_DEBUG_STALL_DIR`)
 
 `space-server` has one debugging hook in its tick loop (`space-server/src/clock.rs`,

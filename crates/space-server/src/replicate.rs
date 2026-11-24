@@ -87,15 +87,45 @@
 //! the client does not hold yet (or one a lost frame owes), carries the full
 //! set; any other delta entry carries the `ShipState` and the `Owner` (always:
 //! they name the entity's motion and its player) plus only the components
-//! whose bytes changed since the client's change base — so a crate's shape,
-//! a chain's joints and a pendulum's spring go out once, and a moving body
-//! costs its state, its residual and its part states. A component that went
-//! away is listed with an empty payload (protocol 5, [`Delta::entities`]).
+//! whose bytes changed since the entity was last sent to this client — so a
+//! crate's shape, a chain's joints and a pendulum's spring go out once, and a
+//! moving body costs its state, its residual and its part states. A component
+//! that went away is listed with an empty payload (protocol 5,
+//! [`Delta::entities`]).
+//!
+//! # How often: distance steps
+//!
+//! An entity is not sent to a client more often than its **step** allows
+//! ([`space_protocol::far`]: every tick within 100 m of the client's ship,
+//! then 10, 5 and 1 times a second out to the 10 km of the view range), and
+//! only when it changed. So every client holds, per entity, the tick it was
+//! last sent it ([`ClientReplica::sent`]) in place of one change base for
+//! all: an entity that was skipped for a while and has come to rest by the
+//! time its turn comes is still brought up to date, with whatever changed
+//! since *its* last word. An entity that has been at rest for longer than its
+//! step's spacing and moves again is due at once, so its first sample is the
+//! start of the motion, not a point somewhere along it.
+//!
+//! The bound that follows: a client is sent at most
+//! `sum over the moving entities in its view of (bytes of one sample x the
+//! rate of its step)` a second, plus 56 bytes a tick for the frame itself,
+//! and never more than the frame budget a tick. A sample of a body that only
+//! moves is its `ShipState` and `PosResidual` — about 130 bytes with the
+//! entry's own framing — so a hundred bodies tumbling a kilometre away cost what
+//! three and a half cost at arm's length.
+//!
+//! # Far replicas
+//!
+//! What another shard simulates beyond the reach of its ghosts is in a
+//! client's interest set like anything else, and is not in the simulation at
+//! all: the shard keeps such an entity in the interest grid under a key of
+//! its own ([`Interest::upsert_far`]) and records its components in the
+//! [`ComponentLog`] when the other shard sends them (`far.rs`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use space_ecs::{ComponentDef, ComponentId, Entity, WithEntity};
-use space_protocol::{Delta, EntityGuid, EntitySnapshot, ShardId, Snapshot, SnapshotBuilder};
+use space_protocol::{far, Delta, EntityGuid, EntitySnapshot, ShardId, Snapshot, SnapshotBuilder};
 use space_sim::{Body, Owner, ShipControls, ShipState, SimWorld};
 use space_world::{InterestGrid, WorldPos};
 
@@ -140,6 +170,15 @@ struct LogEntry {
     components: Vec<(ComponentId, Vec<u8>, u64)>,
     /// Components that went away, and when.
     removed: Vec<(ComponentId, u64)>,
+    /// The tick of the last [`ComponentLog::record`]: the entity changed
+    /// then (its row did, or a far replica's sample arrived), whether or not
+    /// any byte differs.
+    touched: u64,
+    /// The entity left this shard's view ([`ComponentLog::forget`]): nothing
+    /// is logged for it, but what it had is remembered as removed for a
+    /// while, in case it is back under another kind of copy before a client
+    /// was told it had gone.
+    gone: bool,
 }
 
 impl ComponentLog {
@@ -152,13 +191,13 @@ impl ComponentLog {
     /// Number of entities logged.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.values().filter(|e| !e.gone).count()
     }
 
     /// Whether nothing is logged.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     /// Record `guid`'s current components at `tick`: a component whose bytes
@@ -166,6 +205,8 @@ impl ComponentLog {
     /// gone is remembered as removed at `tick`.
     pub fn record(&mut self, guid: EntityGuid, components: Components, tick: u64) {
         let entry = self.entries.entry(guid).or_default();
+        entry.touched = tick;
+        entry.gone = false;
         let mut next: Vec<(ComponentId, Vec<u8>, u64)> = Vec::with_capacity(components.len());
         for (id, bytes) in components {
             let changed_at = match entry.components.iter().find(|(old, _, _)| *old == id) {
@@ -187,8 +228,25 @@ impl ComponentLog {
     }
 
     /// Forget `guid` (it left this shard's world).
+    ///
+    /// Its components are kept as **removed** for [`TOMBSTONE_TICKS`]. An
+    /// entity that leaves the world may be back the same tick as another
+    /// kind of copy — a ghost whose ship has just been handed here and is
+    /// installed as this shard's own, a ghost that is withdrawn and shown as
+    /// a far replica — before any client was told it had gone. Such a client
+    /// goes on holding it, and is sent what changed: that has to include what
+    /// the new copy no longer has (its `Origin`, above all: the ship would
+    /// stay "a ghost" on that client for good, as a first live run showed).
     pub fn forget(&mut self, guid: EntityGuid) {
-        self.entries.remove(&guid);
+        let at = self.scanned + 1;
+        if let Some(entry) = self.entries.get_mut(&guid) {
+            for (id, _, _) in entry.components.drain(..) {
+                entry.removed.retain(|(gone, _)| *gone != id);
+                entry.removed.push((id, at));
+            }
+            entry.touched = at;
+            entry.gone = true;
+        }
     }
 
     /// Record every entity whose row changed since the last refresh, with
@@ -209,12 +267,23 @@ impl ComponentLog {
             }
         }
         self.scanned = tick;
+        self.entries
+            .retain(|_, e| !e.gone || tick.saturating_sub(e.touched) <= TOMBSTONE_TICKS);
+    }
+
+    /// Whether `guid` was recorded after tick `base`: something about it
+    /// changed since a client was sent it at `base`.
+    #[must_use]
+    pub fn touched_after(&self, guid: EntityGuid, base: u64) -> bool {
+        self.entries
+            .get(&guid)
+            .is_some_and(|e| !e.gone && e.touched > base)
     }
 
     /// The full component set of `guid`, as a snapshot entity.
     #[must_use]
     pub fn full(&self, guid: EntityGuid) -> Option<EntitySnapshot> {
-        let entry = self.entries.get(&guid)?;
+        let entry = self.entries.get(&guid).filter(|e| !e.gone)?;
         Some(EntitySnapshot::new(
             guid,
             entry
@@ -230,7 +299,7 @@ impl ComponentLog {
     /// empty payload for each component removed after `base`.
     #[must_use]
     pub fn since(&self, guid: EntityGuid, base: u64) -> Option<EntitySnapshot> {
-        let entry = self.entries.get(&guid)?;
+        let entry = self.entries.get(&guid).filter(|e| !e.gone)?;
         let always = |id: ComponentId| {
             id == <ShipState as ComponentDef>::ID || id == <Owner as ComponentDef>::ID
         };
@@ -342,6 +411,16 @@ pub struct SentFrame {
     pub removed: Vec<EntityGuid>,
 }
 
+/// What a client was last sent of one entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sent {
+    /// The tick of the frame that last carried it: what changed after it is
+    /// what the next entry for it lists.
+    pub at: u64,
+    /// Its distance step for this client ([`space_protocol::far`]).
+    pub step: u8,
+}
+
 /// One client's replication state.
 #[derive(Debug)]
 pub struct ClientReplica {
@@ -351,25 +430,21 @@ pub struct ClientReplica {
     /// The tick of the last frame built for this client — the `base_tick` of the
     /// next delta.
     pub ack_tick: u64,
-    /// The tick up to which this client's interest set has been examined for
-    /// changes: the next delta carries what changed after it.
-    ///
-    /// Equal to [`ClientReplica::ack_tick`] except while a snapshot is going out
-    /// in several chunks. A chunk carries no changes, so the base stays at the
-    /// *first* chunk's tick until the snapshot is complete; the delta that
-    /// follows then picks up everything that moved while the chunks went out.
-    /// (Advancing it with every chunk lost the changes to an entity that was in
-    /// an early chunk and stopped moving before the last one.)
-    pub change_base: u64,
     /// The highest tick the client itself has confirmed applying
     /// (`InputTick::ack_tick`, clamped to the shard's own tick).
     pub client_ack: u64,
     /// The tick of the first frame built for this client, once there is one
     /// (see [`UNACKNOWLEDGED_SHIP_TICKS`]).
     pub introduced_at: Option<u64>,
-    /// Every entity the client has been sent and not been told to remove, so a
-    /// delta can name removals.
-    pub known: HashSet<EntityGuid>,
+    /// Every entity the client has been sent and not been told to remove
+    /// (so a delta can name removals), with the tick it was last sent at and
+    /// its distance step: an entity is sent again when it changed after that
+    /// tick and its step's spacing has passed (see the module docs, "How
+    /// often"). Per entity, not one base for all: an entity in an early chunk
+    /// of a snapshot that changed while the later chunks went out, or one
+    /// that was skipped at a coarse step and then stopped, is still brought
+    /// up to date. (One base that advanced with every frame lost both.)
+    pub sent: HashMap<EntityGuid, Sent>,
     /// Entities that must be (re-)sent whether or not they change again: the
     /// ones a previous frame could not fit, and the ones a frame that is
     /// presumed lost was carrying.
@@ -397,10 +472,9 @@ impl ClientReplica {
         Self {
             ship,
             ack_tick: 0,
-            change_base: 0,
             client_ack: 0,
             introduced_at: None,
-            known: HashSet::new(),
+            sent: HashMap::new(),
             owed: Vec::new(),
             owed_removals: Vec::new(),
             pending_snapshot: VecDeque::new(),
@@ -491,7 +565,13 @@ pub struct Interest {
     by_key: HashMap<u64, EntityGuid>,
     /// guid → its grid key and the position it was last placed at.
     by_guid: HashMap<EntityGuid, (u64, WorldPos)>,
+    /// The last key handed to a far replica ([`Interest::upsert_far`]).
+    far_keys: u64,
 }
+
+/// The bit that marks the grid key of a far replica: an entity's key carries
+/// its generation in the high half ([`grid_key`]), which does not get there.
+const FAR_KEY_BIT: u64 = 1 << 63;
 
 impl Interest {
     /// An empty grid.
@@ -536,6 +616,33 @@ impl Interest {
         self.grid.insert(key, pos, 0.0);
     }
 
+    /// (Re-)place the far replica `guid` — an entity that is in nobody's
+    /// world here, so it has no ECS entity to take a key from — at `pos`.
+    /// A guid that is tracked as an entity of the world is left alone: the
+    /// world's copy is the one that counts.
+    pub fn upsert_far(&mut self, guid: EntityGuid, pos: WorldPos) {
+        let key = match self.by_guid.get(&guid) {
+            Some((key, _)) if key & FAR_KEY_BIT == 0 => return,
+            Some((_, at)) if *at == pos => return,
+            Some((key, _)) => *key,
+            None => {
+                self.far_keys += 1;
+                FAR_KEY_BIT | self.far_keys
+            }
+        };
+        self.by_guid.insert(guid, (key, pos));
+        self.by_key.insert(key, guid);
+        self.grid.insert(key, pos, 0.0);
+    }
+
+    /// Whether `guid` is tracked as a far replica.
+    #[must_use]
+    pub fn is_far(&self, guid: EntityGuid) -> bool {
+        self.by_guid
+            .get(&guid)
+            .is_some_and(|(key, _)| key & FAR_KEY_BIT != 0)
+    }
+
     /// Stop tracking `guid`.
     pub fn remove(&mut self, guid: EntityGuid) {
         if let Some((key, _)) = self.by_guid.remove(&guid) {
@@ -547,11 +654,18 @@ impl Interest {
     /// The guids within `radius` of `center`, nearest first.
     #[must_use]
     pub fn visible(&self, center: WorldPos, radius: f32) -> Vec<EntityGuid> {
+        self.visible_at(center, radius).0
+    }
+
+    /// [`Interest::visible`] with each guid's distance from `center`, metres
+    /// (two lists of one length).
+    #[must_use]
+    pub fn visible_at(&self, center: WorldPos, radius: f32) -> (Vec<EntityGuid>, Vec<f64>) {
         self.grid
             .query_sphere(center, radius, usize::MAX)
             .into_iter()
-            .filter_map(|(key, _)| self.by_key.get(&key).copied())
-            .collect()
+            .filter_map(|(key, distance)| Some((self.by_key.get(&key).copied()?, distance)))
+            .unzip()
     }
 }
 
@@ -629,16 +743,14 @@ pub fn changed_since(sim: &mut SimWorld, guids: &GuidIndex, base_tick: u64) -> V
 
 /// What one tick's replication pass shares between clients.
 ///
-/// Two things are the same for every client in a tick and were being recomputed
-/// for each one: the set of entities that changed since a given tick, and each
-/// entity's encoded snapshot. Both are computed on first use and reused.
+/// An entity's encoded entry is the same for every client that was last
+/// sent it on the same tick — everybody near it, at the finest step — and is
+/// built on first use and reused.
 #[derive(Debug, Default)]
 pub struct PassCache {
     /// `(guid, change base)` → its encoded entry this tick: the full set for
     /// `None`, what changed after the base otherwise (`None`: not logged).
     snapshots: HashMap<(EntityGuid, Option<u64>), Option<EntitySnapshot>>,
-    /// change base → every guid changed since it.
-    changed: HashMap<u64, Vec<EntityGuid>>,
 }
 
 impl PassCache {
@@ -664,18 +776,6 @@ impl PassCache {
             })
             .as_ref()
     }
-
-    /// The guids changed since `base_tick`, scanned on first request.
-    fn changed_since(
-        &mut self,
-        sim: &mut SimWorld,
-        guids: &GuidIndex,
-        base_tick: u64,
-    ) -> &[EntityGuid] {
-        self.changed
-            .entry(base_tick)
-            .or_insert_with(|| changed_since(sim, guids, base_tick))
-    }
 }
 
 /// What one replication pass produced for one client.
@@ -686,6 +786,24 @@ pub enum Frame {
     /// A delta against its `base_tick` — possibly an empty one (see the module
     /// docs, "A frame every tick").
     Delta(Delta),
+}
+
+impl Frame {
+    /// The bytes of this frame's payload as the codec writes them (computed,
+    /// like the budget: the fixed fields of a delta, the entities, the
+    /// removals).
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        let (entities, removed) = match self {
+            Frame::Snapshot(s) => (&s.entities, 0),
+            Frame::Delta(d) => (&d.entities, d.removed.len()),
+        };
+        56 + entities
+            .iter()
+            .map(EntitySnapshot::encoded_len)
+            .sum::<usize>()
+            + removed * 12
+    }
 }
 
 /// The shard-wide facts a frame is built from.
@@ -713,6 +831,10 @@ pub struct Visible<'a> {
     pub ordered: &'a [EntityGuid],
     /// The same guids, for membership tests.
     pub set: &'a HashSet<EntityGuid>,
+    /// How far each guid of `ordered` is from the client's ship, metres: what
+    /// its distance step is taken from. Empty (or shorter): distance 0, the
+    /// finest step.
+    pub distances: &'a [f64],
 }
 
 /// Build the frame one client receives this tick, updating its replica state.
@@ -736,11 +858,8 @@ pub fn build_frame(
     replica.introduced_at.get_or_insert(tick);
 
     // A client that knows nothing gets a snapshot of its whole interest set.
-    if replica.known.is_empty() && replica.pending_snapshot.is_empty() {
+    if replica.sent.is_empty() && replica.pending_snapshot.is_empty() {
         replica.pending_snapshot = visible.ordered.iter().copied().collect();
-        // Everything the snapshot carries is at least as new as this tick, so
-        // this is where the change scan resumes once the snapshot is complete.
-        replica.change_base = tick;
     }
     if !replica.pending_snapshot.is_empty() || replica.snapshot_open {
         let mut builder = SnapshotBuilder::with_budget(cx.budget, tick, cx.shard, cx.epoch);
@@ -764,7 +883,12 @@ pub fn build_frame(
         if !builder.is_empty() || replica.snapshot_open {
             let more = !replica.pending_snapshot.is_empty();
             replica.snapshot_open = more;
-            replica.known.extend(sent.iter().copied());
+            // Each entity's own base is the tick of the chunk it went
+            // out in: what it does afterwards, while the other chunks go
+            // out, is after that.
+            for guid in &sent {
+                replica.sent.insert(*guid, Sent { at: tick, step: 0 });
+            }
             replica.ack_tick = tick;
             replica.remember(tick, sent, Vec::new());
             return Frame::Snapshot(builder.finish_snapshot_chunk(input_ack, more));
@@ -778,50 +902,62 @@ pub fn build_frame(
     // that went out on a frame presumed lost is said again, unless the entity
     // has come back in the meantime.
     let mut removed: Vec<EntityGuid> = replica
-        .known
-        .iter()
+        .sent
+        .keys()
         .filter(|g| !visible.set.contains(g) && **g != replica.ship)
         .copied()
         .collect();
     for guid in std::mem::take(&mut replica.owed_removals) {
-        if guid != replica.ship && !visible.set.contains(&guid) && !replica.known.contains(&guid) {
+        if guid != replica.ship && !visible.set.contains(&guid) && !replica.sent.contains_key(&guid)
+        {
             removed.push(guid);
         }
     }
     removed.sort_unstable();
     removed.dedup();
     for guid in &removed {
-        replica.known.remove(guid);
+        replica.sent.remove(guid);
     }
 
     // The client's own ship first, for as long as it may not have been told
     // which ship that is (see [`UNACKNOWLEDGED_SHIP_TICKS`]). Then debt (it is
-    // the oldest), then this tick's changes, then whatever has just come into
-    // interest without changing — an entity at rest never shows up in the change
-    // scan, so entering the sphere has to be a reason to send it in its own
-    // right. Deduplicated, and restricted to what is visible now.
+    // the oldest), then what is **due** — it changed since this client was
+    // last sent it, and its distance step's spacing has passed (the module
+    // docs, "How often") — then whatever has just come into interest without
+    // changing: an entity at rest is never due, so entering the sphere has to
+    // be a reason to send it in its own right. Deduplicated, and restricted
+    // to what is visible now.
     //
     // What goes out in full: the unconfirmed own ship, debt (a lost frame may
     // have carried the only copy of a component) and anything the client does
-    // not hold. A changed entity it holds goes out as what changed since the
-    // change base.
-    let change_base = replica.change_base;
+    // not hold. An entity it holds goes out as what changed since it was last
+    // sent.
     let mut candidates: Vec<EntityGuid> = Vec::new();
     let mut full: HashSet<EntityGuid> = HashSet::new();
     let mut seen: HashSet<EntityGuid> = HashSet::new();
     let own_ship = replica.ship_is_unconfirmed(tick).then_some(replica.ship);
     let owed = std::mem::take(&mut replica.owed);
     full.extend(own_ship.iter().chain(owed.iter()).copied());
-    let changed = cache.changed_since(sim, cx.guids, replica.change_base);
-    let entered = visible
-        .ordered
-        .iter()
-        .filter(|g| !replica.known.contains(g));
+    let mut due: Vec<EntityGuid> = Vec::new();
+    let mut entered: Vec<EntityGuid> = Vec::new();
+    for (i, guid) in visible.ordered.iter().enumerate() {
+        let Some(sent) = replica.sent.get_mut(guid) else {
+            entered.push(*guid);
+            continue;
+        };
+        let distance = visible.distances.get(i).copied().unwrap_or(0.0);
+        sent.step = far::step_after(distance, sent.step);
+        if tick.saturating_sub(sent.at) >= far::interval(sent.step)
+            && cx.log.touched_after(*guid, sent.at)
+        {
+            due.push(*guid);
+        }
+    }
     for guid in own_ship
         .iter()
         .chain(owed.iter())
-        .chain(changed)
-        .chain(entered)
+        .chain(due.iter())
+        .chain(entered.iter())
         .copied()
     {
         if visible.set.contains(&guid) && seen.insert(guid) {
@@ -834,7 +970,8 @@ pub fn build_frame(
     let mut sent = Vec::new();
     let mut taken = 0usize;
     for guid in &candidates {
-        let base = (!full.contains(guid) && replica.known.contains(guid)).then_some(change_base);
+        let held = replica.sent.get(guid).copied();
+        let base = held.filter(|_| !full.contains(guid)).map(|held| held.at);
         let Some(snap) = cache.snapshot(cx.log, *guid, base) else {
             taken += 1; // gone: not owed, not sent
             continue;
@@ -843,14 +980,19 @@ pub fn build_frame(
             break;
         }
         taken += 1;
-        replica.known.insert(*guid);
+        replica.sent.insert(
+            *guid,
+            Sent {
+                at: tick,
+                step: held.map_or(0, |held| held.step),
+            },
+        );
         sent.push(*guid);
     }
     replica.owed.extend(candidates.into_iter().skip(taken));
 
     let base_tick = replica.ack_tick;
     replica.ack_tick = tick;
-    replica.change_base = tick;
     replica.remember(tick, sent, removed.clone());
     Frame::Delta(builder.finish_delta(base_tick, removed, input_ack))
 }
@@ -1007,6 +1149,7 @@ mod tests {
             Visible {
                 ordered: visible,
                 set: &set,
+                distances: &[],
             },
         )
     }
@@ -1022,10 +1165,11 @@ mod tests {
     /// the later chunks went out and then stopped, is corrected by the first
     /// delta after the snapshot.
     ///
-    /// Mutation this catches: advancing `change_base` with every chunk (setting
-    /// it next to `ack_tick` in the snapshot branch of `build_frame`) — the
-    /// change is then older than the base the first delta scans from, and the
-    /// client keeps the stale state for as long as the ship stays parked.
+    /// Mutation this catches: one base for every entity, advanced with every
+    /// chunk (giving each entity of a chunk the tick of the *last* chunk as
+    /// its `Sent::at`) — the change is then older than the base the first
+    /// delta looks from, and the client keeps the stale state for as long as
+    /// the ship stays parked.
     #[test]
     fn a_change_made_while_a_snapshot_is_going_out_is_not_lost() {
         // 158 B per ship; a 400 B budget carries two per frame.
@@ -1042,9 +1186,13 @@ mod tests {
         );
         assert_eq!(guids_in(&first), vec![all[0], all[1]], "chunk 1");
 
-        // The ship that went out in chunk 1 jumps, once, and is parked again.
+        // A ship that went out in chunk 1 jumps, once, and is parked again.
+        // (Not the client's own ship: that one is repeated in every frame
+        // until the client's first acknowledgement, whatever the bases say —
+        // which is what this test moved until phase 5, and why it could not
+        // fail.)
         let moved_to = WorldPos::ZERO.offset([0.0, 25.0, 0.0]);
-        let entity = guids.entity_of(all[0]).expect("alive");
+        let entity = guids.entity_of(all[1]).expect("alive");
         *sim.world_mut()
             .get_mut::<ShipState>(entity)
             .expect("ship state") = ShipState::at_rest(moved_to);
@@ -1062,7 +1210,7 @@ mod tests {
         assert_eq!(guids_in(&third), vec![all[4], all[5]], "chunk 3");
 
         // The snapshot is complete. Nothing has changed since chunk 2 — but the
-        // client still has the first ship where chunk 1 put it.
+        // client still has the second ship where chunk 1 put it.
         sim.step();
         let mut carried = None;
         for _ in 0..4 {
@@ -1070,7 +1218,7 @@ mod tests {
             let Frame::Delta(delta) = frame else {
                 panic!("the snapshot is complete, so this must be a delta");
             };
-            if let Some(entity) = delta.entities.iter().find(|e| e.guid == all[0]) {
+            if let Some(entity) = delta.entities.iter().find(|e| e.guid == all[1]) {
                 let payload = entity
                     .components
                     .iter()
@@ -1084,6 +1232,160 @@ mod tests {
         }
         let carried = carried.expect("the change made during the snapshot must be sent");
         assert_eq!(carried.pos, moved_to);
+    }
+
+    /// An entity that leaves the log and is back before a client was told
+    /// — a ghost installed as the shard's own ship, in one tick — is sent
+    /// with what it no longer has listed as removed.
+    ///
+    /// Mutation this catches: `forget` dropping the entry outright: the
+    /// client is then sent the new copy's components and keeps the old
+    /// copy's `Origin` — it shows the shard's own ship as a ghost for good.
+    #[test]
+    fn a_copy_that_is_replaced_within_a_tick_loses_what_the_new_one_lacks() {
+        let mut log = ComponentLog::new();
+        let it = guid(9);
+        let origin = space_protocol::ORIGIN_COMPONENT;
+        log.record(it, vec![(0, vec![1]), (10, vec![7]), (origin, vec![2])], 5);
+        log.scanned = 5;
+        assert_eq!(log.len(), 1);
+        log.forget(it);
+        assert_eq!(log.len(), 0);
+        assert!(log.full(it).is_none() && log.since(it, 0).is_none());
+        assert!(
+            !log.touched_after(it, 0),
+            "nothing to send while it is gone"
+        );
+        log.record(it, vec![(0, vec![3]), (2, vec![4])], 6);
+        let sent = log.since(it, 5).expect("logged again");
+        assert_eq!(
+            sent.components,
+            vec![
+                (0, vec![3]),
+                (2, vec![4]),
+                (10, Vec::new()),
+                (origin, Vec::new())
+            ],
+            "the new copy, and what the old one had beyond it as removed"
+        );
+        assert_eq!(
+            log.full(it).expect("logged").components,
+            vec![(0, vec![3]), (2, vec![4])],
+            "a client that never held it gets the new copy alone"
+        );
+        // A forgotten entity that does not come back is dropped for good.
+        log.forget(it);
+        let (mut sim, guids, _) = parked_fleet(1);
+        for _ in 0..(TOMBSTONE_TICKS + 10) {
+            sim.step();
+        }
+        log.refresh(&mut sim, &guids, replicated_components);
+        assert!(!log.entries.contains_key(&it));
+    }
+
+    /// One frame with each visible guid at `distance` metres from the ship.
+    fn frame_at(
+        sim: &mut SimWorld,
+        guids: &GuidIndex,
+        log: &mut ComponentLog,
+        replica: &mut ClientReplica,
+        visible: &[(EntityGuid, f64)],
+    ) -> Frame {
+        log.refresh(sim, guids, replicated_components);
+        let ordered: Vec<EntityGuid> = visible.iter().map(|(g, _)| *g).collect();
+        let distances: Vec<f64> = visible.iter().map(|(_, d)| *d).collect();
+        let set: HashSet<EntityGuid> = ordered.iter().copied().collect();
+        let cx = FrameContext {
+            shard: ShardId::new(1),
+            epoch: 1,
+            budget: 64 * 1024,
+            guids,
+            log,
+        };
+        build_frame(
+            sim,
+            cx,
+            &mut PassCache::new(),
+            replica,
+            Visible {
+                ordered: &ordered,
+                set: &set,
+                distances: &distances,
+            },
+        )
+    }
+
+    /// A ship far from the client is sent at its distance step's rate, an
+    /// entity that moved while it was not due and then stopped is still
+    /// brought up to date, and one that moves after a long rest is sent at
+    /// once.
+    ///
+    /// Mutations this catches: one change base for all entities, advanced
+    /// with every frame (the ship that jumped between two of its turns and
+    /// then parked is never corrected); `>=` the step's spacing replaced by
+    /// "always" (thirty samples a second at any distance); making an entity
+    /// wait for a slot of its step after a rest (its first sample is then up
+    /// to a second into its motion).
+    #[test]
+    fn an_entity_is_sent_at_its_steps_rate_and_never_left_stale() {
+        let (mut sim, guids, all) = parked_fleet(3);
+        let mut replica = ClientReplica::new(all[0]);
+        let mut log = ComponentLog::new();
+        // The client's own ship, one ship 600 m off (five times a second)
+        // and one 3 km off (once a second).
+        let visible = [(all[0], 0.0), (all[1], 600.0), (all[2], 3_000.0)];
+        let set = |sim: &mut SimWorld, guid: EntityGuid, y: f32| {
+            let entity = guids.entity_of(guid).expect("alive");
+            *sim.world_mut().get_mut::<ShipState>(entity).expect("state") =
+                ShipState::at_rest(WorldPos::ZERO.offset([0.0, y, 0.0]));
+        };
+        sim.step();
+        let first = frame_at(&mut sim, &guids, &mut log, &mut replica, &visible);
+        assert!(matches!(first, Frame::Snapshot(_)));
+        // Both far ships move every tick for two seconds.
+        let mut sent = [0usize; 3];
+        for i in 0..60 {
+            set(&mut sim, all[1], i as f32);
+            set(&mut sim, all[2], i as f32);
+            sim.step();
+            let frame = frame_at(&mut sim, &guids, &mut log, &mut replica, &visible);
+            for guid in guids_in(&frame) {
+                sent[all.iter().position(|g| *g == guid).expect("ours")] += 1;
+            }
+        }
+        assert_eq!(sent[1], 10, "600 m: every sixth tick");
+        assert_eq!(sent[2], 2, "3 km: every thirtieth");
+        assert_eq!(replica.sent[&all[1]].step, 2);
+        assert_eq!(replica.sent[&all[2]].step, 3);
+        // The far one jumps once more, right after its turn, and parks.
+        set(&mut sim, all[2], 500.0);
+        let mut carried = None;
+        for _ in 0..31 {
+            sim.step();
+            let frame = frame_at(&mut sim, &guids, &mut log, &mut replica, &visible);
+            let Frame::Delta(delta) = frame else {
+                panic!("a delta")
+            };
+            if let Some(e) = delta.entities.iter().find(|e| e.guid == all[2]) {
+                let state = &e.components[0].1;
+                carried = Some(space_sim::wire::decode_ship_state(state).expect("decodes"));
+            }
+        }
+        let carried = carried.expect("the change is sent when the ship's turn comes");
+        assert_eq!(carried.pos, WorldPos::ZERO.offset([0.0, 500.0, 0.0]));
+        // A long rest, then it moves: in the very next frame.
+        for _ in 0..90 {
+            sim.step();
+            let frame = frame_at(&mut sim, &guids, &mut log, &mut replica, &visible);
+            assert!(
+                !guids_in(&frame).contains(&all[2]),
+                "it does not move: it is not sent"
+            );
+        }
+        set(&mut sim, all[2], 501.0);
+        sim.step();
+        let frame = frame_at(&mut sim, &guids, &mut log, &mut replica, &visible);
+        assert!(guids_in(&frame).contains(&all[2]), "at once");
     }
 
     /// A snapshot whose last entities despawn before their chunk went out

@@ -710,6 +710,181 @@ logs and samples in `target/phase3b/` and `target/dev/shots/phase3b/`).
   restart rule and the extrapolation limit scale with it, and interpolation uses velocities, so a
   thing updated five times a second moves smoothly. Far replicas are never copied into prediction.
 
+**Status: built (phase 5).** What it became, where it differs from the bullets above, and what
+was measured. The code: `space-protocol/src/far.rs` (range, steps, draw delay, the two messages,
+`Origin`), `space-server/src/far.rs` (the far half of a shard), `replicate.rs` (per-entity base and
+steps), `space-client/src/{link,bodies}.rs`. Tests: `space-server/tests/far.rs` (eleven, on two
+shards sixteen cells wide each) and unit tests beside the code; every one names its mutation and
+each mutation was run (`target/phase5/mutate.py`, 33 of them; the first run let eight through —
+tests that took their expectation from the function under test, or that a second line of defence
+kept green — and the tests were tightened until none was left). Live numbers are from `dev.ps1 -ServersOnly
+-PortOffset 300` (four shards, release build, two headless clients at 60 frames a second on the
+harness, `/state` sampled 100 to 200 times a second, 2026-11-24; tracks and frames in
+`target/dev/shots/phase5/`).
+
+- **Who sends what: shard to shard, relayed by the player's own shard.** A client keeps exactly
+  one play connection outside a handoff. Every 10 ticks (not once a second: a third of a second of
+  fast travel is already a kilometre) a shard tells every other shard of its map where its players
+  are — and where the ships are that are on their way to it, so a player's view is there before
+  the player is. Each answers with what it simulates within 10 km of one of them and does not
+  already send as a ghost. It rides the peer connections the handoff uses, behind the peer token:
+  no new listener, no new credential. The alternative — a client connected to every shard in view
+  — was not built: up to eight connections a client, shards that would have to admit players they
+  do not serve, and one entity arriving on two connections with only the client to settle which
+  counts.
+- **Deviation: a far replica is not a `SimWorld` entity.** The plan put it into the world "with
+  its components but no rapier body". It is in **no world**: the shard keeps it in the interest
+  grid under a key of its own (`Interest::upsert_far`) and in the component log, which is all the
+  replication path reads. Nothing can step it, collide with it, hand it over or hash it, by
+  construction; `SimWorld` did not change.
+- **Deviation: the receiver does not move a far replica between updates.** Dead reckoning a moon
+  at one sample a second would put it some two metres off a six-metre orbit and snap it back
+  (arithmetic, not a run: this was not built). A sample keeps **the tick
+  it is the state of** — the simulating shard's, which is the cluster's — all the way to the
+  client (`space_protocol::Origin`, a twelfth replicated component id, 11: what kind of copy this
+  is, of which shard, of which tick), and the client interpolates on that timeline.
+- **Distance steps** (the plan's numbers, plus a near range): every tick to 100 m, every 3rd to
+  250 m (10 Hz), every 6th to 1 km (5 Hz), every 30th to 10 km (1 Hz); coarser only 10 % past a
+  bound, finer at the bound (`far::step_after`). One table for both hops and for **every** entity
+  — own, ghost and far — per client by the distance from that client's ship, between shards by the
+  distance from the receiver's nearest player. `ClientReplica::sent` holds, per entity, the tick it
+  was last sent and its step, in place of the one change base: an entity is due when it changed
+  since then and its step's spacing has passed, so one that was skipped and then stopped is still
+  brought up to date, and one that moves after a rest is sent **at once** (its first sample is the
+  start of the motion). Nothing is sent for what did not change, on either hop. Beyond 10 km: not
+  sent between shards (a member is dropped 10 % further out), and a client is **told** the removal
+  like any entity that leaves its interest — no timeout is involved on that hop.
+- **Bounded cost.** A client: at most `sum over the moving entities in view of (one sample x the
+  rate of its step)` a second plus 56 B a tick, never more than the frame budget a tick. A peer
+  link: the same sum at the step of the receiver's nearest player, plus 12 B per held replica
+  every 2 s (the refresh: the keep-alive of a replica at rest) and the interest (16 B + 36 B a
+  player, three times a second); a `FarUpdate` carries at most 32 KiB, what does not fit waits a
+  tick. `tests/far.rs`: sixty balls 600 m off cost a client under `10 s x (60 x 130 B x 5 + 30 x
+  80 B)` and the link under the like; four hundred appearing at once never make an update over
+  the bound; a body at rest costs 44 B per refresh and no frame.
+- **One entity, one picture: own > ghost > far, in place.** A guid is one of the three on a
+  shard. A far update never touches a guid that is in the world; a guid that enters it (a ghost
+  update names it, a handoff installs it) stops being a far replica in the same moment, and its
+  log entry goes on, so the client gets the difference and keeps the history. A ghost its owner
+  withdraws — it left the border margin — becomes a far replica where it stands
+  (`Shard::ghost_to_far`), to be confirmed by its owner's next update or dropped 6 ticks later.
+  **Found on the way:** an entity replaced by another kind of copy within one tick (a ghost
+  installed as the shard's own ship) kept the old copy's components on clients — the log forgot
+  the entity and with it what had to be listed as removed; a ship stayed "a ghost" for good.
+  `ComponentLog::forget` now keeps what it had as removed for 128 ticks. And a withdrawn ghost of
+  a shard no far update had ever come from was dropped by the silence rule at once (found by
+  delivering the far updates three ticks late in `from_local_to_ghost_to_far_replica_without_a_gap`;
+  the ghost frame that withdraws it now counts as that shard's word).
+- **Smooth at low rates** (`bodies.rs`). A thing is drawn further in the past the further it is
+  from the own ship (`far::draw_delay`: 2 ticks to 12 m, eased up to a step's spacing + 3.5 ticks
+  from 50 m on — 4.5, 6.5, 9.5, 33.5 — continuous, and a function of the **distance alone**, so
+  it does not step when a far replica becomes a ghost and then local). Samples more than a tick
+  apart are joined by the cubic that leaves and arrives with the **velocities** they carry — a
+  six-metre orbit at 0.8 rad/s sampled once a second is followed within 2 cm, where the straight
+  line cuts 47 cm off it (`bodies.rs`' test) — unless the velocities do not explain the way between (what a planet carries; a
+  bounce): then the straight line. **Found on the way, both on the live stack:** (a) the delay
+  was first taken from the distance to the newest *sample*, which steps thirty times a second:
+  everything coming nearer or going away juddered, 0.2 m to and fro at 40 m/s; it is taken to
+  where the thing is drawn now (`draw_time`). (b) **Ghosts were a tick of motion off, to and
+  fro.** A ghost was moved on one tick after every step, whatever tick its update was of; two
+  shards step at the same instants, so the update of tick n is sometimes here before the step
+  and sometimes after: a player flying past at 22 to 35 m/s leapt 0.75 m ahead and waited there,
+  every second or two (0.2 to 0.6 m between two frames). A ghost now knows the tick its state is
+  of and is moved on only while that is behind (`GhostEntry::shown`, `border::
+  GHOST_TICK_TOLERANCE`); `a_ghost_shows_its_owners_state_of_the_tick_whoever_stepped_first`.
+- **Players too.** A far player is a ship with the player model (`Visual(PLAYER)`) and nothing
+  else of the player: `FAR_COMPONENTS` is `ShipState`, `Body`, `Visual`, `Springs`,
+  `Articulation`, `PartStates` — no `Owner`, no `ShipControls`, no `PosResidual`, nothing private
+  — applied by the sender and again by the receiver.
+- **Shard death and map changes.** A shard that sent nothing for 3 s, or that the map no longer
+  names, loses its far replicas here; scene bodies of another revision are never kept. A message
+  to a peer can be dropped (its queue was full, the peer was being dialled): what a refresh names
+  and the receiver lacks, it asks for in its next interest and is sent in full.
+- **Tests whose premise changed.** `physics.rs`' crossing tests held that a client is told a body
+  "left" when its ghost leaves the margin and that a moving body is seen on every tick at any
+  distance: the client now keeps it as a far replica, and the watcher was moved to within 100 m
+  (or, over QUIC, expects one sample in six at 500 m). `replicate.rs`'
+  `a_change_made_while_a_snapshot_is_going_out_is_not_lost` moved the client's **own** ship, which
+  is repeated in every frame until the first acknowledgement whatever the bases say: it could not
+  fail. It moves another ship of the first chunk now, and fails under its mutation. The client's
+  `a_resting_entity_holds_until_it_moves` held that 39 ticks between two samples of a moving
+  entity start its history over (the limit was 15 ticks); that is one motion of something a
+  kilometre off now, and the restart is at 76.
+- **Security**: `docs/security-notes.md`, "Far replicas between shards".
+- **Harness**: `/state` has `source` (`local`/`ghost`/`far`), `step` and `sample_age_s` per body
+  and per other player (`others`), and `far_drawn`. The census line of a shard has `N far` and
+  the traffic.
+
+**Looked at on the live stack:**
+
+- *From the spawn point*, both clients list the 35 bodies of the showcase, 35 distinct: 19
+  `local`, 16 `ghost`, none `far` — and 35 on a `-MinShards 1` stack (all `local`). **Nothing of
+  the showcase is a far replica**: it lies within 64 m of the borders; and a thing within 64 m of
+  *any* face of its cell is a ghost on the root's shard as well (`border::territory_distance` is a
+  lower bound around carved cells — a player 194 m inside the west cell but 4 m from the z = -4
+  plane was a ghost on the root). Far replicas appear more than 64 m from both planes.
+- *A far player*: B standing at `pos` -110 0 80 is `far` for A on the spawn point (133 m, step 1,
+  sample age up to 0.17 s). B flying at up to 10.3 m/s (0.172 m a frame): its drawn position on A
+  moved at most 0.179 m a frame, and the step changed by at most 14.5 mm from one frame to the
+  next. `look2-far-player-first-person.png`: the character, 76 m off, twenty pixels tall.
+- *A crate knocked away* (the zero-g corner's, rammed at 6.2 m/s along (-0.8, 0, 0.6)): on A it
+  went `ghost` step 0 -> `ghost` step 1 at 110 m -> `far` at `pos` -143 3 70; in every one of
+  2603 frames, 35 bodies listed throughout; where it turned far its drawn step changed by 0.8 mm
+  (it moved 56 mm a frame), the largest change anywhere 7.4 mm.
+- *Far -> ghost -> local.* B flying at 43 m/s (0.72 m a frame) from far inside its shard across
+  x = -6 into A's: `far` -> `ghost` -> `local` on A, in all 578 frames; the step changed by 1.8 mm
+  at far -> ghost, 9.3 mm at ghost -> local, 46 mm at most anywhere (before the two fixes above:
+  0.2 to 0.6 m). And A flying to that crate, 266 m off on the other shard, and into it: `far`
+  (step 2) -> `local` at A's own change of shard, in all 3635 frames, never two of it; rammed, it
+  went from 0 to 4.6 m/s (the own ship's prediction was corrected by 16 cm, as it is for any
+  ramming, section 5).
+- *Fast travel out to 14.7 km and back.* Measured sample rates of a moon (a ghost) and a pendulum
+  (local), the same for both: 29.0 a second within 100 m, 10.0 at 181 m, 5.0 at 465 m, 1.0 at
+  3.7 km and at 6.9 km, nothing beyond. The step changed going out at 110 m, at 276 to 279 m and
+  between 1.1 and 1.7 km (at fast-travel speed the place is not resolved better), coming in at
+  972 to 980 m, 248 m and 100 m. Going out the 35 bodies were listed to 10.2 km and gone at
+  10.4 km (the other player too); coming back 22 were there at 10.0 km, 34 at 9.6 km and the
+  last — the one far replica among them — at 8.9 km: at some kilometres a second the far set is
+  a third of a second of flight behind.
+- *A shard killed* (the one B was on, by pid, its path checked): B gone from A's `others` 0.19 s
+  later, the scene re-issued (for one sample the old and the new scene's bodies were listed
+  together, 64 — the 0.3 s of section 2), 35 again at 0.49 s. B came back by itself after 12 s on
+  the spawn point, flew out again and was `far` on A once, among 35 distinct bodies.
+- *Traffic* (census lines, `SPACE_CENSUS_ALWAYS`). To the one client of the root's shard, by its
+  distance from the showcase on that flight: 21.7 kB/s within 60 m (everything every tick; with
+  two clients in the first minute of a stack, while the bowl's balls still roll, 42 to 50 kB/s
+  each), 13.9 kB/s at 80 to 125 m, 11.3 at 130 to 240 m, 8.7 at 300 to 465 m, 6.1 at 1 to 5 km,
+  and 5.4 kB/s beyond 10 km with nothing in view — the own ship every tick and the frames
+  themselves. Between shards: 48 B/s a link from a shard without players (its empty interest),
+  156 B/s a link from one with one player; the most one shard sent to its three peers together
+  was 4.6 kB/s, the most one took in 4.2 kB/s — there were never more than two far replicas at
+  once.
+- *Regression.* Ten crossings of x = -6 at 21 to 33.5 m/s: the drawn ship off the frame before
+  by 4.6 mm at the 99.5th percentile around a switch (4.2 mm away from one; 19.6 and 21.5 mm at
+  most), corrections 0, 1.11 to 1.16 s from a metre past the border, 35 bodies and the other
+  player listed throughout. `smoke.lua` passes. Three body transfers were called off at the start
+  of the cluster by an epoch change, before any client (section 5); none after, on any shard; no
+  shard logged a tick it could not keep up with or a far message it dropped; every client ended
+  with 0 validation messages.
+
+**Not done here, and what still looks wrong.**
+
+- **The demo area has nothing between 64 m and 10 km** (the hold): every far replica looked at
+  was a player or a crate knocked out of the showcase, at most 300 m off. Far replicas at
+  kilometres — their rates, their bounds, their truthful ticks — rest on `tests/far.rs` (3 km, and
+  11.5 km for the cut); the rates measured live at 0.5 to 7 km are of ghosts and local bodies,
+  which go through the same per-client steps. Phase 7's far rock is what will show it.
+- A player in fast travel outruns the interest (above). A thing in the eased band between 12 and
+  50 m that comes nearer or goes away is drawn with its time running up to a tenth faster or
+  slower at 40 m/s (the delay changes with the distance); it does not step.
+- Orientation between sparse samples is a normalised lerp: something spinning faster than half a
+  turn between two samples (a turn a second at a kilometre) is drawn turning the short way round.
+- The bounds on what a peer sends are per peer, and one peer token is the whole cluster's
+  (`docs/security-notes.md`).
+- Not looked at on the live stack: a shard that stalls while it holds far replicas (the 3 s
+  silence rule is a test), more than two far replicas at once (tests: 460), a scene switch with
+  far replicas in view (test).
+
 ## 7. Physics across four borders
 
 **Seen on a live four-shard stack (2026-11-24, after the merge with `main`), and solved in
@@ -883,9 +1058,13 @@ protocol 6 of its own - the merged demo area: `SceneClock` (tag 28), `PlayerInpu
 `ShipControls` - and that 6 stands as released. Everything of this branch is therefore
 **protocol 7**, on top of it: built so far are `ShardHello` + optional client endpoint + secret,
 `ShardRegion` + client endpoint, `RejectReason::Starting`, the peer token in a shard's hello and
-`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30), since phase 3 `ShardWelcome` + tick origin
-(`tick_origin_us`, its last field), and since its review `Snapshot` + `more` (its last field:
-"further chunks of this snapshot follow"). `FarInterest`/`FarUpdate` (30, 31) and the load report's new
+`JoinRedirect` at tag 29, since phase 3 `ShardWelcome` + tick origin
+(`tick_origin_us`, its last field), since its review `Snapshot` + `more` (its last field:
+"further chunks of this snapshot follow"), and since phase 5 `FarInterest` (tag 30: `from`, `tick`,
+`players`, `missing`) and `FarUpdate` (tag 31: `from`, `tick`, `new`, `changed`, `removed`,
+`refresh`, `held`, `more`) — `VARIANT_COUNT` 32 — and one more replicated component id, 11, the
+`Origin` a shard adds to what it tells clients about a ghost or a far replica (14 bytes: version,
+kind, shard, tick; a client that does not know the id skips it). The load report's new
 fields are still to come and stay inside 7 as long as 7 has not been pushed to `main`; once it
 has, the next layout change is 8. (The handoff state's private components are not wire layout:
 the scene-time component got a ninth byte in phase 3.)
