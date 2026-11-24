@@ -20,7 +20,7 @@
 //! | `POST` | `/action/merge` | `shard`, optional `epoch` |
 //! | `POST` | `/action/autoscaler` | `state` = `pause` or `resume` |
 //! | `POST` | `/action/push-map` | re-send the committed map to every shard |
-//! | `POST` | `/action/scene` | `scene` = a name of the scene catalogue (`demo-area`, `materials`, `solar`, `galaxy`): switch every shard to it |
+//! | `POST` | `/action/scene` | `scene` = a name of the scene catalogue (`demo-area`, `materials`, `galaxy`): switch every shard to it |
 //!
 //! # A scene switch answers when the shards have it
 //!
@@ -28,15 +28,15 @@
 //! the change: it first waits — for at most [`Limits::scene_confirm_wait`], by
 //! reading the snapshots the run loop publishes anyway, never by asking the
 //! loop — until every connected shard has confirmed the new revision. So the
-//! page the browser lands on says *All 2 connected shards switched to solar
+//! page the browser lands on says *All 2 connected shards switched to galaxy
 //! (revision 4)*, and the plain-text answer says the same with an
 //! `X-Space-Confirmed: 2/2` header. If the wait runs out it says *Switching to
-//! solar (revision 4): waiting for shard 2 …*, and the dashboard reloads every
+//! galaxy (revision 4): waiting for shard 2 …*, and the dashboard reloads every
 //! second — whatever `?refresh=` says, also "off" — until nobody is waited
 //! for.
 //!
 //! A request for the scene that is already running is answered *already
-//! running solar (revision 4); nothing to do* without going to the run loop at
+//! running galaxy (revision 4); nothing to do* without going to the run loop at
 //! all, so it can be told from a switch at a glance and never runs into the
 //! spacing between actions. The page cannot send one in the ordinary way — the
 //! button of the running scene is disabled, and no control holds a choice a
@@ -841,7 +841,7 @@ fn scene_unchanged(snapshot: &crate::snapshot::Snapshot, refresh: u32) -> Respon
     // The second half of a double click on the button that switched: the
     // browser shows the answer to *this* request, and what the person did was
     // switch — so they land on the switch's banner ("All 2 connected shards
-    // switched to solar"), not on "nothing to do".
+    // switched to galaxy"), not on "nothing to do".
     let just_switched = snapshot
         .scene
         .changed_tick
@@ -1397,7 +1397,6 @@ mod tests {
             "<button name=\"scene\" value=\"demo-area\" disabled",
             ">demo-area (current)</button>",
             ">Switch all shards to materials</button>",
-            ">Switch all shards to solar</button>",
             ">Switch all shards to galaxy</button>",
             "demo-area, revision 1 <span class=\"pill ok\">current</span>",
             "<span class=\"pill ok\">1 of 1 connected shards</span>",
@@ -1522,7 +1521,6 @@ mod tests {
              \"status\":\"All 1 connected shard switched to demo-area (revision 1)\"",
             "\"catalogue\":[{\"name\":\"demo-area\",\"id\":0,\"current\":true},\
              {\"name\":\"materials\",\"id\":1,\"current\":false},\
-             {\"name\":\"solar\",\"id\":2,\"current\":false},\
              {\"name\":\"galaxy\",\"id\":3,\"current\":false}]",
             "\"scene\":{\"name\":\"demo-area\",\"id\":0,\"revision\":1},\
              \"scene_sync\":\"in-sync\"",
@@ -2371,27 +2369,29 @@ mod tests {
             "{before}"
         );
 
-        // Refused: an unknown name, no name, the wrong case, a number.
+        // Refused: an unknown name, the retired `solar` (merged into the
+        // demo area), no name, the wrong case, a number.
         for fields in [
             "scene=nowhere",
+            "scene=solar",
             "",
             "scene=",
-            "scene=Solar",
+            "scene=Galaxy",
             "scene=2",
-            "name=solar",
+            "name=galaxy",
         ] {
             let body = format!("csrf={token}&{fields}");
             let response = service.handle(&post("/action/scene", &body)).await;
             assert_eq!(response.status, 400, "{fields}");
             let page = text(&response);
             assert!(
-                page.contains("demo-area, materials, solar, galaxy"),
+                page.contains("demo-area, materials, galaxy"),
                 "the refusal lists the catalogue: {page}"
             );
             assert!(!page.contains("nowhere"), "what was sent is not echoed");
         }
         // Refused like any other action: another origin, no form token, a GET.
-        let body = format!("csrf={token}&scene=solar");
+        let body = format!("csrf={token}&scene=galaxy");
         let cross = with(
             post("/action/scene", &body),
             "origin",
@@ -2400,9 +2400,9 @@ mod tests {
         assert_eq!(service.handle(&cross).await.status, 403);
         let fetch = with(post("/action/scene", &body), "sec-fetch-site", "cross-site");
         assert_eq!(service.handle(&fetch).await.status, 403);
-        let no_token = service.handle(&post("/action/scene", "scene=solar")).await;
+        let no_token = service.handle(&post("/action/scene", "scene=galaxy")).await;
         assert_eq!(no_token.status, 403);
-        let by_get = service.handle(&get("/action/scene?scene=solar")).await;
+        let by_get = service.handle(&get("/action/scene?scene=galaxy")).await;
         assert_eq!((by_get.status, by_get.header("allow")), (405, Some("POST")));
         assert_eq!(
             state(&text(&service.handle(&get("/api/state")).await)),
@@ -2421,8 +2421,8 @@ mod tests {
         assert_eq!(response.header("x-space-confirmed"), Some("1/1"));
         assert_eq!(
             text(&response).trim_end(),
-            "accepted: scene demo-area -> solar (revision 2), sent to shard 1. All 1 connected \
-             shard switched to solar (revision 2)"
+            "accepted: scene demo-area -> galaxy (revision 2), sent to shard 1. All 1 connected \
+             shard switched to galaxy (revision 2)"
         );
         let location = response.header("location").expect("a redirect").to_owned();
         assert!(
@@ -2434,15 +2434,15 @@ mod tests {
         // answered, not before.
         let page = follow(&service, &response).await;
         for needle in [
-            "<div class=\"notice ok\"><span>All 1 connected shard switched to solar (revision 2).",
-            "<span class=\"pill info\">solar</span>",
-            "<button name=\"scene\" value=\"solar\" disabled",
-            ">solar (current)</button>",
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to galaxy (revision 2).",
+            "<span class=\"pill info\">galaxy</span>",
+            "<button name=\"scene\" value=\"galaxy\" disabled",
+            ">galaxy (current)</button>",
             ">Switch all shards to demo-area</button>",
             "<dt>revision</dt><dd>2</dd>",
             "<span class=\"pill ok\">1 of 1 connected shards</span>",
-            "solar, revision 2 <span class=\"pill ok\">current</span>",
-            "switch every shard to scene solar: accepted",
+            "galaxy, revision 2 <span class=\"pill ok\">current</span>",
+            "switch every shard to scene galaxy: accepted",
         ] {
             assert!(page.contains(needle), "missing {needle:?}");
         }
@@ -2452,7 +2452,7 @@ mod tests {
         check_json(&json).expect("well-formed");
         assert!(
             json.contains(
-                "\"scene\":{\"name\":\"solar\",\"id\":2,\"revision\":2,\"changed_tick\":0"
+                "\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":2,\"changed_tick\":0"
             ),
             "{json}"
         );
@@ -2501,7 +2501,7 @@ mod tests {
         assert_eq!(form.matches(" disabled").count(), 1);
         assert!(form.contains("<button name=\"scene\" value=\"demo-area\" disabled"));
         assert!(form.contains(">demo-area (current)</button>"));
-        for name in ["materials", "solar", "galaxy"] {
+        for name in ["materials", "galaxy"] {
             assert!(
                 form.contains(&format!(">Switch all shards to {name}</button>")),
                 "the label says what the click does: {form}"
@@ -2544,7 +2544,9 @@ mod tests {
         assert!(settled.scene_progress().settled());
         let page = follow(&service, &response).await;
         assert_eq!(controls_a_reload_resets(&page), nothing);
-        let refused = service.handle(&post("/action/scene", "scene=solar")).await;
+        let refused = service
+            .handle(&post("/action/scene", "scene=materials"))
+            .await;
         assert_eq!(refused.status, 403);
         assert_eq!(controls_a_reload_resets(&text(&refused)), nothing);
     }
@@ -2603,18 +2605,18 @@ mod tests {
         // A double click on a real switch: the first half switches, the
         // second — an instant later, well inside the pause — is told that it
         // is already so. Neither is refused.
-        let solar = format!("csrf={token}&refresh=0&scene=solar");
-        let first = service.handle(&post("/action/scene", &solar)).await;
+        let materials = format!("csrf={token}&refresh=0&scene=materials");
+        let first = service.handle(&post("/action/scene", &materials)).await;
         assert!(
-            text(&first).starts_with("accepted: scene demo-area -> solar (revision 2)"),
+            text(&first).starts_with("accepted: scene demo-area -> materials (revision 2)"),
             "{}",
             text(&first)
         );
-        let second = service.handle(&post("/action/scene", &solar)).await;
+        let second = service.handle(&post("/action/scene", &materials)).await;
         assert_eq!(second.status, 303, "{}", text(&second));
         assert_eq!(
             text(&second).trim_end(),
-            "accepted: already running solar (revision 2); nothing to do"
+            "accepted: already running materials (revision 2); nothing to do"
         );
         // The browser shows the answer to the second click. What the person
         // did was switch, so that is the banner they land on — not "nothing
@@ -2627,7 +2629,7 @@ mod tests {
         let landed = follow(&service, &second).await;
         assert!(
             landed.contains(
-                "<div class=\"notice ok\"><span>All 1 connected shard switched to solar \
+                "<div class=\"notice ok\"><span>All 1 connected shard switched to materials \
                  (revision 2)."
             ),
             "{landed}"
@@ -2644,14 +2646,14 @@ mod tests {
         assert!(text(&hurried).contains("Nothing was changed"));
         let json = text(&service.handle(&get("/api/state")).await);
         assert!(
-            json.contains("\"name\":\"solar\",\"id\":2,\"revision\":2"),
+            json.contains("\"name\":\"materials\",\"id\":1,\"revision\":2"),
             "{json}"
         );
         // ...and goes through once the pause is over.
         tokio::time::sleep(service.config.limits.min_action_spacing * 2).await;
         let patient = service.handle(&post("/action/scene", &galaxy)).await;
         assert!(
-            text(&patient).starts_with("accepted: scene solar -> galaxy (revision 3)"),
+            text(&patient).starts_with("accepted: scene materials -> galaxy (revision 3)"),
             "{}",
             text(&patient)
         );
@@ -2666,7 +2668,7 @@ mod tests {
         let mut orch = orchestrator("space-test");
         let (handle, mut port) = crate::ops::channel(orch.snapshot());
         let service = Arc::new(service_with(handle, None, &[]));
-        let body = format!("csrf={}&scene=solar", service.form_token);
+        let body = format!("csrf={}&scene=galaxy", service.form_token);
         let click = |service: &Arc<Service>| {
             let (service, body) = (Arc::clone(service), body.clone());
             tokio::spawn(async move { service.handle(&post("/action/scene", &body)).await })
@@ -2704,7 +2706,7 @@ mod tests {
         let first = first.await.expect("the first half");
         let second = second.await.expect("the second half");
         assert!(
-            text(&first).starts_with("accepted: scene demo-area -> solar (revision 2)"),
+            text(&first).starts_with("accepted: scene demo-area -> galaxy (revision 2)"),
             "{}",
             text(&first)
         );
@@ -2712,7 +2714,7 @@ mod tests {
         assert_eq!(second.status, 303, "{}", text(&second));
         assert_eq!(
             text(&second).trim_end(),
-            "accepted: already running solar (revision 2); nothing to do"
+            "accepted: already running galaxy (revision 2); nothing to do"
         );
         assert_eq!(second.header("x-space-confirmed"), Some("1/1"));
         assert!(
@@ -2740,7 +2742,7 @@ mod tests {
         run_loop(orch, port, ShardAnswers::WhenTold(Arc::clone(&confirm)));
         let service = service_with(handle, None, &[]);
         let wait = service.config.limits.scene_confirm_wait;
-        let body = format!("csrf={}&refresh=0&scene=solar", service.form_token);
+        let body = format!("csrf={}&refresh=0&scene=galaxy", service.form_token);
 
         let started = Instant::now();
         let response = tokio::time::timeout(
@@ -2755,8 +2757,8 @@ mod tests {
         assert_eq!(response.header("x-space-confirmed"), Some("0/1"));
         assert_eq!(
             text(&response).trim_end(),
-            "accepted: scene demo-area -> solar (revision 2), sent to shard 1. Switching to \
-             solar (revision 2): waiting for shard 1 … (0 of 1 connected shard confirmed)"
+            "accepted: scene demo-area -> galaxy (revision 2), sent to shard 1. Switching to \
+             galaxy (revision 2): waiting for shard 1 … (0 of 1 connected shard confirmed)"
         );
 
         // The page: pending, said in the banner, in the Scene card and next to
@@ -2765,10 +2767,10 @@ mod tests {
         for needle in [
             "<meta http-equiv=\"refresh\" content=\"1\">",
             "<strong class=\"warn\">every 1 s while a shard is switching scene</strong>",
-            "<div class=\"notice warn\"><span>Switching to solar (revision 2): waiting for \
+            "<div class=\"notice warn\"><span>Switching to galaxy (revision 2): waiting for \
              shard 1 … (0 of 1 connected shard confirmed).",
             "this page reloads every 1 s until every connected shard has confirmed",
-            "<span class=\"pill warn\">switching → solar, 0 of 1 confirmed</span>",
+            "<span class=\"pill warn\">switching → galaxy, 0 of 1 confirmed</span>",
             "<div class=\"sub\">waiting for shard 1</div>",
             "demo-area, revision 1 <span class=\"pill warn\">behind</span>",
             // The chosen interval is kept for afterwards, and in every form.
@@ -2798,7 +2800,7 @@ mod tests {
         assert_eq!(again.header("x-space-confirmed"), Some("0/1"));
         assert_eq!(
             text(&again).trim_end(),
-            "accepted: already running solar (revision 2); nothing to do. Switching to solar \
+            "accepted: already running galaxy (revision 2); nothing to do. Switching to galaxy \
              (revision 2): waiting for shard 1 … (0 of 1 connected shard confirmed)"
         );
 
@@ -2814,9 +2816,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         for needle in [
-            "<div class=\"notice ok\"><span>All 1 connected shard switched to solar (revision 2).",
+            "<div class=\"notice ok\"><span>All 1 connected shard switched to galaxy (revision 2).",
             "<span class=\"pill ok\">1 of 1 connected shards</span>",
-            "solar, revision 2 <span class=\"pill ok\">current</span>",
+            "galaxy, revision 2 <span class=\"pill ok\">current</span>",
         ] {
             assert!(settled.contains(needle), "missing {needle:?}");
         }
@@ -2908,7 +2910,7 @@ mod tests {
         assert_eq!(location(&orch), "../?refresh=3&switched=1&same=1");
 
         let reply = orch.handle_operator(&OperatorCommand::SetScene {
-            scene: Scene::Solar,
+            scene: Scene::Galaxy,
         });
         orch.handle_scene_ack(&space_protocol::SceneAck {
             shard: ShardId::new(1),
@@ -2970,8 +2972,8 @@ mod tests {
             .await
             .contains("Already running demo-area (revision 1)"));
 
-        let solar = format!("csrf={}&scene=solar", service.form_token);
-        let switched = service.handle(&post("/action/scene", &solar)).await;
+        let galaxy = format!("csrf={}&scene=galaxy", service.form_token);
+        let switched = service.handle(&post("/action/scene", &galaxy)).await;
         assert_eq!(switched.header("x-space-confirmed"), Some("1/1"));
         // The old tab reloads.
         let stale = follow(&service, &asked).await;
@@ -2980,7 +2982,7 @@ mod tests {
         // The switch's own banner stays what it was.
         assert!(follow(&service, &switched)
             .await
-            .contains("All 1 connected shard switched to solar (revision 2)."));
+            .contains("All 1 connected shard switched to galaxy (revision 2)."));
     }
 
     /// What each shard confirmed is on the page next to it, and a shard that
@@ -3043,10 +3045,10 @@ mod tests {
 
         // It answers with something far past anything the cluster ever had.
         let nonsense = crate::scene::MAX_REVISION_CATCH_UP * 4;
-        ack(&mut orch, Scene::Solar, nonsense);
+        ack(&mut orch, Scene::Materials, nonsense);
         let (page, json) = render(&orch).await;
         assert!(page.contains(&format!(
-            "solar, revision {nonsense} <span class=\"pill bad\">not the cluster&#39;s</span>"
+            "materials, revision {nonsense} <span class=\"pill bad\">not the cluster&#39;s</span>"
         )));
         assert!(json.contains("\"scene_sync\":\"differs\""), "{json}");
         check_json(&json).expect("well-formed");
@@ -3069,8 +3071,8 @@ mod tests {
             ("/action/autoscaler", "state=explode", 400),
             ("/action/split", "shard=1&octant=%zz", 400),
             ("/action/scene", "scene=nowhere", 400),
-            ("/action/scene", "scene=solar&epoch=soon", 400),
-            ("/action/scenes", "scene=solar", 404),
+            ("/action/scene", "scene=galaxy&epoch=soon", 400),
+            ("/action/scenes", "scene=galaxy", 404),
         ] {
             let body = format!("csrf={token}&{fields}");
             let response = service.handle(&post(path, &body)).await;

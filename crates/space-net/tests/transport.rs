@@ -84,6 +84,7 @@ fn input_tick(tick: u64) -> Message {
             thrust: [0.0, 0.0, 1_000.0],
             torque: [0.0; 3],
             tick,
+            fast: false,
         }],
         ack_tick: 0,
     })
@@ -917,4 +918,165 @@ async fn an_ipv6_server_is_diallable_through_client_endpoint_for() {
     let (_server_conn, hello) = server_task.await.expect("server task");
     assert_eq!(hello.player_token, "v6");
     assert!(!conn.is_closed());
+}
+
+/// A client endpoint whose connections grant the peer **no** flow-control
+/// credit on a stream: whatever the server writes on the control stream waits
+/// for a window that never opens. It keeps its connection alive like any
+/// other (keep-alive pings), so the idle timeout does not end the wait.
+fn windowless_client() -> quinn::Endpoint {
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(quinn::VarInt::from_u32(0));
+    transport.keep_alive_interval(Some(space_net::KEEP_ALIVE_INTERVAL));
+    let mut config = space_net::crypto::make_client_config();
+    config.transport_config(std::sync::Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client(addr()).expect("client endpoint");
+    endpoint.set_default_client_config(config);
+    endpoint
+}
+
+/// The last word to a peer — a `Reject`, a `JoinRedirect` — is written with a
+/// bound. A peer that says hello and grants no receive window cannot be
+/// written to at all; without the bound `turn_away` waits on that write for as
+/// long as the peer keeps its connection up, and with it whatever the caller
+/// holds (one of the player port's 256 slots, a shard's serving task).
+///
+/// Mutation this catches: `send_last` awaiting `write_all` with no timeout —
+/// the server task below then never finishes and the outer timeout fails the
+/// test.
+#[tokio::test]
+async fn a_peer_that_grants_no_receive_window_cannot_hold_the_last_word() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(server.accept()).await.expect("accept");
+        let started = std::time::Instant::now();
+        conn.turn_away(&Message::JoinRedirect(join_redirect(
+            "0.0.0.0:7871".parse().expect("addr"),
+        )))
+        .await;
+        (started.elapsed(), conn.is_closed())
+    });
+
+    let client = windowless_client();
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("dial")
+        .await
+        .expect("the transport handshake");
+    let (mut send, _recv) = conn.open_bi().await.expect("the control stream");
+    send.write_all(&encode_frame(&Message::Hello(space_net::hello("deaf"))))
+        .await
+        .expect("the hello");
+
+    let (took, closed) = tokio::time::timeout(std::time::Duration::from_secs(8), server_task)
+        .await
+        .expect("turn_away must return although the peer never opens a window")
+        .expect("server task");
+    assert!(closed, "the connection is closed, read or not");
+    assert!(
+        took >= space_net::LAST_WORD_TIMEOUT,
+        "the write really was blocked (else this test proves nothing): {took:?}"
+    );
+    assert!(
+        took <= space_net::TURN_AWAY_LIMIT + std::time::Duration::from_millis(500),
+        "bounded by the write's limit and the drain: {took:?}"
+    );
+    // The peer sees the connection end; it was not left hanging either.
+    tokio::time::timeout(std::time::Duration::from_secs(3), conn.closed())
+        .await
+        .expect("the server closed the connection");
+}
+
+/// The first frame of a connection is a hello, and is read with a hello's
+/// size limit: a header that declares more is refused at once, from the
+/// header alone. Before, a stranger's first eight bytes had the server
+/// allocate up to the general frame limit (1 MiB) and wait for the payload
+/// until the handshake timeout.
+///
+/// Mutation this catches: reading the first frame with `read_frame` (the
+/// general limit) — the accept below then waits for a payload that never
+/// comes and ends as a `Handshake` timeout five seconds later.
+#[tokio::test]
+async fn a_first_frame_larger_than_a_hello_is_refused_from_its_header() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let outcome = accept_connection(server.accept()).await.map(|_| ());
+        (outcome, started.elapsed())
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("dial")
+        .await
+        .expect("the transport handshake");
+    let (mut send, _recv) = conn.open_bi().await.expect("the control stream");
+    // A header only: one byte more than a hello may be, far below the general
+    // frame limit, in this build's protocol version. No payload follows.
+    let declared = space_net::MAX_HELLO_PAYLOAD + 1;
+    assert!(declared < MAX_FRAME_SIZE);
+    let mut header = Vec::new();
+    header.extend_from_slice(&(declared as u32).to_be_bytes());
+    header.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    send.write_all(&header).await.expect("the header");
+
+    let (outcome, took) = server_task.await.expect("server task");
+    let err = outcome.expect_err("not a hello");
+    assert!(
+        matches!(err, NetError::Io(_)),
+        "refused as a bad frame, not timed out as a missing hello: {err:?}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "refused from the header, without waiting for the payload: {took:?}"
+    );
+}
+
+/// The largest hello anything legitimate sends still fits: a shard's hello to
+/// a peer with the longest peer token the orchestrator accepts
+/// (`MAX_SECRET_LEN`) behind the largest shard id. And a hello that cannot
+/// fit is refused where it is built, with the reason, not sent to a server
+/// that would close on it without a word.
+#[tokio::test]
+async fn the_largest_legitimate_hello_fits_and_a_larger_one_is_refused_by_the_sender() {
+    let token = format!(
+        "shard:{}:{}",
+        u32::MAX,
+        "t".repeat(space_net::MAX_SECRET_LEN)
+    );
+    let frame = encode_frame(&Message::Hello(space_net::hello(token.clone())));
+    let payload = frame.len() - space_protocol::FRAME_HEADER_LEN;
+    assert!(
+        payload * 2 < space_net::MAX_HELLO_PAYLOAD,
+        "the largest hello is {payload} bytes: it must fit with room to spare"
+    );
+
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.send_control(&Message::Welcome(welcome(bound)))
+            .await
+            .expect("welcome");
+        (conn, hello)
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let (_conn, _welcome) = connect(
+        &client,
+        bound,
+        "space.local",
+        &space_net::hello(token.clone()),
+    )
+    .await
+    .expect("the largest legitimate hello is taken");
+    let (_server_conn, hello) = server_task.await.expect("server task");
+    assert_eq!(hello.player_token, token);
+
+    let too_long = space_net::hello("x".repeat(space_net::MAX_HELLO_PAYLOAD));
+    let err = connect(&client, bound, "space.local", &too_long)
+        .await
+        .expect_err("a hello no server reads");
+    assert!(
+        matches!(&err, NetError::Protocol(why) if why.contains("hello")),
+        "{err:?}"
+    );
 }

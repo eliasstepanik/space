@@ -39,8 +39,8 @@ use tokio::sync::Mutex;
 
 use crate::crypto::make_client_config;
 use crate::framed::{
-    frame_version_mismatch, read_frame, recv_datagram, recv_stream_message, send_message,
-    send_on_stream,
+    frame_version_mismatch, read_frame, read_frame_capped, recv_datagram, recv_stream_message,
+    send_message, send_on_stream, MAX_HELLO_PAYLOAD,
 };
 
 /// Application close code used when a [`Hello`] is refused.
@@ -53,6 +53,17 @@ pub const REDIRECT_CLOSE_CODE: u32 = 0x24;
 /// How long a refusing server waits for the client to acknowledge a [`Reject`]
 /// before it closes the connection anyway.
 const REJECT_DRAIN: Duration = Duration::from_secs(1);
+
+/// How long the write of a connection's **last word** — a [`Reject`], a
+/// [`JoinRedirect`] — may take before it is given up (see `send_last`). The
+/// answer is a few hundred bytes at most (a redirect carries a shard map of
+/// at most 8 regions), far inside any peer's initial flow-control window, so
+/// only a peer that grants no window at all ever reaches this.
+pub const LAST_WORD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The longest [`Conn::turn_away`] / [`Conn::reject`] can take: the write of
+/// the answer and the wait for the peer to have read it, each bounded.
+pub const TURN_AWAY_LIMIT: Duration = Duration::from_secs(2);
 
 /// Silence after which a connection is declared dead.
 ///
@@ -373,9 +384,22 @@ async fn send_reject(send: &mut SendStream, reason: &RejectReason) {
 /// Write `message` on `send` as the last thing said on it and finish the
 /// stream. Best-effort: the peer may already be gone, and a message too large
 /// to frame is not sent at all (the peer then sees the stream end).
+///
+/// **Bounded** by [`LAST_WORD_TIMEOUT`]: a write on a QUIC stream waits for
+/// the peer's flow-control credit, and a peer that grants none (a receive
+/// window of zero) would otherwise hold the caller — and whatever it holds: a
+/// slot of the player port, a task of a shard's front end — for as long as it
+/// keeps its connection alive. When the bound runs out the stream is reset
+/// and the caller goes on to close the connection.
 async fn send_last(send: &mut SendStream, message: &Message) {
     if let Ok(frame) = space_protocol::try_encode_frame(message) {
-        let _ = send.write_all(&frame).await;
+        if tokio::time::timeout(LAST_WORD_TIMEOUT, send.write_all(&frame))
+            .await
+            .is_err()
+        {
+            let _ = send.reset(VarInt::from_u32(REJECT_CLOSE_CODE));
+            return;
+        }
     }
     let _ = send.finish();
 }
@@ -506,6 +530,16 @@ async fn join_unbounded(
     server_name: &str,
     hello: &Hello,
 ) -> Result<Joined, NetError> {
+    let frame = space_protocol::encode_frame(&Message::Hello(hello.clone()));
+    // The receiver reads no hello larger than this (it would close the
+    // connection without a word): say so here, where the reason is known.
+    let payload = frame.len() - space_protocol::FRAME_HEADER_LEN;
+    if payload > MAX_HELLO_PAYLOAD {
+        return Err(NetError::Protocol(format!(
+            "the hello is {payload} bytes, more than the {MAX_HELLO_PAYLOAD} a server reads \
+             (the token in it is too long)"
+        )));
+    }
     let connecting = endpoint
         .connect(addr, server_name)
         .map_err(|e| NetError::Handshake(e.to_string()))?;
@@ -518,7 +552,6 @@ async fn join_unbounded(
         .open_bi()
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
-    let frame = space_protocol::encode_frame(&Message::Hello(hello.clone()));
     send.write_all(&frame)
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
@@ -617,7 +650,10 @@ async fn accept_first_frame(
         .accept_bi()
         .await
         .map_err(|e| NetError::Handshake(e.to_string()))?;
-    let first = match read_frame(&mut recv).await {
+    // The first frame is a hello, and a hello is small: a peer that has proved
+    // nothing yet is not allocated the general frame limit for it
+    // ([`MAX_HELLO_PAYLOAD`]).
+    let first = match read_frame_capped(&mut recv, MAX_HELLO_PAYLOAD).await {
         Ok(first) => first.ok_or_else(|| NetError::Protocol("the client sent no hello".into()))?,
         Err(err) => {
             // A peer built for another protocol version: the version is in

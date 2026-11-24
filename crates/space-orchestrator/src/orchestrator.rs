@@ -513,6 +513,11 @@ impl<L: Launcher> Orchestrator<L> {
             // operator looks, not only on standard error.
             events.push(0, EventKind::Scene, Severity::Warn, warning);
         }
+        if let Some(note) = control.scene.note() {
+            // A retired scene was replaced by the default: worth a line on
+            // the operator's page, not a warning.
+            events.push(0, EventKind::Scene, Severity::Info, note);
+        }
         Self {
             control,
             launcher,
@@ -714,7 +719,9 @@ impl<L: Launcher> Orchestrator<L> {
         match self.player_target() {
             Some(shard) => PlayerAnswer::Redirect(JoinRedirect {
                 shard,
-                shard_map: self.control.map().clone(),
+                // The map as a player is to see it: where to dial each
+                // shard, not where the shards reach each other.
+                shard_map: self.control.map().for_players(),
             }),
             None => PlayerAnswer::Starting,
         }
@@ -8119,25 +8126,25 @@ mod tests {
         assert!(orch.drain_outbox().is_empty(), "nothing was asked for yet");
 
         orch.tick();
-        let reply = orch.handle_operator(&set_scene(Scene::Solar));
+        let reply = orch.handle_operator(&set_scene(Scene::Galaxy));
         assert!(reply.accepted, "{reply:?}");
         assert_eq!(
             reply.message,
-            "scene demo-area -> solar (revision 2), sent to shard 1, shard 2"
+            "scene demo-area -> galaxy (revision 2), sent to shard 1, shard 2"
         );
         assert_eq!(
             orch.events().get(reply.event).map(|e| e.text.clone()),
             Some(
-                "switch every shard to scene solar: accepted: scene demo-area -> solar \
+                "switch every shard to scene galaxy: accepted: scene demo-area -> galaxy \
                  (revision 2), sent to shard 1, shard 2"
                     .to_owned()
             )
         );
-        assert_eq!(orch.scene(), at(Scene::Solar, 2));
+        assert_eq!(orch.scene(), at(Scene::Galaxy, 2));
         let snapshot = orch.snapshot();
         assert_eq!(
             (snapshot.scene.scene, snapshot.scene.revision),
-            (Scene::Solar, 2)
+            (Scene::Galaxy, 2)
         );
         assert_eq!(snapshot.scene.changed_tick, Some(1));
         assert_eq!(
@@ -8150,25 +8157,25 @@ mod tests {
         assert_eq!(
             scene_sets(&out),
             vec![
-                (ShardId::new(1), at(Scene::Solar, 2)),
-                (ShardId::new(2), at(Scene::Solar, 2))
+                (ShardId::new(1), at(Scene::Galaxy, 2)),
+                (ShardId::new(2), at(Scene::Galaxy, 2))
             ]
         );
         assert_eq!(out.len(), 2, "and nothing else: {out:?}");
         assert!(orch.drain_outbox().is_empty(), "it is sent once");
 
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 2)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Galaxy, 2)));
         assert_eq!(
             (sync_of(&orch, 1), sync_of(&orch, 2)),
             (SceneSync::InSync, SceneSync::Behind)
         );
         assert_eq!(
             orch.scene_confirmed_by(ShardId::new(1)),
-            Some(at(Scene::Solar, 2))
+            Some(at(Scene::Galaxy, 2))
         );
         assert_eq!(
             event_texts(&orch)[0],
-            "shard 1 confirmed scene solar (revision 2)"
+            "shard 1 confirmed scene galaxy (revision 2)"
         );
         let heard = orch
             .snapshot()
@@ -8286,20 +8293,25 @@ mod tests {
     #[test]
     fn scene_changes_between_two_beats_cost_one_message_per_shard() {
         let mut orch = two_registered_shards();
-        for scene in [Scene::Solar, Scene::Galaxy, Scene::Materials, Scene::Solar] {
+        for scene in [
+            Scene::Materials,
+            Scene::Galaxy,
+            Scene::DemoArea,
+            Scene::Materials,
+        ] {
             assert!(orch.handle_operator(&set_scene(scene)).accepted);
         }
         assert_eq!(
             orch.scene(),
-            at(Scene::Solar, 5),
+            at(Scene::Materials, 5),
             "every change is a revision"
         );
         let out = orch.drain_outbox();
         assert_eq!(
             scene_sets(&out),
             vec![
-                (ShardId::new(1), at(Scene::Solar, 5)),
-                (ShardId::new(2), at(Scene::Solar, 5))
+                (ShardId::new(1), at(Scene::Materials, 5)),
+                (ShardId::new(2), at(Scene::Materials, 5))
             ],
             "one message each, with the latest scene"
         );
@@ -8307,24 +8319,24 @@ mod tests {
         // The same scene again: no new revision, nothing sent, and an answer
         // that cannot be taken for a switch. Nobody has confirmed yet, so it
         // also says who is still being waited for.
-        let reply = orch.handle_operator(&set_scene(Scene::Solar));
+        let reply = orch.handle_operator(&set_scene(Scene::Materials));
         assert!(reply.accepted, "{reply:?}");
         assert_eq!(reply.scene_changed, None, "nothing changed");
         assert_eq!(
             reply.message,
-            "already running solar (revision 5); nothing to change. Still waiting for shard 1, \
+            "already running materials (revision 5); nothing to change. Still waiting for shard 1, \
              shard 2 to confirm it (told again every second)"
         );
-        assert_eq!(orch.scene(), at(Scene::Solar, 5));
+        assert_eq!(orch.scene(), at(Scene::Materials, 5));
         assert_eq!(orch.snapshot().scene.changed_tick, Some(0));
         assert!(orch.drain_outbox().is_empty(), "nothing is sent for it");
         // Once everybody has confirmed, there is simply nothing to do.
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 5)));
-        orch.handle_scene_ack(&scene_ack(2, at(Scene::Solar, 5)));
-        let reply = orch.handle_operator(&set_scene(Scene::Solar));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 5)));
+        orch.handle_scene_ack(&scene_ack(2, at(Scene::Materials, 5)));
+        let reply = orch.handle_operator(&set_scene(Scene::Materials));
         assert_eq!(
             reply.message,
-            "already running solar (revision 5); nothing to do"
+            "already running materials (revision 5); nothing to do"
         );
         assert!(reply.accepted && reply.scene_changed.is_none());
         // A real change, by contrast, names the state it made current.
@@ -8372,13 +8384,13 @@ mod tests {
 
         // The scene changes and the first message is "lost" (drained, never
         // acked): the reminder carries the current scene.
-        assert!(orch.handle_operator(&set_scene(Scene::Solar)).accepted);
+        assert!(orch.handle_operator(&set_scene(Scene::Materials)).accepted);
         let _ = orch.drain_outbox();
         let mut reminders = Vec::new();
         for _ in 0..SCENE_RESEND_INTERVAL_TICKS {
             reminders.extend(beat(&mut orch));
         }
-        assert_eq!(reminders, vec![(ShardId::new(1), at(Scene::Solar, 2))]);
+        assert_eq!(reminders, vec![(ShardId::new(1), at(Scene::Materials, 2))]);
 
         // A shard reporting a revision too far ahead to be anything but
         // nonsense is not asked again: it would change nothing.
@@ -8410,14 +8422,14 @@ mod tests {
         use space_server::shard::{Destination, Shard};
         use space_server::ShardConfig;
 
-        // The shard has been running since before the restart: solar, rev 9,
+        // The shard has been running since before the restart: materials, rev 9,
         // with one client connected that was told so.
         let mut shard = Shard::new(ShardConfig::new(
             ShardId::new(1),
             addr(9_001),
             OrchestratorConfig::default().root_node(),
         ));
-        assert!(shard.set_scene(at(Scene::Solar, 9)));
+        assert!(shard.set_scene(at(Scene::Materials, 9)));
         let player = shard
             .join(&space_protocol::Hello {
                 protocol: space_protocol::PROTOCOL_VERSION,
@@ -8522,7 +8534,7 @@ mod tests {
         let log_before = orch.events().len();
 
         // The same revision with another scene is "not above" too.
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 1)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 1)));
         assert_eq!(
             orch.scene(),
             at(Scene::DemoArea, 1),
@@ -8543,9 +8555,9 @@ mod tests {
 
         // Several shards ahead, several answers: one raise, above the highest,
         // and not before a second has passed since the last one.
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 7)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 7)));
         orch.handle_scene_ack(&scene_ack(2, at(Scene::Galaxy, 30)));
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 12)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 12)));
         for _ in 1..SCENE_RESEND_INTERVAL_TICKS {
             orch.tick();
             orch.reconcile_scene();
@@ -8570,13 +8582,13 @@ mod tests {
         assert_eq!(orch.scene(), at(Scene::DemoArea, 31));
         assert_eq!(sync_of(&orch, 2), SceneSync::Differs);
         assert!(event_texts(&orch)[0].starts_with("shard 2 reports scene galaxy"));
-        assert!(orch.handle_operator(&set_scene(Scene::Solar)).accepted);
-        assert_eq!(orch.scene(), at(Scene::Solar, 32));
+        assert!(orch.handle_operator(&set_scene(Scene::Materials)).accepted);
+        assert_eq!(orch.scene(), at(Scene::Materials, 32));
 
         // An operator's change that already got above a reported revision
         // leaves nothing to catch up with.
         let mut orch = two_registered_shards();
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 1)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 1)));
         assert!(orch.handle_operator(&set_scene(Scene::Galaxy)).accepted);
         orch.tick();
         orch.reconcile_scene();
@@ -8587,7 +8599,7 @@ mod tests {
         let mut orch = two_registered_shards();
         orch.control.scene =
             crate::scene::SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSceneSink));
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 9)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 9)));
         orch.tick();
         orch.reconcile_scene();
         assert_eq!(orch.scene(), at(Scene::DemoArea, 1));
@@ -8605,12 +8617,12 @@ mod tests {
     #[test]
     fn a_scene_ack_is_believed_only_about_a_known_shard_and_only_forwards() {
         let mut orch = two_registered_shards();
-        assert!(orch.handle_operator(&set_scene(Scene::Solar)).accepted);
+        assert!(orch.handle_operator(&set_scene(Scene::Materials)).accepted);
         let _ = orch.drain_outbox();
         let shards_before = orch.snapshot().shards.len();
 
         for id in 500..600 {
-            orch.handle_scene_ack(&scene_ack(id, at(Scene::Solar, 2)));
+            orch.handle_scene_ack(&scene_ack(id, at(Scene::Materials, 2)));
         }
         assert_eq!(orch.snapshot().shards.len(), shards_before);
         assert!(orch.scene_confirmed_by(ShardId::new(500)).is_none());
@@ -8619,16 +8631,16 @@ mod tests {
             "nothing is logged about a stranger"
         );
 
-        orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 2)));
+        orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 2)));
         let logged = orch.events().len();
         // The same ack again, and the late answer to the revision before it.
         for _ in 0..50 {
-            orch.handle_scene_ack(&scene_ack(1, at(Scene::Solar, 2)));
+            orch.handle_scene_ack(&scene_ack(1, at(Scene::Materials, 2)));
             orch.handle_scene_ack(&scene_ack(1, at(Scene::DemoArea, 1)));
         }
         assert_eq!(
             orch.scene_confirmed_by(ShardId::new(1)),
-            Some(at(Scene::Solar, 2)),
+            Some(at(Scene::Materials, 2)),
             "a late ack does not move the shard back"
         );
         assert_eq!(orch.events().len(), logged, "and nothing more is logged");
@@ -8650,7 +8662,11 @@ mod tests {
             orch.reconcile_scene();
         }
         assert_eq!(orch.events().len(), logged, "once, not for every repeat");
-        assert_eq!(orch.scene(), at(Scene::Solar, 2), "and it changes no scene");
+        assert_eq!(
+            orch.scene(),
+            at(Scene::Materials, 2),
+            "and it changes no scene"
+        );
     }
 
     /// A shard that comes back (it restarted) is a new shard: it has confirmed
@@ -8733,7 +8749,7 @@ mod tests {
         orch.control.scene =
             crate::scene::SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSceneSink));
         let _ = orch.drain_outbox();
-        let reply = orch.handle_operator(&set_scene(Scene::Solar));
+        let reply = orch.handle_operator(&set_scene(Scene::Materials));
         assert!(!reply.accepted, "{reply:?}");
         assert!(
             reply.message.contains("could not be saved")
@@ -8778,7 +8794,7 @@ mod tests {
 
         let mut orch = start(&config);
         assert_eq!(orch.scene(), at(Scene::DemoArea, 1));
-        assert!(orch.handle_operator(&set_scene(Scene::Solar)).accepted);
+        assert!(orch.handle_operator(&set_scene(Scene::Materials)).accepted);
         assert!(orch.handle_operator(&set_scene(Scene::Galaxy)).accepted);
         assert_eq!(orch.scene(), at(Scene::Galaxy, 3));
         drop(orch);
@@ -8811,6 +8827,21 @@ mod tests {
                 .is_some_and(|t| t.contains("is not usable") && t.contains("materials")),
             "{texts:?}"
         );
+        drop(orch);
+
+        // The file names the retired `solar` (merged into the demo area): the
+        // default scene one revision up, an info line, no warning.
+        std::fs::write(&scene_file, "4 solar\n").expect("write the retired scene");
+        let orch = start(&restarted_with);
+        assert_eq!(orch.scene(), at(Scene::DemoArea, 5));
+        let first = orch.events().newest_first().next().expect("one entry");
+        assert_eq!(first.severity, Severity::Info);
+        assert!(
+            first.text.contains("retired scene \"solar\"") && first.text.contains("demo-area"),
+            "{}",
+            first.text
+        );
+        assert_eq!(orch.events().len(), 1);
         let _ = std::fs::remove_file(&state_path);
         let _ = std::fs::remove_file(&scene_file);
     }
@@ -8866,13 +8897,21 @@ mod tests {
             panic!("a shard owns the spawn point: {:?}", orch.player_answer());
         };
         assert_eq!(redirect.shard, ShardId::new(1));
-        assert_eq!(&redirect.shard_map, orch.map());
+        // The published map, as a player is to see it: where players dial
+        // each shard — and nothing of where the shards reach each other,
+        // which the orchestrator's own map still says.
+        assert_eq!(redirect.shard_map, orch.map().for_players());
         assert_eq!(
             redirect.shard_map.client_endpoint_of(ShardId::new(1)),
             Some(any_host(spec.host_port)),
             "the host the player dialed, the shard's port"
         );
-        assert_eq!(redirect.shard_map.regions[0].endpoint, addr(spec.host_port));
+        assert_eq!(orch.map().regions[0].endpoint, addr(spec.host_port));
+        assert_eq!(
+            redirect.shard_map.regions[0].endpoint,
+            any_host(spec.host_port),
+            "the internal endpoint is not sent to players"
+        );
 
         // A second shard takes a layout cell: the spawn point is not in it.
         orch.tick();

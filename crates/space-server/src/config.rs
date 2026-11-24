@@ -46,8 +46,9 @@ pub const ADOPT_TIMEOUT_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 /// (`TargetFull`, "entity is not available here", …) or its
 /// [`StaleEpoch`](space_protocol::StaleEpoch). The ship is still across the
 /// boundary on the next tick, so without a pause the shard re-offered at once —
-/// about fifteen offer/refusal round trips a second, each with a `Redirect`
-/// (carrying the whole shard map) to every client watching the ship — for as
+/// about fifteen offer/refusal round trips a second (each used to come with a
+/// `Redirect` to every client watching the ship; now a redirect waits for the
+/// accept, so a refused offer redirects nobody) — for as
 /// long as the peer kept refusing. Two seconds matches the handoff timeout: it
 /// is the rate a peer that does not answer at all is retried at. A shard-map
 /// change clears the pause, because the refusal was about the old map.
@@ -67,6 +68,25 @@ pub const REOFFER_BACKOFF_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 /// no-op for a client that already has it, and the cost on the tick is one
 /// comparison (the clients are only walked on the tick it is due).
 pub const SCENE_REANNOUNCE_TICKS: SimTick = 5 * space_sim::TICK_HZ as SimTick;
+
+/// How far a shard's scene clock may drift from the wall clock, µs, before
+/// the shard re-anchors it ([`crate::Shard::sync_scene_clock`]): 30 ms.
+///
+/// A shard's tick count falls behind the wall clock whenever its loop skips a
+/// tick (a stall), so its mapping from ticks to scene time drifts; past this
+/// it is moved back onto the wall clock — the planets jump by that much, and
+/// what they carry with them. Two shards on hosts with synchronised clocks
+/// therefore agree on the scene time to within about twice this.
+pub const SCENE_CLOCK_TOLERANCE_US: i64 = 30_000;
+
+/// Microseconds of UTC since the Unix epoch, now (what scene time is).
+#[must_use]
+pub fn wall_clock_us() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
+}
 
 /// How many inputs one client may have waiting between two ticks.
 ///

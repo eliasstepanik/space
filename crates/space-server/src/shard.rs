@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use space_protocol::{
     EntityGuid, HandoffReason, Hello, InputTick, JoinRedirect, Message, NeighbourStatus,
-    PlayerInput, Redirect, RejectReason, SceneAck, SceneState, ShardId, ShardMap, ShardRegion,
-    StaleEpoch, Welcome,
+    PlayerInput, Redirect, RejectReason, SceneAck, SceneClock, SceneState, ShardId, ShardMap,
+    ShardRegion, StaleEpoch, Welcome,
 };
 use space_sim::{ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
@@ -185,6 +185,9 @@ struct PendingCommit {
     components: Components,
     /// The shard that committed it (and now holds a ghost of it).
     from: ShardId,
+    /// The sender's scene time of the state
+    /// ([`crate::handoff::SCENE_TIME_COMPONENT`]).
+    scene_time: Option<i64>,
 }
 
 /// One shard: its region, its simulation, its clients and its handoff ledger.
@@ -243,6 +246,8 @@ pub struct Shard {
     /// The scene clients are told to draw, and the revision it was set at (see
     /// [`Shard::set_scene`]).
     scene: SceneState,
+    /// Whether the scene clock was set ([`Shard::sync_scene_clock`]).
+    scene_clock_set: bool,
     stats: ShardStats,
 }
 
@@ -281,8 +286,42 @@ impl Shard {
             shard_map: map,
             epoch_participant: EpochParticipant::new(),
             scene: SceneState::UNSET,
+            scene_clock_set: false,
             stats: ShardStats::default(),
         }
+    }
+
+    /// The mapping from this shard's ticks to scene time (see
+    /// [`space_protocol::SceneClock`]).
+    #[must_use]
+    pub fn scene_clock(&self) -> SceneClock {
+        self.sim.scene_clock()
+    }
+
+    /// Use `clock` from now on and tell every client (tests, and
+    /// [`Shard::sync_scene_clock`]).
+    pub fn set_scene_clock(&mut self, clock: SceneClock) {
+        self.sim.set_scene_clock(clock);
+        self.scene_clock_set = true;
+        self.send_to_all(Message::SceneClock(clock));
+    }
+
+    /// Keep the scene clock on the wall clock: `now_us` is the wall clock's
+    /// time (µs since the Unix epoch, [`crate::config::wall_clock_us`]) of the
+    /// tick just produced. The first call anchors the clock there; later
+    /// calls re-anchor it only when it has drifted more than
+    /// [`crate::config::SCENE_CLOCK_TOLERANCE_US`] from the wall clock (a
+    /// skipped tick), and tell every client. Returns whether it re-anchored.
+    /// The run loops call it after every tick; a shard nobody calls it on
+    /// counts scene time from 0 at tick 0 (deterministic, for tests).
+    pub fn sync_scene_clock(&mut self, now_us: i64) -> bool {
+        let tick = self.sim.tick();
+        let drift = now_us - self.sim.scene_clock().time_us_at(tick);
+        if self.scene_clock_set && drift.abs() <= crate::config::SCENE_CLOCK_TOLERANCE_US {
+            return false;
+        }
+        self.set_scene_clock(SceneClock::new(tick, now_us));
+        true
     }
 
     /// This shard's id.
@@ -607,16 +646,25 @@ impl Shard {
     /// [`JoinRefusal::Elsewhere`] — or `Rejected(Starting)` while the owner's
     /// address is not known.
     pub fn join(&mut self, hello: &Hello) -> Result<Welcome, JoinRefusal> {
+        // A player's token is its identity towards the shards for as long as
+        // its link lives: it is what a staged ship is matched to its owner
+        // by. An empty one is nobody's — and it is also what a transfer that
+        // *has* no owner (a body) carries, so it must never be taken for a
+        // match. Refused here, before anything is decided on it.
+        if hello.player_token.is_empty() {
+            return Err(RejectReason::Other("a hello must carry a player token".into()).into());
+        }
         if self.clients.len() >= MAX_PLAYERS_PER_SHARD {
             return Err(RejectReason::Full.into());
         }
         // Does this hello match a staged transfer's owner? If so the client is
         // the redirected player and gets no placeholder (see the method docs).
+        // Only a **ship** has an owner to come for it.
         let staged_owner = self
             .ledger
             .incoming()
             .values()
-            .any(|staged| staged.owner_token == hello.player_token);
+            .any(|staged| staged.is_owned_by(&hello.player_token));
         // A fresh join is this shard's only if the spawn point is. (Decided
         // before a session id is spent on it.)
         let spawn = if staged_owner {
@@ -658,10 +706,17 @@ impl Shard {
             Destination::Client(session),
             Message::SceneUpdate(self.scene),
         );
+        // And the clock the scene's planets move by.
+        self.send_to(
+            Destination::Client(session),
+            Message::SceneClock(self.sim.scene_clock()),
+        );
         Ok(Welcome {
             session,
             shard: self.config.shard,
-            shard_map: self.shard_map.clone(),
+            // What a player needs of the map: the regions and where to dial
+            // each shard — not where the shards reach each other.
+            shard_map: self.shard_map.for_players(),
         })
     }
 
@@ -770,7 +825,7 @@ impl Shard {
         match known {
             Some(shard) => JoinRefusal::Elsewhere(JoinRedirect {
                 shard,
-                shard_map: self.shard_map.clone(),
+                shard_map: self.shard_map.for_players(),
             }),
             None => RejectReason::Starting.into(),
         }
@@ -851,9 +906,12 @@ impl Shard {
                 .incoming()
                 .get(&status.entity)
                 .is_some_and(|staged| {
+                    // (An ownerless transfer — a body, a stray ship — carries
+                    // an empty owner token: nobody's, whatever a client's
+                    // own token is. See [`Incoming::is_owned_by`].)
                     self.clients
                         .get(&session)
-                        .is_some_and(|client| client.player_token == staged.owner_token)
+                        .is_some_and(|client| staged.is_owned_by(&client.player_token))
                 });
         if status.connected {
             if claim_is_authorized {
@@ -1106,7 +1164,14 @@ impl Shard {
             self.abort_outgoing(accept.entity, HandoffReason::EpochChanged);
             return;
         }
-        self.ledger.mark_accepted(&accept);
+        // The first accept of a ship's transfer is what redirects its
+        // player (see [`Shard::redirect_owner`]); a repeated one is not.
+        let first_ship_accept = self.ledger.outgoing().get(&accept.entity).is_some_and(|e| {
+            !e.accepted && e.kind == TransferKind::Ship && self.session_of(accept.entity).is_some()
+        });
+        if self.ledger.mark_accepted(&accept) && first_ship_accept {
+            self.redirect_owner(accept.entity, accept.to, accept.activation_tick);
+        }
     }
 
     fn on_commit(&mut self, commit: space_protocol::HandoffCommit) {
@@ -1210,6 +1275,8 @@ impl Shard {
             kind: staged.kind,
             components,
             from: staged.from,
+            scene_time: crate::handoff::scene_time_of(&commit.state)
+                .or_else(|| crate::handoff::scene_time_of(&staged.state)),
         });
     }
 
@@ -1333,6 +1400,7 @@ impl Shard {
         // message to a client is still its frame.
         if tick.is_multiple_of(SCENE_REANNOUNCE_TICKS) {
             self.send_to_all(Message::SceneUpdate(self.scene));
+            self.send_to_all(Message::SceneClock(self.sim.scene_clock()));
         }
 
         // 6. Replication.
@@ -1403,6 +1471,15 @@ impl Shard {
                 continue;
             }
             self.remove_ghost(pending.guid);
+            // Where it was relative to the planet it is near, by our clock.
+            let mut state = pending.state;
+            if let Some(sent) = pending.scene_time {
+                let c = self.sim.carry(state.pos, sent, self.sim.scene_time());
+                if c != [0.0; 3] {
+                    state.pos = space_world::WorldPos::from_f64_metres_around(state.pos, c);
+                }
+            }
+            let pending = PendingCommit { state, ..pending };
             let entity = self
                 .sim
                 .spawn_ship(pending.guid, pending.session, pending.state);
@@ -1520,8 +1597,8 @@ impl Shard {
         self.timeout_pass(tick);
     }
 
-    /// Offer the ship `guid` a client drives to `to`, and redirect everyone
-    /// watching it there (see the module docs of [`crate::handoff`]).
+    /// Offer the ship `guid` a client drives to `to`. Its player is redirected
+    /// there once `to` has accepted ([`Shard::redirect_owner`]).
     fn offer_ship(
         &mut self,
         guid: EntityGuid,
@@ -1530,76 +1607,65 @@ impl Shard {
         lead: SimTick,
         group: u64,
     ) {
-        {
-            let Some(entity) = self.sim.entity_of(guid) else {
-                return;
-            };
-            let Some(ship_pos) = self.sim.ship_state(guid).map(|s| s.pos) else {
-                return;
-            };
-            let Some(state) = replicate::snapshot_of(&self.sim, &self.guids, entity) else {
-                return;
-            };
-            // Stamp the owner's token into the offer's state so the accepting
-            // shard can require a claiming client's hello token to match it
-            // (see [`OWNER_TOKEN_COMPONENT`]).
-            let mut state = with_owner_token(state, &self.owner_token_of(guid));
-            state.components.push(TransferKind::Ship.component(lead));
-            let offer = Ledger::offer_with_lead(
-                guid,
-                self.config.shard,
-                to,
-                self.epoch(),
-                tick,
-                state,
-                lead,
-            );
-            let activation = offer.activation_tick;
-            self.ledger
-                .offer_sent_as(&offer, tick, TransferKind::Ship, group);
-            self.send_to(Destination::Shard(to), Message::HandoffOffer(offer));
-            // Tell the client *now*, with the activation tick, so it can open the
-            // new connection while the old path is still live (guarantee 3).
-            let redirect = Redirect {
-                entity: guid,
-                new_shard: to,
-                shard_map: self.shard_map.clone(),
-                activation_tick: activation,
-            };
-            // Everyone whose interest set holds the entity is redirected, not just
-            // the player driving it: `Redirect::entity` is "the entity the client
-            // is now interested in", so an observer that has been watching the ship
-            // must be told to follow it to `to` rather than simply lose it.
-            //
-            // "Holds the entity" is a distance test against the one ship being
-            // offered — the same `distance² <= radius²` rule the interest grid
-            // applies — not a full sphere query per client, which walked ~9 000
-            // grid cells for every client for every offer.
-            let radius_sq =
-                f64::from(self.config.interest_radius) * f64::from(self.config.interest_radius);
-            let watchers: Vec<u64> = self
-                .clients
-                .values()
-                .filter(|client| {
-                    let anchor = client
-                        .ship
-                        .and_then(|g| self.sim.ship_state(g))
-                        .map_or(WorldPos::ZERO, |s| s.pos);
-                    WorldPos::distance_squared(anchor, ship_pos) <= radius_sq
-                })
-                .map(|client| client.session)
-                .collect();
-            for session in watchers {
-                if let Some(client) = self.clients.get_mut(&session) {
-                    client.redirect_pending = Some(to);
-                    client.redirect_deadline = Some(tick.saturating_add(REDIRECT_TIMEOUT_TICKS));
-                }
-                self.send_to(
-                    Destination::Client(session),
-                    Message::Redirect(redirect.clone()),
-                );
-            }
+        let Some(entity) = self.sim.entity_of(guid) else {
+            return;
+        };
+        let Some(state) = replicate::snapshot_of(&self.sim, &self.guids, entity) else {
+            return;
+        };
+        // Stamp the owner's token into the offer's state so the accepting
+        // shard can require a claiming client's hello token to match it
+        // (see [`OWNER_TOKEN_COMPONENT`]).
+        let mut state = with_owner_token(state, &self.owner_token_of(guid));
+        state.components.push(TransferKind::Ship.component(lead));
+        state
+            .components
+            .push(crate::handoff::scene_time_component(self.sim.scene_time()));
+        let offer =
+            Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
+        self.ledger
+            .offer_sent_as(&offer, tick, TransferKind::Ship, group);
+        self.send_to(Destination::Shard(to), Message::HandoffOffer(offer));
+    }
+
+    /// `to` accepted the ship `guid`: tell the player who flies it, with the
+    /// activation tick, so its client opens the new connection while the old
+    /// path is still live (guarantee 3).
+    ///
+    /// Not before the accept: until then the accepting shard has not staged
+    /// the transfer, so the owner's hello there would not match a staged
+    /// owner token and would be answered like a fresh join — and its
+    /// `NeighbourStatus` would be dropped as a claim for nothing. The accept
+    /// is sent after the staging, so a client redirected here can only
+    /// arrive after it.
+    ///
+    /// **Only the owner.** Everyone who had the ship in sight used to be sent
+    /// the redirect too ("follow it rather than lose it"). A bystander has
+    /// nothing to follow it *with*: a client plays on the shard that
+    /// simulates its own ship, and what it sees of the ship that left is
+    /// this shard's ghost of it (`crate::border`), fed by the new owner. All
+    /// the redirect did for a bystander was make it say hello to the
+    /// accepting shard with its own token — where nothing is staged for it,
+    /// so it was sent away again, or, on the shard that owns the spawn
+    /// point, welcomed as a newcomer and given a **second ship** there for
+    /// as long as its client kept the useless connection (ten seconds).
+    fn redirect_owner(&mut self, guid: EntityGuid, to: ShardId, activation: SimTick) {
+        let Some(session) = self.session_of(guid) else {
+            return;
+        };
+        let tick = self.sim.tick();
+        let redirect = Redirect {
+            entity: guid,
+            new_shard: to,
+            // The map as a player is to see it (client endpoints only).
+            shard_map: self.shard_map.for_players(),
+            activation_tick: activation,
+        };
+        if let Some(client) = self.clients.get_mut(&session) {
+            client.redirect_pending = Some(to);
+            client.redirect_deadline = Some(tick.saturating_add(REDIRECT_TIMEOUT_TICKS));
         }
+        self.send_to(Destination::Client(session), Message::Redirect(redirect));
     }
 
     /// Commit every transfer that is ready (and, for a group, every member
@@ -1927,6 +1993,7 @@ mod tests {
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick: 1,
+                    fast: false,
                 };
                 23_000
             ],
@@ -2030,6 +2097,46 @@ mod tests {
 
     use space_protocol::Scene;
 
+    /// Two shards that booted at different times (different ticks) agree on
+    /// the scene time once both follow the wall clock; a shard re-anchors
+    /// only when it has drifted past the tolerance, and tells its clients.
+    #[test]
+    fn shards_agree_on_the_scene_clock_and_re_anchor_only_on_drift() {
+        let (mut a, mut b) = (shard(), shard());
+        a.tick_n(7);
+        b.tick_n(300);
+        let now = 1_763_900_000_000_000;
+        assert!(
+            a.sync_scene_clock(now) && b.sync_scene_clock(now),
+            "the first sync anchors"
+        );
+        assert_eq!(a.scene_clock().time_us_at(7), now);
+        assert_eq!(b.scene_clock().time_us_at(300), now);
+        // A second later both are a second on, on their own ticks.
+        a.tick_n(30);
+        b.tick_n(30);
+        let later = now + 1_000_000;
+        assert!(!a.sync_scene_clock(later) && !b.sync_scene_clock(later + 20_000));
+        assert_eq!(a.sim().scene_time(), later);
+        assert_eq!(b.sim().scene_time(), later);
+        // A stall: shard b skipped three ticks (100 ms). It re-anchors, and
+        // tells its client.
+        let session = join(&mut b, "p");
+        let _ = b.take_outbox();
+        b.tick();
+        assert!(b.sync_scene_clock(later + 33_333 + 100_000));
+        assert_eq!(b.scene_clock().time_us_at(b.sim().tick()), later + 133_333);
+        let told: Vec<SceneClock> = b
+            .take_outbox()
+            .into_iter()
+            .filter_map(|o| match (o.dest, o.message) {
+                (Destination::Client(s), Message::SceneClock(c)) if s == session => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, vec![b.scene_clock()]);
+    }
+
     fn shard() -> Shard {
         Shard::new(ShardConfig::new(
             ShardId::new(1),
@@ -2075,7 +2182,7 @@ mod tests {
     fn a_joining_client_is_told_the_scene_before_its_first_frame() {
         let mut shard = shard();
         assert_eq!(shard.scene(), SceneState::UNSET, "nobody has set one yet");
-        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        assert!(shard.set_scene(state(Scene::Galaxy, 4)));
         assert!(shard.take_outbox().is_empty(), "nobody to tell yet");
 
         let session = join(&mut shard, "player");
@@ -2088,11 +2195,16 @@ mod tests {
             .collect();
         assert_eq!(
             mine.first(),
-            Some(&&Message::SceneUpdate(state(Scene::Solar, 4))),
+            Some(&&Message::SceneUpdate(state(Scene::Galaxy, 4))),
             "the scene comes first"
         );
+        assert_eq!(
+            mine.get(1),
+            Some(&&Message::SceneClock(shard.scene_clock())),
+            "then the scene clock"
+        );
         assert!(
-            matches!(mine.get(1), Some(Message::Snapshot(_))),
+            matches!(mine.get(2), Some(Message::Snapshot(_))),
             "then the first frame: {mine:?}"
         );
         assert_eq!(
@@ -2121,13 +2233,14 @@ mod tests {
     #[test]
     fn a_client_that_missed_the_scene_is_told_again_without_a_change() {
         let mut shard = shard();
-        assert!(shard.set_scene(state(Scene::Solar, 4)));
+        assert!(shard.set_scene(state(Scene::Galaxy, 4)));
         let (a, b) = (join(&mut shard, "a"), join(&mut shard, "b"));
         // Both announcements are lost on the way to the clients.
         let lost = scene_updates(&mut shard);
         assert_eq!(lost.len(), 2, "precondition: the join announced the scene");
 
         let mut told: Vec<(SimTick, u64, SceneState)> = Vec::new();
+        let mut clocks = 0;
         for _ in 0..(2 * SCENE_REANNOUNCE_TICKS) {
             let tick = shard.tick();
             let mut frames = 0;
@@ -2136,6 +2249,12 @@ mod tests {
                     (Destination::Client(session), Message::SceneUpdate(scene)) => {
                         assert_eq!(frames, 0, "the announcement comes before the frames");
                         told.push((tick, session, scene));
+                    }
+                    (Destination::Client(_), Message::SceneClock(clock)) => {
+                        assert_eq!(frames, 0, "the clock comes before the frames");
+                        assert_eq!(tick % SCENE_REANNOUNCE_TICKS, 0, "with the scene");
+                        assert_eq!(clock, shard.scene_clock());
+                        clocks += 1;
                     }
                     (Destination::Client(_), Message::Snapshot(_) | Message::Delta(_)) => {
                         frames += 1;
@@ -2146,7 +2265,7 @@ mod tests {
             assert_eq!(frames, 2, "tick {tick}: one frame per client, as ever");
         }
         told.sort_unstable_by_key(|(tick, session, _)| (*tick, *session));
-        let solar = state(Scene::Solar, 4);
+        let solar = state(Scene::Galaxy, 4);
         assert_eq!(
             told,
             vec![
@@ -2158,6 +2277,7 @@ mod tests {
             "the current scene, to every client, once per interval and on no other tick"
         );
         assert_eq!(shard.scene(), solar, "no change of scene was needed");
+        assert_eq!(clocks, 4, "the clock is said again with the scene");
 
         // A shard with nobody connected says nothing to nobody.
         let mut empty = self::shard();
@@ -2186,8 +2306,8 @@ mod tests {
         );
 
         for stale in [
-            state(Scene::Solar, 2),
-            state(Scene::Solar, 1),
+            state(Scene::Galaxy, 2),
+            state(Scene::Galaxy, 1),
             state(Scene::Galaxy, 2),
             SceneState::UNSET,
         ] {
@@ -2237,31 +2357,31 @@ mod tests {
             (acks, updates)
         };
 
-        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 4)));
         let (confirmed, relayed) = drain(&mut shard);
         assert_eq!(
             confirmed,
             vec![SceneAck {
                 shard: ShardId::new(1),
-                applied: state(Scene::Solar, 4)
+                applied: state(Scene::Galaxy, 4)
             }]
         );
-        assert_eq!(relayed, vec![(session, state(Scene::Solar, 4))]);
+        assert_eq!(relayed, vec![(session, state(Scene::Galaxy, 4))]);
 
         // The same message again (the orchestrator re-sends until it hears an
         // ack): confirmed again, relayed to nobody.
-        shard.orchestrator_message(Message::SceneSet(state(Scene::Solar, 4)));
+        shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 4)));
         let (confirmed, relayed) = drain(&mut shard);
         assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert_eq!(confirmed[0].applied, state(Scene::Galaxy, 4));
         assert!(relayed.is_empty());
 
         // A late, older one: the answer names the newer scene the shard runs.
         shard.orchestrator_message(Message::SceneSet(state(Scene::Galaxy, 3)));
         let (confirmed, relayed) = drain(&mut shard);
-        assert_eq!(confirmed[0].applied, state(Scene::Solar, 4));
+        assert_eq!(confirmed[0].applied, state(Scene::Galaxy, 4));
         assert!(relayed.is_empty());
-        assert_eq!(shard.scene(), state(Scene::Solar, 4));
+        assert_eq!(shard.scene(), state(Scene::Galaxy, 4));
 
         assert_eq!(shard.epoch(), epoch, "a scene is not an epoch");
         assert_eq!(shard.shard_map(), &map);

@@ -1313,6 +1313,15 @@ mod tests {
             Message::SceneUpdate(space_protocol::SceneState::UNSET),
             "the first thing behind the welcome is the scene"
         );
+        let clock = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
+            .await
+            .expect("the scene clock must arrive")
+            .expect("recv")
+            .expect("a message");
+        assert!(
+            matches!(clock, Message::SceneClock(_)),
+            "then the scene clock: {clock:?}"
+        );
         let frame = tokio::time::timeout(Duration::from_secs(5), conn.recv_stream())
             .await
             .expect("the first snapshot must arrive")
@@ -1346,7 +1355,7 @@ mod tests {
         use space_protocol::{Scene, SceneState};
         let (net, shard, serve) = served_shard().await;
         let bound = net.local_addr().expect("addr");
-        let solar = SceneState::new(Scene::Solar.id(), 1);
+        let solar = SceneState::new(Scene::Galaxy.id(), 1);
         let galaxy = SceneState::new(Scene::Galaxy.id(), 2);
         assert!(shard.lock().await.set_scene(solar));
 
@@ -1403,7 +1412,7 @@ mod tests {
         use space_protocol::{Scene, SceneState};
         let (net, shard, serve) = served_shard().await;
         let bound = net.local_addr().expect("addr");
-        let solar = SceneState::new(Scene::Solar.id(), 3);
+        let solar = SceneState::new(Scene::Galaxy.id(), 3);
         assert!(shard.lock().await.set_scene(solar));
 
         let endpoint = client_endpoint_for(bound).expect("client endpoint");
@@ -1454,10 +1463,10 @@ mod tests {
     #[test]
     fn a_scene_switch_reads_as_what_happened() {
         use space_protocol::{Scene, SceneState};
-        let solar = SceneState::new(Scene::Solar.id(), 2);
+        let solar = SceneState::new(Scene::Galaxy.id(), 2);
         assert_eq!(
             scene_switch_line(ShardId::new(3), SceneState::UNSET, solar),
-            "space-server: shard 3 runs scene solar (revision 2), as told by the orchestrator"
+            "space-server: shard 3 runs scene galaxy (revision 2), as told by the orchestrator"
         );
         assert_eq!(
             scene_switch_line(
@@ -1465,7 +1474,7 @@ mod tests {
                 SceneState::new(Scene::DemoArea.id(), 1),
                 solar
             ),
-            "space-server: shard 3 switched scene: demo-area (revision 1) -> solar (revision 2)"
+            "space-server: shard 3 switched scene: demo-area (revision 1) -> galaxy (revision 2)"
         );
     }
 

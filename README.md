@@ -45,6 +45,7 @@ with a readable message.
 | drag with the left mouse button | look around |
 | `C` | chase camera / first person |
 | `B` | brake assist (stops the ship when no movement key is held) |
+| `F` | fast travel: the speed limit grows with the distance to the nearest surface (normal flight near anything: within 120 m, or 2 km of what you are flying at; the Moon is about half a minute away). Switching it off drops the ship to its normal 120 m/s |
 | `H` | HUD on / off |
 | `Esc` | back to the connect screen; on the connect screen: quit (window only) |
 
@@ -153,10 +154,18 @@ every shard**. Connected clients follow within a second.
 
 | scene | |
 |---|---|
-| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit |
+| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit. The area rides along with **Earth** (eight Earth radii ahead and above the spawn point): the Moon, the Sun and the planets move around it on their real orbits, sped up 8766× (a year per real hour, the Moon round in 4.5 min), at real size, each a solid ball you can land on, pulling with its real `GM` within a finite reach that ends far from the demo area |
 | `materials` | PBR chart: gold, plastic and steel from mirror-smooth to rough |
-| `solar` | the solar system at real size and distance (coloured spheres) |
 | `galaxy` | the deterministic galaxy through the LOD selector |
+
+(The old `solar` scene is part of `demo-area` now; its wire id 2 stays
+reserved and resolves to the default, so an orchestrator whose saved scene was
+`solar` comes back up showing the demo area.)
+
+The planets move by **scene time** (UTC microseconds): every shard maps its
+ticks onto the wall clock, re-anchors when it drifts more than 30 ms, and
+tells its clients the mapping (`SceneClock`, protocol 6), so all shards and
+clients agree on where the Moon is.
 
 `space-orchestrator --scene NAME` sets the scene a new cluster starts with; a
 scene chosen in the web UI is remembered next to the orchestrator's state file

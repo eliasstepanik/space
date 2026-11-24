@@ -30,11 +30,18 @@
 //!   shard can register through this port.**
 //! * **It keeps no state per player.** Nothing outlives a connection but two
 //!   counters.
-//! * **It is cheap.** A connection gets one bounded wait for its hello
-//!   ([`HELLO_TIMEOUT`]), the answer, and a close that waits at most a second
-//!   for the answer to be read. At most [`MAX_PENDING`] connections are in
-//!   that state at once; one more is refused before any handshake work is
-//!   done for it.
+//! * **It is cheap.** A first packet from an address that has not been
+//!   validated is answered with a QUIC retry — no slot, no handshake; a real
+//!   client comes back with the token within the same connect call. A
+//!   connection then gets one bounded wait for its hello ([`HELLO_TIMEOUT`]),
+//!   the answer — a write that gives up after a second if the peer grants no
+//!   flow-control window ([`space_net::LAST_WORD_TIMEOUT`]) — and a close
+//!   that waits at most a second for the answer to be read; the whole of it
+//!   is bounded once more from outside ([`ANSWER_SLACK`]). At most
+//!   [`MAX_PENDING`] connections are in that state at once; one more is
+//!   refused before any handshake work is done for it. There is **no limit
+//!   per source address**: one host can take all the room for as long as it
+//!   keeps dialing (`docs/security-notes.md`).
 //! * **It cannot be made to fill a log.** The lines a peer can cause (being
 //!   refused for the limit above, a shard that dialed the wrong port) go
 //!   through a [`space_net::LogBudget`]: a few per window, the rest counted.
@@ -60,6 +67,11 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most connections the player port serves at once (each lives for a
 /// handshake and an answer). One more is refused unanswered.
 pub const MAX_PENDING: usize = 256;
+
+/// What the bound on one whole connection adds to the sum of its parts (the
+/// hello's limit and [`space_net::TURN_AWAY_LIMIT`]): room for the scheduler,
+/// so the parts' own limits are what normally ends a connection.
+pub const ANSWER_SLACK: Duration = Duration::from_millis(500);
 
 /// How many lines a peer can cause the player port to write per
 /// [`LOG_WINDOW`]; the rest are counted and summed up in the next one.
@@ -117,6 +129,11 @@ pub struct PlayerServer {
     turned_away: AtomicU64,
     /// Connections refused unanswered for want of room.
     refused: AtomicU64,
+    /// First packets answered with a retry (the sender's address was not
+    /// validated yet; a real client comes straight back).
+    retried: AtomicU64,
+    /// Connections dropped because the whole exchange ran out of its bound.
+    timed_out: AtomicU64,
     /// The budget for lines a peer can cause.
     lines: space_net::LogBudget,
 }
@@ -139,6 +156,8 @@ impl PlayerServer {
             redirected: AtomicU64::new(0),
             turned_away: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            retried: AtomicU64::new(0),
+            timed_out: AtomicU64::new(0),
             lines: space_net::LogBudget::new(LOG_LINES, LOG_WINDOW),
         })
     }
@@ -198,6 +217,20 @@ impl PlayerServer {
         self.refused.load(Ordering::Relaxed)
     }
 
+    /// How many first packets were answered with a QUIC retry instead of a
+    /// handshake (every honest connection counts once here).
+    #[must_use]
+    pub fn retried(&self) -> u64 {
+        self.retried.load(Ordering::Relaxed)
+    }
+
+    /// How many connections were dropped because hello, answer and close
+    /// together ran out of their bound.
+    #[must_use]
+    pub fn timed_out(&self) -> u64 {
+        self.timed_out.load(Ordering::Relaxed)
+    }
+
     /// Start accepting; each connection is answered in its own task. Returns
     /// the accept task's handle so a caller can abort it on shutdown.
     pub fn spawn_accept(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -206,6 +239,20 @@ impl PlayerServer {
                 let Some(incoming) = self.endpoint.accept().await else {
                     return; // endpoint closed
                 };
+                // Is the sender where it says it is? A first packet proves
+                // nothing about its source address, and this port is public:
+                // answered as it is, a forged source would have the port do
+                // a TLS handshake's work — and send its certificate — towards
+                // somebody else, and hold one of the slots below while it
+                // waits. So it is answered with a QUIC retry (a stateless
+                // token, no slot, no handshake); a real client comes back
+                // with the token at once and is `remote_address_validated`.
+                if !incoming.remote_address_validated() {
+                    self.retried.fetch_add(1, Ordering::Relaxed);
+                    // (Cannot fail: an unvalidated connection may be retried.)
+                    let _ = incoming.retry();
+                    continue;
+                }
                 // Room for it? Refused before any handshake work otherwise.
                 let Ok(permit) = Arc::clone(&self.room).try_acquire_owned() else {
                     incoming.refuse();
@@ -221,7 +268,17 @@ impl PlayerServer {
                 };
                 let server = Arc::clone(&self);
                 tokio::spawn(async move {
-                    server.answer_one(incoming).await;
+                    // The whole of it is bounded, whatever the parts do: the
+                    // hello, the answer and the close each have a limit of
+                    // their own, and this one stands behind them. Running
+                    // out of it drops the connection, which closes it.
+                    let limit = server.hello_timeout + space_net::TURN_AWAY_LIMIT + ANSWER_SLACK;
+                    if tokio::time::timeout(limit, server.answer_one(incoming))
+                        .await
+                        .is_err()
+                    {
+                        server.timed_out.fetch_add(1, Ordering::Relaxed);
+                    }
                     drop(permit);
                 });
             }
@@ -429,6 +486,97 @@ mod tests {
         // All the room is free again: nothing is still being served.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(server.room.available_permits(), MAX_PENDING);
+    }
+
+    /// A first packet proves nothing about where it came from, so it is
+    /// answered with a QUIC retry instead of a handshake and takes no slot;
+    /// a real client comes back with the token inside the same connect call
+    /// and gets its answer as before. One retry per connection, not more.
+    ///
+    /// Mutation this catches: accepting an unvalidated connection (the port
+    /// does handshake work, and holds a slot, for a source address nobody
+    /// has shown to exist), or a retry a real client cannot get past.
+    #[tokio::test]
+    async fn a_first_packet_is_retried_and_a_real_client_still_gets_its_answer() {
+        let (server, addr) = serving(HELLO_TIMEOUT);
+        server.publish(PlayerAnswer::Redirect(redirect_to(1)));
+        for n in 1..=3u64 {
+            let joined = hello(addr, &space_net::hello("a-player"))
+                .await
+                .expect("an answer, through the retry");
+            assert!(matches!(&joined, Joined::Elsewhere(r) if r.shard == ShardId::new(1)));
+            assert_eq!(server.retried(), n, "one retry per connection");
+            assert_eq!(server.redirected(), n);
+        }
+        assert_eq!((server.refused(), server.timed_out()), (0, 0));
+    }
+
+    /// A peer that says hello and then grants the port **no** flow-control
+    /// window cannot be written to: the answer's write would wait for as
+    /// long as the peer keeps its connection alive, and with it one of the
+    /// 256 slots — 256 such peers and the port answers nobody. The write
+    /// gives up after a second and the whole connection is bounded besides,
+    /// so the slot is free again in a few seconds.
+    ///
+    /// Mutation this catches: an unbounded write of the last word together
+    /// with no bound on `answer_one` (the slot is then never returned and
+    /// the last assertion fails).
+    #[tokio::test]
+    async fn a_peer_that_grants_no_receive_window_does_not_keep_a_slot() {
+        let hello_timeout = Duration::from_millis(500);
+        let (server, addr) = serving(hello_timeout);
+        server.publish(PlayerAnswer::Redirect(redirect_to(1)));
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(0));
+        transport.keep_alive_interval(Some(space_net::KEEP_ALIVE_INTERVAL));
+        let mut config = space_net::crypto::make_client_config();
+        config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client(loopback0()).expect("client endpoint");
+        endpoint.set_default_client_config(config);
+
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let conn = endpoint
+                .connect(addr, SERVER_NAME)
+                .expect("dial")
+                .await
+                .expect("the transport handshake");
+            let (mut send, recv) = conn.open_bi().await.expect("the control stream");
+            send.write_all(&space_protocol::encode_frame(&Message::Hello(
+                space_net::hello("a-windowless-player"),
+            )))
+            .await
+            .expect("the hello");
+            held.push((conn, send, recv));
+        }
+        // All four are being answered: each holds a slot now.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.room.available_permits(), MAX_PENDING - 4);
+
+        // And none of them holds it for long, although every one of them
+        // keeps its connection up and never reads.
+        let limit = hello_timeout + space_net::TURN_AWAY_LIMIT + ANSWER_SLACK;
+        let started = Instant::now();
+        while server.room.available_permits() != MAX_PENDING {
+            assert!(
+                started.elapsed() < limit + Duration::from_secs(1),
+                "{} slots still held after {:?}",
+                MAX_PENDING - server.room.available_permits(),
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for (conn, _send, _recv) in &held {
+            tokio::time::timeout(Duration::from_secs(3), conn.closed())
+                .await
+                .expect("the port closed the connection");
+        }
+        // A real client is served as ever.
+        let joined = hello(addr, &space_net::hello("a-player"))
+            .await
+            .expect("an answer");
+        assert!(matches!(joined, Joined::Elsewhere(_)));
     }
 
     /// A shard pointed at the player port (its transport hello names it

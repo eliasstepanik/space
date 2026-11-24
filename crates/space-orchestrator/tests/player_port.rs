@@ -459,7 +459,7 @@ async fn nothing_said_on_the_player_port_reaches_the_orchestrator() {
         }),
         Message::SceneAck(SceneAck {
             shard: root.shard,
-            applied: space_protocol::SceneState::new(space_protocol::Scene::Solar.id(), 77),
+            applied: space_protocol::SceneState::new(space_protocol::Scene::Materials.id(), 77),
         }),
     ];
     for message in &forged {

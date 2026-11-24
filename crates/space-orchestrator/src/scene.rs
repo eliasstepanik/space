@@ -40,6 +40,12 @@
 //!
 //! The initial scene (`--scene`) is exactly that: what a cluster shows until an
 //! operator chooses. Once a scene has been saved, the saved one wins.
+//!
+//! A file naming a **retired** scene ([`RETIRED_SCENE_NAMES`]: `solar`, now
+//! part of the demo area) is not a problem either: it loads as
+//! [`Scene::DEFAULT`] one revision above the saved one (so it supersedes what
+//! the shards held), and [`SceneStore::note`] says the retired scene was
+//! replaced.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,6 +74,11 @@ pub const MAX_REVISION_CATCH_UP: u64 = 1 << 32;
 /// offered to a full queue is dropped rather than waited for. This is what
 /// makes a dropped `SceneSet` (or a dropped ack) heal itself.
 pub const SCENE_RESEND_INTERVAL_TICKS: u64 = crate::config::TICK_HZ;
+
+/// Names of scenes that were retired from the catalogue
+/// ([`Scene::RETIRED_IDS`]). A scene file naming one loads as
+/// [`Scene::DEFAULT`] (see the module docs, "Persistence").
+pub const RETIRED_SCENE_NAMES: [&str; 1] = ["solar"];
 
 /// Where the scene is persisted for the state file at `state_path`: the same
 /// path with `.scene` **appended** (`space-orchestrator.id.scene`).
@@ -154,6 +165,8 @@ enum Stored {
     /// A revision, but a scene name this build does not know (the file was
     /// written by a build with a larger catalogue).
     UnknownScene(String, u64),
+    /// A scene that was retired from the catalogue, at its revision.
+    Retired(String, u64),
     /// Something else. The text says what.
     Unusable(String),
 }
@@ -192,6 +205,7 @@ fn parse_stored(text: &str) -> Stored {
     };
     match Scene::from_name(name) {
         Some(scene) => Stored::Scene(scene, revision),
+        None if RETIRED_SCENE_NAMES.contains(&name) => Stored::Retired(name.to_owned(), revision),
         None => Stored::UnknownScene(shown(name), revision),
     }
 }
@@ -222,6 +236,9 @@ pub struct SceneStore {
     /// Whether the current scene was read from the file (rather than being
     /// the configured initial scene).
     restored: bool,
+    /// A remark about the file read at startup that is not a problem (a
+    /// retired scene replaced by the default), if any.
+    note: Option<String>,
 }
 
 impl SceneStore {
@@ -243,6 +260,7 @@ impl SceneStore {
             path: None,
             warning: None,
             restored: false,
+            note: None,
         }
     }
 
@@ -252,13 +270,30 @@ impl SceneStore {
     /// file the store starts at `initial`, [`FIRST_REVISION`]. When the file
     /// cannot be used the store starts at `initial` too and
     /// [`Self::warning`] says why — this never fails (see the module docs).
+    /// When the file names a retired scene the store starts at
+    /// [`Scene::DEFAULT`], one revision above the saved one, and
+    /// [`Self::note`] says so.
     ///
     /// Nothing is written until the scene is changed.
     #[must_use]
     pub fn open(path: &Path, initial: Scene) -> Self {
+        let mut note = None;
         let (scene, revision, restored, warning) = match read_stored(path) {
             Stored::Nothing => (initial, FIRST_REVISION, false, None),
             Stored::Scene(scene, revision) => (scene, revision, true, None),
+            // Not a problem: the retired scene's content lives on in the
+            // default. One revision up, so every shard and client that still
+            // holds the old revision adopts the replacement.
+            Stored::Retired(name, revision) => {
+                let revision = revision.saturating_add(1);
+                note = Some(format!(
+                    "the scene file {} names the retired scene {name:?}; it was replaced by \
+                     the default scene {} at revision {revision}",
+                    path.display(),
+                    Scene::DEFAULT
+                ));
+                (Scene::DEFAULT, revision, false, None)
+            }
             // The revision is still good: keep counting from it, so the scene
             // that replaces the unknown one is a newer revision, not a repeat.
             Stored::UnknownScene(name, revision) => (
@@ -291,6 +326,7 @@ impl SceneStore {
             path: Some(path.to_path_buf()),
             warning,
             restored,
+            note,
         }
     }
 
@@ -322,6 +358,13 @@ impl SceneStore {
     #[must_use]
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
+    }
+
+    /// A remark about the scene file read at startup that is not a problem
+    /// (a retired scene replaced by the default); `None`: nothing to say.
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
     }
 
     /// Whether the current scene was read back from the scene file.
@@ -433,9 +476,9 @@ mod tests {
         let state = temp_path("fresh");
         remove(&state);
         let path = scene_path(&state);
-        let store = SceneStore::open(&path, Scene::Solar);
-        assert_eq!(store.current(), SceneState::new(Scene::Solar.id(), 1));
-        assert_eq!(store.scene(), Scene::Solar);
+        let store = SceneStore::open(&path, Scene::Galaxy);
+        assert_eq!(store.current(), SceneState::new(Scene::Galaxy.id(), 1));
+        assert_eq!(store.scene(), Scene::Galaxy);
         assert!(!store.restored());
         assert_eq!(store.warning(), None, "a missing file is the normal start");
         assert_eq!(store.path(), Some(path.as_path()));
@@ -457,8 +500,8 @@ mod tests {
         {
             let mut store = SceneStore::open(&path, Scene::DemoArea);
             assert_eq!(
-                store.set(Scene::Solar).expect("saved"),
-                SceneState::new(Scene::Solar.id(), 2)
+                store.set(Scene::Materials).expect("saved"),
+                SceneState::new(Scene::Materials.id(), 2)
             );
             assert_eq!(
                 store.set(Scene::Galaxy).expect("saved"),
@@ -499,13 +542,13 @@ mod tests {
         for junk in [
             "",
             "\n",
-            "solar",
-            "solar 3",
-            "three solar",
-            "0 solar",
-            "-1 solar",
-            "3 solar extra",
-            "18446744073709551616 solar",
+            "galaxy",
+            "galaxy 3",
+            "three galaxy",
+            "0 galaxy",
+            "-1 galaxy",
+            "3 galaxy extra",
+            "18446744073709551616 galaxy",
             "\u{0}\u{1}\u{2}",
             huge.as_str(),
         ] {
@@ -524,10 +567,10 @@ mod tests {
             );
             assert!(warning.len() < 600, "a huge file does not make a huge line");
             // The store still works, and the next change repairs the file.
-            assert!(store.set(Scene::Solar).is_ok(), "{junk:?}");
+            assert!(store.set(Scene::Galaxy).is_ok(), "{junk:?}");
             assert_eq!(
                 std::fs::read_to_string(&path).expect("repaired"),
-                "2 solar\n"
+                "2 galaxy\n"
             );
         }
         // Invalid UTF-8 is "cannot be read", not a panic.
@@ -555,15 +598,57 @@ mod tests {
         remove(&state);
     }
 
+    /// `solar` was merged into the demo area. A cluster whose operator had
+    /// chosen it comes back up on the default scene, without a warning, one
+    /// revision above the saved one (so shards and clients still holding the
+    /// old revision adopt it), and says what it replaced.
+    ///
+    /// Mutation this catches: treating the retired name like an unknown one
+    /// (a warning on the operator's page for a planned change, and `--scene`
+    /// instead of the default), or restarting the revision at 1.
+    #[test]
+    fn a_retired_scene_loads_as_the_default_and_keeps_the_revision_rising() {
+        let state = temp_path("retired");
+        remove(&state);
+        let path = scene_path(&state);
+        std::fs::write(&path, "6 solar\n").expect("write");
+        let mut store = SceneStore::open(&path, Scene::Materials);
+        assert_eq!(store.current(), SceneState::new(Scene::DEFAULT.id(), 7));
+        assert_eq!(store.scene(), Scene::DemoArea);
+        assert!(
+            store
+                .current()
+                .supersedes(&SceneState::new(space_protocol::SceneId(2), 6)),
+            "the replacement supersedes the retired scene's revision"
+        );
+        assert_eq!(store.warning(), None, "a retired scene is not a problem");
+        assert!(!store.restored());
+        let note = store.note().expect("the replacement is reported");
+        assert!(
+            note.contains("retired scene \"solar\"")
+                && note.contains("demo-area")
+                && note.contains("revision 7"),
+            "{note}"
+        );
+        // Nothing is written until the scene changes; then the file is clean.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("untouched"),
+            "6 solar\n"
+        );
+        assert_eq!(store.set(Scene::Galaxy).expect("saved").revision, 8);
+        assert_eq!(std::fs::read_to_string(&path).expect("saved"), "8 galaxy\n");
+        remove(&state);
+    }
+
     /// The same crash window the counter has: only the temp file was written.
     #[test]
     fn a_lone_temp_file_is_read_like_the_scene_file() {
         let state = temp_path("tmponly");
         remove(&state);
         let path = scene_path(&state);
-        std::fs::write(FileSceneSink::tmp_path(&path), "5 solar\n").expect("write");
+        std::fs::write(FileSceneSink::tmp_path(&path), "5 galaxy\n").expect("write");
         let store = SceneStore::open(&path, Scene::DemoArea);
-        assert_eq!(store.current(), SceneState::new(Scene::Solar.id(), 5));
+        assert_eq!(store.current(), SceneState::new(Scene::Galaxy.id(), 5));
         remove(&state);
     }
 
@@ -583,7 +668,7 @@ mod tests {
     fn a_scene_that_cannot_be_saved_is_not_adopted() {
         let mut store = SceneStore::with_sink(Scene::DemoArea, Box::new(BrokenSink));
         let before = store.current();
-        let err = store.set(Scene::Solar).expect_err("the write fails");
+        let err = store.set(Scene::Galaxy).expect_err("the write fails");
         assert!(err.to_string().contains("disk full"));
         assert_eq!(store.current(), before, "nothing changed");
         assert_eq!(store.scene(), Scene::DemoArea);
@@ -596,7 +681,7 @@ mod tests {
             store.warning().is_none(),
             "nothing to read is not a problem"
         );
-        assert!(store.set(Scene::Solar).is_err());
+        assert!(store.set(Scene::Galaxy).is_err());
         assert_eq!(store.scene(), Scene::DemoArea);
     }
 
@@ -608,17 +693,20 @@ mod tests {
         let state = temp_path("raise");
         remove(&state);
         let path = scene_path(&state);
-        let mut store = SceneStore::open(&path, Scene::Solar);
-        assert_eq!(store.current(), SceneState::new(Scene::Solar.id(), 1));
+        let mut store = SceneStore::open(&path, Scene::Galaxy);
+        assert_eq!(store.current(), SceneState::new(Scene::Galaxy.id(), 1));
         assert_eq!(
             store.raise_above(9).expect("saved"),
-            SceneState::new(Scene::Solar.id(), 10)
+            SceneState::new(Scene::Galaxy.id(), 10)
         );
-        assert_eq!(std::fs::read_to_string(&path).expect("saved"), "10 solar\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("saved"),
+            "10 galaxy\n"
+        );
         // Something at or below the current revision still moves one up.
         assert_eq!(store.raise_above(3).expect("saved").revision, 11);
         assert_eq!(store.raise_above(11).expect("saved").revision, 12);
-        assert_eq!(store.scene(), Scene::Solar);
+        assert_eq!(store.scene(), Scene::Galaxy);
         // The ceiling is an error, not a wrap-around.
         assert!(store.raise_above(u64::MAX).is_err());
         assert_eq!(store.revision(), 12);

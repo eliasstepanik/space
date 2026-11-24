@@ -63,6 +63,10 @@ pub fn boot(config: OrchestratorConfig, peer_token: String) -> Result<ControlPla
         // its event log, so it shows on the operator's page.
         eprintln!("space-orchestrator: {warning}");
     }
+    if let Some(note) = scene.note() {
+        // A retired scene replaced by the default: expected, not a problem.
+        println!("space-orchestrator: {note}");
+    }
     let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), peer_token);
     control.scene = scene;
     control.set_unclaimed_root_owner(root_owner);
@@ -218,14 +222,14 @@ mod tests {
             "the initial scene, since nothing was saved"
         );
         assert_eq!(control.scene.path(), Some(scene_file.as_path()));
-        control.scene.set(Scene::Solar).expect("saved");
+        control.scene.set(Scene::Galaxy).expect("saved");
         drop(control);
 
         // Restarted with the same flags: the saved scene wins over `--scene`.
         let control = boot(config.clone(), String::new()).expect("second boot");
         assert_eq!(
             control.scene.current(),
-            SceneState::new(Scene::Solar.id(), 2)
+            SceneState::new(Scene::Galaxy.id(), 2)
         );
         assert!(control.scene.restored());
         drop(control);

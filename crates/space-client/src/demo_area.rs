@@ -7,7 +7,7 @@
 //! [`EYE_HEIGHT`] below. Seen from the spawn point:
 //!
 //! ```text
-//!                         far backdrop: beacon towers out to ~1 km, a moon, stars
+//!          the sky: Earth (ahead, up to the right), the Moon, the Sun, stars
 //!
 //!   z=-30   [ the Kestrel on its apron: 24 m of ship, nose to the left,  ]
 //!           [ port side to the spawn point, a floodlight on a mast       ]
@@ -36,11 +36,14 @@
 //! * **lights and shadows**: a warm key, two warm fills, and red, green and
 //!   blue lamps whose shadows of a character, a ship and a pillar fall on a
 //!   white wall in the complementary colours (models shadowing a model);
-//! * **environment**: a dusk sky ([`ENVIRONMENT`]) — the ambient light in
-//!   every shadow, what the chrome ball and the smooth end of the gold row
-//!   reflect, and what the glass shows where nothing stands behind it;
-//! * **emissive**: the lamps around the lights, a glowing beacon cube, the
-//!   beacons on the towers;
+//! * **environment**: space ([`ENVIRONMENT`]) — black, but with a faint,
+//!   cool ambient light in every shadow (nothing that should be lit is
+//!   black), what the chrome ball and the smooth end of the gold row reflect,
+//!   and what the glass shows where nothing stands behind it;
+//! * **sunlight**: the Sun's light from where the Sun really is at the scene
+//!   time (added by the app every frame, `crate::scenes::World::sky`) — it
+//!   goes round once an hour;
+//! * **emissive**: the lamps around the lights, a glowing beacon cube;
 //! * **models**: the ship (small over the mirror, full size on its pad) and
 //!   the placeholder character, some facing the spawn point and some away;
 //! * **a real asset**: the IC-4 Kestrel ([`crate::kestrel`]) landed on an
@@ -48,16 +51,18 @@
 //!   glTF model with a complete interior, to walk up to, around and into
 //!   (nothing is solid), lit by a floodlight on the apron and, for whoever
 //!   goes in, by a lamp in its crew quarters;
-//! * **depth, fog, tone mapping**: self-lit towers receding to ~1 km into
-//!   the haze of the horizon, a moon and stars above.
+//! * **depth**: the solar system at real size around the area
+//!   (`space_scene::solar`): Earth eight Earth radii ahead and above, the
+//!   Moon, the Sun and the planets moving on their orbits, and stars all
+//!   round.
 //!
-//! The sky is painted ([`Environment::background`]): its horizon is the
-//! renderer's fog colour, so what the fog takes fades *into the sky* instead
-//! of glowing against black, and the polished metal reflects the same sky
-//! that is seen behind it. The ambient light comes from that sky as well;
-//! the point lights only model the shapes and cast the shadows: six for the
-//! stations, one for the ship, and the renderer's eighth inside the ship,
-//! lit only for a camera that is in there to see it.
+//! The area **rides along with Earth** (the old `solar` scene merged into
+//! this one): Earth stands still in the sky, the Moon goes round it every
+//! four and a half minutes and the Sun once an hour. The sky is not painted:
+//! space is black and there is no distance fog. The point lights model the
+//! shapes and cast the shadows: six for the stations, one for the ship, the
+//! Sun as the eighth — and inside the ship the cabin lamp takes the Sun's
+//! place, lit only for a camera that is in there to see it.
 //!
 //! The meshes are built once ([`DemoArea::shared`]) and every frame reuses
 //! their `Arc`s, which is what keeps them on the GPU.
@@ -88,7 +93,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use space_render::quality::FOG_COLOR;
 use space_render::{
     rotation_y, CameraPose, Environment, MeshData, MeshMaterial, Scene, SceneLight, Texture,
     IDENTITY_ROTATION,
@@ -102,6 +106,7 @@ use crate::bodies::MeshCache;
 use crate::kestrel::{Berth, Detail, CABIN_LAMP, GEAR_DROP};
 use crate::meshes::{glow, quat_matrix, sign_mesh};
 use crate::scenes::{at, character_mesh, ship_mesh, Body, Prop, EYE_HEIGHT};
+use space_world::WorldPos;
 
 /// The height of the floor's top, metres (scene space).
 pub const FLOOR: f64 = -(EYE_HEIGHT as f64);
@@ -151,24 +156,14 @@ pub const KESTREL_BERTH: Berth = Berth::landed(
 /// Nothing at all is further from the spawn point than this, metres.
 pub const BACKDROP_RADIUS: f64 = 8_000.0;
 
-/// The demo area's surroundings: a clear sky at dusk, painted behind
-/// everything.
-///
-/// * The **horizon** has the hue of the renderer's fog, so what the fog
-///   takes fades towards the sky behind it: haze, not a glow against black.
-/// * The **zenith** is a much darker blue: the picture keeps a gradient, and
-///   the moon and the stars still stand out overhead.
-/// * The **ground** is dark: seen from the platform's edge, the haze thickens
-///   into night below.
-/// * The **intensity** is one half. At full strength the sky is a bright
-///   day: its ambient light on a wall is then as strong as one of the
-///   coloured lamps, and their shadows wash out to pastel. At half, a shadow
-///   is a dim blue-grey — never black — the far corners of the floor are
-///   still plainly a floor, and the red, green and blue lamps own their wall.
+/// The demo area's surroundings: space. Nothing is painted behind
+/// everything (the stars and planets are), but a faint, cool ambient light
+/// stands in for the light of Earth, the stars and the scattered light of
+/// the lamps: a shadow is a dim blue-grey — never black — the far corners of
+/// the floor are still plainly a floor, and the red, green and blue lamps own
+/// their wall. Polished metal reflects that dim gradient.
 pub const ENVIRONMENT: Environment =
-    Environment::gradient([0.045, 0.085, 0.22], FOG_COLOR, [0.05, 0.06, 0.08])
-        .with_intensity(0.5)
-        .with_background(true);
+    Environment::gradient([0.07, 0.09, 0.15], [0.06, 0.065, 0.08], [0.03, 0.033, 0.04]);
 
 /// The demo area's content: props (mesh models), bodies (spheres and boxes)
 /// and lights at fixed places.
@@ -186,6 +181,10 @@ pub struct DemoArea {
     /// there (nothing of the deck it lights can be seen from outside).
     cabin_light: SceneLight,
 }
+
+/// The area's lamps are lights of a frame only for a camera this close to the
+/// spawn point, metres (see [`DemoArea::scene_for`]).
+pub const LAMP_RANGE: f64 = 20_000.0;
 
 /// A camera this close to the ship's bounds has the cabin lamp lit, metres.
 const CABIN_LIGHT_RANGE: f64 = 1.5;
@@ -769,104 +768,17 @@ impl DemoArea {
 
     fn backdrop(&mut self) {
         let mut dice = Dice(0x5eed_d0e5);
-        // Towers: dark, faintly self-lit slabs with a beacon on top, in a wide
-        // arc ahead and to the sides, from 140 m to 1 km. Nothing lights them
-        // out there but themselves; the fog takes them one after another.
-        let glow = MeshMaterial {
-            base_color: [0.2, 0.22, 0.28],
-            metallic: 0.0,
-            roughness: 0.9,
-            emissive: [0.014, 0.02, 0.038],
-            base_color_texture: None,
-        };
-        let towers = [
-            Arc::new(MeshData::cuboid([1.2, 16.0, 1.2], 4.0, glow)),
-            Arc::new(MeshData::cuboid([0.9, 24.0, 0.9], 4.0, glow)),
-            Arc::new(MeshData::cuboid([2.0, 10.0, 1.6], 4.0, glow)),
-        ];
-        const TOWERS: usize = 24;
-        for i in 0..TOWERS {
-            let t = i as f64 / (TOWERS - 1) as f64;
-            // Bearing from straight ahead, radians: about -110..110 degrees.
-            let bearing = (t * 2.0 - 1.0) * 1.9 + dice.between(-0.04, 0.04);
-            let distance = 140.0 * 7.0f64.powf(dice.roll());
-            let mesh = &towers[i % towers.len()];
-            let scale = dice.between(0.8, 1.5) * (distance / 300.0).clamp(1.0, 2.4);
-            let (x, z) = (distance * bearing.sin(), -distance * bearing.cos());
-            let half_height = f64::from(mesh.bounds_max[1]) * scale;
-            // Standing on the plane of the floor (well outside the floor).
-            let base = FLOOR - 1.0;
-            self.prop(
-                mesh,
-                [x, base + half_height, z],
-                dice.between(0.0, 1.5) as f32,
-                scale as f32,
-            );
-            let warm = dice.roll() < 0.6;
-            self.bodies.push(Body {
-                emissive: if warm {
-                    [5.0, 1.0, 0.3]
-                } else {
-                    [0.6, 2.2, 5.0]
-                },
-                ..Body::sphere(
-                    "tower beacon",
-                    at([x, base + 2.0 * half_height + 0.5 * scale, z]),
-                    (0.5 * scale) as f32,
-                    [0.0; 3],
-                )
-            });
-        }
-        // A moon, high ahead to the right: self-lit (no light reaches it), with
-        // darker seas — smaller spheres let into its near side — and far
-        // enough away to be tinted by the fog.
-        let moon = [225.0, 150.0, -540.0];
-        const MOON_RADIUS: f64 = 34.0;
-        self.bodies.push(Body {
-            emissive: [0.5, 0.48, 0.44],
-            roughness: 1.0,
-            ..Body::sphere("moon", at(moon), MOON_RADIUS as f32, [0.0; 3])
-        });
-        let range = moon.iter().map(|c| c * c).sum::<f64>().sqrt();
-        let towards_spawn = moon.map(|c| -c / range);
-        for (across, up, radius) in [
-            (-0.38, 0.30, 12.0),
-            (0.30, 0.42, 8.0),
-            (0.12, -0.36, 10.0),
-            (-0.48, -0.30, 5.0),
-            (0.55, -0.02, 6.0),
-        ] {
-            // A direction on the near side: `towards_spawn` tilted across
-            // (about the vertical) and up.
-            let (sin, cos) = f64::sin_cos(across);
-            let flat = [
-                towards_spawn[0] * cos - towards_spawn[2] * sin,
-                towards_spawn[1] + up,
-                towards_spawn[0] * sin + towards_spawn[2] * cos,
-            ];
-            let length = flat.iter().map(|c| c * c).sum::<f64>().sqrt();
-            // Let in so far that only a shallow cap shows.
-            let depth = MOON_RADIUS - 0.82 * radius;
-            let centre = [0, 1, 2].map(|i| moon[i] + flat[i] / length * depth);
-            self.bodies.push(Body {
-                emissive: [0.3, 0.29, 0.275],
-                roughness: 1.0,
-                ..Body::sphere("moon sea", at(centre), radius as f32, [0.0; 3])
-            });
-        }
-        // Stars overhead, further than the fog reaches: pale dots. None in
-        // the haze of the horizon or below it — against the painted sky a
-        // star down there reads as a speck of dust in front of the picture —
-        // and the lower ones are the fainter ones.
+        // Stars all round, pale dots a few kilometres out (the planets, the
+        // Moon and the Sun are the app's: they move, `crate::scenes::World::sky`).
         const STARS: usize = 200;
         for _ in 0..STARS {
-            // Uniform on the cap of the sphere above 9 degrees of elevation.
-            let y: f64 = dice.between(0.16, 1.0);
+            // Uniform on the sphere.
+            let y: f64 = dice.between(-1.0, 1.0);
             let around = dice.between(0.0, std::f64::consts::TAU);
             let flat = (1.0 - y * y).sqrt();
             let distance = dice.between(4_500.0, 7_000.0);
             let size = dice.between(7.0, 18.0) as f32;
-            let glow = (dice.between(0.4, 1.6) * (0.3 + 0.7 * y)) as f32;
+            let glow = dice.between(0.4, 1.6) as f32;
             self.bodies.push(Body {
                 emissive: [glow, glow, glow * 1.1],
                 ..Body::sphere(
@@ -933,7 +845,17 @@ impl DemoArea {
     #[must_use]
     pub fn scene_for(&self, camera: &CameraPose, detail: Detail) -> Scene {
         let instances = self.bodies.iter().map(|b| b.instance(camera)).collect();
-        let mut lights = self.lights.clone();
+        // The lamps light the area; from further away than this nothing they
+        // light can be told apart, and a shadow ray from a planet's surface
+        // to a lamp half a million kilometres away would wade through the
+        // whole area's geometry at the end (a frame on the Moon took seconds
+        // on the High preset): out there the Sun is the only light.
+        let in_range = WorldPos::distance(WorldPos::ZERO, camera.position) < LAMP_RANGE;
+        let mut lights = if in_range {
+            self.lights.clone()
+        } else {
+            Vec::new()
+        };
         // The cabin lamp lights a deck that cannot be seen from outside the
         // hull (the canopy is opaque): it is a light of the frame — a shadow
         // ray for every pixel — only for a camera that is in the ship.
@@ -1017,7 +939,7 @@ mod tests {
                 "{}",
                 body.name
             );
-            let backdrop = matches!(body.name, "tower beacon" | "moon" | "moon sea" | "star");
+            let backdrop = body.name == "star";
             assert_eq!(far > AREA_RADIUS, backdrop, "{} at {far} m", body.name);
         }
         for prop in area.props() {
@@ -1081,16 +1003,16 @@ mod tests {
             7,
             "a key, two fills, the three lamps and the ship's floodlight"
         );
-        // The rest of the light is the sky: painted, its horizon the hue of
-        // the fog, darker overhead, and much dimmer on the wall of the shadow
-        // theatre than one of its lamps is (or the shadows wash out).
-        assert!(ENVIRONMENT.background && !ENVIRONMENT.is_none());
-        let [zenith, horizon, _ground] = ENVIRONMENT.colors();
+        // The rest of the light is space's: nothing painted, a faint cool
+        // ambient light, brighter overhead than below, and much dimmer on the
+        // wall of the shadow theatre than one of its lamps is (or the shadows
+        // wash out). (The Sun's light is the app's: it moves.)
+        assert!(!ENVIRONMENT.background && !ENVIRONMENT.is_none());
+        let [zenith, horizon, ground] = ENVIRONMENT.colors();
         for c in 0..3 {
-            let same_hue = horizon[c] / FOG_COLOR[c] - horizon[0] / FOG_COLOR[0];
-            assert!(same_hue.abs() < 1e-6);
-            assert!(zenith[c] < horizon[c]);
+            assert!(zenith[c] >= horizon[c] && horizon[c] > ground[c]);
         }
+        assert!(zenith[2] > zenith[0], "cool");
         let on_the_wall = ENVIRONMENT.ambient([0.0, 0.0, 1.0]);
         let wall = area
             .props()
@@ -1131,8 +1053,10 @@ mod tests {
         // Emissive: the beacon cube.
         let beacon = bodies.iter().find(|b| b.name == "beacon").expect("beacon");
         assert!(beacon.emissive.iter().sum::<f32>() > 1.0);
-        // Backdrop.
-        assert!(named("tower beacon") >= 10 && named("star") >= 100 && named("moon") == 1);
+        // Backdrop: stars; no towers, and no painted moon (the real Moon is
+        // the app's, in the sky that moves).
+        assert!(named("star") >= 100);
+        assert_eq!(named("tower beacon") + named("moon") + named("moon sea"), 0);
 
         // Models: the character several times, the ship more than once, and
         // textures on the floor, the crates and the panels.
@@ -1223,8 +1147,8 @@ mod tests {
             &ship(&World::default().build(&spawn_camera())),
             &full
         ));
-        // Far fewer meshes than props: the crates, characters, ships and
-        // towers share theirs.
+        // Fewer meshes than props: the crates, characters and ships share
+        // theirs.
         let props = area.props().len();
         let mut meshes: Vec<*const MeshData> = first
             .models
@@ -1235,7 +1159,7 @@ mod tests {
             .collect();
         meshes.sort_unstable();
         meshes.dedup();
-        assert!(meshes.len() * 2 < props, "{}", meshes.len());
+        assert!(meshes.len() < props, "{} of {props}", meshes.len());
         // The scene moves with the camera, by exactly the camera's move.
         let (a, b) = (first.models[0].position, second.models[0].position);
         assert!((a[0] - b[0] - 3.0).abs() < 1e-4 && (a[2] - b[2] + 5.0).abs() < 1e-4);

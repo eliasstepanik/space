@@ -51,9 +51,20 @@
 //!    the new connection shows its ship, now owned by the new session. That
 //!    frame is the switch: inputs go to the new shard from then on and the old
 //!    connection is closed. "Its ship" is the ship it has been flying, by
-//!    guid: a connection that reaches the accepting shard before the shards'
-//!    own offer does is given a placeholder ship there, and a frame showing
-//!    *that* is not the switch (the old shard still simulates the real one).
+//!    guid. The shard sends the redirect only once the accepting shard has
+//!    staged the ship, so the hello there is recognised (by the token) and
+//!    the client is given no ship of its own. Should the accepting shard have
+//!    dropped the transfer again by then (an abort that crossed the hello),
+//!    it answers like for a fresh join: it sends the client on (the attempt
+//!    is over, see below) or — the shard that owns the spawn point — lets it
+//!    in with a **new** ship. A frame showing that ship is not the switch;
+//!    it is the sign that this connection is of no use, and the link closes
+//!    it at once, which removes the ship.
+//!
+//! Only a redirect for the **own** ship is followed. A shard sends one to
+//! the ship's player and to nobody else; a redirect naming any other entity
+//! is ignored (there is nothing a second connection could do for a ship this
+//! client does not fly — it is seen through the own shard's ghost of it).
 //!
 //! The ship keeps its guid and its world position across the switch, so
 //! [`Replica::offset`] — and with it the camera — is continuous: the
@@ -109,6 +120,16 @@
 //! apart). A body that a neighbouring shard simulates arrives as its
 //! ghost — the same guid, the same components — and is drawn like any other.
 //!
+//! # The scene clock
+//!
+//! Every shard maps its ticks to **scene time** (the time the demo area's
+//! planets move by) and says how in a [`Message::SceneClock`] behind its
+//! `Welcome`, again whenever it re-anchors and every few seconds. The link
+//! keeps the mapping of the shard being played on ([`Replica::scene_clock`]);
+//! during a handoff the accepting shard's is held back and taken at the
+//! switch, together with that shard's ticks — a mapping is only meaningful
+//! with the ticks of the shard that made it.
+//!
 //! # Prediction
 //!
 //! The link remembers every input batch it sends ([`ServerLink::take_sent`])
@@ -132,13 +153,14 @@ use space_ecs::{ComponentDef, ComponentId};
 use space_net::{client_endpoint_for, hello, join, Conn, Joined, NetError};
 use space_protocol::{
     resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
-    PlayerInput, Redirect, RejectReason, SceneState, ShardId, ShardMap, Welcome,
+    PlayerInput, Redirect, SceneClock, SceneState, ShardId, ShardMap, Welcome,
 };
 use space_sim::articulation::{decode_articulation, decode_part_states};
 use space_sim::body::{decode_body, decode_residual, decode_visual};
 use space_sim::spring::decode_springs;
 use space_sim::{
-    Articulation, Body, CollisionGroups, Owner, PartStates, PosResidual, ShipState, Springs, Visual,
+    Articulation, Body, CollisionGroups, Owner, PartStates, PosResidual, ShipControls, ShipState,
+    Springs, Visual,
 };
 use space_world::WorldPos;
 use tokio::task::JoinHandle;
@@ -178,15 +200,6 @@ const REDIRECT_PATIENCE: Duration = Duration::from_secs(10);
 /// A third is not a path to a shard any more — it is a loop or a
 /// misconfigured cluster — and ends the attempt with a readable reason.
 pub const MAX_JOIN_REDIRECTS: usize = 2;
-
-/// How often, and how far apart, the link asks the accepting shard of a
-/// handoff again when that shard does not know of the handoff yet. The
-/// offering shard tells the client and the accepting shard at the same
-/// moment, so the client's dial can get there first; the shard then takes
-/// the hello for a fresh join. A few tries a short pause apart stay well
-/// inside the handoff's lead.
-const ADOPT_RETRIES: usize = 5;
-const ADOPT_RETRY_PAUSE: Duration = Duration::from_millis(120);
 
 /// Why a join did not end on a shard, and at which address.
 #[derive(Debug, Clone, PartialEq)]
@@ -419,6 +432,9 @@ pub struct Replica {
     /// survives a shard transition; compare it with the value last drawn to
     /// notice a change (see the module docs, "The scene").
     pub scene: SceneState,
+    /// How the shard being played on maps its ticks to scene time (see the
+    /// module docs, "The scene clock"); `None` until it has said.
+    pub scene_clock: Option<SceneClock>,
     /// Every ship the shard being played on has reported and not removed
     /// again, our own included (see [`Replica::others`]).
     ships: ShipView,
@@ -758,6 +774,41 @@ impl Replica {
         })
     }
 
+    /// Whether `message` is a frame carrying a ship owned by `session` that
+    /// is **not** `guid`: a ship the shard made for this session itself.
+    fn frame_has_other_ship_of(message: &Message, session: u64, guid: EntityGuid) -> bool {
+        let entities = match message {
+            Message::Snapshot(s) => &s.entities,
+            Message::Delta(d) => &d.entities,
+            _ => return false,
+        };
+        entities.iter().any(|entity| {
+            entity.guid != guid
+                && owner_of(entity) == Some(session)
+                && ship_state_of(entity).is_some()
+        })
+    }
+
+    /// Whether the own ship is in fast travel, as the shard last said (its
+    /// replicated `ShipControls`).
+    #[must_use]
+    pub fn own_fast(&self) -> bool {
+        let Some(guid) = self.ship else {
+            return false;
+        };
+        self.ships
+            .ships
+            .iter()
+            .find(|t| t.ship.guid == guid)
+            .and_then(|t| {
+                t.components
+                    .iter()
+                    .find(|(id, _)| *id == ShipControls::ID)
+                    .and_then(|(_, b)| space_protocol::codec::decode_raw::<ShipControls>(b).ok())
+            })
+            .is_some_and(|(c, _)| c.fast)
+    }
+
     /// The ship state in `entity`, if it is this session's ship.
     fn own_state(&self, entity: &EntitySnapshot) -> Option<ShipState> {
         if owner_of(entity)? != self.session {
@@ -883,6 +934,8 @@ struct Pending {
     /// The newest scene this shard has announced on this connection, kept for
     /// the moment it becomes the shard being played on.
     scene: Option<SceneState>,
+    /// Its scene clock, kept for the same moment.
+    scene_clock: Option<SceneClock>,
     /// The ships this shard has reported on this connection, kept for the
     /// same moment: its join snapshot arrives long before the switch, and the
     /// deltas after it only name ships that change.
@@ -897,6 +950,8 @@ struct Shared {
     /// Thrust intent, each axis in `-1..=1` (world frame; the ship is never
     /// torqued, so its body frame stays the world frame).
     thrust: [f32; 3],
+    /// Fast travel on, sent with every input.
+    fast: bool,
     /// Input batches sent.
     seq: u64,
     /// The inputs sent since the app last took them ([`ServerLink::take_sent`]),
@@ -996,6 +1051,7 @@ impl ServerLink {
             replica: Replica::joined(welcome.session, welcome.shard, &welcome.shard_map),
             tick_seen: Instant::now(),
             thrust: [0.0; 3],
+            fast: false,
             seq: 0,
             sent: VecDeque::new(),
             entry,
@@ -1043,6 +1099,11 @@ impl ServerLink {
     /// Set the thrust intent sent with every following input batch.
     pub fn set_thrust(&self, thrust: [f32; 3]) {
         lock(&self.shared).thrust = thrust;
+    }
+
+    /// Set fast travel on or off for every following input batch.
+    pub fn set_fast(&self, fast: bool) {
+        lock(&self.shared).fast = fast;
     }
 
     /// The inputs sent since the last call, oldest first, each tagged with
@@ -1188,6 +1249,7 @@ async fn send_inputs(shared: SharedRef) {
                 thrust: s.thrust,
                 torque: [0.0; 3],
                 tick,
+                fast: s.fast,
             };
             s.sent.push_back(input);
             while s.sent.len() > SENT_LOG {
@@ -1242,20 +1304,32 @@ async fn read_frames(
                 follow_redirect(&shared, &player_token, generation, redirect);
             }
             // The shard's last word to a client it has let go of: this
-            // connection is over (the shard closes it too).
+            // connection is over (the shard closes it too). It names where a
+            // new player starts — or, while it does not know that, says
+            // "starting" (a `Reject`): the same last word without an address.
             Ok(Some(Message::JoinRedirect(redirect))) => {
-                let_go(&shared, generation, redirect.shard);
+                let_go(&shared, generation, Some(redirect.shard));
+                return;
+            }
+            Ok(Some(Message::Reject(_))) => {
+                let_go(&shared, generation, None);
                 return;
             }
             Ok(Some(Message::SceneUpdate(update))) => on_scene(&shared, generation, update),
+            Ok(Some(Message::SceneClock(clock))) => on_scene_clock(&shared, generation, clock),
             Ok(Some(message)) => on_frame(&shared, generation, &message),
-            // Peer gone.
-            Ok(None) => return,
+            // Peer gone. (A handoff's connection that ended is no longer a
+            // way to its shard: forget it, so the next redirect dials anew.)
+            Ok(None) => {
+                forget_closed_pending(&shared, generation);
+                return;
+            }
             // A bad frame ends nothing; the connection state is the authority
             // on whether to carry on.
             Err(e) => {
                 log::warn!("space-client: server frame: {e}");
                 if conn.is_closed() {
+                    forget_closed_pending(&shared, generation);
                     return;
                 }
             }
@@ -1264,9 +1338,9 @@ async fn read_frames(
 }
 
 /// The shard on the connection with reader `generation` has let go of this
-/// client and named `owner` as where a new player starts (a `JoinRedirect`
-/// on an established connection): it had let the client in for a handoff
-/// that never completed.
+/// client — a `JoinRedirect` on an established connection, naming `owner` as
+/// where a new player starts, or a `Reject` (`owner` unknown: "starting"):
+/// it had let the client in for a handoff that never completed.
 ///
 /// For the connection of a handoff in flight that is the end of that attempt
 /// and nothing more — the old shard was never given up, and offers the ship
@@ -1274,13 +1348,15 @@ async fn read_frames(
 /// end of the session: the link closes, and whoever keeps it up (the app,
 /// for a client started with a server address) joins again through the
 /// entry address.
-fn let_go(shared: &SharedRef, generation: u64, owner: ShardId) {
+fn let_go(shared: &SharedRef, generation: u64, owner: Option<ShardId>) {
     let mut s = lock(shared);
     if generation == s.active_generation {
+        let starts = owner.map_or_else(
+            || "the cluster is starting".to_owned(),
+            |owner| format!("a new player starts on shard {}", owner.0),
+        );
         log::warn!(
-            "space-client: the shard let go of this client (a new player starts on shard {}); \
-             the connection is closed",
-            owner.0
+            "space-client: the shard let go of this client ({starts}); the connection is closed"
         );
         s.active.close(0, "let go");
         return;
@@ -1296,6 +1372,22 @@ fn let_go(shared: &SharedRef, generation: u64, owner: ShardId) {
             );
             pending.conn.close(0, "handoff did not complete");
         }
+    }
+}
+
+/// The connection with reader `generation` has ended. If it was the
+/// connection of a handoff in flight, that attempt is over: the entry is
+/// dropped, so a later redirect to the same shard opens a new connection
+/// instead of "reporting in again" on a dead one (which would keep every
+/// further handoff to that shard from completing until the entry's patience
+/// ran out, ten seconds later).
+fn forget_closed_pending(shared: &SharedRef, generation: u64) {
+    let mut s = lock(shared);
+    if s.pending
+        .as_ref()
+        .is_some_and(|p| p.generation == generation && p.conn.is_closed())
+    {
+        s.pending = None;
     }
 }
 
@@ -1316,6 +1408,18 @@ fn on_scene(shared: &SharedRef, generation: u64, update: SceneState) {
     }
     if s.replica.adopt_scene(update, from_active) {
         log_scene(update);
+    }
+}
+
+/// Take a scene clock from the connection with reader `generation`: the
+/// shard being played on's at once, the accepting shard's of a handoff kept
+/// for the switch.
+fn on_scene_clock(shared: &SharedRef, generation: u64, clock: SceneClock) {
+    let mut s = lock(shared);
+    if generation == s.active_generation {
+        s.replica.scene_clock = Some(clock);
+    } else if let Some(pending) = s.pending.as_mut().filter(|p| p.generation == generation) {
+        pending.scene_clock = Some(clock);
     }
 }
 
@@ -1361,6 +1465,23 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     // one the redirect was about.
     let ours = flying.unwrap_or(pending.entity);
     if !Replica::frame_has_ship_of(message, pending.session, ours) {
+        // A *different* ship under our new session: this shard did not take
+        // us for the player of the ship being handed over (it had dropped
+        // the transfer by the time we said hello) and let us in as a
+        // newcomer, with a ship on the spawn point. That connection can
+        // never become the switch, and while it lives there are two ships
+        // of this player. Close it now; the shard removes the ship with it.
+        // The old shard was never given up, and offers the ship again.
+        if Replica::frame_has_other_ship_of(message, pending.session, ours) {
+            if let Some(pending) = s.pending.take() {
+                log::info!(
+                    "space-client: shard {} let this client in as a new player instead of \
+                     taking the ship over; leaving it again",
+                    pending.shard.0
+                );
+                pending.conn.close(0, "not a handoff");
+            }
+        }
         return;
     }
     // The switch: the new shard is simulating our ship.
@@ -1384,6 +1505,10 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
         if s.replica.adopt_scene(theirs, true) {
             log_scene(theirs);
         }
+    }
+    // The new shard's ticks come with its own mapping onto scene time.
+    if pending.scene_clock.is_some() {
+        s.replica.scene_clock = pending.scene_clock;
     }
     log::info!(
         "space-client: now on shard {} (session {}), transition {}",
@@ -1410,6 +1535,20 @@ fn follow_redirect(
         }
         if s.replica.shard == Some(redirect.new_shard) {
             return;
+        }
+        // Only the ship this client flies is followed anywhere (see the
+        // module docs). Before the first frame has named it, the redirect is
+        // taken at its word: a shard redirects a ship's own player only.
+        if s.replica.ship.is_some_and(|ours| ours != redirect.entity) {
+            log::debug!(
+                "space-client: ignoring a redirect for {:?}, which is not this client's ship",
+                redirect.entity
+            );
+            return;
+        }
+        // A connection to that shard that has ended is not a way there.
+        if s.pending.as_ref().is_some_and(|p| p.conn.is_closed()) {
+            s.pending = None;
         }
         // Already connected there: the shards re-offered (the first attempt
         // timed out or was refused), so just report in again.
@@ -1462,38 +1601,28 @@ async fn open_redirect(
     // Where players reach the accepting shard: its client endpoint in the
     // redirect's map, one without an IP meaning the host this client entered
     // through — the rule a join redirect follows.
-    let (entry, ours) = {
-        let s = lock(shared);
-        (s.entry, s.replica.ship)
-    };
+    let entry = lock(shared).entry;
     let addr = client_address(&redirect.shard_map, redirect.new_shard, entry)
         .ok_or("the shard map has no reachable endpoint for it")?;
-    // The offering shard told us and the accepting shard at the same moment.
-    // If our hello gets there first, the accepting shard does not know of the
-    // handoff yet and answers as it answers a fresh join — with a welcome and
-    // a ship of our own if it owns the spawn point (the frames then show the
-    // ship that is ours, see `on_frame`), otherwise by sending us on. Sent
-    // on while our own ship is being handed over, we ask again in a moment:
-    // by then it knows. For somebody else's ship (we were only watching it)
-    // being sent on is simply the answer.
-    let mut asked = 0;
-    let (conn, welcome) = loop {
-        asked += 1;
-        match hello_at(addr, player_token).await {
-            Ok(Joined::Shard(conn, welcome)) => break (conn, welcome),
-            Ok(Joined::Elsewhere(_)) | Err(NetError::Rejected(RejectReason::Starting))
-                if ours == Some(redirect.entity) && asked < ADOPT_RETRIES =>
-            {
-                tokio::time::sleep(ADOPT_RETRY_PAUSE).await;
-            }
-            Ok(Joined::Elsewhere(sent_on)) => {
-                return Err(format!(
-                    "{addr} does not take this client (a new player starts on shard {})",
-                    sent_on.shard.0
-                ));
-            }
-            Err(e) => return Err(format!("{addr}: {e}")),
+    // One hello. The offering shard sends the redirect only after the
+    // accepting shard has staged the ship and said so (`HandoffAccept`), so
+    // that shard knows whose hello this is. (While the redirect went out
+    // together with the offer the hello could get there first, and the link
+    // asked up to five times; that order no longer exists.) What is left is
+    // a transfer the accepting shard has dropped again in between — an abort
+    // or a map change that crossed our hello. Then it answers as it answers
+    // a fresh join, and that is the end of this attempt, not something to
+    // ask again about: nothing was given up, and the old shard offers the
+    // ship anew (with a new redirect) if it still should go.
+    let (conn, welcome) = match hello_at(addr, player_token).await {
+        Ok(Joined::Shard(conn, welcome)) => (conn, welcome),
+        Ok(Joined::Elsewhere(sent_on)) => {
+            return Err(format!(
+                "{addr} does not take this client (a new player starts on shard {})",
+                sent_on.shard.0
+            ));
         }
+        Err(e) => return Err(format!("{addr}: {e}")),
     };
     {
         let mut s = lock(shared);
@@ -1505,6 +1634,7 @@ async fn open_redirect(
             entity: redirect.entity,
             opened: Instant::now(),
             scene: None,
+            scene_clock: None,
             ships: ShipView::default(),
         }) {
             previous.conn.close(0, "superseded");
@@ -1672,14 +1802,16 @@ mod tests {
         assert!((r.offset()[0] - 512.5).abs() < 1e-3, "{:?}", r.offset());
     }
 
-    /// A client that reaches the accepting shard before the shards' own offer
-    /// does is given a placeholder ship there. A frame showing that ship is
-    /// not the switch: the ship being handed over is still simulated by the
-    /// old shard, and switching would abandon it there.
+    /// A client whose hello the accepting shard did not recognise (the
+    /// transfer was dropped before the hello arrived) is, on the shard that
+    /// owns the spawn point, let in as a new player with a ship of its own.
+    /// A frame showing that ship is not the switch: the ship being handed
+    /// over is still simulated by the old shard, and switching would abandon
+    /// it there. It is what tells the link to leave that shard again
+    /// (`frame_has_other_ship_of`).
     ///
-    /// Mutation this catches: switching on any ship the new session owns — the
-    /// player (or a bystander redirected because it was watching the ship)
-    /// jumps to the accepting shard's spawn point.
+    /// Mutation this catches: switching on any ship the new session owns —
+    /// the player jumps to the accepting shard's spawn point.
     #[test]
     fn a_placeholder_ship_on_the_accepting_shard_is_not_the_switch() {
         let ours = EntityGuid::new(ShardId::new(1), 1);
@@ -1688,6 +1820,26 @@ mod tests {
         let with_placeholder = frame(5, vec![ship(placeholder, new_session, 512.0)]);
         assert!(!Replica::frame_has_ship_of(
             &with_placeholder,
+            new_session,
+            ours
+        ));
+        // It is a ship of this session that is not the one flown: the sign
+        // of a connection to leave. Other players' ships, and our own under
+        // whatever session, are not.
+        assert!(Replica::frame_has_other_ship_of(
+            &with_placeholder,
+            new_session,
+            ours
+        ));
+        let others = frame(5, vec![ship(placeholder, 8, 512.0), ship(ours, 9, 0.0)]);
+        assert!(!Replica::frame_has_other_ship_of(
+            &others,
+            new_session,
+            ours
+        ));
+        let adopted = frame(5, vec![ship(ours, new_session, 0.0)]);
+        assert!(!Replica::frame_has_other_ship_of(
+            &adopted,
             new_session,
             ours
         ));
@@ -1741,19 +1893,19 @@ mod tests {
         // Repeats and late messages change nothing, on either connection.
         for from_active in [true, false] {
             assert!(!r.adopt_scene(scene(Scene::Galaxy, 2), from_active));
-            assert!(!r.adopt_scene(scene(Scene::Solar, 1), from_active));
+            assert!(!r.adopt_scene(scene(Scene::Materials, 1), from_active));
             assert!(!r.adopt_scene(SceneState::UNSET, from_active));
         }
         assert_eq!(r.scene, scene(Scene::Galaxy, 2));
 
         // A newer revision counts wherever it is heard: the scene is the
         // cluster's, and the accepting shard may learn of a change first.
-        assert!(r.adopt_scene(scene(Scene::Solar, 3), false));
-        assert_eq!(r.scene, scene(Scene::Solar, 3));
+        assert!(r.adopt_scene(scene(Scene::Materials, 3), false));
+        assert_eq!(r.scene, scene(Scene::Materials, 3));
 
         // The handoff itself keeps the scene.
         r.switch_to(3, ShardId::new(2), ShipView::default());
-        assert_eq!(r.scene, scene(Scene::Solar, 3));
+        assert_eq!(r.scene, scene(Scene::Materials, 3));
         assert_eq!(r.handoffs, 1);
     }
 
@@ -1765,15 +1917,15 @@ mod tests {
         let mut r = Replica::new(7, ShardId::new(1));
         assert!(r.adopt_scene(scene(Scene::Galaxy, 1), true));
         assert!(
-            !r.adopt_scene(scene(Scene::Solar, 1), false),
+            !r.adopt_scene(scene(Scene::Materials, 1), false),
             "not while it is only the accepting shard of a handoff in flight"
         );
         assert_eq!(r.scene, scene(Scene::Galaxy, 1));
         assert!(
-            r.adopt_scene(scene(Scene::Solar, 1), true),
+            r.adopt_scene(scene(Scene::Materials, 1), true),
             "once it is the shard being played on"
         );
-        assert_eq!(r.scene, scene(Scene::Solar, 1));
+        assert_eq!(r.scene, scene(Scene::Materials, 1));
     }
 
     /// A scene this build does not know is kept as it was sent (the revision
@@ -1789,10 +1941,10 @@ mod tests {
         assert_eq!(r.scene.scene.or_default(), Scene::DEFAULT);
         log_scene(unknown); // says so; must not panic
         assert!(
-            !r.adopt_scene(scene(Scene::Solar, 4), true),
+            !r.adopt_scene(scene(Scene::Materials, 4), true),
             "still ordered"
         );
-        assert!(r.adopt_scene(scene(Scene::Solar, 6), true));
+        assert!(r.adopt_scene(scene(Scene::Materials, 6), true));
     }
 
     fn region(depth: u8, index: [i64; 3], shard: u32) -> space_protocol::ShardRegion {

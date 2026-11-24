@@ -9,7 +9,7 @@ describes current behaviour, not intent.
   and no certificate pinning. A dialler cannot verify which process it reached,
   and an acceptor requests no client certificate. Nothing below changes that.
 * **Registration (shard → orchestrator).** `ShardHello` carries the **cluster
-  secret** (protocol 6). `ControlPlane::check_credentials` checks — when a
+  secret** (protocol 7). `ControlPlane::check_credentials` checks — when a
   secret is required — the secret first, in constant time; a wrong or missing
   one is a final refusal (`Unauthorized`) that says nothing else, in
   particular not what the cluster is called, and is logged without the
@@ -41,7 +41,9 @@ describes current behaviour, not intent.
   (`--peer-token[-file]`, `SPACE_ORCHESTRATOR_PEER_TOKEN[_FILE]`) of at least
   16 characters — a shorter or empty one is refused at startup, because an
   empty token is what a shard takes for "no peer token" and it then lets every
-  peer in. A shard presents the token in every hello to another shard
+  peer in — and at most 1024 (`space_net::MAX_SECRET_LEN`): it has to fit a
+  hello, which is read with a size limit of its own (see "Every listening
+  port" below). A shard presents the token in every hello to another shard
   (`shard:<id>:<token>` in the hello's token field) and refuses a peer hello
   without it before reading a peer message (`space-server/src/net.rs`,
   `peer_token_admits`; `Unauthorized`; counted, and written to the shard's log
@@ -133,6 +135,37 @@ describes current behaviour, not intent.
    stall map changes for about nine seconds per registration, each costing a
    shard id.
 
+## Every listening port: the first frame and the last word
+
+What holds for the player port, the control port and every shard's game port
+alike (`space-net/src/endpoint.rs`, `framed.rs`):
+
+* **The first frame is read as a hello, with a hello's size limit.** Whoever
+  opens a connection has proved nothing yet, and the first frame it sends is
+  read with a limit of 4 KiB (`MAX_HELLO_PAYLOAD`; a real hello is about 60
+  bytes, 1051 at most between shards with the longest peer token). A header
+  that declares more is refused from the header alone. Before, the general
+  frame limit applied: eight bytes from a stranger made the receiver allocate
+  up to 1 MiB and wait for it until the handshake timeout. A dialer whose
+  hello would not fit is told so before it dials. Frames after the hello are
+  still read with the 1 MiB limit — from a peer that was welcomed.
+* **The last word is written with a time limit.** A `Reject` or a
+  `JoinRedirect` that ends a connection (`Conn::turn_away`, `Conn::reject`,
+  the version-mismatch answer) is written for at most a second
+  (`LAST_WORD_TIMEOUT`) and the close then waits at most another for it to be
+  read. A QUIC write waits for the peer's flow-control credit; a peer that
+  says hello and grants a receive window of zero could otherwise keep the
+  writing task — and whatever it holds — for as long as it keeps its
+  connection alive.
+* **A hello carries a token, and a player's may not be empty.** A shard
+  refuses a client hello without a token (`Shard::join`). A staged handoff
+  that has no player — a body, a ship nobody flies — is staged under the
+  empty owner token, and "is this the player of that staged ship" is asked
+  through `handoff::Incoming::is_owned_by`: a ship transfer, a non-empty
+  owner token, compared in constant time. An empty hello token used to equal
+  the empty owner token of every body in flight: such a hello was welcomed by
+  a shard that does not own the spawn point, and could claim the body.
+
 ## Player port (`space-orchestrator --player-bind`)
 
 The one address a player dials. Off unless given. It is **public by design**:
@@ -149,19 +182,44 @@ tell it anyway.
   (`shard:<id>` in the token field) is refused with a sentence saying which
   port this is. The control port, in turn, refuses a hello that is not a
   shard's with a readable reason and never hands it to the run loop.
-* **What it exposes.** The shard map: every region, its owner's id, and for
-  each shard the address players dial (the *client endpoint*) **and the
-  address shards dial each other on** (the endpoint) — the same map a shard
-  sends a client in its `Welcome`. So anybody who can reach the player port
-  learns how many shards there are and where they listen. Neither secret is
-  in it, nor the cluster's name, the scene, loads or the event log.
-* **Limits.** At most 256 hellos in flight (more are closed at once and
-  counted as `refused_busy` in `/api/state`), 5 s for a hello to arrive, log
-  lines about bad hellos a few per ten seconds. There is **no rate limit per
-  source address** and no proof of the source beyond QUIC's own handshake:
-  whoever reaches the port can keep it busy, which delays other players'
-  joins and nothing else — shards, the map and players already on a shard do
-  not pass through it.
+* **What it exposes.** The shard map **as a player needs it**
+  (`ShardMap::for_players`): every region, its owner's id, and for each shard
+  the address players dial (the *client endpoint*). The address shards dial
+  each other on (the internal endpoint) is not in it — in a map sent to a
+  player that field repeats the client endpoint. The same holds for the map
+  in a shard's `Welcome`, in its `JoinRedirect` and in a handoff's
+  `Redirect`; shards and the orchestrator exchange the real map among
+  themselves only. So anybody who can reach the player port learns how many
+  shards there are, which ground each owns and where players reach them — all
+  of which a player has to know. Neither secret is in it, nor the cluster's
+  name, the scene, loads or the event log. (With the `process` launcher the
+  two addresses differ only in the IP today — `127.0.0.1:<port>` against
+  `0.0.0.0:<port>` — so the port a shard listens on is known either way.)
+* **Limits.** A first packet from an address that has not been validated is
+  answered with a QUIC **retry** (a stateless token; no handshake, no slot):
+  a forged source address gets one small packet and nothing else, and a real
+  client comes back with the token within the same connect. Then: at most 256
+  hellos in flight (more are closed at once and counted as `refused_busy` in
+  `/api/state`), 5 s for a hello to arrive, at most a second to write the
+  answer and a second for it to be read, the whole connection bounded once
+  more from outside (`player.rs`, `ANSWER_SLACK`), log lines about bad hellos
+  a few per ten seconds.
+* **Known limit: no cap per source address.** The 256 slots are shared by
+  everybody. One host that keeps opening connections and saying nothing can
+  hold all of them — each for the 5 s a hello may take — and while it does,
+  other players' joins are refused (`refused_busy`). That delays joins and
+  nothing else: shards, the map and players already on a shard do not pass
+  through the port. A per-source limit (or a far shorter hello timeout once
+  the retry has shown the peer is real and fast) is not built.
+* **Known limit: the spawn point's shard is a choke point.** Every new
+  player is sent to the one shard that owns the spawn point, a shard takes
+  100 players (`MAX_PLAYERS_PER_SHARD`), and a player who never moves is
+  never handed to another shard and is **never evicted for being idle** — a
+  client that keeps its connection alive keeps its slot. A hundred idle
+  clients (or one host that opens a hundred links) fill it; from then on a
+  join is answered `Full` there, while the player port keeps sending new
+  players to it. Idle eviction, a queue, or spreading newcomers over the
+  shards around the spawn point are not built.
 * **A shard is believed about its client endpoint** as it is about its
   endpoint (deferred item 4): a registered shard — any local process on a
   secretless loopback control port — can advertise any address, and players

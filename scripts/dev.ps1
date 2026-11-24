@@ -25,7 +25,8 @@
                     15 s, until the HUD's pos passes 512) and the HUD changes
                     to "shard 2  handoffs 1" - a seamless shard transition.
 
-    Scene (-Scene demo-area|materials|solar|galaxy): what the SERVERS show.
+    Scene (-Scene demo-area|materials|galaxy): what the SERVERS show. The
+    solar system is part of demo-area (there is no separate solar scene).
     Standalone shards take it on their command line. The orchestrator takes it
     as its initial scene; a scene chosen later in the web UI is remembered in
     target\dev\orchestrator.id.scene, and giving -Scene forgets that choice.
@@ -77,8 +78,8 @@
     (http://127.0.0.1:7980/) shows the four regions and their shards.
 
 .EXAMPLE
-    .\scripts\dev.ps1 -Topology single -Scene solar -ConnectScreen
-    One shard showing the solar system; the client starts on the connect
+    .\scripts\dev.ps1 -Topology single -Scene galaxy -ConnectScreen
+    One shard showing the galaxy; the client starts on the connect
     screen with the shard's address in the field.
 
 .EXAMPLE
@@ -100,7 +101,7 @@
 param(
     [ValidateSet('orchestrated', 'single', 'two-shards')]
     [string]$Topology = 'orchestrated',
-    [ValidateSet('demo-area', 'materials', 'solar', 'galaxy')]
+    [ValidateSet('demo-area', 'materials', 'galaxy')]
     [string]$Scene = 'demo-area',
     [ValidateSet('window', 'headless', 'stream')]
     [string]$Client = 'window',

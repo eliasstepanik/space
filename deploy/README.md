@@ -111,15 +111,17 @@ start).
 ## Scene and the orchestrator web UI
 
 **The scene is server state.** The orchestrator owns it, every shard runs it and
-tells its clients; a client has no say. Catalogue: `demo-area` (default),
-`materials`, `solar`, `galaxy`. `space-orchestrator --scene NAME` (env
+tells its clients; a client has no say. Catalogue: `demo-area` (default; the
+solar system is part of it), `materials`, `galaxy`. The former `solar` scene was
+retired: a saved `solar` comes back as `demo-area` at the next revision, and
+`--scene solar` is refused. `space-orchestrator --scene NAME` (env
 `SPACE_ORCHESTRATOR_SCENE`, compose variable `SPACE_SCENE`) is only the *initial*
 scene: one chosen at run time is saved next to the id counter
 (`<state file>.scene`) and wins on restart, so keep the state directory on a
 volume and delete that file to make `--scene` apply again. A shard run without
 an orchestrator takes `space-server --scene NAME`; give hand-wired `--peer`
 shards the same one. Client, shard and orchestrator must come from the same
-build (wire protocol 6) - the pipelines above build them from one commit.
+build (wire protocol 7) - the pipelines above build them from one commit.
 
 **The web UI** is part of the `space-orchestrator` binary (server-rendered HTML,
 no JavaScript): cluster, map, shards, autoscaler, id allocator, recent events,
@@ -186,7 +188,7 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
 
 **Not run**
 - Neither compose file since the cluster secret was added to them (shard
-  lifecycle change, wire protocol 6), nor since the control port stopped being
+  lifecycle change, wire protocol 7), nor since the control port stopped being
   published and the local file's default secret was removed: the
   `SPACE_CLUSTER_SECRET` lines (`${...:?...}` in the local file) and the
   `ports:` lists are correct by inspection and YAML-checked

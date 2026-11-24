@@ -49,10 +49,10 @@
 //! |---|-----------|--------------|
 //! | 1 | **The guid never changes.** The client's own ship object survives the move; nothing it holds has to be re-keyed. | [`EntityGuid`] is `(minting shard, serial)` and is *never* rewritten on handoff ([`space_protocol::EntityGuid`]). The receiving shard adopts the existing guid instead of minting a new one — a body's exactly as a ship's. |
 //! | 2 | **Exactly one shard simulates the entity at every tick.** No double-step (which would double the physics) and no gap (which would freeze the ship). | The offering shard keeps stepping the entity until the activation tick; the accepting shard **stages** the state outside its [`SimWorld`] and only spawns it at commit. An entity is therefore in at most one world at any tick. A **ghost** of it — the receiver's before the install, the sender's after the commit — is a kinematic copy that is never integrated ([`SimWorld::insert_ghost`]), so it is not a second simulator; the install replaces the receiver's ghost. |
-//! | 3 | **The client keeps receiving from the old shard until the new one is proven up** (make-before-break). | The [`Redirect`] tells the client the activation tick *in advance*; the old shard keeps sending deltas until it commits. The commit waits for [`NeighbourStatus`] with `connected = true`, so a client that cannot reach the new shard never loses its feed. An unowned body has no client to move: the clients watching it stay where they are and keep seeing it, as a ghost on the side it left and as a body on the side it entered. |
+//! | 3 | **The client keeps receiving from the old shard until the new one is proven up** (make-before-break). | The [`Redirect`] tells the ship's player — and nobody else: a bystander needs no second connection, it keeps seeing the ship as this shard's ghost of it — the activation tick *in advance*, once the accepting shard has accepted (so the transfer is staged there before the client can arrive: its hello matches the staged owner ([`Incoming::is_owned_by`]) and it is given no ship of its own); the old shard keeps sending deltas until it commits. The commit waits for [`NeighbourStatus`] with `connected = true`, so a client that cannot reach the new shard never loses its feed. An unowned body has no client to move: the clients watching it stay where they are and keep seeing it, as a ghost on the side it left and as a body on the side it entered. |
 //! | 4 | **The state the new shard activates with is the state at the activation tick.** | The commit carries the *final* state as of `activation_tick` ([`HandoffCommit::state`]), replacing what the offer staged. Staging a stale snapshot and then only telling the peer "go" would leave the entity jumping backwards by the offer→activation distance. For a body it is the full component list, parts, joints, springs and position residual included. |
 //! | 5 | **Inputs are never lost or applied twice.** | Inputs are tick-keyed ([`SimWorld::apply_inputs`]), so everything the client sent up to activation is applied by the old shard, and the new shard's `input_ack` starts at the activation tick — the client's `input_ack`-based reconciliation drops exactly what the old shard already applied. (An unowned body takes no inputs.) |
-//! | 6 | **Any failure leaves the world exactly as it was.** | Every timeout and refusal path is an [`HandoffAbort`]: the offering shard keeps simulating, the accepting shard drops its staged copy, and the client is never told anything happened. An abort of one member of a group aborts the whole group, so an island is never left half moved by a failure. |
+//! | 6 | **Any failure leaves the world exactly as it was.** | Every timeout and refusal path is an [`HandoffAbort`]: the offering shard keeps simulating and the accepting shard drops its staged copy. An abort of one member of a group aborts the whole group, so an island is never left half moved by a failure. **What the client sees of a failure** depends on when it happened. Before the accept (a refused or unanswered offer) it is told nothing: no redirect was sent. After it, the client has been redirected and may hold a second connection, on which it has given nothing up: the accepting shard ends it when the adoption has not come within `ADOPT_TIMEOUT_TICKS` — with a `JoinRedirect` or a `Reject(Starting)` as its last word on a shard that does not own the spawn point, which the client takes as the end of that attempt; on the spawn point's owner with a ship of the client's own on the spawn point, which the client recognises as not the ship it flies and leaves at once (the ship goes with the session). A hello that arrives after the staged copy was dropped is answered the same two ways. Either way the client keeps playing on the old shard, which offers the ship again after its pause. So the *world* is as it was; a session, and on the spawn point's owner a ship, may have existed on the accepting shard for a moment. |
 //! | 7 | **A handoff cannot straddle a shard-map change.** | Offer, accept and commit all carry the [`epoch`](HandoffOffer::epoch); a message under a stale epoch is answered with [`StaleEpoch`], an in-flight transfer whose epoch no longer matches the shard's own map aborts with [`HandoffReason::EpochChanged`] the moment the tick pass sees it (before *and* after the commit gate), and a commit under a stale epoch is refused. |
 //! | 8 | **It finishes in bounded time.** | [`HANDOFF_TIMEOUT_TICKS`] bounds **every** waiting state on **both** sides: the offering shard's sweep terminates an outgoing transfer whatever it is waiting on (offer unanswered, commit waiting on the client, a commit that can no longer be built), and the accepting shard's sweep drops a staged transfer whose commit never arrived, so a dead peer degrades to "nothing happened" rather than a frozen entity or a permanently poisoned guid. A body's lead ([`crate::border::BODY_HANDOFF_LEAD`]) is well inside that budget; a staged body (no session to wait for) is dropped only after twice the budget, so never while the sender may still commit it — its commit would be the only copy left. |
 //!
@@ -89,6 +89,38 @@ use space_sim::SimTick;
 /// registry's id space (like the owner token at `u16::MAX`), never sent to a
 /// client, stripped before the state is imported.
 pub const TRANSFER_COMPONENT: u16 = u16::MAX - 1;
+
+/// The private component id a handoff state carries the **scene time** it
+/// describes under (`i64` µs, big endian): the sending shard's
+/// `SimWorld::scene_time` when it took the state. The receiving shard's own
+/// scene clock may differ by a few milliseconds (each shard keeps its own
+/// mapping onto the wall clock), which near a moon moving thousands of
+/// kilometres a second is kilometres: the receiver moves the state by what
+/// the orbiting bodies carry it from that time to its own
+/// (`SimWorld::carry`), so it arrives where it was relative to the planet it
+/// is near. Never sent to a client, stripped before the state is imported.
+/// Private ids are [`PRIVATE_COMPONENTS`] and up.
+pub const SCENE_TIME_COMPONENT: u16 = u16::MAX - 2;
+
+/// The lowest private component id of a handoff state.
+pub const PRIVATE_COMPONENTS: u16 = SCENE_TIME_COMPONENT;
+
+/// The [`SCENE_TIME_COMPONENT`] for scene time `us`.
+#[must_use]
+pub fn scene_time_component(us: i64) -> (u16, Vec<u8>) {
+    (SCENE_TIME_COMPONENT, us.to_be_bytes().to_vec())
+}
+
+/// The scene time a handoff state carries, if it carries one.
+#[must_use]
+pub fn scene_time_of(state: &EntitySnapshot) -> Option<i64> {
+    state
+        .components
+        .iter()
+        .find(|(id, _)| *id == SCENE_TIME_COMPONENT)
+        .and_then(|(_, b)| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(i64::from_be_bytes)
+}
 
 /// What a transfer moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +239,26 @@ pub struct Incoming {
     pub session: Option<u64>,
     /// What moves.
     pub kind: TransferKind,
+}
+
+impl Incoming {
+    /// Whether the staged entity is the ship of the player whose hello token
+    /// is `player_token`: the one client that may be welcomed for it on a
+    /// shard that does not own the spawn point, adopt it, and open or cancel
+    /// its commit gate.
+    ///
+    /// Only a **ship** transfer with a **non-empty** owner token has such a
+    /// player. A body — and a ship nobody drives — is staged with the empty
+    /// token ("no owner"), and the empty string must not be read as a token
+    /// that an empty `player_token` equals: that made a hello without a token
+    /// the "owner" of every body in flight. The compare itself is constant
+    /// time, as for every secret ([`space_net::constant_time_eq`]).
+    #[must_use]
+    pub fn is_owned_by(&self, player_token: &str) -> bool {
+        self.kind == TransferKind::Ship
+            && !self.owner_token.is_empty()
+            && space_net::constant_time_eq(player_token.as_bytes(), self.owner_token.as_bytes())
+    }
 }
 
 /// The ledger of in-flight transfers on one shard.
@@ -532,5 +584,74 @@ impl Ledger {
             epoch: offer.epoch,
             activation_tick: offer.activation_tick,
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::{Incoming, TransferKind};
+    use space_protocol::{EntityGuid, EntitySnapshot, ShardId};
+
+    fn staged(kind: TransferKind, owner_token: &str) -> Incoming {
+        Incoming {
+            from: ShardId(1),
+            epoch: 1,
+            activation_tick: 30,
+            local_activation_tick: 30,
+            started_at: 0,
+            state: EntitySnapshot::new(EntityGuid::new(ShardId(1), 1), Vec::new()),
+            owner_token: owner_token.into(),
+            session: None,
+            kind,
+        }
+    }
+
+    /// A staged transfer belongs to a player only if it is a ship **and**
+    /// carries an owner token, and then only to the player with that token.
+    ///
+    /// Mutation this catches: `staged.owner_token == player_token` (the
+    /// empty token of an ownerless transfer equals an empty hello token), or
+    /// dropping the kind (a body staged under some token is taken for a
+    /// player's ship, and its "owner" welcomed off the spawn shard).
+    #[test]
+    fn only_a_ship_with_an_owner_token_has_an_owner() {
+        let ship = staged(TransferKind::Ship, "the-players-token");
+        assert!(ship.is_owned_by("the-players-token"));
+        assert!(!ship.is_owned_by("another-token"));
+        assert!(!ship.is_owned_by(""));
+        assert!(!ship.is_owned_by("the-players-token-and-more"));
+        // Nobody flies it: nobody's, and above all not the empty token's.
+        let stray = staged(TransferKind::Ship, "");
+        assert!(!stray.is_owned_by(""));
+        assert!(!stray.is_owned_by("the-players-token"));
+        // A body has no player, whatever its state claims.
+        let body = staged(TransferKind::Body, "");
+        assert!(!body.is_owned_by(""));
+        let labelled = staged(TransferKind::Body, "the-players-token");
+        assert!(!labelled.is_owned_by("the-players-token"));
+    }
+}
+
+#[cfg(test)]
+mod scene_time_tests {
+    use super::{scene_time_component, scene_time_of, PRIVATE_COMPONENTS, TRANSFER_COMPONENT};
+    use space_protocol::{EntityGuid, EntitySnapshot, ShardId};
+
+    /// The scene time a handoff state carries comes back exactly, a state
+    /// without one has none, and the id is private (stripped before import).
+    #[test]
+    fn a_handoff_state_carries_its_scene_time() {
+        let guid = EntityGuid::new(ShardId(1), 1);
+        let mut state = EntitySnapshot::new(guid, vec![(0, vec![1, 2, 3])]);
+        assert_eq!(scene_time_of(&state), None);
+        state.components.push(scene_time_component(-42));
+        state
+            .components
+            .push(scene_time_component(1_763_900_000_123_456));
+        assert_eq!(scene_time_of(&state), Some(-42), "the first one counts");
+        let (id, _) = scene_time_component(0);
+        assert!((PRIVATE_COMPONENTS..TRANSFER_COMPONENT).contains(&id));
+        let bad = EntitySnapshot::new(guid, vec![(id, vec![1, 2])]);
+        assert_eq!(scene_time_of(&bad), None, "a malformed one is ignored");
     }
 }

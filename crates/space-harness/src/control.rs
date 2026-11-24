@@ -91,7 +91,7 @@ pub struct ClientState {
     /// Completed shard transitions.
     pub handoffs: u64,
     /// The scene being drawn while playing, by its catalogue name
-    /// (`"demo-area"`, `"materials"`, `"solar"`, `"galaxy"`). The server
+    /// (`"demo-area"`, `"materials"`, `"galaxy"`). The server
     /// chooses it; `None` while not on a server.
     pub scene: Option<String>,
     /// The revision the server chose the scene at; it goes up with every
@@ -141,6 +141,35 @@ pub struct ClientState {
     /// shard that took the ship. `None` while not on a server.
     #[serde(default)]
     pub shard_address: Option<String>,
+    /// Whether fast travel is on (`F` while playing).
+    #[serde(default)]
+    pub fast: bool,
+    /// The body of the solar system whose surface is nearest to the ship
+    /// (`"Earth"`, `"Moon"`, `"Sun"`, ...), in the scenes that have one (the
+    /// demo area); `None` elsewhere.
+    #[serde(default)]
+    pub nearest: Option<String>,
+    /// How far that body's surface is, metres.
+    #[serde(default)]
+    pub nearest_surface_m: Option<f64>,
+    /// The solar system's bodies where the client draws them (the demo
+    /// area; empty elsewhere): what a script steers by.
+    #[serde(default)]
+    pub sky: Vec<SkyBodyState>,
+}
+
+/// One body of the solar system as the client draws it ([`ClientState::sky`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkyBodyState {
+    /// `"Sun"`, `"Earth"`, `"Moon"`, ...
+    pub name: String,
+    /// Its centre, metres from the scene's spawn point (the frame of
+    /// [`ClientState::scene_position`]).
+    pub position: [f64; 3],
+    /// Its radius, metres.
+    pub radius: f64,
+    /// How far its surface is from the ship (as drawn), metres.
+    pub surface_m: f64,
 }
 
 /// One physics body as the client draws it ([`ClientState::bodies`]).
@@ -602,7 +631,7 @@ mod tests {
             session: Some(41),
             tick: 900,
             handoffs: 1,
-            scene: Some("solar".into()),
+            scene: Some("galaxy".into()),
             scene_revision: 3,
             frame: 12,
             width: 640,
@@ -626,7 +655,13 @@ mod tests {
         }];
         state.bodies_in_view = 1;
         state.correction_m = 0.002;
+        state.fast = true;
+        state.nearest = Some("Moon".into());
+        state.nearest_surface_m = Some(12.5);
         let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["fast"], true);
+        assert_eq!(json["nearest"], "Moon");
+        assert_eq!(json["nearest_surface_m"], 12.5);
         assert_eq!(json["gravity"], 9.81);
         assert_eq!(json["landed"], true);
         assert_eq!(json["bodies"][0]["visual"], "crate");
@@ -644,7 +679,7 @@ mod tests {
         assert_eq!(json["position"], serde_json::json!([3.0, 4.0, 0.0]));
         assert_eq!(json["scene_position"], serde_json::json!([1.0, 2.0, -3.0]));
         assert_eq!(json["speed"], 5.0);
-        assert_eq!(json["scene"], "solar");
+        assert_eq!(json["scene"], "galaxy");
         assert_eq!(json["scene_revision"], 3);
         assert_eq!(json["retry_in_s"], serde_json::Value::Null);
         assert_eq!(json["frame"], 12);
@@ -680,6 +715,10 @@ mod tests {
             "correction_m",
             "correction_max_m",
             "shard_address",
+            "fast",
+            "nearest",
+            "nearest_surface_m",
+            "sky",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }

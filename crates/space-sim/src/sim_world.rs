@@ -417,9 +417,58 @@ impl SimWorld {
         self.physics.statics()
     }
 
-    /// Replace the gravity field (zones and large bodies).
-    pub fn set_gravity(&mut self, field: GravityField) {
+    /// Replace the gravity field (zones and large bodies). The world's scene
+    /// clock ([`SimWorld::set_scene_clock`]) stays: `field.clock` is
+    /// overwritten with it.
+    pub fn set_gravity(&mut self, mut field: GravityField) {
+        field.clock = self.physics.gravity.clock;
         self.physics.gravity = field;
+    }
+
+    /// Map ticks to scene time by `clock` from now on (what orbiting bodies
+    /// and moving statics move by; see [`crate::gravity`] and
+    /// [`crate::rigid`]). The next step runs from the scene time the last one
+    /// ended at to the new mapping's time of the tick it produces, so a
+    /// re-anchored clock moves the planets once, and everything they carry
+    /// with them.
+    pub fn set_scene_clock(&mut self, clock: space_protocol::SceneClock) {
+        self.physics.gravity.clock = clock;
+    }
+
+    /// The mapping from ticks to scene time in use.
+    #[must_use]
+    pub fn scene_clock(&self) -> space_protocol::SceneClock {
+        self.physics.gravity.clock
+    }
+
+    /// The scene time of the current tick, µs (where the last step ended, or
+    /// the clock's time of the tick after a reset).
+    #[must_use]
+    pub fn scene_time(&self) -> i64 {
+        self.physics
+            .last_time
+            .unwrap_or_else(|| self.physics.gravity.clock.time_us_at(self.tick))
+    }
+
+    /// How far the orbiting bodies carry the point `pos` from scene time
+    /// `from_us` to `to_us`, metres ([`GravityField::carry`]). A shard moves
+    /// a body handed over from another shard (whose clock may differ by a few
+    /// milliseconds) by this, so it arrives where it was relative to the
+    /// planet it is near.
+    #[must_use]
+    pub fn carry(&self, pos: space_world::WorldPos, from_us: i64, to_us: i64) -> [f64; 3] {
+        self.physics
+            .gravity
+            .carry(pos, [0.0; 3], self.tick, from_us, to_us)
+    }
+
+    /// Distance from `pos` to the nearest surface of the scene now (a large
+    /// body, a gravity zone or a static), metres — what fast travel scales
+    /// its speed limit by ([`crate::physics::fast_travel_limit`]).
+    #[must_use]
+    pub fn surface_distance(&self, pos: space_world::WorldPos) -> f64 {
+        self.physics
+            .surface_distance(pos, [0.0; 3], self.tick, self.scene_time())
     }
 
     /// The gravity field in force.
@@ -434,6 +483,8 @@ impl SimWorld {
     /// with it (see [`SimWorld::with_tick`]).
     pub fn reset_clock(&mut self, tick: SimTick) {
         self.tick = tick;
+        // Scene time restarts at the clock's time of `tick`.
+        self.physics.last_time = None;
         self.world.set_tick(tick.wrapping_add(1));
         self.input_buf.clear();
     }
@@ -1023,9 +1074,28 @@ impl SimWorld {
             }
             let input = resolved[last].2;
             let entity = Entity::new(index, generation);
+            let leaving_fast = self
+                .world
+                .get::<ShipControls>(entity)
+                .is_some_and(|c| c.fast && !input.fast);
             if let Some(controls) = self.world.get_mut::<ShipControls>(entity) {
                 controls.thrust = input.thrust;
                 controls.torque = input.torque;
+                controls.fast = input.fast;
+            }
+            // Leaving fast travel drops the ship to its normal top speed at
+            // once (rather than coasting on at fast-travel speed).
+            if leaving_fast {
+                let top = f64::from(crate::physics::top_speed(&self.params));
+                let too_fast = self.world.get::<ShipState>(entity).is_some_and(|s| {
+                    let v = s.vel.map(f64::from);
+                    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() > top
+                });
+                if too_fast {
+                    if let Some(s) = self.world.get_mut::<ShipState>(entity) {
+                        crate::physics::limit_speed(s, top);
+                    }
+                }
             }
             // Record the ack for this session: the server has now stepped this
             // owner's input for `next_tick` into the state.
@@ -1106,7 +1176,11 @@ impl SimWorld {
             });
             if !zero {
                 if let Some(controls) = self.world.get_mut::<ShipControls>(entity) {
-                    *controls = ShipControls::default();
+                    // Fast travel is a mode, not an input: it stays.
+                    *controls = ShipControls {
+                        fast: controls.fast,
+                        ..ShipControls::default()
+                    };
                 }
             }
         }
@@ -1241,7 +1315,7 @@ impl SimWorld {
     /// tick:u64 | entity_count:u64
     /// entity: index:u32 | generation:u32 | present:u16 | components in id order
     ///   ShipState      : cell 3×i64 | local 3×f32 | vel 3×f32 | quat 4×f32 | ang_vel 3×f32
-    ///   ShipControls   : thrust 3×f32 | torque 3×f32
+    ///   ShipControls   : thrust 3×f32 | torque 3×f32 | fast:u8
     ///   Owner          : u64
     ///   ShardAuthority : u32
     ///   Body .. PartStates (ids 4..=8), PosResidual (10): id:u8 | len:u32 | wire bytes
@@ -1322,6 +1396,7 @@ impl SimWorld {
                 for &v in &c.torque {
                     put_f32(&mut out, v);
                 }
+                put_int(&mut out, i128::from(u8::from(c.fast)), 1);
             }
             if let Some(o) = w.get::<Owner>(entity) {
                 put_int(&mut out, i128::from(o.0), 8);
@@ -1338,7 +1413,7 @@ impl SimWorld {
 
 /// The comparison key of an input: its raw bits, so the ordering is total and
 /// independent of arrival order.
-fn input_bits(input: &PlayerInput) -> ([u32; 3], [u32; 3]) {
+fn input_bits(input: &PlayerInput) -> ([u32; 3], [u32; 3], bool) {
     (
         [
             input.thrust[0].to_bits(),
@@ -1350,6 +1425,7 @@ fn input_bits(input: &PlayerInput) -> ([u32; 3], [u32; 3]) {
             input.torque[1].to_bits(),
             input.torque[2].to_bits(),
         ],
+        input.fast,
     )
 }
 
@@ -1372,6 +1448,7 @@ mod tests {
             // Inputs are buffered by tick; these tests apply them for the tick
             // `step()` is about to produce (tick 1).
             tick: 1,
+            fast: false,
         }
     }
 
@@ -1416,6 +1493,7 @@ mod tests {
             thrust: [1.0, 0.0, 0.0],
             torque: [0.0; 3],
             tick: too_far,
+            fast: false,
         };
         sim.apply_inputs(1, &[bad]);
         assert_eq!(
@@ -1462,6 +1540,7 @@ mod tests {
                     thrust: [f32::from(u8::try_from(k).unwrap()), 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 })
                 .collect();
             sim.apply_inputs(tick, &batch);
@@ -1492,6 +1571,7 @@ mod tests {
                     thrust: [0.5, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 })
                 .collect();
             sim.apply_inputs(tick, &batch);
@@ -1516,6 +1596,7 @@ mod tests {
                     thrust: [0.5, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 })
                 .collect();
             batch.push(PlayerInput {
@@ -1523,6 +1604,7 @@ mod tests {
                 thrust: [0.25, 0.0, 0.0],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             });
             sim.apply_inputs(tick, &batch);
         }
@@ -1781,6 +1863,7 @@ mod tests {
                     thrust: [1.0, 0.3, -0.2],
                     torque: [0.1, 0.9, 0.0],
                     tick,
+                    fast: false,
                 }],
             );
             sim.step();

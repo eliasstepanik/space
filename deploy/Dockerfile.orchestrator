@@ -30,7 +30,7 @@ USER orchestrator
 # (H9); the scene an operator chose is kept next to it (`orchestrator.id.scene`).
 #
 # Read by the binary itself (no flag in the entrypoint below):
-#   SPACE_ORCHESTRATOR_SCENE         initial scene (demo-area, materials, solar,
+#   SPACE_ORCHESTRATOR_SCENE         initial scene (demo-area, materials,
 #                                    galaxy); a saved choice on the volume wins
 #   SPACE_ORCHESTRATOR_WEBUI         `ip:port` of the operator web UI; unset or
 #                                    empty = off. In a container it must be the

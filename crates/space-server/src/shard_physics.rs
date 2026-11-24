@@ -18,7 +18,7 @@ use space_world::WorldPos;
 
 use super::{Destination, PendingCommit, Shard};
 use crate::border;
-use crate::handoff::{Ledger, TransferKind, TRANSFER_COMPONENT};
+use crate::handoff::{scene_time_component, Ledger, TransferKind, PRIVATE_COMPONENTS};
 use crate::replicate::{self, Components};
 
 /// Spacing of the spawn grid, metres: a ship is 0.6 m wide, so two players
@@ -135,6 +135,7 @@ pub struct BodyInfo {
 const SHIP_STATE: u16 = <ShipState as ComponentDef>::ID;
 const CONTROLS: u16 = <ShipControls as ComponentDef>::ID;
 const OWNER: u16 = <Owner as ComponentDef>::ID;
+const PARTS: u16 = <PartStates as ComponentDef>::ID;
 const PART_STATES: u16 = <PartStates as ComponentDef>::ID;
 const RESIDUAL: u16 = <PosResidual as ComponentDef>::ID;
 
@@ -165,9 +166,43 @@ pub(super) fn replicated_of(
 /// `list` without the handoff's private components.
 fn strip_private(list: &[(u16, Vec<u8>)]) -> Components {
     list.iter()
-        .filter(|(id, _)| *id < TRANSFER_COMPONENT)
+        .filter(|(id, _)| *id < PRIVATE_COMPONENTS)
         .cloned()
         .collect()
+}
+
+/// A body's component list moved by what the orbiting bodies carry it from
+/// the sender's scene time `sent` to ours (see
+/// [`crate::handoff::SCENE_TIME_COMPONENT`]); unchanged without one.
+fn carried_components(sim: &SimWorld, mut list: Components, sent: Option<i64>) -> Components {
+    let Some(sent) = sent else { return list };
+    let now = sim.scene_time();
+    for (id, bytes) in &mut list {
+        if *id == SHIP_STATE {
+            if let Ok(mut s) = space_sim::wire::decode_ship_state(bytes) {
+                let c = sim.carry(s.pos, sent, now);
+                if c != [0.0; 3] {
+                    s.pos = space_world::WorldPos::from_f64_metres_around(s.pos, c);
+                    *bytes = space_sim::wire::encode_ship_state(&s);
+                }
+            }
+        } else if *id == PARTS {
+            if let Ok(mut p) = space_sim::articulation::decode_part_states(bytes) {
+                let mut moved = false;
+                for s in &mut p.0 {
+                    let c = sim.carry(s.pos, sent, now);
+                    if c != [0.0; 3] {
+                        s.pos = space_world::WorldPos::from_f64_metres_around(s.pos, c);
+                        moved = true;
+                    }
+                }
+                if moved {
+                    *bytes = space_sim::articulation::encode_part_states(&p);
+                }
+            }
+        }
+    }
+    list
 }
 
 /// `list` with its `Owner` (if any) set to 0.
@@ -829,6 +864,9 @@ impl Shard {
         };
         let mut state = EntitySnapshot::new(guid, list);
         state.components.push(TransferKind::Body.component(lead));
+        state
+            .components
+            .push(scene_time_component(self.sim.scene_time()));
         let offer =
             Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
         self.ledger
@@ -842,17 +880,21 @@ impl Shard {
         guid: EntityGuid,
         kind: TransferKind,
     ) -> Option<EntitySnapshot> {
-        match kind {
+        let mut state = match kind {
             TransferKind::Ship => {
                 let entity = self.sim.entity_of(guid)?;
-                replicate::snapshot_of(&self.sim, &self.guids, entity)
+                replicate::snapshot_of(&self.sim, &self.guids, entity)?
             }
             TransferKind::Body => {
                 let mut state = EntitySnapshot::new(guid, self.sim.export_entity(guid)?);
                 state.components.push(TransferKind::Body.component(0));
-                Some(state)
+                state
             }
-        }
+        };
+        state
+            .components
+            .push(scene_time_component(self.sim.scene_time()));
+        Some(state)
     }
 
     /// Whether a body offer can be taken: it imports here as it is, and it
@@ -901,7 +943,8 @@ impl Shard {
             return;
         }
         self.drop_ghost(guid, false);
-        match self.sim.import_entity(guid, &pending.components) {
+        let components = carried_components(&self.sim, pending.components, pending.scene_time);
+        match self.sim.import_entity(guid, &components) {
             Ok(_) => {
                 self.index_now(guid);
                 self.stats.received += 1;

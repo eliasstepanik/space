@@ -10,7 +10,7 @@ use space_ecs::ComponentId;
 
 use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
 use crate::guid::EntityGuid;
-use crate::scene::{SceneAck, SceneState};
+use crate::scene::{SceneAck, SceneClock, SceneState};
 use crate::shard::{
     EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
 };
@@ -30,6 +30,10 @@ pub struct PlayerInput {
     pub torque: [f32; 3],
     /// Tick the input applies to.
     pub tick: u64,
+    /// Fast travel on (protocol 6): the ship's speed limit scales with its
+    /// distance to the nearest surface (see `space_sim::physics`). It stays
+    /// as the last input set it while no input arrives.
+    pub fast: bool,
 }
 
 /// A batch of inputs for one tick.
@@ -416,7 +420,7 @@ pub enum RejectReason {
     /// that would send the player on but does not know where to yet. Not
     /// final: a client that keeps its connection up by itself tries again.
     ///
-    /// (Appended in protocol 6, behind `Other`: the variant index is the wire
+    /// (Appended in protocol 7, behind `Other`: the variant index is the wire
     /// tag.)
     Starting,
 }
@@ -489,7 +493,7 @@ pub struct Welcome {
 }
 
 /// "Not here: a new player starts on that shard" — the answer to a player's
-/// [`Hello`] from whoever is not the shard to play on (protocol 6).
+/// [`Hello`] from whoever is not the shard to play on (protocol 7).
 ///
 /// Two senders:
 ///
@@ -544,11 +548,11 @@ pub struct ShardHello {
     /// Region the shard claims, or `None` for "assign me one".
     pub region: Option<ShardRegion>,
     /// Where **players** are to dial this shard, if not at `endpoint`
-    /// (protocol 6): what the orchestrator puts into the map as the shard's
+    /// (protocol 7): what the orchestrator puts into the map as the shard's
     /// [`ShardRegion::client_endpoint`]. An unspecified IP there means "the
     /// host the player dialed". `None` = the endpoint.
     pub client_endpoint: Option<std::net::SocketAddr>,
-    /// The cluster secret (protocol 6), empty when the shard was given none.
+    /// The cluster secret (protocol 7), empty when the shard was given none.
     /// An orchestrator whose control port is not on loopback — or that was
     /// given a secret explicitly — refuses a hello without the right one.
     /// The **last** field of the message.
@@ -692,6 +696,13 @@ pub enum Message {
     /// connection a client opens during a handoff — and again whenever the
     /// shard's scene changes. A client keeps the highest revision it has seen.
     SceneUpdate(SceneState),
+    /// Shard → client: how this shard's ticks map to scene time (protocol 6).
+    ///
+    /// Sent right after the [`Message::SceneUpdate`] on every join, whenever
+    /// the shard re-anchors its clock and again every few seconds. A client
+    /// moves the scene's planets by it (see [`crate::scene`], "The scene
+    /// clock").
+    SceneClock(SceneClock),
     /// Orchestrator's player port, or a shard → client: a new player starts on
     /// that shard, dial it ([`JoinRedirect`]). The answer to a [`Hello`] in
     /// place of a [`Welcome`]; never sent unasked to a peer that is playing.
@@ -705,7 +716,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 29;
+    pub const VARIANT_COUNT: u32 = 30;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -742,7 +753,8 @@ impl Message {
             Message::SceneSet(_) => 25,
             Message::SceneAck(_) => 26,
             Message::SceneUpdate(_) => 27,
-            Message::JoinRedirect(_) => 28,
+            Message::SceneClock(_) => 28,
+            Message::JoinRedirect(_) => 29,
         }
     }
 

@@ -296,8 +296,8 @@ mod tests {
         };
         assert_eq!(merge.to_string(), "merge shard 2 into the region around it");
         let scene = OperatorCommand::SetScene {
-            scene: Scene::Solar,
+            scene: Scene::Galaxy,
         };
-        assert_eq!(scene.to_string(), "switch every shard to scene solar");
+        assert_eq!(scene.to_string(), "switch every shard to scene galaxy");
     }
 }

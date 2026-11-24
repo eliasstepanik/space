@@ -296,7 +296,7 @@ async fn a_shard_stops_when_it_loses_its_orchestrator() {
 /// the client endpoint it asks for — and it then runs on the region of its
 /// welcome: the internal endpoint as the orchestrator recorded it (IP filled
 /// in), and the client endpoint the orchestrator put into the map. The map a
-/// player is handed names both.
+/// player is handed names the client endpoint only (`ShardMap::for_players`).
 ///
 /// Mutation this catches: the shard writing its *advertised* address back
 /// over the orchestrator's (the map it hands out would name `0.0.0.0` as its
@@ -342,7 +342,9 @@ async fn an_orchestrated_shard_takes_its_two_addresses_from_its_welcome() {
         welcome.shard_map.client_endpoint_of(ShardId::new(5)),
         Some(players_at)
     );
-    assert_eq!(welcome.shard_map.regions[0].endpoint, internal);
+    // ...as a player is to see it: the internal endpoint stays inside the
+    // cluster, and the map names the client endpoint in its place.
+    assert_eq!(welcome.shard_map.regions[0].endpoint, players_at);
     shard.abort();
 }
 

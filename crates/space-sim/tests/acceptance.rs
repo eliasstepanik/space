@@ -86,6 +86,7 @@ fn tick_inputs(rng: &mut Rng, tick: SimTick) -> Vec<PlayerInput> {
             thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             tick,
+            fast: false,
         })
         .collect()
 }
@@ -246,6 +247,7 @@ fn step_ship_physics() {
         thrust: [1.0, 0.0, 0.0],
         torque: [0.0; 3],
         tick: 0,
+        fast: false,
     };
 
     // --- linear: 1 s of full thrust from rest -------------------------------
@@ -393,6 +395,7 @@ fn prediction_reconcile() {
             thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             tick,
+            fast: false,
         });
     }
     assert_eq!(pred.pending_ticks(), 8);
@@ -462,6 +465,7 @@ fn prediction_correction_bounded() {
             thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
             tick,
+            fast: false,
         };
         // The client always predicts as if its input arrived.
         client.apply_input(input);
@@ -571,6 +575,7 @@ fn prediction_converges_under_latency_reorder_and_loss() {
                 thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
                 torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
                 tick: client_tick,
+                fast: false,
             };
             // The client always predicts as if its input arrived.
             client.apply_input(input);
@@ -682,6 +687,7 @@ fn prediction_converges_under_latency_reorder_and_loss() {
             thrust: held.0,
             torque: held.1,
             tick,
+            fast: false,
         };
         truth.apply_inputs(tick, &[input]);
         truth.step();
@@ -864,6 +870,7 @@ fn idle_ships_are_not_replicated() {
             thrust: [1.0, 0.0, 0.0],
             torque: [0.0; 3],
             tick: 2,
+            fast: false,
         }],
     );
     sim.step();
@@ -1198,6 +1205,7 @@ fn ship_state_codec_rejects_states_that_would_poison_the_integrator() {
         thrust: [0.0, 0.0, 1.0],
         torque: [0.0; 3],
         tick: 1,
+        fast: false,
     };
     let coast = PlayerInput {
         thrust: [0.0; 3],
@@ -1327,6 +1335,7 @@ fn ship_state_codec_rejects_states_that_would_poison_the_integrator() {
                 thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
                 torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
                 tick,
+                fast: false,
             }
         } else {
             coast

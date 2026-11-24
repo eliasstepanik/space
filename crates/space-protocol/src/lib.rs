@@ -68,7 +68,7 @@ pub use messages::{
     Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
-pub use scene::{Scene, SceneAck, SceneId, SceneState, UnknownScene};
+pub use scene::{Scene, SceneAck, SceneClock, SceneId, SceneState, UnknownScene};
 pub use shard::{
     resolve_client_endpoint, AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId,
     ShardMap, ShardRegion,

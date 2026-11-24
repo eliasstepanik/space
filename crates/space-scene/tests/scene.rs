@@ -10,7 +10,7 @@ use rapier3d_f64::prelude::{Pose, Vector};
 use space_protocol::{EntityGuid, Scene, ShardId, ShardMap, ShardRegion};
 use space_scene::{demo, visual, BodyDef, StaticDef, KESTREL};
 use space_sim::shape::quat_to_rot;
-use space_sim::{SimWorld, Visual};
+use space_sim::{SimWorld, Visual, WorldPoint};
 use space_world::{NodeRef, WorldPos};
 
 fn minter() -> impl FnMut() -> EntityGuid {
@@ -158,11 +158,30 @@ fn the_anchor_lies_beside_and_above_the_corner_where_the_roots_cells_meet() {
             Some(anchor)
         );
     }
-    // Nothing of the demo area comes near a horizontal border: every static
-    // and body is placed well inside the 512 m to the cell layer's floor and
-    // ceiling.
-    let heights = space_scene::statics(Scene::DemoArea)
+    // Nothing of the demo area's showcase comes near a horizontal border:
+    // every static and body of it is placed well inside the 512 m to the cell
+    // layer's floor and ceiling. The demo area's **sky** (the solar system
+    // merged into it: Earth, Moon, Sun, planets) is the other kind of static
+    // — thousands of kilometres away and larger than any cell, so it spans
+    // shard borders by nature. That is sound because a static is no entity:
+    // every shard builds every static of the scene itself, at the same place
+    // (this anchor) and moved by the same scene clock, and none is ever
+    // handed over.
+    let statics = space_scene::statics(Scene::DemoArea);
+    let far = |s: &&StaticDef| s.offset.iter().map(|c| c * c).sum::<f64>().sqrt() > 1_000.0;
+    let sky: Vec<&StaticDef> = statics.iter().filter(far).collect();
+    assert_eq!(
+        sky.len(),
+        space_scene::solar::sky_bodies().len(),
+        "what lies beyond a kilometre is exactly the sky's bodies"
+    );
+    for body in &sky {
+        let distance = body.offset.iter().map(|c| c * c).sum::<f64>().sqrt();
+        assert!(distance > 1.0e6, "a sky body {distance} m away");
+    }
+    let heights = statics
         .iter()
+        .filter(|s| !far(s))
         .map(|s| s.offset[1])
         .chain(
             space_scene::body_defs(Scene::DemoArea)
@@ -328,9 +347,14 @@ fn body_shapes(d: &BodyDef) -> Vec<(SharedShape, Pose)> {
 fn no_showcase_object_starts_intersecting_another() {
     let bodies = space_scene::body_defs(Scene::DemoArea);
     let statics = space_scene::statics(Scene::DemoArea);
+    // (The sky's bodies where they are at scene time 0.)
     let static_shapes: Vec<(SharedShape, Pose, &str)> = statics
         .iter()
-        .map(|s| (static_shape(s), pose(s.offset, s.rotation), s.name))
+        .map(|s| {
+            let o = s.motion.as_ref().map_or([0.0; 3], |m| m.offset(0));
+            let at = [s.offset[0] + o[0], s.offset[1] + o[1], s.offset[2] + o[2]];
+            (static_shape(s), pose(at, s.rotation), s.name)
+        })
         .collect();
     let shapes: Vec<Vec<(SharedShape, Pose)>> = bodies.iter().map(body_shapes).collect();
     let depth = |a: &(SharedShape, Pose), b: (&SharedShape, &Pose)| {
@@ -598,10 +622,234 @@ fn the_planetoid_holds_its_crates_and_moons_and_lets_a_player_land() {
                 thrust: [0.0, 1.0, 0.0],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
         );
         sim.step();
     }
     let up = from_centre(sim.state_of(player).unwrap().pos)[1] - r - 1.7;
     assert!(up > 2.0, "a second of lift raised the player only {up} m");
+}
+
+// ---------------------------------------------------------------- the sky
+
+/// The demo area's solar system, as the physics has it: Earth fixed eight
+/// Earth radii from the spawn point, the Moon at its distance and the Sun at
+/// one AU at any scene time, the colliders where the gravity says the bodies
+/// are, and every reach ending far from the demo area — the spawn point, the
+/// zero-g corner and the gravity room feel exactly what they felt before.
+#[test]
+fn the_sky_moves_on_its_orbits_and_leaves_the_demo_area_alone() {
+    use space_scene::solar::{self, EARTH_RADIUS, MOON_DISTANCE, MOON_RADIUS};
+    let anchor = WorldPos::from_metres([3_000_000, 0, -2_000_000]);
+    let env = space_scene::environment(Scene::DemoArea, anchor);
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let earth_c = solar::EARTH_CENTER;
+    assert!(
+        (len(earth_c) - 8.0 * EARTH_RADIUS).abs() < 1.0,
+        "8 Earth radii out"
+    );
+    let body = |name: &str| {
+        env.gravity
+            .bodies
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap()
+            .clone()
+    };
+    for t_us in [
+        0,
+        1_763_900_000_000_000,
+        1_763_900_067_500_000,
+        -5_000_000_000,
+    ] {
+        let at = |name: &str| WorldPos::delta(anchor, body(name).center_at(0, t_us).to_world_pos());
+        let earth = at("Earth");
+        assert!(
+            (0..3).all(|k| (earth[k] - earth_c[k]).abs() < 1e-3),
+            "Earth stands still"
+        );
+        let rel = |p: [f64; 3]| [p[0] - earth[0], p[1] - earth[1], p[2] - earth[2]];
+        assert!((len(rel(at("Moon"))) - MOON_DISTANCE).abs() < 1.0);
+        assert!((len(rel(at("Sun"))) - solar::AU).abs() < 1.0e3);
+        let mars = WorldPos::delta(
+            body("Sun").center_at(0, t_us).to_world_pos(),
+            body("Mars").center_at(0, t_us).to_world_pos(),
+        );
+        assert!((len(mars) - 2.2794e11).abs() < 1.0e3);
+        // The collider moves with the body, to the bit.
+        let moon_static = env
+            .statics
+            .iter()
+            .find(|s| {
+                matches!(s.shape, space_sim::ShapeRef::Ball { radius }
+                    if (f64::from(radius) - MOON_RADIUS).abs() < 1.0)
+            })
+            .unwrap();
+        let p = moon_static.place_at(t_us);
+        let c = body("Moon").center_at(0, t_us);
+        assert_eq!((p.origin, p.offset), (c.origin, c.offset));
+        // Nothing of it reaches the demo area.
+        for b in &env.gravity.bodies {
+            if b.name == "planetoid" {
+                continue;
+            }
+            let d = len(b.center_at(0, t_us).delta_to(anchor));
+            assert!(
+                d > b.reach + 1.0e6,
+                "{} reaches to {d} m of the spawn point",
+                b.name
+            );
+            assert!(b.reach.is_finite() && b.reach > b.radius, "{}", b.name);
+        }
+        let mut field = env.gravity.clone();
+        field.clock = space_protocol::SceneClock::new(0, t_us);
+        let g = field.at(anchor, 0);
+        assert!(
+            g.iter().all(|v| v.to_bits() == 0),
+            "the spawn point floats: {g:?}"
+        );
+        let room = WorldPos::from_f64_metres_around(anchor, demo::GRAVITY_ROOM_CENTER);
+        assert_eq!(field.at(room, 0), [0.0, -9.81, 0.0]);
+        let carry = field.carry(anchor, [0.0; 3], 0, t_us, t_us + 33_333);
+        assert!(
+            carry.iter().all(|v| v.to_bits() == 0),
+            "nothing carries the demo area"
+        );
+    }
+    // The reaches as documented.
+    assert!((body("Earth").reach - 6.0 * EARTH_RADIUS).abs() < 1.0);
+    assert!((body("Moon").reach - 10.0 * MOON_RADIUS).abs() < 1.0);
+    assert!((body("Sun").reach - 10.0 * solar::SUN_RADIUS).abs() < 1.0);
+    // On the Moon's surface: its 1.62 m/s².
+    let t = 1_763_900_000_000_000;
+    let moon = body("Moon").center_at(0, t);
+    let surface = WorldPoint::new(
+        moon.origin,
+        [moon.offset[0], moon.offset[1] + MOON_RADIUS, moon.offset[2]],
+    )
+    .to_world_pos();
+    let mut field = env.gravity.clone();
+    field.clock = space_protocol::SceneClock::new(0, t);
+    assert!((len(field.at(surface, 0)) - 1.62).abs() < 0.01);
+    // The Moon goes round in about four and a half minutes, the year is an
+    // hour.
+    let month = solar::sky_body("Moon")
+        .unwrap()
+        .path
+        .as_ref()
+        .unwrap()
+        .terms[0]
+        .period_us;
+    assert!((month as f64 / 1e6 - 269.3).abs() < 0.5, "{month}");
+    let year = solar::period_us(solar::AU, solar::SUN_GM);
+    assert!((year as f64 / 1e6 - 3600.0).abs() < 1.0, "{year}");
+}
+
+/// Fast travel from the demo area to the Moon in about a minute, then a
+/// landing on it, through the same physics a shard runs: the ship steers at
+/// the Moon in fast travel, is caught up and carried along inside its reach,
+/// slows as the ground comes near, and stands on the Moon at the end.
+#[test]
+fn a_ship_fast_travels_to_the_moon_and_lands() {
+    use space_protocol::PlayerInput;
+    use space_scene::solar::MOON_RADIUS;
+    let anchor = WorldPos::from_metres([3_000_000, 0, -2_000_000]);
+    let mut sim = SimWorld::new(ShardId(9));
+    sim.set_scene_clock(space_protocol::SceneClock::new(0, 1_763_900_000_000_000));
+    space_scene::install_environment(&mut sim, Scene::DemoArea, anchor).unwrap();
+    let ship = EntityGuid::new(ShardId(9), 1);
+    sim.spawn_ship(ship, 1, space_sim::ShipState::at_rest(anchor));
+    let moon = |sim: &SimWorld| {
+        let b = sim
+            .gravity()
+            .bodies
+            .iter()
+            .find(|b| b.name == "Moon")
+            .unwrap();
+        b.center_at(sim.tick(), sim.scene_time())
+    };
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let mut arrived = None;
+    let mut top = 0.0f64;
+    for tick in 1..=(120 * 30) {
+        let s = sim.ship_state(ship).unwrap();
+        let to = moon(&sim).delta_to(s.pos).map(|v| -v);
+        let surface = len(to) - MOON_RADIUS;
+        if surface < 3_000.0 {
+            arrived = Some(tick);
+            break;
+        }
+        let dir = to.map(|v| (v / len(to)) as f32);
+        let t = sim.tick() + 1;
+        sim.apply_inputs(
+            t,
+            &[PlayerInput {
+                entity: ship,
+                thrust: dir,
+                torque: [0.0; 3],
+                tick: t,
+                fast: true,
+            }],
+        );
+        sim.step();
+        top = top.max(len(sim.ship_state(ship).unwrap().vel.map(f64::from)));
+    }
+    let arrived = f64::from(arrived.expect("reached the Moon")) / 30.0;
+    assert!(arrived < 45.0, "{arrived} s");
+    assert!(top > 1.0e7, "fast in between: {top} m/s");
+    // Fast travel off (the ship drops to its normal top speed) and down in
+    // normal flight, the way a pilot does it: push towards the ground while
+    // slower than a twentieth of the height per second, brake otherwise.
+    let mut settled = 0;
+    for _ in 0..(150 * 30) {
+        let s = sim.ship_state(ship).unwrap();
+        let up = moon(&sim).delta_to(s.pos);
+        let height = len(up) - MOON_RADIUS;
+        let v = s.vel.map(f64::from);
+        let speed = len(v);
+        settled = if height < 2.5 && speed < 0.3 {
+            settled + 1
+        } else {
+            0
+        };
+        if settled > 60 {
+            break;
+        }
+        // On the ground: hands off (gravity holds it).
+        let thrust = if height < 1.0 {
+            [0.0; 3]
+        } else if speed < (height / 20.0).max(1.0) {
+            up.map(|c| (-c / len(up)) as f32)
+        } else {
+            let k = (speed / 1.5).min(1.0) / speed;
+            v.map(|c| (-c * k) as f32)
+        };
+        let t = sim.tick() + 1;
+        sim.apply_inputs(
+            t,
+            &[PlayerInput {
+                entity: ship,
+                thrust,
+                torque: [0.0; 3],
+                tick: t,
+                fast: false,
+            }],
+        );
+        sim.step();
+    }
+    assert!(settled > 60, "came to rest on the ground");
+    let s = sim.ship_state(ship).unwrap();
+    let height = len(moon(&sim).delta_to(s.pos)) - MOON_RADIUS;
+    assert!(
+        height > 0.0 && height < 3.0,
+        "landed: {height} m over the ground"
+    );
+    assert!(
+        len(s.vel.map(f64::from)) < 0.5,
+        "at rest on it: {:?}",
+        s.vel
+    );
+    let g = len(sim.gravity().at(s.pos, sim.tick()));
+    assert!(g > 1.5, "the Moon's pull: {g}");
 }

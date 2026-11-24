@@ -32,7 +32,7 @@
 //! without either runs the plain forward shaders, with no ray-query code in
 //! them at all. Two things cast no shadow: transmissive instances (glass),
 //! and a sphere or box instance that *contains* a light — it is that light's
-//! lamp, like the Sun around the solar scene's point light. Mesh models
+//! lamp, like the Sun around the solar system's point light. Mesh models
 //! always cast shadows, so keep lights outside closed meshes.
 //!
 //! The same rays keep the sky out of where it cannot get. A scene's

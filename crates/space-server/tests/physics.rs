@@ -33,7 +33,7 @@
 //! | [`a_busy_spawn_point_never_puts_a_ship_across_a_border`] | the spawn grid stays on its shard's ground when the scene is cut into four shard areas |
 //! | [`replication_bandwidth_of_the_moving_showcase`] | bytes per tick for a client in the demo area, and for the chain |
 //! | [`over_quic_a_body_crosses_between_two_real_shards`] | the same handoff through the real front end, paced at 30 Hz |
-//! | [`an_old_peer_is_refused_with_both_versions`] | protocol 6 |
+//! | [`an_old_peer_is_refused_with_both_versions`] | protocol 7 |
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -687,6 +687,7 @@ impl Player {
                     thrust,
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -1727,6 +1728,7 @@ fn joining_players_get_distinct_free_spawn_points_and_ships_are_solid() {
                     thrust: dir,
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -2188,11 +2190,11 @@ async fn over_quic_a_body_crosses_between_two_real_shards() {
     b.stop();
 }
 
-/// A peer still on protocol 5 — a v5 client or shard — is turned away at
-/// the hello with both versions named, before any session exists.
+/// A peer still on protocol 6 — a client or shard of the last release — is
+/// turned away at the hello with both versions named, before any session exists.
 #[tokio::test]
 async fn an_old_peer_is_refused_with_both_versions() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     let a = quic::start(1, NodeRef::new(64, [0, 0, 0]));
     let endpoint = space_net::client_endpoint_for(a.addr()).expect("endpoint");
     for token in ["old-client", "shard:7"] {
@@ -2201,17 +2203,17 @@ async fn an_old_peer_is_refused_with_both_versions() {
             a.addr(),
             space_server::net::SERVER_NAME,
             &Hello {
-                protocol: 5,
+                protocol: 6,
                 player_token: token.into(),
             },
         )
         .await
-        .expect_err("a v5 peer is refused");
+        .expect_err("a v6 peer is refused");
         assert_eq!(
             err,
             space_net::NetError::VersionMismatch {
-                seen: 5,
-                expected: 6
+                seen: 6,
+                expected: 7
             },
             "{token}"
         );

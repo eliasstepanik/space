@@ -69,27 +69,30 @@ use crate::messages::Message;
 /// may describe an unowned body. None of it is readable by a v4 peer, so the
 /// version bumps and such a peer is refused at the hello.
 ///
-/// **Version 6** (shard lifecycle): [`crate::ShardHello`] carries the cluster
-/// secret as a new last field. That changes the layout of an existing message,
-/// so the version bumps: a v5 orchestrator would fail to decode a v6 shard's
-/// hello mid-handshake instead of refusing it with a reason. With it a hello
-/// names neither id nor region (the orchestrator assigns both), a
-/// [`crate::RejectReason::Draining`] answer to it means "ask again", and a
-/// shard-to-shard [`crate::Hello`] carries the peer token behind the shard id
-/// in its existing token field (`shard:<id>:<token>`).
+/// **Version 6** (the merged demo area: orbits and fast travel): every shard
+/// sends its clients a [`crate::SceneClock`] (wire tag 28, appended) behind the
+/// `Welcome` and again every few seconds — the mapping from its ticks to the
+/// scene time the planets move by; a [`crate::PlayerInput`] carries the
+/// fast-travel flag (`fast`), and so does the replicated `ShipControls`
+/// component (25 bytes, was 24). A v5 client would fail on the new tag and
+/// misread every input, so the version bumps.
 ///
-/// **Still version 6** (one address): version 6 has never been released —
-/// nothing built from it has been pushed to `main` — so the layout changes of
-/// the sharding branch all live in it instead of each taking a number.
+/// **Version 7** (shard lifecycle and one address): [`crate::ShardHello`]
+/// carries an optional client endpoint and, as its last field, the cluster
+/// secret; a hello names neither id nor region (the orchestrator assigns
+/// both), a [`crate::RejectReason::Draining`] answer to it means "ask again",
+/// and a shard-to-shard [`crate::Hello`] carries the peer token behind the
+/// shard id in its existing token field (`shard:<id>:<token>`).
 /// [`crate::ShardRegion`] carries a **client endpoint** behind its endpoint
 /// (so every message with a shard map in it changed: `Welcome`, `Redirect`,
 /// `DirectoryReply`, `ShardWelcome`, a `ShardHello`'s claim);
-/// [`crate::ShardHello`] carries an optional client endpoint before the
-/// secret, which stays its last field; [`crate::RejectReason::Starting`] and
-/// the message [`crate::JoinRedirect`] (wire tag 28) were appended.
-/// [`crate::Hello`] keeps its layout, as in every version: a peer of another
-/// version is still told so with a readable `Reject`.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// [`crate::RejectReason::Starting`] and the message [`crate::JoinRedirect`]
+/// (wire tag 29) were appended. These change the layouts of existing
+/// messages, so the version bumps: a v6 peer would fail to decode a v7 map
+/// mid-handshake instead of refusing it with a reason. [`crate::Hello`]
+/// keeps its layout, as in every version: a peer of another version is still
+/// told so with a readable `Reject`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Largest accepted frame payload, in bytes (1 MiB).
 ///

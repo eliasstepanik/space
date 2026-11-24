@@ -20,6 +20,20 @@
 //! a player would otherwise have to be. It is the client's choice of input,
 //! nothing the server knows about; `B` switches it off for those who want to
 //! coast.
+//!
+//! # Fast travel
+//!
+//! `F` switches **fast travel** on and off. Unlike the brake assist it is the
+//! server's business: the flag rides in every input
+//! (`space_protocol::PlayerInput::fast`) and the shard's flight model scales
+//! the ship's speed limit with its distance to the nearest surface
+//! (`space_sim::physics::fast_travel_limit`): a second's worth of the
+//! distance (less 2 km of the surface being approached), so the Moon is about
+//! half a minute away, while near anything (the demo area, a planet's ground)
+//! it is normal flight. Letting
+//! go of the keys in fast travel stops the ship by itself, so the brake
+//! assist sends nothing while the ship is faster than its normal top speed;
+//! switching fast travel off drops the ship to that top speed at once.
 
 use space_stream::{Key, ViewerInput};
 
@@ -35,10 +49,16 @@ pub const KEY_CAMERA: char = 'c';
 pub const KEY_HUD: char = 'h';
 /// Switches the brake assist on / off while playing.
 pub const KEY_BRAKE: char = 'b';
+/// Switches fast travel on / off while playing.
+pub const KEY_FAST: char = 'f';
 
 /// The keys, for the hint line of the HUD and `--help`.
 pub const KEY_HELP: &str = "W/A/S/D move  Space/Shift up/down  drag mouse: look  \
-     C camera  B brake assist  H hud  Esc disconnect";
+     C camera  B brake  F fast travel  H hud  Esc disconnect";
+
+/// The normal top speed of a ship, metres/second (the placeholder flight
+/// model's): above it the brake assist leaves a ship in fast travel alone.
+pub const TOP_SPEED: f32 = 120.0;
 
 /// Above this speed, metres/second, the brake assist brakes at full thrust;
 /// below it the thrust falls off with the speed, so the ship eases to a stop
@@ -237,6 +257,9 @@ pub struct Controls {
     pub hud: bool,
     /// Whether the ship is braked while no movement key is held.
     pub brake_assist: bool,
+    /// Whether fast travel is on (sent with every input; see the module
+    /// docs).
+    pub fast: bool,
 }
 
 impl Controls {
@@ -250,6 +273,7 @@ impl Controls {
             camera: CameraMode::default(),
             hud: true,
             brake_assist: true,
+            fast: false,
         }
     }
 
@@ -259,6 +283,12 @@ impl Controls {
     #[must_use]
     pub fn thrust(&self, velocity: Option<[f32; 3]>) -> [f32; 3] {
         match velocity {
+            // Fast travel stops a ship that is let go by itself.
+            Some(velocity)
+                if self.fast && velocity.iter().map(|v| v * v).sum::<f32>() > TOP_SPEED.powi(2) =>
+            {
+                self.view.thrust()
+            }
             Some(velocity) if self.brake_assist && !self.view.any_held() => brake(velocity),
             _ => self.view.thrust(),
         }
@@ -324,6 +354,7 @@ impl Controls {
                     KEY_CAMERA => self.camera = self.camera.toggled(),
                     KEY_HUD => self.hud = !self.hud,
                     KEY_BRAKE => self.brake_assist = !self.brake_assist,
+                    KEY_FAST => self.fast = !self.fast,
                     // W/A/S/D arrive as text too; they are the movement keys.
                     _ => {}
                 }
@@ -411,10 +442,12 @@ mod tests {
         c.handle(screen, ViewerInput::Text('h'));
         c.handle(screen, ViewerInput::Text('b'));
         c.handle(screen, key(Key::Backspace, true));
+        c.handle(screen, ViewerInput::Text('f'));
+        c.handle(screen, key(Key::Backspace, true));
         assert_eq!(c.prompt.text(), "wch");
         assert_eq!(
-            (c.camera, c.hud, c.brake_assist),
-            (CameraMode::Chase, true, true)
+            (c.camera, c.hud, c.brake_assist, c.fast),
+            (CameraMode::Chase, true, true, false)
         );
         // The arrow keys: the movement half is ignored, the caret half moves.
         c.handle(screen, key(Key::Left, true));
@@ -564,5 +597,23 @@ mod tests {
         assert_ne!(CameraMode::Chase.name(), CameraMode::FirstPerson.name());
         assert!(KEY_HELP.contains("C camera") && KEY_HELP.contains("Esc"));
         assert!(KEY_HELP.contains("B brake") && !KEY_HELP.contains('\n'));
+        assert!(KEY_HELP.contains("F fast travel"));
+    }
+
+    /// `F` toggles fast travel while playing; a ship faster than its normal
+    /// top speed in fast travel is not braked (fast travel stops it), a slow
+    /// one is, as ever.
+    #[test]
+    fn f_toggles_fast_travel_and_the_brake_assist_leaves_a_fast_ship_alone() {
+        let mut c = Controls::new("");
+        let screen = ScreenKind::Online;
+        assert!(!c.fast);
+        c.handle(screen, ViewerInput::Text('f'));
+        assert!(c.fast);
+        assert_eq!(c.thrust(Some([0.0, 0.0, -5_000.0])), [0.0; 3]);
+        assert_ne!(c.thrust(Some([0.0, 0.0, -5.0])), [0.0; 3], "braked");
+        c.handle(screen, ViewerInput::Text('F'));
+        assert!(!c.fast);
+        assert_ne!(c.thrust(Some([0.0, 0.0, -5_000.0])), [0.0; 3], "braked");
     }
 }

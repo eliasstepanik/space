@@ -11,17 +11,23 @@
 //!
 //! | scene | content |
 //! |---|---|
-//! | `demo-area` | [`crate::demo_area`]: everything the renderer can do, around the spawn point |
+//! | `demo-area` | [`crate::demo_area`]: everything the renderer can do, around the spawn point, riding along with Earth with the real-size solar system moving around it ([`sky_bodies`]) |
 //! | `materials` | a PBR material chart ([`materials_bodies`]) |
-//! | `solar` | the solar system at real size ([`solar_bodies`]) |
 //! | `galaxy` | the deterministic galaxy through the LOD selector |
+//!
+//! The demo area's sky moves: where the Sun, the planets and the Moon are is
+//! a function of the scene time ([`SkyTime`]: the shard's scene clock and the
+//! tick a frame is drawn at), so it is not part of [`World::build`] (built
+//! once per camera position) but added to every frame ([`World::sky`]).
 
 use std::sync::{Arc, OnceLock};
 
+use space_protocol::SceneClock;
 use space_render::{
     CameraPose, Environment, GpuInstance, MeshData, ModelInstance, Quality, QualityPreset,
     RenderOptions, Scene, SceneLight, SHAPE_BOX, SHAPE_SPHERE,
 };
+use space_scene::solar::SkyBody;
 use space_world::{Galaxy, LodSelector, NodeRef, WorldPos, MAX_SELECTED};
 
 use crate::demo_area::DemoArea;
@@ -64,8 +70,8 @@ pub fn ship_mesh() -> Arc<MeshData> {
 /// cut the outer stations off and makes walking among them feel zoomed in.
 pub const FOV_Y: f32 = 50.0 * std::f32::consts::PI / 180.0;
 
-/// The faint, even light of the scenes that are in space (the solar system,
-/// the galaxy): no sky is painted — space is black — but whoever stands
+/// The faint, even light of the scenes that are in space (the galaxy): no
+/// sky is painted — space is black — but whoever stands
 /// there, or flies away from every lamp, is a dim shape and not a black
 /// cut-out, and polished metal has something to reflect.
 pub const SPACE_AMBIENT: Environment = Environment::gradient([0.05; 3], [0.04; 3], [0.03; 3]);
@@ -290,7 +296,6 @@ impl World {
     pub fn spawn(&self) -> WorldPos {
         match self.scene {
             space_protocol::Scene::DemoArea | space_protocol::Scene::Materials => WorldPos::ZERO,
-            space_protocol::Scene::Solar => solar_spawn(),
             space_protocol::Scene::Galaxy => at(GALAXY_SPAWN_M),
         }
     }
@@ -303,19 +308,18 @@ impl World {
     pub fn initial_view(&self) -> (f32, f32) {
         match self.scene {
             space_protocol::Scene::Galaxy => (std::f32::consts::PI, 0.0),
-            space_protocol::Scene::DemoArea
-            | space_protocol::Scene::Materials
-            | space_protocol::Scene::Solar => (0.0, 0.0),
+            space_protocol::Scene::DemoArea | space_protocol::Scene::Materials => (0.0, 0.0),
         }
     }
 
-    /// The camera's field of view and depth range for this scene.
+    /// The camera's field of view and depth range for this scene. (The
+    /// projection's far plane is infinite: the demo area's near plane suits
+    /// a crate at arm's length and the planets 30 AU out alike.)
     #[must_use]
     pub fn lens(&self) -> Lens {
         let (near, far) = match self.scene {
-            space_protocol::Scene::DemoArea => (0.05, 1.0e5),
+            space_protocol::Scene::DemoArea => (0.05, 1.0e13),
             space_protocol::Scene::Materials => (0.05, 1.0e3),
-            space_protocol::Scene::Solar => (1.0, 1.0e13),
             space_protocol::Scene::Galaxy => (1.0, 5.0e6),
         };
         Lens {
@@ -352,7 +356,7 @@ impl World {
             space_protocol::Scene::DemoArea | space_protocol::Scene::Materials => {
                 Some(-f64::from(EYE_HEIGHT))
             }
-            space_protocol::Scene::Solar | space_protocol::Scene::Galaxy => None,
+            space_protocol::Scene::Galaxy => None,
         }
     }
 
@@ -364,7 +368,7 @@ impl World {
         match self.scene {
             space_protocol::Scene::DemoArea => crate::demo_area::ENVIRONMENT,
             space_protocol::Scene::Materials => CHART_ENVIRONMENT,
-            space_protocol::Scene::Solar | space_protocol::Scene::Galaxy => SPACE_AMBIENT,
+            space_protocol::Scene::Galaxy => SPACE_AMBIENT,
         }
     }
 
@@ -375,7 +379,6 @@ impl World {
         let scene = match self.scene {
             space_protocol::Scene::DemoArea => DemoArea::shared().scene_for(camera, self.detail),
             space_protocol::Scene::Materials => materials_scene(camera),
-            space_protocol::Scene::Solar => solar_scene(camera),
             space_protocol::Scene::Galaxy => galaxy_scene(camera),
         };
         scene.with_environment(self.environment())
@@ -383,16 +386,14 @@ impl World {
 
     /// The render options every front end uses for this scene, so the same
     /// preset gates the same features — including the SSR/refraction post
-    /// pass — whichever way the frame leaves the GPU. The scenes at
-    /// astronomical scale turn the presets' distance fog off (it is tuned for
-    /// metres, and would paint every star and planet solid fog colour); the
-    /// demo area halves it, so its backdrop fades over a kilometre rather
-    /// than half of one.
+    /// pass — whichever way the frame leaves the GPU. The scenes in space
+    /// (the demo area with its planets, the galaxy) turn the presets'
+    /// distance fog off: it is tuned for metres, and would paint every star
+    /// and planet solid fog colour.
     #[must_use]
     pub fn options(&self, preset: QualityPreset) -> RenderOptions {
         let fog_scale = match self.scene {
-            space_protocol::Scene::Galaxy | space_protocol::Scene::Solar => 0.0,
-            space_protocol::Scene::DemoArea => 0.5,
+            space_protocol::Scene::Galaxy | space_protocol::Scene::DemoArea => 0.0,
             space_protocol::Scene::Materials => 1.0,
         };
         RenderOptions {
@@ -404,16 +405,45 @@ impl World {
         }
     }
 
-    /// Where `position` is, in words, for the scenes that have named places:
-    /// the nearest body of the solar system and how far away its surface is.
+    /// Where `position` is, in words, for the scenes that have named places
+    /// (the demo area's sky): the nearest body of the solar system at `time`
+    /// and how far away its surface is.
     #[must_use]
-    pub fn whereabouts(&self, position: WorldPos) -> Option<String> {
-        if self.scene != space_protocol::Scene::Solar {
-            return None;
-        }
-        let bodies = solar_bodies();
+    pub fn whereabouts(&self, position: WorldPos, time: &SkyTime) -> Option<String> {
+        let bodies = self.sky_bodies(time);
         let (body, surface) = nearest(&bodies, position)?;
         Some(format!("{} from {}", format_distance(surface), body.name))
+    }
+
+    /// The solar system's bodies at `time`, in scene space (none for the
+    /// scenes without one).
+    #[must_use]
+    pub fn sky_bodies(&self, time: &SkyTime) -> Vec<Body> {
+        match self.scene {
+            space_protocol::Scene::DemoArea => sky_bodies(time),
+            space_protocol::Scene::Materials | space_protocol::Scene::Galaxy => Vec::new(),
+        }
+    }
+
+    /// What moves in this scene's sky at `time` as `camera` sees it: the
+    /// instances of the Sun, the planets and the Moon, and the sunlight (a
+    /// point light at the Sun). Empty for the scenes without a sky.
+    #[must_use]
+    pub fn sky(
+        &self,
+        camera: &CameraPose,
+        time: &SkyTime,
+    ) -> (Vec<GpuInstance>, Option<SceneLight>) {
+        if self.scene != space_protocol::Scene::DemoArea {
+            return (Vec::new(), None);
+        }
+        let bodies = sky_bodies(time);
+        let sun = bodies.first().map(|sun| SceneLight {
+            position: sun.position,
+            color: [1.0, 0.97, 0.92],
+            intensity: SUN_INTENSITY,
+        });
+        (bodies.iter().map(|b| b.instance(camera)).collect(), sun)
     }
 }
 
@@ -517,98 +547,105 @@ pub fn materials_scene(camera: &CameraPose) -> Scene {
     scene_of(camera, &materials_bodies(), materials_lights())
 }
 
-// ---- real-size solar system ----------------------------------------------------
+// ---- the demo area's sky: the solar system --------------------------------------
 
 /// One astronomical unit, metres.
-pub const AU: f64 = 1.495_978_707e11;
+pub const AU: f64 = space_scene::solar::AU;
 
-/// Mean radius (m), mean distance from the Sun (m), heliocentric longitude at
-/// which the body is placed (degrees, in the XZ plane) and colour, for the
-/// eight planets. Sizes and distances are the real ones; the longitudes are
-/// simply a fixed, spread-out arrangement (nothing orbits yet).
-const PLANETS: [(&str, f64, f64, f64, [f32; 3]); 8] = [
-    ("Mercury", 2.4397e6, 5.791e10, 40.0, [0.55, 0.52, 0.50]),
-    ("Venus", 6.0518e6, 1.0821e11, 130.0, [0.90, 0.78, 0.52]),
-    ("Earth", 6.371e6, AU, 0.0, [0.16, 0.36, 0.75]),
-    ("Mars", 3.3895e6, 2.2794e11, 310.0, [0.76, 0.33, 0.18]),
-    ("Jupiter", 6.9911e7, 7.7857e11, 20.0, [0.80, 0.66, 0.50]),
-    ("Saturn", 5.8232e7, 1.43353e12, 345.0, [0.88, 0.79, 0.58]),
-    ("Uranus", 2.5362e7, 2.87246e12, 330.0, [0.60, 0.85, 0.90]),
-    ("Neptune", 2.4622e7, 4.49506e12, 10.0, [0.25, 0.38, 0.85]),
-];
+/// Sunlight: a point light at the Sun this strong, so that a surface at 1 AU
+/// is properly exposed; it falls off with the square of the distance like
+/// the real thing.
+pub const SUN_INTENSITY: f32 = (3.2 * AU * AU) as f32;
 
-const SUN_RADIUS: f64 = 6.9634e8;
-const EARTH_RADIUS: f64 = 6.371e6;
-const MOON_RADIUS: f64 = 1.7374e6;
-const MOON_DISTANCE: f64 = 3.844e8;
-
-/// The heliocentric position of a body `distance` metres out at `longitude`
-/// degrees. Longitude 0 is the -Z axis, so that a camera on the sunward side
-/// of Earth looks down -Z (the default view direction) at a fully lit planet.
-fn heliocentric(distance: f64, longitude_deg: f64) -> [f64; 3] {
-    let a = longitude_deg.to_radians();
-    [distance * a.sin(), 0.0, -distance * a.cos()]
+/// The moment the demo area's sky is drawn at: the shard's mapping from
+/// ticks to scene time and the (fractional) tick of the frame.
+///
+/// A body is drawn **interpolated between its places at the two ticks
+/// around** the frame's — the way the own ship is — so a ship carried along
+/// by the Moon (and drawn between two of its ticks) stays exactly where it
+/// is on the Moon in the picture too.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SkyTime {
+    /// The shard's mapping.
+    pub clock: SceneClock,
+    /// The tick drawn at.
+    pub tick: f64,
 }
 
-/// The Sun, the eight planets and the Moon as plain coloured spheres at their
-/// real sizes and real mean distances (the Sun at the world origin).
-#[must_use]
-pub fn solar_bodies() -> Vec<Body> {
-    let mut bodies = vec![Body {
-        emissive: [24.0, 21.0, 16.0],
-        ..Body::sphere("Sun", WorldPos::ZERO, SUN_RADIUS as f32, [1.0, 0.95, 0.8])
-    }];
-    for (name, radius, distance, longitude, color) in PLANETS {
-        bodies.push(Body {
-            // A faint glow of its own colour, so a planet far from the Sun (or
-            // seen from its night side) is dim rather than invisible.
-            emissive: color.map(|c| c * 0.04),
-            ..Body::sphere(
-                name,
-                at(heliocentric(distance, longitude)),
-                radius as f32,
-                color,
-            )
-        });
+impl SkyTime {
+    /// At `tick` by `clock`.
+    #[must_use]
+    pub const fn new(clock: SceneClock, tick: f64) -> Self {
+        Self { clock, tick }
     }
-    // The Moon, a little ahead of and beside Earth as seen from the spawn.
-    let earth = heliocentric(AU, 0.0);
-    let moon = [
-        earth[0] + MOON_DISTANCE * 0.62,
-        earth[1] + MOON_DISTANCE * 0.18,
-        earth[2] - MOON_DISTANCE * 0.76,
-    ];
-    bodies.push(Body {
-        emissive: [0.02; 3],
-        ..Body::sphere("Moon", at(moon), MOON_RADIUS as f32, [0.55, 0.54, 0.52])
-    });
-    bodies
+
+    /// `body`'s centre, metres from the spawn point.
+    #[must_use]
+    pub fn center(&self, body: &SkyBody) -> [f64; 3] {
+        let tick = if self.tick.is_finite() {
+            self.tick.max(0.0)
+        } else {
+            0.0
+        };
+        let base = tick.floor();
+        let alpha = tick - base;
+        let t0 = self.clock.time_us_at(base as u64);
+        let t1 = self.clock.time_us_at(base as u64 + 1);
+        let (a, b) = (body.center(t0, 0.0), body.center(t1, 0.0));
+        core::array::from_fn(|k| a[k] + (b[k] - a[k]) * alpha)
+    }
+
+    /// The scene time drawn at, µs (the whole microsecond).
+    #[must_use]
+    pub fn time_us(&self) -> i64 {
+        self.clock.time_at(self.tick).0
+    }
 }
 
-/// Sunlight: one point light at the Sun, bright enough that a surface at 1 AU
-/// is properly exposed. It falls off with the square of the distance like the
-/// real thing, so Mercury is ~7x brighter and Neptune ~900x dimmer.
-#[must_use]
-pub fn solar_lights() -> Vec<SceneLight> {
-    vec![SceneLight {
-        position: WorldPos::ZERO,
-        color: [1.0, 0.97, 0.92],
-        intensity: (3.2 * AU * AU) as f32,
-    }]
+/// How a body of the solar system is drawn: its colour.
+fn sky_color(name: &str) -> [f32; 3] {
+    match name {
+        "Sun" => [1.0, 0.95, 0.8],
+        "Mercury" => [0.55, 0.52, 0.50],
+        "Venus" => [0.90, 0.78, 0.52],
+        "Earth" => [0.16, 0.36, 0.75],
+        "Mars" => [0.76, 0.33, 0.18],
+        "Jupiter" => [0.80, 0.66, 0.50],
+        "Saturn" => [0.88, 0.79, 0.58],
+        "Uranus" => [0.60, 0.85, 0.90],
+        "Neptune" => [0.25, 0.38, 0.85],
+        _ => [0.55, 0.54, 0.52],
+    }
 }
 
-/// The solar system's spawn point: on the sunward side of Earth, four Earth
-/// radii from its centre, where looking down -Z shows the lit planet.
+/// The Sun, the eight planets and the Moon (in `space_scene::solar`'s order:
+/// the Sun first) as plain coloured spheres at their real sizes, where they
+/// are at `time`, in scene space: Earth stands still ahead of the spawn
+/// point, the rest move on their orbits.
 #[must_use]
-pub fn solar_spawn() -> WorldPos {
-    let earth = heliocentric(AU, 0.0);
-    at([earth[0], earth[1], earth[2] + 4.0 * EARTH_RADIUS])
-}
-
-/// The solar system seen from `camera`.
-#[must_use]
-pub fn solar_scene(camera: &CameraPose) -> Scene {
-    scene_of(camera, &solar_bodies(), solar_lights())
+pub fn sky_bodies(time: &SkyTime) -> Vec<Body> {
+    space_scene::solar::sky_bodies()
+        .iter()
+        .map(|b| {
+            let color = sky_color(b.name);
+            let position = at(time.center(b));
+            if b.name == "Sun" {
+                Body {
+                    emissive: [24.0, 21.0, 16.0],
+                    ..Body::sphere(b.name, position, b.radius as f32, color)
+                }
+            } else {
+                Body {
+                    // A faint glow of its own colour, so a planet far from the
+                    // Sun (or seen from its night side) is dim rather than
+                    // invisible.
+                    emissive: color.map(|c| c * 0.03),
+                    roughness: 0.9,
+                    ..Body::sphere(b.name, position, b.radius as f32, color)
+                }
+            }
+        })
+        .collect()
 }
 
 // ---- the galaxy ------------------------------------------------------------------
@@ -700,64 +737,79 @@ mod tests {
         world.camera(world.spawn(), view.forward(), aspect)
     }
 
-    /// Sizes and distances are the real ones, and survive the round trip
-    /// through `WorldPos` at full precision: Neptune is 30 AU out to within a
-    /// metre, not to within the ~500 km an `f32` position would give.
+    /// The demo area's sky: real sizes, Earth where `space-scene` puts it
+    /// (eight Earth radii ahead of the spawn point, above the horizon), the
+    /// Moon at its distance from Earth, the planets at their distances from
+    /// the Sun — at any scene time, interpolated between ticks; and the
+    /// whereabouts name the nearest body.
     #[test]
-    fn the_solar_system_is_real_size() {
-        let bodies = solar_bodies();
-        let find = |name: &str| *bodies.iter().find(|b| b.name == name).expect(name);
-        let sun = find("Sun");
-        assert_eq!(sun.position, WorldPos::ZERO);
-        assert!((f64::from(sun.radius) - 6.9634e8).abs() < 100.0);
-        for (name, radius, from_sun) in [
-            ("Earth", 6.371e6, AU),
-            ("Jupiter", 6.9911e7, 7.7857e11),
-            ("Neptune", 2.4622e7, 4.49506e12),
-        ] {
-            let body = find(name);
-            assert!(
-                (f64::from(body.radius) - radius).abs() / radius < 1e-6,
-                "{name}"
+    fn the_demo_areas_sky_is_the_solar_system_at_real_size() {
+        let world = World::new(SceneKind::DemoArea);
+        let clock = SceneClock::new(1000, 1_763_900_000_000_000);
+        for tick in [1000.0, 1234.5, 90_000.25] {
+            let time = SkyTime::new(clock, tick);
+            let bodies = world.sky_bodies(&time);
+            assert_eq!(bodies.len(), 10);
+            let find = |name: &str| *bodies.iter().find(|b| b.name == name).expect(name);
+            let (sun, earth) = (find("Sun"), find("Earth"));
+            let to_earth = WorldPos::distance(WorldPos::ZERO, earth.position);
+            assert!((to_earth - 8.0 * 6.371e6).abs() < 1.0, "{to_earth}");
+            assert!(metres(earth.position)[1] > 0.0, "above the horizon");
+            assert!((f64::from(earth.radius) - 6.371e6).abs() < 1.0);
+            let moon = WorldPos::distance(earth.position, find("Moon").position);
+            assert!((moon - 3.844e8).abs() < 1.0e3, "{moon}");
+            for (name, from_sun) in [
+                ("Earth", AU),
+                ("Jupiter", 7.7857e11),
+                ("Neptune", 4.49506e12),
+            ] {
+                let d = WorldPos::distance(sun.position, find(name).position);
+                assert!((d - from_sun).abs() / from_sun < 1e-6, "{name}: {d}");
+            }
+            let (instances, sun_light) = world.sky(&spawn_camera(&world, 1.5), &time);
+            assert_eq!(instances.len(), 10);
+            assert_eq!(sun_light.expect("sunlight").position, sun.position);
+            assert_eq!(
+                world.whereabouts(WorldPos::ZERO, &time).as_deref(),
+                Some("44597 km from Earth")
             );
-            let d = WorldPos::distance(sun.position, body.position);
-            assert!((d - from_sun).abs() < 1.0, "{name}: {d} m from the Sun");
         }
-        let moon = WorldPos::distance(find("Earth").position, find("Moon").position);
-        assert!(
-            (moon - MOON_DISTANCE).abs() / MOON_DISTANCE < 0.01,
-            "{moon}"
+        // Between two ticks a body is between its places at the two.
+        let a = world.sky_bodies(&SkyTime::new(clock, 1000.0))[9].position;
+        let b = world.sky_bodies(&SkyTime::new(clock, 1001.0))[9].position;
+        let mid = world.sky_bodies(&SkyTime::new(clock, 1000.5))[9].position;
+        let half = WorldPos::distance(a, b) / 2.0;
+        assert!((WorldPos::distance(a, mid) - half).abs() < 1.0);
+        // The other scenes have no sky.
+        let galaxy = World::new(SceneKind::Galaxy);
+        assert!(galaxy.sky_bodies(&SkyTime::default()).is_empty());
+        assert_eq!(
+            galaxy.whereabouts(WorldPos::ZERO, &SkyTime::default()),
+            None
         );
-        assert_eq!(bodies.len(), 10);
     }
 
-    /// The solar spawn point sits just off Earth, between it and the Sun,
-    /// with Earth dead ahead — and the camera-relative instance the renderer
-    /// gets is exact to well under a metre even though both are 1 AU from the
-    /// origin.
+    /// The Moon goes round once in about four and a half minutes, Earth's
+    /// year is a real hour: after a quarter of a lunar month the Moon is a
+    /// quarter of the way round.
     #[test]
-    fn the_solar_spawn_faces_the_lit_side_of_earth() {
-        let world = World::new(SceneKind::Solar);
-        let camera = spawn_camera(&world, 16.0 / 9.0);
-        let bodies = solar_bodies();
-        let (body, surface) = nearest(&bodies, camera.position).expect("bodies");
-        assert_eq!(body.name, "Earth");
-        assert!((surface - 3.0 * 6.371e6).abs() < 1.0, "{surface}");
-        assert_eq!(
-            world.whereabouts(camera.position).as_deref(),
-            Some("19113 km from Earth")
-        );
-        let scene = world.build(&camera);
-        let earth = scene.instances[3].center;
-        assert!(earth[0].abs() < 0.5 && earth[1].abs() < 0.5, "{earth:?}");
+    fn the_sky_moves_one_year_per_hour() {
+        let world = World::new(SceneKind::DemoArea);
+        let clock = SceneClock::new(0, 0);
+        let month: f64 = 27.321_661 * 86_400.0 / 8766.0 * 30.0; // ticks
+        let moon_at = |tick: f64| metres(world.sky_bodies(&SkyTime::new(clock, tick))[9].position);
+        let earth = metres(world.sky_bodies(&SkyTime::new(clock, 0.0))[3].position);
+        let rel = |p: [f64; 3]| [p[0] - earth[0], p[1] - earth[1], p[2] - earth[2]];
+        let (a, b) = (rel(moon_at(0.0)), rel(moon_at(month / 4.0)));
+        let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (3.844e8 * 3.844e8);
+        assert!(dot.abs() < 0.01, "a quarter turn: cos = {dot}");
+        assert!((month / 30.0 - 269.3).abs() < 0.5, "{} s", month / 30.0);
+        let sun_at = |tick: f64| metres(world.sky_bodies(&SkyTime::new(clock, tick))[0].position);
+        let (s0, s1) = (sun_at(0.0), sun_at(3600.0 * 30.0));
         assert!(
-            (f64::from(earth[2]) + 4.0 * 6.371e6).abs() < 4.0,
-            "{earth:?}"
+            WorldPos::distance(at(s0), at(s1)) < 1.0e-3 * AU,
+            "a year later"
         );
-        // The Sun is behind the camera, one AU away.
-        let sun = scene.instances[0].center;
-        assert!((f64::from(sun[2]) - AU).abs() / AU < 1e-3, "{sun:?}");
-        assert_eq!(scene.lights.len(), 1);
     }
 
     #[test]
@@ -846,14 +898,16 @@ mod tests {
                 assert_eq!(options.preset, preset);
                 assert!(!options.gi_enabled);
             }
-            let astronomical = matches!(kind, SceneKind::Solar | SceneKind::Galaxy);
+            let in_space = matches!(kind, SceneKind::DemoArea | SceneKind::Galaxy);
             let fog = world.options(QualityPreset::High).fog_scale;
-            assert_eq!(fog == 0.0, astronomical, "{kind}");
-            assert_eq!(world.floor().is_none(), astronomical, "{kind}");
-            assert_eq!(environment.background, !astronomical, "{kind}");
+            assert_eq!(fog == 0.0, in_space, "{kind}");
+            assert_eq!(world.floor().is_none(), kind == SceneKind::Galaxy, "{kind}");
+            assert_eq!(environment.background, !in_space, "{kind}");
             assert_eq!(
-                world.whereabouts(world.spawn()).is_some(),
-                kind == SceneKind::Solar
+                world
+                    .whereabouts(world.spawn(), &SkyTime::default())
+                    .is_some(),
+                kind == SceneKind::DemoArea
             );
         }
         assert_eq!(World::default().scene(), SceneKind::DemoArea);

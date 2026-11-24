@@ -272,7 +272,7 @@ became, and where it differs from the bullets above:
   (>= 16 characters). A configured secret is required on every bind, loopback included. Off
   loopback with none configured the orchestrator starts only with `--min-shards >= 1`: it then
   generates one and hands it to what it launches; otherwise it refuses to start. `ShardHello`
-  ends with `secret` (`PROTOCOL_VERSION` 6). When a secret is required it is checked before the
+  ends with `secret` (`PROTOCOL_VERSION` 7). When a secret is required it is checked before the
   cluster name: without it a hello is told `Unauthorized` and nothing about the cluster. The
   peer token is generated when none is given (`--peer-token[-file]`,
   `SPACE_ORCHESTRATOR_PEER_TOKEN[_FILE]`; a configured one under 16 characters is refused at
@@ -332,8 +332,9 @@ became, and where it differs from the bullets above:
 
 **Status: built (phase 2).** What it became, and where it differs from the bullets above:
 
-- **Wire** (`PROTOCOL_VERSION` still 6, which was never released): `Message::JoinRedirect { shard,
-  shard_map }` is tag 28 (`VARIANT_COUNT` 29); `ShardRegion` ends with `client_endpoint`
+- **Wire** (`PROTOCOL_VERSION` 7 — 6 is what `main` shipped meanwhile, the merged demo area with
+  `SceneClock` at tag 28; see section 9): `Message::JoinRedirect { shard, shard_map }` is tag 29
+  (`VARIANT_COUNT` 30); `ShardRegion` ends with `client_endpoint`
   (`ShardRegion::new` sets it to the endpoint; `resolve_client_endpoint(addr, entry_host)` is the
   one rule: port 0 = none, an unspecified IP = the entry's host, anything else as it is;
   `ShardMap::client_endpoint_of`); `ShardHello` carries an optional `client_endpoint` before its
@@ -344,7 +345,11 @@ became, and where it differs from the bullets above:
   port's port): a listener of its own that reads one hello, checks the version, answers and
   closes. It holds no reference to the orchestrator: the run loop (`run_with_player`) publishes
   the current answer after every turn and the listener reads it. 256 hellos in flight at most, 5 s
-  for a hello, no per-player state. **"Starting" is not "until `min-shards` are up"** as the
+  for a hello, no per-player state. A first packet from an address that is not validated yet is
+  answered with a QUIC retry and takes none of the 256; the answer's write gives up after a second
+  (a peer that grants no receive window), and the whole of one connection is bounded from outside
+  as well. The map in the answer is `ShardMap::for_players()`: client endpoints only. **"Starting"
+  is not "until `min-shards` are up"** as the
   bullet says: the answer is a redirect as soon as the committed map's spawn owner is a connected
   shard with a client endpoint, and "starting" otherwise (no root yet, the owner dead and not yet
   replaced). Waiting for all of `min-shards` would keep players out for no reason - the other
@@ -364,13 +369,23 @@ became, and where it differs from the bullets above:
   redirects and names the hops when it gives up; the entry address is what is remembered, retried
   and shown, the shard's own address is `shard_address` (harness `/state`, Lua). A handoff
   `Redirect` is dialed at the target's **client** endpoint, resolved against the entry's host.
-  **Added:** the offering shard sends the offer and the client's `Redirect` in the same tick, so
-  the client's hello can reach the accepting shard before the offer does - which used to be
-  covered by the region-centre fallback and is now a `JoinRedirect`/`Starting` answer; the client
-  asks again (5 times, 120 ms apart) before it treats that as the end of the handoff.
+  **The handoff's hello** (changed by the merge with `main`, `d83fe04`): the offering shard sends
+  the client's `Redirect` when the accepting shard's `HandoffAccept` arrives, not with the offer,
+  so the transfer is staged before the client can say hello there, and the hello is recognised by
+  its token. The client therefore says hello **once** (it used to ask up to 5 times, 120 ms
+  apart, while the two went out in the same tick). What is left is a transfer the accepting shard
+  dropped again before the hello arrived: it then answers like for a fresh join - a
+  `JoinRedirect`/`Starting`, which ends that attempt (the old shard offers again), or, on the
+  spawn point's owner, a welcome with a new ship, which the client recognises in the first frame
+  and leaves at once. A `Reject` as the last word on a handoff's connection ends it like a
+  `JoinRedirect` does, and a connection that has closed is never reused for the next redirect.
+  **Only the ship's own player is redirected** (`Shard::redirect_owner`); a bystander keeps seeing
+  the ship as its own shard's ghost of it, and a client ignores a redirect for a ship it does not
+  fly. A hello without a player token is refused by every shard.
 - **Client endpoints in the map**: the orchestrator keeps one per shard beside the endpoint, sets
   it in every region it gives (hello, carve, replacement) and fills an unspecified **internal**
-  IP from the control connection's source (`ControlPlane::as_seen_from`); a client endpoint's
+  IP from the control connection's source (the free function `control::as_seen_from`, which the
+  run loop applies to a hello when it handles it); a client endpoint's
   unspecified IP is left as it is - that is its meaning. The `process` launcher starts a shard
   with `--client-endpoint 0.0.0.0:<its port>`. `/api/state` has `player_port { bind, answer,
   sends_to_shard, redirected, told_starting, refused_busy }`, `map.spawn_owner` and a
@@ -384,7 +399,8 @@ became, and where it differs from the bullets above:
   port, and players dial that shard as before. A player who comes back after its shard died
   starts on the spawn point again (nothing of a player is kept across a shard's death). A client
   notices a dead shard through QUIC's idle timeout (about 10 s) before it dials the entry again.
-  The player port has no per-source rate limit (`docs/security-notes.md`).
+  The player port has no per-source limit, and the spawn point's shard takes 100 players and
+  evicts nobody for being idle (both in `docs/security-notes.md`, "Player port").
 
 ## 5. One cluster tick, seamless crossing
 
@@ -432,6 +448,24 @@ became, and where it differs from the bullets above:
 
 ## 7. Physics across four borders
 
+**Seen on a live four-shard stack (2026-11-24, after the merge with `main`; not solved):**
+
+- **A standing player is handed over because another flew by.** A ship within island reach of
+  another ship's motion (0.5 m + 1 s of it: some 10-30 m at flying speed) is one island with it,
+  and the island's home is that of its lowest guid. A player standing 9 m beside the path of one
+  who crossed x = -6 and came back was handed to the neighbour shard and back at **every**
+  crossing (12 handoffs in 6 crossings, without moving; 65 m away: none). The same happens to a
+  player standing on the spawn point when a newcomer walks off towards a border, 4-6 m away.
+  Nothing jumps and no second ship appears, but each is a session switch for somebody who did
+  nothing. Ships need to be left out of islands they do not touch, or given the hysteresis
+  section 5 plans.
+- **A crossing beside the showcase's bodies takes 3 s instead of 1.** From the spawn point over
+  x = -6 at z about 0 (twice), and from the bowl's side over x = -6 at z about -35 (twice; the
+  way back took 1 s): one attempt is called off (the shards' `aborted` counters rise), the 2 s
+  re-offer pause runs, the second attempt goes through. Thirty-five other crossings, away from
+  bodies, took 0.99-1.07 s. Not looked into further than that: which member of the group is
+  refused, and why, is the first thing the four-shard fixture below should show.
+
 `space-server/tests/physics.rs` gets a four-shard fixture with the borders through the showcase:
 islands whose members have three or four homes, ghost refresh between every pair, hysteresis at
 the corner where four cells meet, a player walking through the room across both borders. What
@@ -453,12 +487,21 @@ breaks is fixed in `border.rs` / `shard_physics.rs` with the rules written down 
 - Compose, local and production: the orchestrator only, socket mounted, player port published,
   control port not published, web UI on loopback as now.
 
-## 9. The wire (PROTOCOL_VERSION 5 -> 6)
+## 9. The wire (PROTOCOL_VERSION 6 -> 7)
 
 `ShardRegion` + client endpoint. `LoadReport` + entity count, hot cell. `ShardHello` + secret.
 `ShardWelcome` + tick origin. Peer hellos carry the peer token in the existing token field.
-Appended variants: `JoinRedirect`, `FarInterest`, `FarUpdate` (`VARIANT_COUNT` 31). The handoff
+Appended variants: `JoinRedirect`, `FarInterest`, `FarUpdate` (`VARIANT_COUNT` 32). The handoff
 messages, the epoch messages and `Hello` keep their layouts.
+
+**Status.** This plan was written as "5 -> 6". While the branch was being built `main` shipped a
+protocol 6 of its own - the merged demo area: `SceneClock` (tag 28), `PlayerInput::fast`, 25-byte
+`ShipControls` - and that 6 stands as released. Everything of this branch is therefore
+**protocol 7**, on top of it: built so far are `ShardHello` + optional client endpoint + secret,
+`ShardRegion` + client endpoint, `RejectReason::Starting`, the peer token in a shard's hello and
+`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30). `FarInterest`/`FarUpdate` (30, 31), the tick
+origin and the load report's new fields are still to come and stay inside 7 as long as 7 has not
+been pushed to `main`; once it has, the next layout change is 8.
 
 ## 10. Phases
 

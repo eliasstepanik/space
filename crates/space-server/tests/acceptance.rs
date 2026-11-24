@@ -88,6 +88,8 @@ struct Pair {
     /// The sending shard is part of the key because session ids are per-shard
     /// counters that both shards start at 1 — a bare session id is ambiguous.
     client_frames: Vec<(ShardId, u64, Message)>,
+    /// How many handoff offers each shard has sent the other.
+    offers_sent: Vec<ShardId>,
 }
 
 impl Pair {
@@ -114,6 +116,7 @@ impl Pair {
             a,
             b,
             client_frames: Vec::new(),
+            offers_sent: Vec::new(),
         }
     }
 
@@ -155,6 +158,9 @@ impl Pair {
             drain(id_b, &mut self.b, &mut self.client_frames);
         }
         for (from, message) in pending {
+            if matches!(message, Message::HandoffOffer(_)) {
+                self.offers_sent.push(from);
+            }
             let target = if self.other(from) == id_a {
                 &mut self.a
             } else {
@@ -193,6 +199,7 @@ impl Pair {
                 ],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
             ack_tick: 0,
         };
@@ -578,7 +585,7 @@ fn client_gets_a_snapshot_then_deltas_and_its_input_ack_advances() {
 fn a_redirected_clients_second_connection_is_told_the_scene() {
     let mut pair = Pair::new();
     let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
-    let scene = SceneState::new(Scene::Solar.id(), 3);
+    let scene = SceneState::new(Scene::Galaxy.id(), 3);
     assert!(pair.a.set_scene(scene));
     assert!(pair.b.set_scene(scene));
     let (session_a, _guid) = join(&mut pair.a, "player");
@@ -1011,6 +1018,7 @@ fn an_unanswered_offer_times_out_and_the_world_is_unchanged() {
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -1086,11 +1094,9 @@ fn a_stale_epoch_offer_is_refused_and_the_transfer_aborts() {
     for _ in 0..600 {
         pair.thrust(id_a, session_a, 0, 1.0);
         pair.tick();
-        for (_, _, message) in std::mem::take(&mut pair.client_frames) {
-            if matches!(message, Message::Redirect(_)) {
-                saw_offer = true;
-            }
-        }
+        // A redirect waits for an accept that never comes here, so the
+        // offer itself is what shows A tried.
+        saw_offer = saw_offer || pair.offers_sent.contains(&id_a);
         // The StaleEpoch answer is consumed by `peer_message` on A; observe its
         // effect through A's counters instead of the message itself.
         if pair.a.stats().aborted > 0 {
@@ -1299,6 +1305,7 @@ async fn a_client_can_connect_to_a_running_shard() {
                 thrust: [1.0, 0.0, 0.0],
                 torque: [0.0; 3],
                 tick,
+                fast: false,
             }],
             ack_tick: 0,
         };
@@ -1575,7 +1582,10 @@ async fn a_fresh_join_over_the_wire_is_sent_to_the_spawn_points_owner() {
         panic!("expected a redirect, got {joined:?}");
     };
     assert_eq!(redirect.shard, id_a);
-    assert_eq!(redirect.shard_map, map);
+    // The map as a player gets it: the client endpoints, and nothing of
+    // where the shards reach each other (10.9.8.7 never leaves the cluster).
+    assert_eq!(redirect.shard_map, map.for_players());
+    assert!(!format!("{:?}", redirect.shard_map).contains("10.9.8.7"));
     assert_eq!(
         redirect.shard_map.client_endpoint_of(id_a),
         Some(players_at)
@@ -1695,6 +1705,7 @@ fn drive_offer(a: &mut Shard, guid: EntityGuid, session: u64) -> space_protocol:
                     thrust: [1.0, 0.0, 0.0],
                     torque: [0.0; 3],
                     tick,
+                    fast: false,
                 }],
                 ack_tick: 0,
             },
@@ -2696,7 +2707,7 @@ fn frames_of(shard: &mut Shard, session: u64) -> Vec<Message> {
         .into_iter()
         .filter(|o| o.dest == Destination::Client(session))
         .map(|o| o.message)
-        .filter(|message| !matches!(message, Message::SceneUpdate(_)))
+        .filter(|message| !matches!(message, Message::SceneUpdate(_) | Message::SceneClock(_)))
         .collect()
 }
 
@@ -2728,6 +2739,7 @@ fn input(ship: EntityGuid, tick: u64, thrust: [f32; 3], ack_tick: u64) -> InputT
             thrust,
             torque: [0.0; 3],
             tick,
+            fast: false,
         }],
         ack_tick,
     }
@@ -3111,6 +3123,87 @@ fn offer_and_accept(pair: &mut Pair, token: &str) -> (u64, EntityGuid) {
     (session_a, guid)
 }
 
+/// A client is redirected only once the accepting shard has staged the ship.
+///
+/// The redirect used to go out with the offer. Over real connections the
+/// client's hello could then reach B before the offer did: B, holding no
+/// staged transfer for the client's token, spawned it a placeholder ship at
+/// its spawn point — on top of the ship on its way in, the two shoving each
+/// other apart through their ghosts — and dropped its `NeighbourStatus` as a
+/// claim for nothing. Waiting for the accept makes that order impossible.
+///
+/// Mutation this catches: sending the `Redirect` from the offer instead of
+/// from the accept (the outbox of the offer tick then holds one).
+#[test]
+fn a_client_is_redirected_only_after_the_peer_accepted() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (session_a, guid) = join(&mut pair.a, "player");
+
+    // Fly out of A, holding everything A sends until it offers the ship.
+    let mut offer = None;
+    for _ in 0..600 {
+        pair.thrust(id_a, session_a, 0, 1.0);
+        pair.a.tick();
+        let mut redirected = false;
+        for out in pair.a.take_outbox() {
+            match out.message {
+                Message::HandoffOffer(o) => offer = Some(o),
+                Message::Redirect(_) => redirected = true,
+                _ => {}
+            }
+        }
+        assert!(!redirected, "a redirect went out before B accepted");
+        if offer.is_some() {
+            break;
+        }
+    }
+    let offer = offer.expect("A offered the ship");
+
+    // B stages it and accepts; only the accept makes A redirect the client.
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    let accept = pair
+        .b
+        .take_outbox()
+        .into_iter()
+        .find_map(|out| match out.message {
+            Message::HandoffAccept(a) => Some(a),
+            _ => None,
+        })
+        .expect("B accepted");
+    pair.a
+        .peer_message(id_b, Message::HandoffAccept(accept.clone()));
+    let redirects: Vec<(Destination, Redirect)> = pair
+        .a
+        .take_outbox()
+        .into_iter()
+        .filter_map(|out| match out.message {
+            Message::Redirect(r) => Some((out.dest, r)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redirects.len(), 1, "one redirect, to the one client");
+    let (dest, redirect) = &redirects[0];
+    assert!(matches!(dest, Destination::Client(s) if *s == session_a));
+    assert_eq!(redirect.entity, guid);
+    assert_eq!(redirect.new_shard, id_b);
+    assert_eq!(redirect.activation_tick, accept.activation_tick);
+
+    // A repeated accept redirects nobody again.
+    pair.a.peer_message(id_b, Message::HandoffAccept(accept));
+    assert!(!pair
+        .a
+        .take_outbox()
+        .iter()
+        .any(|out| matches!(out.message, Message::Redirect(_))));
+
+    // So the client arriving at B is the staged ship's owner: no placeholder.
+    let welcome = pair.b.join(&space_net::hello("player")).expect("join B");
+    assert_eq!(pair.b.ship_of(welcome.session), None, "no placeholder ship");
+    assert_eq!(pair.b.stats().ships, 0);
+}
+
 /// A peer that refuses an offer is not asked again on the very next tick.
 ///
 /// B is full, so every offer is answered with `TargetFull`. The ship is still
@@ -3176,8 +3269,8 @@ fn a_refused_offer_is_not_repeated_every_tick() {
          not once per tick: {offers} offers"
     );
     assert_eq!(
-        redirects, offers,
-        "one redirect per offer, to the one client"
+        redirects, 0,
+        "a client is redirected only once the peer has accepted: a refused offer          sends it nowhere"
     );
     assert!(pair.a.sim().ship_state(guid).is_some(), "A keeps the ship");
 
@@ -3551,4 +3644,222 @@ fn an_undecodable_handoff_state_is_never_installed_as_a_default() {
         "the ship is where its offer put it, not at the world origin"
     );
     assert_ne!(installed.pos, ShipState::IDENTITY.pos);
+}
+
+/// Only the player who flies a ship is redirected when it is handed over.
+///
+/// Everybody who had the ship in sight used to be sent the `Redirect` too. A
+/// bystander's client then said hello to the accepting shard with its own
+/// token: nothing is staged for it there, so it was sent away again — or, on
+/// the shard that owns the spawn point, welcomed as a new player and given a
+/// second ship for as long as its client kept that connection. A bystander
+/// needs no redirect: it stays on the shard that simulates its own ship and
+/// keeps seeing the ship that left as that shard's ghost of it
+/// ([`an_observer_sees_no_gap_across_a_handoff`]).
+///
+/// Mutation this catches: redirecting every client within the interest
+/// radius of the ship (`redirect_watchers`).
+#[test]
+fn only_the_ships_own_player_is_redirected() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let (mover, guid) = join(&mut pair.a, "mover");
+    let (bystander, bystander_ship) = join(&mut pair.a, "bystander");
+    assert_ne!(guid, bystander_ship);
+
+    let mut redirects: Vec<(u64, Redirect)> = Vec::new();
+    for _ in 0..600 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for (from, session, message) in std::mem::take(&mut pair.client_frames) {
+            if let Message::Redirect(redirect) = message {
+                assert_eq!(from, id_a);
+                redirects.push((session, redirect));
+            }
+        }
+        if !redirects.is_empty() {
+            break;
+        }
+    }
+    // A few more ticks: a redirect to the bystander must not follow either.
+    for _ in 0..10 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for (_, session, message) in std::mem::take(&mut pair.client_frames) {
+            if let Message::Redirect(redirect) = message {
+                redirects.push((session, redirect));
+            }
+        }
+    }
+    assert_eq!(redirects.len(), 1, "one redirect: {redirects:?}");
+    let (session, redirect) = &redirects[0];
+    assert_eq!(*session, mover, "to the ship's own player");
+    assert_eq!(redirect.entity, guid);
+    assert!(
+        pair.a.ship_of(bystander) == Some(bystander_ship),
+        "the bystander is where it was, with the ship it had"
+    );
+}
+
+/// A hello without a player token is refused, by every shard, before
+/// anything is decided on it.
+///
+/// The token is what a staged ship is matched to its player by, and a
+/// transfer that has **no** player (a body; a ship nobody flies) is staged
+/// with the empty token. A hello whose token is empty used to *equal* that:
+/// it was welcomed by a shard that does not own the spawn point as "the
+/// player being handed over", and could then claim the staged entity.
+///
+/// Mutation this catches: dropping the empty-token refusal in `Shard::join`,
+/// or comparing a hello's token to a staged owner token with `==` again.
+#[test]
+fn a_hello_without_a_token_is_refused_and_owns_nothing_that_is_staged() {
+    use space_server::shard::JoinRefusal;
+    let refused = |answer: Result<Welcome, JoinRefusal>| {
+        let Err(JoinRefusal::Rejected(RejectReason::Other(why))) = answer else {
+            panic!("expected a refusal in words, got {answer:?}");
+        };
+        assert!(why.contains("token"), "{why}");
+    };
+    // On the shard that owns the spawn point: no session, no ship.
+    let mut alone = lone_shard();
+    let before = alone.next_session();
+    refused(alone.join(&space_net::hello("")));
+    assert_eq!(alone.next_session(), before, "no session spent");
+    assert_eq!((alone.stats().clients, alone.stats().ships), (0, 0));
+
+    // On a shard that does not own it, with an **ownerless** transfer staged
+    // (the offer's state carries the empty owner token): still nobody's.
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let guid = EntityGuid::new(id_a, 77);
+    let activation_tick = pair.b.sim().tick() + space_server::handoff::HANDOFF_LEAD;
+    pair.b.peer_message(
+        id_a,
+        Message::HandoffOffer(space_protocol::HandoffOffer {
+            entity: guid,
+            from: id_a,
+            to: id_b,
+            epoch: pair.b.epoch(),
+            state: Box::new(offer_state(guid, "")),
+            activation_tick,
+        }),
+    );
+    assert!(
+        pair.b
+            .take_outbox()
+            .iter()
+            .any(|o| matches!(o.message, Message::HandoffAccept(_))),
+        "B staged the ownerless transfer"
+    );
+    refused(pair.b.join(&space_net::hello("")));
+    assert_eq!(pair.b.stats().clients, 0);
+    // A resident of B with a token of its own cannot claim it either — and
+    // neither could one whose token were empty: the staged entity has no
+    // owner at all.
+    let mut pair = Pair::new();
+    let resident = residents_of_b(&mut pair, &["resident".to_owned()])[0];
+    let own_ship = pair.b.ship_of(resident).expect("a ship of its own");
+    pair.b.peer_message(
+        id_a,
+        Message::HandoffOffer(space_protocol::HandoffOffer {
+            entity: guid,
+            from: id_a,
+            to: id_b,
+            epoch: pair.b.epoch(),
+            state: Box::new(offer_state(guid, "")),
+            activation_tick,
+        }),
+    );
+    let _ = pair.b.take_outbox();
+    pair.b.client_status(
+        resident,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: true,
+        },
+    );
+    assert_eq!(pair.b.ship_of(resident), Some(own_ship), "nothing adopted");
+    assert!(
+        !pair
+            .b
+            .take_outbox()
+            .iter()
+            .any(|o| matches!(o.message, Message::NeighbourStatus(_))),
+        "and the commit gate of the offering shard was not opened"
+    );
+}
+
+/// The map a player is sent — in a `Welcome`, a `JoinRedirect`, a handoff's
+/// `Redirect` — names where **players** dial each shard and nothing else: the
+/// internal endpoints (where the shards reach each other) are replaced by
+/// the client endpoints. The shard's own map keeps the real ones.
+///
+/// Mutation this catches: sending `self.shard_map.clone()` to a client — every
+/// player who says hello learns the cluster's internal addresses.
+#[test]
+fn a_player_is_sent_client_endpoints_and_no_internal_ones() {
+    use space_server::shard::JoinRefusal;
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let internal =
+        |n: u8| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 8, n)), 7_900 + u16::from(n));
+    let players = |n: u8| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7_870 + u16::from(n));
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(region(0), id_a, internal(1)).with_client_endpoint(players(1)),
+            ShardRegion::new(region(1), id_b, internal(2)).with_client_endpoint(players(2)),
+        ],
+    );
+    pair.a.set_shard_map(map.clone());
+    pair.b.set_shard_map(map.clone());
+    let for_players = map.for_players();
+    assert_eq!(for_players.epoch, map.epoch);
+    let leaks = |sent: &ShardMap| {
+        sent.regions
+            .iter()
+            .any(|r| r.endpoint == internal(1) || r.endpoint == internal(2))
+    };
+    assert!(leaks(&map) && !leaks(&for_players));
+    for (sent, real) in for_players.regions.iter().zip(&map.regions) {
+        assert_eq!((sent.node, sent.shard), (real.node, real.shard));
+        assert_eq!(sent.client_endpoint, real.client_endpoint);
+        assert_eq!(sent.endpoint, real.client_endpoint);
+    }
+    // Everything a client derives from the map is unchanged by it.
+    assert_eq!(
+        space_scene::scene_anchor(&for_players),
+        space_scene::scene_anchor(&map)
+    );
+    assert_eq!(for_players.client_endpoint_of(id_b), Some(players(2)));
+
+    // The welcome.
+    let welcome = pair.a.join(&space_net::hello("mover")).expect("join A");
+    assert_eq!(welcome.shard_map, for_players);
+    // The join redirect of a shard that does not own the spawn point.
+    let Err(JoinRefusal::Elsewhere(sent_on)) = pair.b.join(&space_net::hello("other")) else {
+        panic!("B sends a newcomer to A");
+    };
+    assert_eq!(sent_on.shard_map, for_players);
+    // The handoff's redirect.
+    let mover = welcome.session;
+    let mut redirect = None;
+    for _ in 0..600 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for message in pair.frames_for(id_a, mover) {
+            if let Message::Redirect(r) = message {
+                redirect = Some(r);
+            }
+        }
+        if redirect.is_some() {
+            break;
+        }
+    }
+    assert_eq!(redirect.expect("a redirect").shard_map, for_players);
+    // The shards themselves still hold, and use, the real map.
+    assert_eq!(pair.a.shard_map(), &map);
+    assert_eq!(pair.b.shard_map(), &map);
 }

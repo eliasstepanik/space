@@ -42,14 +42,16 @@ fn per_entity_snapshot_size_is_measured() {
 
     // Component payloads are the hand-rolled wire formats from `space_sim::wire`.
     assert_eq!(ship_bytes.len(), 76, "ShipState wire length");
-    assert_eq!(ctrl_bytes.len(), 24, "ShipControls wire length");
+    // 25 since protocol 6: thrust, torque and the fast-travel flag.
+    assert_eq!(ctrl_bytes.len(), 25, "ShipControls wire length");
     assert_eq!(owner_bytes.len(), 8, "Owner wire length");
 
-    // The number docs/plan.md and the Snapshot doc comment quote (~158 B), now
+    // The number docs/plan.md and the Snapshot doc comment quote (~158 B; 159
+    // since protocol 6 added the fast-travel flag to the controls), now
     // pinned exactly: if this trips, the real size drifted and the docs must be
     // updated to match.
     assert_eq!(
-        measured, 158,
+        measured, 159,
         "per-entity snapshot size drifted; update the docs that quote ~158 B"
     );
 }

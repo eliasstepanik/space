@@ -61,7 +61,7 @@ to `latest` to resume auto-updates.
 ## Scene and the operator web UI
 
 `SPACE_SCENE` in `.env` is the scene the cluster starts with (`demo-area`,
-`materials`, `solar`, `galaxy`). Once an operator switches it in the web UI the
+which includes the solar system, `materials`, `galaxy`). Once an operator switches it in the web UI the
 choice is saved in `./state/orchestrator.id.scene` and wins over `.env` on every
 restart; delete that file to go back to `SPACE_SCENE`.
 

@@ -157,7 +157,27 @@ fn draw_replica(scene: &mut Scene, kind: SceneKind, replica: &Replica) {
     let mut bodies = body_renderer()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = bodies.draw(replica, replica.tick as f64, spawn, Instant::now(), scene);
+    let _ = bodies.draw(
+        replica,
+        replica.tick as f64,
+        spawn,
+        Instant::now(),
+        scene,
+        &|_| [0.0; 3],
+    );
+    // The demo area's sky (the Sun, the planets, the Moon) at the newest tick
+    // heard, by the shard's scene clock.
+    let time = space_client::scenes::SkyTime::new(
+        replica.scene_clock.unwrap_or_default(),
+        replica.tick as f64,
+    );
+    let (sky, sun) = World::new(kind).sky(&camera, &time);
+    scene.instances.extend(sky);
+    if let Some(sun) = sun {
+        if scene.lights.len() < 8 {
+            scene.lights.push(sun);
+        }
+    }
 }
 
 /// A captured, JPEG-encoded frame.

@@ -92,6 +92,7 @@ fn demo_area_with_200_bodies_and_32_ships() {
                 thrust: [rnd(), rnd() * 0.2, rnd()],
                 torque: [0.0, rnd() * 0.3, 0.0],
                 tick: t,
+                fast: false,
             })
             .collect();
         sim.apply_inputs(t, &inputs);

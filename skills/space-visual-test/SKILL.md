@@ -120,8 +120,10 @@ frame blocks until the next one. `frame.jpg` is small and fine for looking;
 `frame.png` is lossless (and large) for pixel-exact checks. Input is
 the same vocabulary a person has: keys (`w a s d space shift`, `enter backspace
 escape tab delete home end caret_left caret_right`), typed text, view turns in
-degrees. While playing, `c` (camera), `b` (brake assist) and `h` (HUD) are
-typed: `{"text":"c"}`.
+degrees. While playing, `c` (camera), `b` (brake assist), `f` (fast travel)
+and `h` (HUD) are typed: `{"text":"c"}`. `/state` also has `fast` (fast travel
+on), `nearest` and `nearest_surface_m` (the solar-system body whose surface is
+nearest: `"Earth"`, `"Moon"`, ...; the demo area only).
 
 Then **open the picture** (the Read tool shows PNG/JPEG) and look at it.
 
@@ -144,7 +146,8 @@ physics showcase and asserts the physics happened (it lands in the gravity
 room and lifts off, sets a spring pendulum swinging, pushes a floating crate
 and the door, lands on the planetoid and lifts off, watches a moon circle
 it); it flies around for a couple of minutes, so give it
-`--script-timeout 300`. The API:
+`--script-timeout 300`. `scripts/harness/moon.lua` fast-travels to the Moon
+and lands on it (about three minutes; `--script-timeout 330`). The API:
 
 ```lua
 client.type("127.0.0.1:7777")  client.press("enter")
@@ -154,7 +157,7 @@ client.turn(30, -10)           -- degrees: yaw left+, pitch up+
 local s = client.state()       -- same fields as GET /state (s.scene, s.scene_position, ...);
                                -- s.address = the entry address that was dialed, s.shard_address = the
                                -- shard being played on (nil while not on one), s.shard = its id
-client.wait_until(function() return client.state().scene == "solar" end, 10)   -- after a scene switch
+client.wait_until(function() return client.state().scene == "galaxy" end, 10)  -- after a scene switch
 client.wait(0.5)  client.wait_frames(2)
 client.screenshot("after.png") -- below --out-dir; returns the path
 local r, g, b = client.pixel(x, y)
@@ -190,16 +193,16 @@ captured without touching the mouse or keyboard.
 
 Open `http://127.0.0.1:7980/` (no login on loopback). The **Scene** card
 switches every shard and client at once: it has one button per scene
-("Switch all shards to solar", ...; the running one is greyed out as
+("Switch all shards to galaxy", ...; the running one is greyed out as
 `(current)`). One click switches. The answer waits up to 1.5 s for the shards
-to confirm and then says "All 1 connected shard switched to solar (revision
+to confirm and then says "All 1 connected shard switched to galaxy (revision
 2)", or "Switching ..." if some have not confirmed yet; the page then
 refreshes every second until they have. The client's picture changes within a
 second or two. The same from a script:
 
 ```sh
 T=$(curl -s http://127.0.0.1:7980/api/state | python3 -c "import json,sys; print(json.load(sys.stdin)['webui']['form_token'])")
-curl -s -D - -o /dev/null -X POST --data "csrf=$T&scene=solar" http://127.0.0.1:7980/action/scene | grep -iE "x-space-(result|confirmed)"
+curl -s -D - -o /dev/null -X POST --data "csrf=$T&scene=galaxy" http://127.0.0.1:7980/action/scene | grep -iE "x-space-(result|confirmed)"
 ```
 
 `X-Space-Result` is `accepted` or `refused`; `X-Space-Confirmed: 1/1` says how
@@ -227,10 +230,23 @@ Check what your change touches, and one step either side of it.
   sphere and cube with textured panels behind them; the gold/plastic roughness
   chart; red, green and blue lamps casting coloured shadows on a white wall;
   the texture crates (the UV grid must read `A1` top-left, upright, not
-  mirrored); the ship; several characters; an emissive cube; distant towers
-  fading into a painted dusk sky. Polished metal reflects that sky; nothing
+  mirrored); the ship; several characters; an emissive cube; stars in a
+  black sky. Polished metal reflects a dim ambient gradient; nothing
   should be black. The HUD reads `pos 0.0 0.0 0.0` on arrival. Look from the
   spawn, from close up, from above and from behind.
+- **The sky** (demo area): Earth ahead, up to the right, about 14 degrees
+  across (it does not move: the area rides along with it); the Moon (it goes
+  round Earth in 4.5 minutes: look twice, a minute apart), the Sun (round
+  once an hour; the stations' shadows follow it) and the planets as coloured
+  spheres. The HUD's last lines say the nearest body (`44597 km from Earth`
+  at the spawn point). **Fast travel**: type `f` (HUD `fast travel on`),
+  turn towards the Moon (`/state`'s `sky` lists every body's position in
+  the `scene_position` frame) and hold W: within about half a minute
+  `nearest` = `Moon` and `nearest_surface_m` falls to ~2-3 km (fast travel
+  keeps 2 km clear of what it flies at); type `f` again (the ship drops to
+  120 m/s) and come down in normal flight (`gravity` about 1.6, then
+  `landed`). `scripts/harness/moon.lua` does exactly that
+  (`--script-timeout 300`).
 - **Physics showcase** (demo area; the shard simulates it): turn right from
   the spawn point for the **gravity room** — a blue mat, cyan edges round the
   volume gravity acts in, a `GRAVITY 9.81 M/S2` sign; inside a crate stack, a
@@ -263,7 +279,25 @@ Check what your change touches, and one step either side of it.
   (`pos 0 0 0`, the root's shard) cross x = -6 and z = -4: the HUD's shard
   number changes at each crossing, `handoffs` counts up and `/state`'s
   `shard_address` changes with it (`address` does not); nothing may
-  vanish or turn black. Stop one shard **by its pid**, never by name:
+  vanish or turn black. A crossing takes about a second from the border to
+  the new shard number (the handoff's lead), **into** the spawn point's cell
+  as out of it; more than two is a defect, and so is a client log line
+  `does not take this client`. Seen on a live four-shard stack and not
+  solved: a crossing right beside the showcase's bodies (x = -6 at z about
+  0, coming from the spawn point; x = -6 at z about -35 from the bowl's
+  side) took about 3 s — the time of one attempt called off, the 2 s pause
+  and a second attempt; the shards' `aborted` counters rise with it. The
+  ship's physics island takes bodies along there
+  (`space-server/src/border.rs`; four borders are `docs/plan-sharding.md`
+  §7). A second client that only looks on keeps its `shard`,
+  `session` and `handoffs` while the first crosses (only a ship's own player
+  is redirected; the HUD's `players` stays what it was) **if it stands
+  clear of the mover** — some tens of metres: within reach of the mover's
+  motion (0.5 m plus one second of it) the two ships are one physics island,
+  which is moved to the mover's shard and back, so the bystander's HUD shard
+  number flips and its `handoffs` rises by two per fly-by although it never
+  moved. Its picture does not jump and no second ship appears (the shards'
+  logs: the ship counts add up to the number of players at every line). Stop one shard **by its pid**, never by name:
   `target/dev/launched-shards.pid` lists the pids of exactly the shards the
   orchestrator has running (it rewrites the file whenever one starts, stops
   or is seen to have exited) — and check what a pid is before you stop it

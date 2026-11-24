@@ -2926,6 +2926,8 @@ impl FrameGpu {
         };
 
         // ---- descriptors -------------------------------------------------------
+        // Per-type counts must cover every binding of the five sets (forward,
+        // gi, tone, rq, post); RADV enforces them, lavapipe does not.
         let pool = unsafe {
             device
                 .create_descriptor_pool(
@@ -2938,11 +2940,11 @@ impl FrameGpu {
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                                descriptor_count: 4,
+                                descriptor_count: 6,
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                                descriptor_count: 6,
+                                descriptor_count: 7,
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::SAMPLER,
@@ -2954,7 +2956,7 @@ impl FrameGpu {
                             },
                             vk::DescriptorPoolSize {
                                 ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-                                descriptor_count: 3,
+                                descriptor_count: 4,
                             },
                         ]),
                     None,

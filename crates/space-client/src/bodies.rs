@@ -522,6 +522,11 @@ impl BodyRenderer {
     /// `scene` (models for the parts and pins, sphere instances for the
     /// coils), placed around the scene's `spawn` point. Returns what was
     /// drawn.
+    ///
+    /// `carry` is how far a body at a place is to be moved to be drawn where
+    /// it is at the moment the sky is drawn at (a body resting on the Moon
+    /// moves with the Moon, and is drawn a moment later than the Moon would
+    /// otherwise put it); `[0; 3]` everywhere else.
     pub fn draw(
         &mut self,
         replica: &Replica,
@@ -529,17 +534,24 @@ impl BodyRenderer {
         spawn: WorldPos,
         now: Instant,
         scene: &mut Scene,
+        carry: &dyn Fn(WorldPos) -> [f64; 3],
     ) -> Vec<Drawn> {
         let camera = scene.camera;
         let anchor = replica.anchor();
         // Every body's poses first: a spring may end on another body.
         let mut bodies: Vec<(EntityGuid, Arc<Physical>, Vec<Pose>)> = Vec::new();
         for tracked in replica.bodies() {
-            let (Some(physics), Some(poses)) =
+            let (Some(physics), Some(mut poses)) =
                 (tracked.physics.clone(), pose_at(&tracked.history, t))
             else {
                 continue;
             };
+            for pose in &mut poses {
+                let c = carry(pose.pos);
+                if c != [0.0; 3] {
+                    pose.pos = WorldPos::from_f64_metres_around(pose.pos, c);
+                }
+            }
             self.last.insert(
                 tracked.ship.guid,
                 Last {

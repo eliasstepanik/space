@@ -282,6 +282,35 @@ impl ShardMap {
             .find(|endpoint| endpoint.port() != 0)
     }
 
+    /// The map as it is sent to a **player** — in a `Welcome`, a
+    /// [`JoinRedirect`](crate::JoinRedirect), a handoff's
+    /// [`Redirect`](crate::Redirect): the same epoch and regions, with every
+    /// region's internal [`endpoint`](ShardRegion::endpoint) replaced by its
+    /// [`client_endpoint`](ShardRegion::client_endpoint).
+    ///
+    /// A player needs the regions (who owns which ground, where the scene's
+    /// anchor is) and the client endpoints (where to dial), and nothing else.
+    /// The internal endpoints are the cluster's own addressing — container or
+    /// private-network addresses and the ports shards reach each other on —
+    /// and telling them to everybody who says hello on a public port maps the
+    /// cluster's inside for no one's benefit. Shard-to-shard and
+    /// orchestrator-to-shard maps keep the real ones: this is applied where a
+    /// map leaves for a client, never to the map a shard holds.
+    #[must_use]
+    pub fn for_players(&self) -> Self {
+        Self {
+            epoch: self.epoch,
+            regions: self
+                .regions
+                .iter()
+                .map(|region| ShardRegion {
+                    endpoint: region.client_endpoint,
+                    ..region.clone()
+                })
+                .collect(),
+        }
+    }
+
     /// Every region covering `pos`, shallowest first — useful for logging why a
     /// lookup picked what it picked.
     #[must_use]

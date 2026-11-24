@@ -215,6 +215,9 @@ impl OwnShip {
         let key = key_of(replica, scene)?;
         let state = replica.state?;
         let mut world = SimWorld::new(replica.shard.unwrap_or(ShardId::NONE));
+        if let Some(clock) = replica.scene_clock {
+            world.set_scene_clock(clock);
+        }
         if let Some(anchor) = key.anchor.filter(|_| key.scene_set) {
             if let Err(e) = space_scene::install_environment(&mut world, scene, anchor) {
                 log::warn!("space-client: the prediction has no scene: {e}");
@@ -316,6 +319,19 @@ impl OwnShip {
         shown: f64,
         now: Instant,
     ) {
+        // The shard's mapping onto scene time (the planets, and what they
+        // carry), and its word on fast travel.
+        if let Some(clock) = replica.scene_clock {
+            if clock != self.predictor.world().scene_clock() {
+                self.predictor.set_scene_clock(clock);
+                self.cache.clear();
+            }
+        }
+        let fast = replica.own_fast();
+        if fast != self.predictor.authoritative_fast {
+            self.predictor.authoritative_fast = fast;
+            self.cache.clear();
+        }
         // The shard's word. A ship at rest is not sent while it stays at rest:
         // then the newest tick heard is the tick of its last state too.
         if let Some(state) = replica.state {
@@ -461,6 +477,13 @@ impl OwnShip {
     #[must_use]
     pub fn gravity(&self) -> [f64; 3] {
         self.gravity
+    }
+
+    /// The scene's gravity field as the prediction has it (its sources, the
+    /// shard's scene clock): what moves things with the planets.
+    #[must_use]
+    pub fn gravity_field(&self) -> &space_sim::GravityField {
+        self.predictor.world().gravity()
     }
 
     /// Whether the ship stands on something in gravity: it touches a static

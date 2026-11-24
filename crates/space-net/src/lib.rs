@@ -66,10 +66,11 @@ pub use endpoint::{
     accept_connection, accept_incoming, accept_incoming_within, client_endpoint,
     client_endpoint_for, client_endpoint_on, connect, connect_within, hello, join, join_within,
     server_endpoint, transport_config, Conn, Joined, NetError, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT,
-    KEEP_ALIVE_INTERVAL,
+    KEEP_ALIVE_INTERVAL, LAST_WORD_TIMEOUT, TURN_AWAY_LIMIT,
 };
 pub use framed::{
-    read_frame, recv_datagram, send_datagram, send_message, send_on_stream, MessageClass,
+    read_frame, read_frame_capped, recv_datagram, send_datagram, send_message, send_on_stream,
+    MessageClass, MAX_HELLO_PAYLOAD, MAX_SECRET_LEN,
 };
 pub use log_budget::{held_back_note, LogBudget};
 pub use secret::{constant_time_eq, Secret};
