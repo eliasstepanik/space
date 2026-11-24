@@ -2585,6 +2585,7 @@ dependencies = [
  "space-ecs",
  "space-harness",
  "space-net",
+ "space-orchestrator",
  "space-protocol",
  "space-render",
  "space-scene",

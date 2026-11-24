@@ -242,6 +242,7 @@ impl Cluster {
                 shard: id,
                 endpoint: bound,
                 region: Some(ShardRegion::new(region, id, bound)),
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("the orchestrator accepts the booting shard");
@@ -262,6 +263,7 @@ impl Cluster {
                 shard: ShardId::NONE,
                 endpoint: bound,
                 region: None,
+                client_endpoint: None,
                 secret: spec.secret.clone(),
             })
             .expect("the orchestrator welcomes the launched shard");
@@ -519,6 +521,7 @@ impl Cluster {
                 shard: ShardId::NONE,
                 endpoint: addr_on(9),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("the shard for the split registers");

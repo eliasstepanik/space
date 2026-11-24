@@ -67,6 +67,7 @@ fn options(cluster: &str, claim_region: Option<space_world::NodeRef>) -> Orchest
         advertise: None,
         claim_region,
         cluster: cluster.to_owned(),
+        client_endpoint: None,
         secret: String::new(),
     }
 }
@@ -81,6 +82,26 @@ async fn a_client_is_welcomed_by(endpoint: SocketAddr) {
     space_net::connect(&client, endpoint, space_server::net::SERVER_NAME, &hello)
         .await
         .expect("the shard welcomes a real client");
+}
+
+/// A real client says hello at `endpoint` — a shard that serves, but does not
+/// own the scene's spawn point — and must be sent on to `owner`, at the
+/// address the map names for its players.
+async fn a_client_is_sent_on_by(endpoint: SocketAddr, owner: ShardId, owner_at: SocketAddr) {
+    let client = space_net::client_endpoint().expect("client endpoint");
+    let joined = space_net::join(
+        &client,
+        endpoint,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("player"),
+    )
+    .await
+    .expect("the shard answers a real client");
+    let space_net::Joined::Elsewhere(redirect) = joined else {
+        panic!("a new player starts on the spawn point's shard, got {joined:?}");
+    };
+    assert_eq!(redirect.shard, owner);
+    assert_eq!(redirect.shard_map.client_endpoint_of(owner), Some(owner_at));
 }
 
 #[tokio::test]
@@ -196,8 +217,10 @@ async fn a_second_region_less_shard_is_given_the_next_layout_cell() {
     // Each knows where the other listens (the map push behind the commit).
     assert!(map.regions.iter().all(|r| r.endpoint.port() != 0));
 
+    // Both serve. A new player starts on the spawn point, which is a's: a
+    // welcomes it, and b — dialed directly — sends it to a.
     a_client_is_welcomed_by(a.endpoint).await;
-    a_client_is_welcomed_by(b.endpoint).await;
+    a_client_is_sent_on_by(b.endpoint, a.shard, a.endpoint).await;
 
     a.abort();
     b.abort();
@@ -302,6 +325,7 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
             advertise: None,
             claim_region: None,
             cluster,
+            client_endpoint: None,
             secret: String::new(),
         },
         control_addr,
@@ -524,13 +548,13 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
         launcher.poll(child_launch).await.expect("poll"),
         space_orchestrator::launcher::Poll::Alive
     );
+    // (Asked as a peer shard would ask, with the cluster's peer token: the
+    // child answers a peer with its own id and map. A *player* who dials it
+    // is sent to the shard that owns the spawn point — checked below.)
     let client = space_net::client_endpoint().expect("client endpoint");
     let mut seen = None;
     for _ in 0..100 {
-        let hello = Hello {
-            protocol: space_protocol::PROTOCOL_VERSION,
-            player_token: "after-the-split".into(),
-        };
+        let hello = space_server::net::peer_hello_with(root.shard, "secret");
         let (conn, welcome) = space_net::connect(
             &client,
             child_region.endpoint,
@@ -558,6 +582,12 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
         root_map.lookup(&root_node.center()),
         "and agrees with the root shard about everything else"
     );
+    // The spawn point stayed with the root's shard: a player who dials the
+    // child is sent there, the root's shard welcomes it.
+    let spawn = space_scene::scene_anchor(&root_map).expect("a spawn point");
+    assert_eq!(root_map.lookup(&spawn), Some(root.shard));
+    a_client_is_sent_on_by(child_region.endpoint, root.shard, root.endpoint).await;
+    a_client_is_welcomed_by(root.endpoint).await;
 
     launcher.kill(child_launch).await.expect("kill");
     root.abort();

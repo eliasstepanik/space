@@ -61,8 +61,10 @@ pub struct ClientState {
     pub screen: Screen,
     /// The error text on the [`Screen::Error`] screen.
     pub error: Option<String>,
-    /// The server address: what is typed in the connect prompt, or the server
-    /// being connected to / played on.
+    /// The server address: what is typed in the connect prompt, or the
+    /// address being connected to / that was connected through — the
+    /// **entry** address. It need not be a shard's: the orchestrator's player
+    /// port sends a client on to one ([`shard_address`](Self::shard_address)).
     pub address: String,
     /// The shard currently played on.
     pub shard: Option<u32>,
@@ -133,6 +135,12 @@ pub struct ClientState {
     /// The largest such correction of the last five seconds, metres.
     #[serde(default)]
     pub correction_max_m: f64,
+    /// The address (`ip:port`) of the shard being played on: the entry
+    /// [`address`](Self::address) itself when that is a shard, otherwise the
+    /// shard the client was sent on to — and, after a shard transition, the
+    /// shard that took the ship. `None` while not on a server.
+    #[serde(default)]
+    pub shard_address: Option<String>,
 }
 
 /// One physics body as the client draws it ([`ClientState::bodies`]).
@@ -671,9 +679,21 @@ mod tests {
             "bodies_in_view",
             "correction_m",
             "correction_max_m",
+            "shard_address",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }
+        // The shard's own address, beside the entry address: null while not
+        // on a server, a string once on a shard.
+        assert_eq!(fresh["shard_address"], serde_json::Value::Null);
+        let on_a_shard = ClientState {
+            address: "play.example.org:7777".into(),
+            shard_address: Some("203.0.113.7:7871".into()),
+            ..ClientState::default()
+        };
+        let json = serde_json::to_value(&on_a_shard).unwrap();
+        assert_eq!(json["address"], "play.example.org:7777");
+        assert_eq!(json["shard_address"], "203.0.113.7:7871");
         assert_eq!(
             serde_json::from_value::<ClientState>(old).unwrap(),
             ClientState::default()

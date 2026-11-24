@@ -14,6 +14,12 @@
 //!     │◄── frame(Welcome{session}) ─┤   └ ok ─► Welcome
 //! ```
 //!
+//! A server that is not the shard a new player starts on answers the hello
+//! with a [`space_protocol::JoinRedirect`] instead of a `Welcome` and closes
+//! ([`Conn::turn_away`]); [`join`] hands that back as [`Joined::Elsewhere`],
+//! and [`connect`] — for callers that want the peer itself — reports it as an
+//! error.
+//!
 //! The control stream stays open after the handshake: either side writes
 //! point-to-point control messages ([`space_protocol::Redirect`],
 //! [`space_protocol::StaleEpoch`]) on it, while bulk state (snapshots) and
@@ -27,7 +33,7 @@ use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt};
 use space_protocol::{
-    check_hello, Hello, Message, Reject, RejectReason, Welcome, PROTOCOL_VERSION,
+    check_hello, Hello, JoinRedirect, Message, Reject, RejectReason, Welcome, PROTOCOL_VERSION,
 };
 use tokio::sync::Mutex;
 
@@ -39,6 +45,10 @@ use crate::framed::{
 
 /// Application close code used when a [`Hello`] is refused.
 pub const REJECT_CLOSE_CODE: u32 = 0x20;
+
+/// Application close code a client uses once it has read a
+/// [`JoinRedirect`]: the connection has said all it had to say.
+pub const REDIRECT_CLOSE_CODE: u32 = 0x24;
 
 /// How long a refusing server waits for the client to acknowledge a [`Reject`]
 /// before it closes the connection anyway.
@@ -301,11 +311,23 @@ impl Conn {
     /// a second) for the peer to close first — [`connect`] does exactly that as
     /// soon as it has read a `Reject`.
     pub async fn reject(&self, reason: RejectReason) {
+        self.turn_away(&Message::Reject(Reject { reason })).await;
+    }
+
+    /// Answer the peer's hello with `message` **instead of a welcome** — a
+    /// [`Reject`], or a [`space_protocol::JoinRedirect`] naming the shard to
+    /// dial — and end the connection: the answer is written on the control
+    /// stream, the stream finished, and the close waits (up to a second) for
+    /// the peer to have read it. [`join`] closes from its side as soon as it
+    /// has, so this normally returns at once.
+    ///
+    /// Nothing the peer sent behind its hello is read.
+    pub async fn turn_away(&self, message: &Message) {
         {
             let mut send = self.control_send.lock().await;
-            send_reject(&mut send, &reason).await;
+            send_last(&mut send, message).await;
         }
-        drain_then_close(&self.conn, b"rejected").await;
+        drain_then_close(&self.conn, b"turned away").await;
     }
 
     /// Whether the connection is already gone (locally closed, timed out, or the
@@ -339,10 +361,22 @@ fn encode(message: &Message) -> io::Result<Vec<u8>> {
 ///
 /// Best-effort: the peer may already be gone.
 async fn send_reject(send: &mut SendStream, reason: &RejectReason) {
-    let frame = space_protocol::encode_frame(&Message::Reject(Reject {
-        reason: reason.clone(),
-    }));
-    let _ = send.write_all(&frame).await;
+    send_last(
+        send,
+        &Message::Reject(Reject {
+            reason: reason.clone(),
+        }),
+    )
+    .await;
+}
+
+/// Write `message` on `send` as the last thing said on it and finish the
+/// stream. Best-effort: the peer may already be gone, and a message too large
+/// to frame is not sent at all (the peer then sees the stream end).
+async fn send_last(send: &mut SendStream, message: &Message) {
+    if let Ok(frame) = space_protocol::try_encode_frame(message) {
+        let _ = send.write_all(&frame).await;
+    }
     let _ = send.finish();
 }
 
@@ -372,7 +406,10 @@ async fn drain_then_close(conn: &Connection, why: &[u8]) {
 ///   [`Reject`] carrying [`RejectReason::VersionMismatch`] (the server-side
 ///   check is [`check_hello`]; this is the client's view of it).
 /// * [`NetError::Rejected`] for any other refusal.
-/// * [`NetError::Protocol`] when the first frame is not a `Welcome`/`Reject`.
+/// * [`NetError::Protocol`] when the first frame is not a `Welcome`/`Reject` —
+///   which includes a [`JoinRedirect`]: `connect` is for a caller that wants
+///   the peer at `addr` itself (a shard dialling a neighbour or its
+///   orchestrator). A **player** uses [`join`], which hands the redirect back.
 pub async fn connect(
     endpoint: &Endpoint,
     addr: SocketAddr,
@@ -396,7 +433,64 @@ pub async fn connect_within(
     hello: &Hello,
     limit: Duration,
 ) -> Result<(Conn, Welcome), NetError> {
-    let handshake = connect_unbounded(endpoint, addr, server_name, hello);
+    match join_within(endpoint, addr, server_name, hello, limit).await? {
+        Joined::Shard(conn, welcome) => Ok((conn, welcome)),
+        // A caller of `connect` wants *this* peer or nobody: a shard dialling
+        // a neighbour, a shard dialling its orchestrator. Being sent on means
+        // the address is not what it was taken for.
+        Joined::Elsewhere(redirect) => Err(NetError::Protocol(format!(
+            "{addr} does not take this connection itself: it sends players on to {} (it is a \
+             player entry — an orchestrator's player port, or a shard that does not own the \
+             spawn point)",
+            redirect.shard
+        ))),
+    }
+}
+
+/// What a server answered a player's hello with ([`join`]).
+#[derive(Debug)]
+pub enum Joined {
+    /// This is a shard and it took the player: the connection and its
+    /// [`Welcome`], ready for [`Message::InputTick`] traffic.
+    Shard(Conn, Welcome),
+    /// Not here: a new player starts on the shard the redirect names, at the
+    /// client endpoint its map gives ([`space_protocol::JoinRedirect`]). The
+    /// connection it arrived on is already closed.
+    Elsewhere(JoinRedirect),
+}
+
+/// Say hello to `addr` **as a player**, whatever is listening there: a shard
+/// answers with a [`Welcome`] ([`Joined::Shard`]), an orchestrator's player
+/// port — or a shard that does not own the spawn point — with a
+/// [`space_protocol::JoinRedirect`] ([`Joined::Elsewhere`]). Following the
+/// redirect, and how often, is the caller's business. Bounded by
+/// [`HANDSHAKE_TIMEOUT`]; see [`join_within`].
+///
+/// # Errors
+///
+/// As [`connect`], for everything but a redirect.
+pub async fn join(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+    hello: &Hello,
+) -> Result<Joined, NetError> {
+    join_within(endpoint, addr, server_name, hello, HANDSHAKE_TIMEOUT).await
+}
+
+/// [`join`] with a caller-chosen bound on the whole handshake.
+///
+/// # Errors
+///
+/// As [`join`]; running out of `limit` is a [`NetError::Handshake`].
+pub async fn join_within(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    server_name: &str,
+    hello: &Hello,
+    limit: Duration,
+) -> Result<Joined, NetError> {
+    let handshake = join_unbounded(endpoint, addr, server_name, hello);
     match tokio::time::timeout(limit, handshake).await {
         Ok(result) => result,
         Err(_) => Err(NetError::Handshake(format!(
@@ -405,13 +499,13 @@ pub async fn connect_within(
     }
 }
 
-/// The handshake itself, with no bound of its own (see [`connect_within`]).
-async fn connect_unbounded(
+/// The handshake itself, with no bound of its own (see [`join_within`]).
+async fn join_unbounded(
     endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
     hello: &Hello,
-) -> Result<(Conn, Welcome), NetError> {
+) -> Result<Joined, NetError> {
     let connecting = endpoint
         .connect(addr, server_name)
         .map_err(|e| NetError::Handshake(e.to_string()))?;
@@ -449,7 +543,7 @@ async fn connect_unbounded(
         }
     };
     match reply {
-        Message::Welcome(welcome) => Ok((
+        Message::Welcome(welcome) => Ok(Joined::Shard(
             Conn {
                 conn,
                 control_send: Arc::new(Mutex::new(send)),
@@ -457,6 +551,12 @@ async fn connect_unbounded(
             },
             welcome,
         )),
+        Message::JoinRedirect(redirect) => {
+            // Read: the sender is waiting for exactly this to close its side
+            // (see [`Conn::turn_away`]).
+            conn.close(VarInt::from_u32(REDIRECT_CLOSE_CODE), b"redirected");
+            Ok(Joined::Elsewhere(redirect))
+        }
         Message::Reject(reject) => {
             // Tell the server it has been read, so it can tear the connection
             // down immediately instead of waiting for its drain timeout.
@@ -464,7 +564,7 @@ async fn connect_unbounded(
             Err(reject_to_err(reject.reason))
         }
         other => Err(NetError::Protocol(format!(
-            "expected Welcome or Reject, got {other:?}"
+            "expected Welcome, JoinRedirect or Reject, got {other:?}"
         ))),
     }
 }

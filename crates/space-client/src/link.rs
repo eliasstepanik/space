@@ -1,12 +1,29 @@
 //! The multiplayer seam: a normal `space-net` player connection.
 //!
-//! [`ServerLink::connect`] is the same client path a native client uses:
-//! [`space_net::client_endpoint_for`] + [`space_net::connect`] with a
+//! [`ServerLink::join`] is the same client path a native client uses:
+//! [`space_net::client_endpoint_for`] + [`space_net::join`] with a
 //! [`space_net::hello`] (so the `PROTOCOL_VERSION` gate is the transport's, not
 //! reimplemented here). No server protocol is added: the link sends
 //! [`Message::InputTick`] batches (datagrams) and reads the replicated
 //! [`Message::Snapshot`] / [`Message::Delta`] frames the shard sends every
 //! client.
+//!
+//! # One address
+//!
+//! The address a player types — the **entry** address — need not be a shard.
+//! Every address is treated alike: a `Welcome` means it is one; a
+//! `JoinRedirect` (the orchestrator's player port answers with one, and so
+//! does a shard that does not own the scene's spawn point) names the shard a
+//! new player starts on, and the link dials that shard's **client endpoint**
+//! in the redirect's map — [`MAX_JOIN_REDIRECTS`] times at most. A client
+//! endpoint without an IP (`0.0.0.0:port`) means "the host of the entry
+//! address, this port": the shards run where the player port does, so no
+//! host name is configured anywhere. The same rule resolves the address of a
+//! handoff's [`Message::Redirect`]. The link keeps the entry address for
+//! that ([`ServerLink::entry`]) and says where it is really playing
+//! ([`ServerLink::shard_address`]); whoever keeps a connection up joins again
+//! through the **entry** address, never through a shard's — the shard may be
+//! gone, the entry knows who owns the spawn point now.
 //!
 //! Three kinds of task run on the caller's tokio runtime: an input sender (one
 //! batch per simulation tick) and, per connection, a reader for the
@@ -112,10 +129,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use space_ecs::{ComponentDef, ComponentId};
-use space_net::{client_endpoint_for, connect, hello, Conn, NetError};
+use space_net::{client_endpoint_for, hello, join, Conn, Joined, NetError};
 use space_protocol::{
-    EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    SceneState, ShardId, ShardMap,
+    resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
+    PlayerInput, Redirect, RejectReason, SceneState, ShardId, ShardMap, Welcome,
 };
 use space_sim::articulation::{decode_articulation, decode_part_states};
 use space_sim::body::{decode_body, decode_residual, decode_visual};
@@ -154,6 +171,70 @@ const SENT_LOG: usize = 300;
 /// complete before it is abandoned (the shards time a handoff out long before
 /// this; a later redirect then starts afresh).
 const REDIRECT_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The most [`JoinRedirect`](space_protocol::JoinRedirect)s one join follows:
+/// the entry address may send the player on (the orchestrator's player port
+/// does), and the shard it names may once more (its map was a moment behind).
+/// A third is not a path to a shard any more — it is a loop or a
+/// misconfigured cluster — and ends the attempt with a readable reason.
+pub const MAX_JOIN_REDIRECTS: usize = 2;
+
+/// How often, and how far apart, the link asks the accepting shard of a
+/// handoff again when that shard does not know of the handoff yet. The
+/// offering shard tells the client and the accepting shard at the same
+/// moment, so the client's dial can get there first; the shard then takes
+/// the hello for a fresh join. A few tries a short pause apart stay well
+/// inside the handoff's lead.
+const ADOPT_RETRIES: usize = 5;
+const ADOPT_RETRY_PAUSE: Duration = Duration::from_millis(120);
+
+/// Why a join did not end on a shard, and at which address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinError {
+    /// The address that was being dialed when it failed: the entry address,
+    /// or the shard a redirect named.
+    pub at: SocketAddr,
+    /// What went wrong there.
+    pub failure: JoinFailure,
+}
+
+/// What went wrong at one address of a join ([`JoinError`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinFailure {
+    /// The connection or the hello failed, or was refused.
+    Net(NetError),
+    /// The address sent the player on once more than
+    /// [`MAX_JOIN_REDIRECTS`] allow; these are the shards named, in order.
+    TooManyRedirects(Vec<ShardId>),
+    /// The redirect named a shard its map gives no address for.
+    NoAddress(ShardId),
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.failure {
+            JoinFailure::Net(error) => write!(f, "{}: {error}", self.at),
+            JoinFailure::TooManyRedirects(chain) => {
+                let chain: Vec<String> = chain.iter().map(ToString::to_string).collect();
+                write!(
+                    f,
+                    "{} sent this client on a {}. time (to {}); a join follows at most {}",
+                    self.at,
+                    chain.len(),
+                    chain.join(", then "),
+                    MAX_JOIN_REDIRECTS
+                )
+            }
+            JoinFailure::NoAddress(shard) => write!(
+                f,
+                "{} sent this client to {shard}, and its map names no address for it",
+                self.at
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
 
 /// A fresh player token: the prefix plus 64 process-unique random bits.
 #[must_use]
@@ -821,6 +902,10 @@ struct Shared {
     /// The inputs sent since the app last took them ([`ServerLink::take_sent`]),
     /// in the clock of the shard being played on (cleared at a switch).
     sent: VecDeque<PlayerInput>,
+    /// The address the player dialed first — what was typed, or `--server`.
+    /// A client endpoint without an IP (`0.0.0.0:port`) means "this host,
+    /// that port", for a join redirect and a handoff redirect alike.
+    entry: SocketAddr,
     /// The connection being played on: inputs go here, its frames are the view.
     active: Conn,
     /// Which reader generation belongs to `active`.
@@ -859,25 +944,61 @@ pub struct ServerLink {
 }
 
 impl ServerLink {
-    /// Connect as an ordinary player and start the sender/reader tasks. Must be
-    /// called inside a tokio runtime.
+    /// Join the world through `entry` as an ordinary player and start the
+    /// sender/reader tasks. Must be called inside a tokio runtime.
+    ///
+    /// Every address is treated alike (`docs/plan-sharding.md` §4). Whatever
+    /// listens at `entry` answers the hello with one of three things:
+    ///
+    /// * a `Welcome` — it is a shard, and this is where the player plays;
+    /// * a `JoinRedirect` — it is the orchestrator's player port, or a shard
+    ///   that does not own the scene's spawn point: the link dials the shard
+    ///   it names, at the **client endpoint** its map gives for that shard
+    ///   (an endpoint without an IP, `0.0.0.0:port`, meaning `entry`'s host
+    ///   and that port), and says hello again there — at most
+    ///   [`MAX_JOIN_REDIRECTS`] times in one join;
+    /// * a `Reject` — the reason is the error.
+    ///
+    /// The link remembers `entry` for as long as it lives ([`Self::entry`]):
+    /// it is what a later handoff's client endpoints are resolved against.
     ///
     /// # Errors
     ///
-    /// [`NetError`] when the transport or the hello handshake fails (including
-    /// [`NetError::VersionMismatch`]).
-    pub async fn connect(addr: SocketAddr) -> Result<Self, NetError> {
+    /// [`JoinError`]: the address that was being dialed and what went wrong
+    /// there — the transport or the hello failed or was refused (including
+    /// [`NetError::VersionMismatch`]), a redirect too many, or a redirect to a
+    /// shard the map names no address for.
+    pub async fn join(entry: SocketAddr) -> Result<Self, JoinError> {
         let player_token: Arc<str> = unique_player_token().into();
-        let endpoint = client_endpoint_for(addr).map_err(|e| NetError::Handshake(e.to_string()))?;
-        let (conn, welcome) =
-            connect(&endpoint, addr, SERVER_NAME, &hello(player_token.as_ref())).await?;
-        // `endpoint` may drop: the connection keeps the endpoint driver alive.
+        let (conn, welcome) = join_through(entry, &player_token).await?;
+        Ok(Self::start(entry, player_token, conn, &welcome))
+    }
+
+    /// [`Self::join`], with a failure reduced to its [`NetError`] (a redirect
+    /// too many, or to nowhere, is a [`NetError::Protocol`] that says so).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::join`].
+    pub async fn connect(addr: SocketAddr) -> Result<Self, NetError> {
+        Self::join(addr).await.map_err(|err| match err.failure {
+            JoinFailure::Net(error) => error,
+            JoinFailure::TooManyRedirects(_) | JoinFailure::NoAddress(_) => {
+                NetError::Protocol(err.to_string())
+            }
+        })
+    }
+
+    /// Start the link's tasks on a connection a shard welcomed.
+    fn start(entry: SocketAddr, player_token: Arc<str>, conn: Conn, welcome: &Welcome) -> Self {
+        // (The client endpoint may drop: the connection keeps its driver alive.)
         let shared = Arc::new(Mutex::new(Shared {
             replica: Replica::joined(welcome.session, welcome.shard, &welcome.shard_map),
             tick_seen: Instant::now(),
             thrust: [0.0; 3],
             seq: 0,
             sent: VecDeque::new(),
+            entry,
             active: conn.clone(),
             active_generation: 0,
             next_generation: 1,
@@ -891,16 +1012,32 @@ impl ServerLink {
             spawn_reader(&shared, &player_token, conn, 0, true),
         ];
         lock(&shared).tasks = tasks;
-        Ok(Self {
+        Self {
             shared,
             player_token,
-        })
+        }
     }
 
     /// The player token this link presents to every shard.
     #[must_use]
     pub fn player_token(&self) -> &str {
         &self.player_token
+    }
+
+    /// The address this link was joined through: what the player dialed
+    /// first. It never changes — not with a join redirect, not with a
+    /// handoff.
+    #[must_use]
+    pub fn entry(&self) -> SocketAddr {
+        lock(&self.shared).entry
+    }
+
+    /// The address of the shard being played on right now: the entry address
+    /// itself when that is a shard, otherwise where a redirect led — and
+    /// after a handoff, the shard that took the ship.
+    #[must_use]
+    pub fn shard_address(&self) -> SocketAddr {
+        lock(&self.shared).active.remote_address()
     }
 
     /// Set the thrust intent sent with every following input batch.
@@ -961,6 +1098,50 @@ impl ServerLink {
 impl Drop for ServerLink {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Say hello at `addr` as the player `player_token`.
+async fn hello_at(addr: SocketAddr, player_token: &str) -> Result<Joined, NetError> {
+    let endpoint = client_endpoint_for(addr).map_err(|e| NetError::Handshake(e.to_string()))?;
+    join(&endpoint, addr, SERVER_NAME, &hello(player_token)).await
+}
+
+/// Where a player dials `shard` according to `map`, when it entered through
+/// `entry`: the shard's client endpoint, an endpoint without an IP meaning
+/// `entry`'s host ([`resolve_client_endpoint`]). `None` when the map names no
+/// address for the shard.
+fn client_address(map: &ShardMap, shard: ShardId, entry: SocketAddr) -> Option<SocketAddr> {
+    resolve_client_endpoint(map.client_endpoint_of(shard)?, entry.ip())
+}
+
+/// Say hello at `entry` and follow what it answers until a shard welcomes
+/// the player (see [`ServerLink::join`]).
+async fn join_through(entry: SocketAddr, player_token: &str) -> Result<(Conn, Welcome), JoinError> {
+    let mut at = entry;
+    let mut sent_on: Vec<ShardId> = Vec::new();
+    loop {
+        let fail = |failure| JoinError { at, failure };
+        match hello_at(at, player_token).await {
+            Ok(Joined::Shard(conn, welcome)) => {
+                if at != entry {
+                    log::info!(
+                        "space-client: {entry} sent this client to shard {} at {at}",
+                        welcome.shard.0
+                    );
+                }
+                return Ok((conn, welcome));
+            }
+            Ok(Joined::Elsewhere(redirect)) => {
+                sent_on.push(redirect.shard);
+                if sent_on.len() > MAX_JOIN_REDIRECTS {
+                    return Err(fail(JoinFailure::TooManyRedirects(sent_on)));
+                }
+                at = client_address(&redirect.shard_map, redirect.shard, entry)
+                    .ok_or_else(|| fail(JoinFailure::NoAddress(redirect.shard)))?;
+            }
+            Err(error) => return Err(fail(JoinFailure::Net(error))),
+        }
     }
 }
 
@@ -1060,6 +1241,12 @@ async fn read_frames(
             Ok(Some(Message::Redirect(redirect))) => {
                 follow_redirect(&shared, &player_token, generation, redirect);
             }
+            // The shard's last word to a client it has let go of: this
+            // connection is over (the shard closes it too).
+            Ok(Some(Message::JoinRedirect(redirect))) => {
+                let_go(&shared, generation, redirect.shard);
+                return;
+            }
             Ok(Some(Message::SceneUpdate(update))) => on_scene(&shared, generation, update),
             Ok(Some(message)) => on_frame(&shared, generation, &message),
             // Peer gone.
@@ -1072,6 +1259,42 @@ async fn read_frames(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// The shard on the connection with reader `generation` has let go of this
+/// client and named `owner` as where a new player starts (a `JoinRedirect`
+/// on an established connection): it had let the client in for a handoff
+/// that never completed.
+///
+/// For the connection of a handoff in flight that is the end of that attempt
+/// and nothing more — the old shard was never given up, and offers the ship
+/// again if it still should go. For the connection being played on it is the
+/// end of the session: the link closes, and whoever keeps it up (the app,
+/// for a client started with a server address) joins again through the
+/// entry address.
+fn let_go(shared: &SharedRef, generation: u64, owner: ShardId) {
+    let mut s = lock(shared);
+    if generation == s.active_generation {
+        log::warn!(
+            "space-client: the shard let go of this client (a new player starts on shard {}); \
+             the connection is closed",
+            owner.0
+        );
+        s.active.close(0, "let go");
+        return;
+    }
+    if s.pending
+        .as_ref()
+        .is_some_and(|p| p.generation == generation)
+    {
+        if let Some(pending) = s.pending.take() {
+            log::info!(
+                "space-client: shard {} did not take the ship over; staying where it is",
+                pending.shard.0
+            );
+            pending.conn.close(0, "handoff did not complete");
         }
     }
 }
@@ -1236,18 +1459,42 @@ async fn open_redirect(
     generation: u64,
     redirect: &Redirect,
 ) -> Result<(), String> {
-    let addr = redirect
-        .shard_map
-        .regions
-        .iter()
-        .find(|region| region.shard == redirect.new_shard)
-        .map(|region| region.endpoint)
-        .filter(|addr| !addr.ip().is_unspecified() && addr.port() != 0)
+    // Where players reach the accepting shard: its client endpoint in the
+    // redirect's map, one without an IP meaning the host this client entered
+    // through — the rule a join redirect follows.
+    let (entry, ours) = {
+        let s = lock(shared);
+        (s.entry, s.replica.ship)
+    };
+    let addr = client_address(&redirect.shard_map, redirect.new_shard, entry)
         .ok_or("the shard map has no reachable endpoint for it")?;
-    let endpoint = client_endpoint_for(addr).map_err(|e| e.to_string())?;
-    let (conn, welcome) = connect(&endpoint, addr, SERVER_NAME, &hello(player_token.as_ref()))
-        .await
-        .map_err(|e| format!("{addr}: {e}"))?;
+    // The offering shard told us and the accepting shard at the same moment.
+    // If our hello gets there first, the accepting shard does not know of the
+    // handoff yet and answers as it answers a fresh join — with a welcome and
+    // a ship of our own if it owns the spawn point (the frames then show the
+    // ship that is ours, see `on_frame`), otherwise by sending us on. Sent
+    // on while our own ship is being handed over, we ask again in a moment:
+    // by then it knows. For somebody else's ship (we were only watching it)
+    // being sent on is simply the answer.
+    let mut asked = 0;
+    let (conn, welcome) = loop {
+        asked += 1;
+        match hello_at(addr, player_token).await {
+            Ok(Joined::Shard(conn, welcome)) => break (conn, welcome),
+            Ok(Joined::Elsewhere(_)) | Err(NetError::Rejected(RejectReason::Starting))
+                if ours == Some(redirect.entity) && asked < ADOPT_RETRIES =>
+            {
+                tokio::time::sleep(ADOPT_RETRY_PAUSE).await;
+            }
+            Ok(Joined::Elsewhere(sent_on)) => {
+                return Err(format!(
+                    "{addr} does not take this client (a new player starts on shard {})",
+                    sent_on.shard.0
+                ));
+            }
+            Err(e) => return Err(format!("{addr}: {e}")),
+        }
+    };
     {
         let mut s = lock(shared);
         if let Some(previous) = s.pending.replace(Pending {
@@ -1319,6 +1566,62 @@ mod tests {
         let mut r = Replica::new(7, ShardId::new(1));
         assert!(!r.apply(&frame(5, vec![])));
         assert_eq!((r.tick, r.ship, r.offset()), (5, None, [0.0; 3]));
+    }
+
+    /// Where a redirect — a join redirect or a handoff's — is dialed: the
+    /// named shard's **client** endpoint, never its internal one; without an
+    /// IP it is the host of the address the player dialed first, with the
+    /// endpoint's port; a port of 0 is no address at all.
+    ///
+    /// Mutation this catches: dialing the internal endpoint (unreachable
+    /// from outside the cluster's host), dialing `0.0.0.0`, or resolving
+    /// against anything but the entry address.
+    #[test]
+    fn a_redirect_is_dialed_at_the_client_endpoint_on_the_entry_host() {
+        let entry: SocketAddr = "203.0.113.7:7777".parse().expect("an address");
+        let node = space_world::NodeRef::new(40, [0, 0, 0]);
+        let region = |shard: u32, internal: &str, players: &str| {
+            space_protocol::ShardRegion::new(
+                node,
+                ShardId::new(shard),
+                internal.parse().expect("an address"),
+            )
+            .with_client_endpoint(players.parse().expect("an address"))
+        };
+        let map = ShardMap::new(
+            1,
+            vec![
+                region(1, "127.0.0.1:7870", "0.0.0.0:7870"),
+                region(2, "127.0.0.1:7871", "198.51.100.9:7871"),
+                region(3, "127.0.0.1:7872", "0.0.0.0:0"),
+                region(4, "10.0.0.4:7873", "[::]:7873"),
+            ],
+        );
+        let dialed = |shard: u32| client_address(&map, ShardId::new(shard), entry);
+        assert_eq!(dialed(1), Some("203.0.113.7:7870".parse().unwrap()));
+        assert_eq!(dialed(2), Some("198.51.100.9:7871".parse().unwrap()));
+        assert_eq!(dialed(3), None, "not known yet");
+        assert_eq!(dialed(4), Some("203.0.113.7:7873".parse().unwrap()));
+        assert_eq!(dialed(5), None, "not in the map");
+        // Entered over IPv6: the same rule.
+        let entry6: SocketAddr = "[2001:db8::7]:7777".parse().expect("an address");
+        assert_eq!(
+            client_address(&map, ShardId::new(1), entry6),
+            Some("[2001:db8::7]:7870".parse().unwrap())
+        );
+        // A map built with `ShardRegion::new` has one address per shard.
+        let plain = ShardMap::new(
+            1,
+            vec![space_protocol::ShardRegion::new(
+                node,
+                ShardId::new(1),
+                "127.0.0.1:7778".parse().expect("an address"),
+            )],
+        );
+        assert_eq!(
+            client_address(&plain, ShardId::new(1), entry),
+            Some("127.0.0.1:7778".parse().unwrap())
+        );
     }
 
     #[test]

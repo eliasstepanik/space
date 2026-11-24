@@ -135,6 +135,24 @@ impl core::fmt::Display for ShardId {
 /// depth-20 node inside a depth-16 node) and the deepest match wins, which is
 /// how a split is expressed — the child node is added with the new owner and
 /// the parent keeps the old one.
+///
+/// # Two addresses
+///
+/// A shard is reached by two kinds of peer, and they need not see it at the
+/// same address:
+///
+/// * `endpoint` is the **internal** one: where the cluster's other shards dial
+///   it (handoffs, ghosts).
+/// * `client_endpoint` is where a **player** dials it — after a
+///   [`JoinRedirect`](crate::JoinRedirect) or a handoff's
+///   [`Redirect`](crate::Redirect). An **unspecified IP** there
+///   (`0.0.0.0:port`, `[::]:port`) means *"the host you dialed, this port"*:
+///   the shards of a cluster run on the host of the address the player typed,
+///   so no public host name has to be configured anywhere
+///   ([`resolve_client_endpoint`] is that rule).
+///
+/// A map built by hand (`space-server --peer`, a test) has one address per
+/// shard: [`ShardRegion::new`] uses it for both.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardRegion {
     /// Octree node covered by this region.
@@ -142,8 +160,12 @@ pub struct ShardRegion {
     pub node: NodeRef,
     /// Shard that owns everything inside `node`.
     pub shard: ShardId,
-    /// Where to reach that shard (UDP for quinn, per `docs/plan.md`).
+    /// Where the cluster's other shards reach that shard (UDP for quinn, per
+    /// `docs/plan.md`).
     pub endpoint: SocketAddr,
+    /// Where a player reaches that shard (see the type docs, "Two
+    /// addresses"). Port 0 = not known yet.
+    pub client_endpoint: SocketAddr,
 }
 
 impl ShardRegion {
@@ -157,14 +179,24 @@ impl ShardRegion {
     pub const UNRESOLVED_ENDPOINT: SocketAddr =
         SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
-    /// Build a region.
+    /// Build a region whose shard is reached at `endpoint` by everybody:
+    /// other shards and players alike (the client endpoint is the endpoint).
     #[must_use]
     pub fn new(node: NodeRef, shard: ShardId, endpoint: SocketAddr) -> Self {
         Self {
             node,
             shard,
             endpoint,
+            client_endpoint: endpoint,
         }
+    }
+
+    /// The same region with players sent to `client_endpoint` instead (see
+    /// the type docs, "Two addresses").
+    #[must_use]
+    pub fn with_client_endpoint(mut self, client_endpoint: SocketAddr) -> Self {
+        self.client_endpoint = client_endpoint;
+        self
     }
 
     /// Whether this region covers `pos`.
@@ -172,6 +204,31 @@ impl ShardRegion {
     pub fn contains(&self, pos: &WorldPos) -> bool {
         octree::contains(self.node, *pos)
     }
+}
+
+/// The address a player dials for a region's
+/// [`client_endpoint`](ShardRegion::client_endpoint), given the host of the
+/// address the player dialed first (the **entry** address: what was typed, or
+/// `--server`).
+///
+/// * port 0 — the shard's address is not known yet: `None`;
+/// * an unspecified IP (`0.0.0.0`, `::`) — "the host you dialed, this port":
+///   `entry_host` with the endpoint's port;
+/// * anything else — the endpoint as it is.
+///
+/// One rule for a join redirect and a handoff redirect alike.
+#[must_use]
+pub fn resolve_client_endpoint(
+    client_endpoint: SocketAddr,
+    entry_host: std::net::IpAddr,
+) -> Option<SocketAddr> {
+    if client_endpoint.port() == 0 {
+        return None;
+    }
+    if client_endpoint.ip().is_unspecified() {
+        return Some(SocketAddr::new(entry_host, client_endpoint.port()));
+    }
+    Some(client_endpoint)
 }
 
 /// The routing table: which octree region which shard owns, at which epoch.
@@ -210,6 +267,19 @@ impl ShardMap {
             }
         }
         best.map(|(_, shard)| shard)
+    }
+
+    /// Where a player dials `shard`, as the map says it: the client endpoint
+    /// of the first of its regions that has one (port 0 = not known yet, and
+    /// skipped). Still to be put through [`resolve_client_endpoint`]: it may
+    /// name the unspecified IP.
+    #[must_use]
+    pub fn client_endpoint_of(&self, shard: ShardId) -> Option<SocketAddr> {
+        self.regions
+            .iter()
+            .filter(|region| region.shard == shard)
+            .map(|region| region.client_endpoint)
+            .find(|endpoint| endpoint.port() != 0)
     }
 
     /// Every region covering `pos`, shallowest first — useful for logging why a

@@ -355,7 +355,10 @@ pub struct IslandKey {
 /// Tell a client to open a connection to a neighbouring shard for `entity`.
 ///
 /// The new shard map is included so the client never has to ask for it again
-/// before following the redirect.
+/// before following the redirect: it dials `new_shard`'s **client endpoint**
+/// in that map ([`ShardRegion::client_endpoint`], an unspecified IP there
+/// meaning the host the player dialed first — the rule a [`JoinRedirect`]
+/// follows too).
 ///
 /// `activation_tick` is the tick the *new* shard starts being authoritative at.
 /// The client must report back with a [`NeighbourStatus`] once its connection to
@@ -407,6 +410,15 @@ pub enum RejectReason {
     Draining,
     /// Anything else; for logs only.
     Other(String),
+    /// The cluster has no shard for a new player right now: it is starting,
+    /// or the shard that owns the spawn point is being replaced. Said to a
+    /// player's [`Hello`] by the orchestrator's player port, and by a shard
+    /// that would send the player on but does not know where to yet. Not
+    /// final: a client that keeps its connection up by itself tries again.
+    ///
+    /// (Appended in protocol 6, behind `Other`: the variant index is the wire
+    /// tag.)
+    Starting,
 }
 
 /// A connection was refused, with the reason.
@@ -476,6 +488,34 @@ pub struct Welcome {
     pub shard_map: ShardMap,
 }
 
+/// "Not here: a new player starts on that shard" — the answer to a player's
+/// [`Hello`] from whoever is not the shard to play on (protocol 6).
+///
+/// Two senders:
+///
+/// * the **orchestrator's player port**, the one address players type: it
+///   answers every hello with the owner of the scene's spawn point and closes;
+/// * a **shard that does not own the spawn point**, to a fresh join: a new
+///   player always starts on the spawn point, so it is sent to its owner
+///   instead of being put somewhere in this shard's region.
+///
+/// The client dials `shard`'s **client endpoint** in `shard_map`
+/// ([`ShardRegion::client_endpoint`], through
+/// [`crate::shard::resolve_client_endpoint`]) and says hello again there —
+/// two such hops at most per attempt. The connection the redirect arrived on
+/// is finished: the sender closes it once the answer has been read.
+///
+/// Not to be confused with [`Redirect`], which moves a player that is
+/// *playing* to the shard its ship is being handed to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinRedirect {
+    /// The shard to dial: the owner of the spawn point as the sender's map
+    /// has it.
+    pub shard: ShardId,
+    /// The sender's map, which names that shard's client endpoint.
+    pub shard_map: ShardMap,
+}
+
 /// Shard → orchestrator: "give me an id and my map" (Phase 3, P3.1).
 ///
 /// The first message on a shard↔orchestrator control connection, after the
@@ -496,13 +536,22 @@ pub struct ShardHello {
     pub cluster: String,
     /// The shard's id, or [`ShardId::NONE`] to request a fresh allocation.
     pub shard: ShardId,
-    /// Where the shard is listening for peers and clients.
+    /// Where the shard is listening: the **internal** endpoint the cluster's
+    /// other shards dial. An unspecified IP (`0.0.0.0:port`: a shard in a
+    /// container that does not know its own address) is filled in by the
+    /// orchestrator with the IP the control connection comes from.
     pub endpoint: std::net::SocketAddr,
     /// Region the shard claims, or `None` for "assign me one".
     pub region: Option<ShardRegion>,
+    /// Where **players** are to dial this shard, if not at `endpoint`
+    /// (protocol 6): what the orchestrator puts into the map as the shard's
+    /// [`ShardRegion::client_endpoint`]. An unspecified IP there means "the
+    /// host the player dialed". `None` = the endpoint.
+    pub client_endpoint: Option<std::net::SocketAddr>,
     /// The cluster secret (protocol 6), empty when the shard was given none.
     /// An orchestrator whose control port is not on loopback — or that was
     /// given a secret explicitly — refuses a hello without the right one.
+    /// The **last** field of the message.
     pub secret: String,
 }
 
@@ -514,6 +563,7 @@ impl core::fmt::Debug for ShardHello {
             .field("shard", &self.shard)
             .field("endpoint", &self.endpoint)
             .field("region", &self.region)
+            .field("client_endpoint", &self.client_endpoint)
             .field("secret", &redacted(&self.secret))
             .finish()
     }
@@ -642,6 +692,10 @@ pub enum Message {
     /// connection a client opens during a handoff — and again whenever the
     /// shard's scene changes. A client keeps the highest revision it has seen.
     SceneUpdate(SceneState),
+    /// Orchestrator's player port, or a shard → client: a new player starts on
+    /// that shard, dial it ([`JoinRedirect`]). The answer to a [`Hello`] in
+    /// place of a [`Welcome`]; never sent unasked to a peer that is playing.
+    JoinRedirect(JoinRedirect),
 }
 
 impl Message {
@@ -651,7 +705,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 28;
+    pub const VARIANT_COUNT: u32 = 29;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -688,6 +742,7 @@ impl Message {
             Message::SceneSet(_) => 25,
             Message::SceneAck(_) => 26,
             Message::SceneUpdate(_) => 27,
+            Message::JoinRedirect(_) => 28,
         }
     }
 
@@ -709,6 +764,7 @@ impl Message {
             Message::DirectoryReply(r) => Some(r.shard_map.epoch),
             Message::Redirect(r) => Some(r.shard_map.epoch),
             Message::Welcome(w) => Some(w.shard_map.epoch),
+            Message::JoinRedirect(r) => Some(r.shard_map.epoch),
             _ => None,
         }
     }

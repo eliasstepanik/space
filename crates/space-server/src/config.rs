@@ -29,12 +29,14 @@ pub const REDIRECT_TIMEOUT_TICKS: SimTick = 4 * space_sim::TICK_HZ as SimTick;
 
 /// Ticks a client that connected to us *for* a staged handoff entity (and so
 /// was given no placeholder ship) has to adopt it before we treat it as an
-/// ordinary newcomer and spawn it a ship of its own.
+/// ordinary newcomer.
 ///
 /// This is the other half of not spawning a phantom ship for a redirected
 /// client: we hold off the placeholder until adoption, and if adoption never
 /// comes (the client crashed, or its token only coincidentally matched a staged
-/// transfer) we fall back to the ordinary join behaviour.
+/// transfer) we fall back to the ordinary join behaviour — a ship on the
+/// scene's spawn point if this shard owns it, otherwise a `JoinRedirect` to
+/// the shard that does (`Shard::join`).
 pub const ADOPT_TIMEOUT_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 
 /// Ticks a shard waits before offering an entity to the **same** peer again

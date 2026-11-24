@@ -202,6 +202,9 @@ impl LocalLauncher {
                 shard: ShardId::NONE,
                 bind: loopback,
                 advertise: None,
+                // In this process, on loopback: players dial the address
+                // the shard bound.
+                client_endpoint: None,
                 claim_region: None,
                 cluster: spec.cluster.clone(),
                 secret: spec.secret.clone(),

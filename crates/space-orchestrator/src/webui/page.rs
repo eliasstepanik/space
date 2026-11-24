@@ -531,7 +531,40 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
     // ---- cluster
     h.raw("<div class=\"card\"><h2>Cluster</h2>\n<dl>\n");
     h.fact("name", &s.cluster);
-    h.fact("control endpoint (QUIC)", s.bind);
+    // The one address players type, and what a hello there is answered with.
+    match s.player_port {
+        Some(port) => {
+            h.fact("player port (QUIC)", port.addr);
+            match port.sends_to {
+                Some(shard) => h.fact(
+                    "players are sent to",
+                    format_args!("{shard}, which owns the spawn point"),
+                ),
+                None => h.fact(
+                    "players are told",
+                    "the cluster is starting: no connected shard owns the spawn point",
+                ),
+            }
+            h.fact(
+                "player hellos",
+                format_args!(
+                    "{} redirected, {} told to try again{}",
+                    port.redirected,
+                    port.turned_away,
+                    if port.refused == 0 {
+                        String::new()
+                    } else {
+                        format!(", {} refused (busy)", port.refused)
+                    }
+                ),
+            );
+        }
+        None => h.fact(
+            "player port",
+            "none (--player-bind): players dial a shard directly",
+        ),
+    }
+    h.fact("control endpoint (QUIC, shards only)", s.bind);
     if s.control_addr != s.bind {
         h.fact("shards are told to dial", s.control_addr);
     }
@@ -899,8 +932,8 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         "<section class=\"card\"><h2>Shards<span class=\"count\">",
         s.shards.len(),
         "</span></h2>\n<div class=\"scroll\"><table>\n<tr><th>shard</th><th>link</th>\
-         <th>address</th><th>region</th><th>scene</th><th>last message</th>\
-         <th>load report</th><th>autoscaler</th></tr>\n",
+         <th>address (shards dial)</th><th>players dial</th><th>region</th><th>scene</th>\
+         <th>last message</th><th>load report</th><th>autoscaler</th></tr>\n",
     );
     for view in &s.shards {
         h.wrapped("<tr><td class=\"mono\">", view.shard, "</td><td>");
@@ -929,6 +962,12 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         match view.advertised {
             Some(address) => h.text(address),
             None => h.raw("<span class=\"dim\">unknown</span>"),
+        }
+        h.raw("</td><td class=\"mono\">");
+        client_endpoint(h, view.client_endpoint);
+        if s.spawn_owner == Some(view.shard) {
+            h.raw(" ");
+            h.pill("info", "spawn point");
         }
         h.raw("</td><td class=\"mono\">");
         if view.regions.is_empty() {
@@ -994,6 +1033,23 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         h.raw("</td></tr>\n");
     }
     h.raw("</table></div></section>\n");
+}
+
+/// Where a shard's players are sent, spelled out: an address, or — for the
+/// unspecified IP — "the host they dialed" and the port.
+fn client_endpoint(h: &mut Html, endpoint: Option<std::net::SocketAddr>) {
+    match endpoint {
+        Some(at) if at.ip().is_unspecified() => {
+            h.text(at);
+            h.wrapped(
+                "<div class=\"sub\">",
+                format_args!("the host they dialed, port {}", at.port()),
+                "</div>",
+            );
+        }
+        Some(at) => h.text(at),
+        None => h.raw("<span class=\"dim\">unknown</span>"),
+    }
 }
 
 /// The owner's connection state, looked up in the shard list.
@@ -1083,9 +1139,12 @@ fn region_row(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
     let (class, label) = owner_link(s, region.shard);
     h.pill(class, label);
     h.raw("<div class=\"sub mono\">");
-    match region.endpoint {
-        Some(endpoint) => h.text(endpoint),
-        None => h.raw("address not known yet"),
+    match (region.endpoint, region.client_endpoint) {
+        (Some(endpoint), Some(players)) if players != endpoint => {
+            h.text(format_args!("{endpoint}, players dial {players}"));
+        }
+        (Some(endpoint), _) => h.text(endpoint),
+        (None, _) => h.raw("address not known yet"),
     }
     h.raw("</div></td><td>");
     split_cell(h, input, region);

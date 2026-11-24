@@ -31,9 +31,12 @@ Every push to `main` is released, so the newest prebuilt Windows client is
 always
 [`space-client.exe`](https://github.com/eliasstepanik/space/releases/latest/download/space-client.exe).
 Run it with no arguments: a window opens on the **connect screen**. Type the
-address of a shard (`host`, `host:port` or `[ipv6]:port`; the port defaults to
-7777) and press Enter. The client and the servers must come from the same
-release; a mismatch is refused with a readable message.
+server's address (`host`, `host:port` or `[ipv6]:port`; the port defaults to
+7777) and press Enter. That one address is all a player needs: a cluster's is
+its orchestrator's **player port**, which sends the client on to the shard a
+new player starts on (a single shard's own address works the same way). The
+client and the servers must come from the same release; a mismatch is refused
+with a readable message.
 
 | | |
 |---|---|
@@ -54,8 +57,8 @@ map, so all players agree on where things are.
 Needs the Rust toolchain from `rust-toolchain.toml`.
 
 ```powershell
-.\scripts\dev.ps1                          # orchestrator + web UI + one shard + the window client
-.\scripts\dev.ps1 -MinShards 4             # the orchestrator starts four shards itself: the demo area in four shard areas
+.\scripts\dev.ps1                          # orchestrator (player port, web UI) + the shard it starts + the window client
+.\scripts\dev.ps1 -MinShards 4             # four shards behind the same address: the demo area in four shard areas
 .\scripts\dev.ps1 -Topology two-shards     # two neighbouring shards: fly across the border
 .\scripts\dev.ps1 -Client headless -Script scripts\harness\smoke.lua   # a scripted test run
 ```
@@ -74,10 +77,29 @@ By hand:
 
 ```powershell
 cargo build --release -p space-client -p space-server -p space-orchestrator
-.\target\release\space-orchestrator.exe --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
-.\target\release\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+.\target\release\space-orchestrator.exe --bind 127.0.0.1:7900 --player-bind 127.0.0.1:7777 --state orchestrator.id --webui 127.0.0.1:7980
+.\target\release\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7870
 .\target\release\space-client.exe --server 127.0.0.1:7777
 ```
+
+### One address
+
+A client connects to **one address**: the orchestrator's player port
+(`--player-bind`, off unless given; 7777 in the dev scripts). It answers the
+client's hello with the shard that owns the scene's spawn point and closes;
+the client dials that shard and plays there — game traffic never passes
+through the orchestrator. While no shard owns the spawn point yet (the cluster
+is starting, or that shard is being replaced) the client is told so and tries
+again. A shard that is dialed directly does the same thing when the spawn
+point is not its own, so every address leads to the same place: **a new player
+always starts on the spawn point.** A client started with `--server` that
+loses its shard comes back through that address by itself.
+
+Where a shard's players reach it is part of the shard map: `space-server
+--client-endpoint ADDR`, and `0.0.0.0:<port>` there means "the host the player
+dialed, this port" — which is what the orchestrator gives the shards it starts,
+so no public host name is configured anywhere. The player port is the public
+entry and needs no token; the control port (`--bind`) is for shards only.
 
 ### Shards
 
@@ -90,7 +112,7 @@ z = -4 — up to `--max-shards` (default 8). Start more by hand with the same
 orchestrator do it:
 
 ```powershell
-.\target\release\space-orchestrator.exe --webui 127.0.0.1:7980 --launcher process --min-shards 4
+.\target\release\space-orchestrator.exe --player-bind 127.0.0.1:7777 --webui 127.0.0.1:7980 --launcher process --min-shards 4
 ```
 
 `--launcher process` starts the `space-server` lying next to the orchestrator,
@@ -102,11 +124,12 @@ at most (the root and the seven layout cells) and not more than `--max-shards`
 or `--max-regions`. A shard that dies — its process exits, its connection to
 the orchestrator closes, or it stops acknowledging map changes — is replaced:
 its region goes to a new shard under a new id and the scene's bodies are built
-again. The replacement listens on the next free port of the range, so a client
-that was on the dead shard has to be pointed at the new address. A shard that
-loses its orchestrator exits by itself. For now a client has to be pointed at
-the shard that owns the spawn point (the web UI lists the root region's
-address; `dev.ps1 -MinShards` does it for you).
+again. The replacement listens on the next free port of the range; a client
+that was on the dead shard and was started with `--server <player port>` comes
+back through the player port and is sent there (it starts on the spawn point
+again: where a player was is not kept). A shard that loses its orchestrator
+exits by itself. The web UI and `/api/state` show the player port, which shard
+it sends players to, and where each shard's players dial it.
 
 The orchestrator's control port takes any shard on a loopback address. On any
 other address a shard needs the **cluster secret** (`SPACE_CLUSTER_SECRET` on
@@ -155,10 +178,13 @@ space-client [--server ADDR] [--headless | --stream ADDR] [--size WxH]
 
 - **window** (default), **`--headless`** (no window, renders offscreen) or
   **`--stream ADDR`** (headless, and streams the picture to the browser viewer).
-- `--server ADDR` connects at once and keeps reconnecting (after 2, 3, 5, then
-  every 8 s) when the shard is not there yet or goes away, until the address is
-  edited or Esc is pressed; connection events are logged to stderr. Without it
-  the connect screen is shown and waits, in every front end.
+- `--server ADDR` connects at once and keeps reconnecting **to that address**
+  (after 2, 3, 5, then every 8 s) when nothing is there yet or the shard goes
+  away, until the address is edited or Esc is pressed; connection events are
+  logged to stderr. Without it the connect screen is shown and waits, in every
+  front end. `ADDR` may be a shard or an orchestrator's player port: the
+  client follows up to two redirects to the shard it plays on, and the harness
+  `/state` says both (`address`, `shard_address`).
 - A headless or streamed client never quits on user input (a viewer cannot take
   it down): it ends through the harness, `--frames`, a finished `--script` or a
   signal.
@@ -175,7 +201,7 @@ scripts that act as a user.
 ```sh
 space-client --headless --harness 127.0.0.1:8098
 curl http://127.0.0.1:8098/                          # the routes
-curl http://127.0.0.1:8098/state                     # screen, scene, position, speed, fps, gravity, bodies ...
+curl http://127.0.0.1:8098/state                     # screen, address, shard, shard_address, scene, position, speed, fps, gravity, bodies ...
 curl -o frame.png http://127.0.0.1:8098/frame.png    # or frame.jpg (much smaller)
 curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'
 

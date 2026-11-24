@@ -11,8 +11,9 @@
 use std::collections::{HashMap, HashSet};
 
 use space_protocol::{
-    EntityGuid, HandoffReason, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    RejectReason, SceneAck, SceneState, ShardId, ShardMap, ShardRegion, StaleEpoch, Welcome,
+    EntityGuid, HandoffReason, Hello, InputTick, JoinRedirect, Message, NeighbourStatus,
+    PlayerInput, Redirect, RejectReason, SceneAck, SceneState, ShardId, ShardMap, ShardRegion,
+    StaleEpoch, Welcome,
 };
 use space_sim::{ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
@@ -55,6 +56,35 @@ pub const MAX_PLAYERS_PER_SHARD: usize = 100;
 /// Snapshots, redirects and everything addressed to a shard or the orchestrator
 /// are kept.
 pub const MAX_OUTBOX: usize = 4096;
+
+/// Why a hello was not answered with a [`Welcome`] ([`Shard::join`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinRefusal {
+    /// Refused, for the reason given (the shard is full, or it would send the
+    /// player on but does not know where to yet:
+    /// [`RejectReason::Starting`]).
+    Rejected(RejectReason),
+    /// Not here: a new player starts on the scene's spawn point, and another
+    /// shard owns it. The client is to dial that shard instead.
+    Elsewhere(JoinRedirect),
+}
+
+impl JoinRefusal {
+    /// The message that answers the hello in place of a welcome.
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        match self {
+            JoinRefusal::Rejected(reason) => Message::Reject(space_protocol::Reject { reason }),
+            JoinRefusal::Elsewhere(redirect) => Message::JoinRedirect(redirect),
+        }
+    }
+}
+
+impl From<RejectReason> for JoinRefusal {
+    fn from(reason: RejectReason) -> Self {
+        JoinRefusal::Rejected(reason)
+    }
+}
 
 /// One message routed to a peer: a client session or another shard.
 #[derive(Debug, Clone)]
@@ -261,15 +291,30 @@ impl Shard {
         self.config.shard
     }
 
-    /// Record the address the front end actually bound to.
+    /// Record the address the front end actually bound to: where other shards
+    /// and players alike reach this shard (a standalone shard has one address).
     ///
     /// A shard started on port 0 does not know its port until the socket exists,
     /// and the shard map it hands out in a [`Welcome`] must carry a reachable one.
     pub fn set_endpoint(&mut self, addr: std::net::SocketAddr) {
-        self.config.endpoint = addr;
+        self.set_endpoints(addr, addr);
+    }
+
+    /// Record this shard's two addresses in its own regions of the map: the
+    /// internal `endpoint` other shards dial, and the `client_endpoint`
+    /// players are sent to ([`ShardRegion::client_endpoint`]). An orchestrated
+    /// shard takes both from the region its `ShardWelcome` names — they are
+    /// the orchestrator's to decide.
+    pub fn set_endpoints(
+        &mut self,
+        endpoint: std::net::SocketAddr,
+        client_endpoint: std::net::SocketAddr,
+    ) {
+        self.config.endpoint = endpoint;
         for region in &mut self.shard_map.regions {
             if region.shard == self.config.shard {
-                region.endpoint = addr;
+                region.endpoint = endpoint;
+                region.client_endpoint = client_endpoint;
             }
         }
     }
@@ -526,29 +571,45 @@ impl Shard {
     ///
     /// The version gate itself lives in [`space_net::accept_connection`] (it
     /// answers the mismatch before this is ever called); what is checked here is
-    /// the shard's own policy: a token is turned away only for capacity or
-    /// draining, and a successful join spawns the player's ship **inside this
-    /// shard's region** so the client starts on authoritative ground.
+    /// the shard's own policy. There are two kinds of hello:
     ///
-    /// **The one exception is a redirected client.** A client that connects to us
-    /// while we hold a staged handoff whose owner token matches the client's hello
-    /// token is coming *for that entity*, so we do not spawn a placeholder for it:
-    /// the placeholder used to sit at the region centre until the client reported
-    /// in, and a client that crashed before reporting left a phantom ship there
-    /// forever. Such a client is *awaiting adopt* ([`Client::ship`] is `None`) and
-    /// gets its ship by adopting the staged entity in [`Shard::client_status`]; if
-    /// adoption never comes it is spawned a ship like any newcomer after
-    /// [`crate::config::ADOPT_TIMEOUT_TICKS`].
+    /// **A fresh join.** A new player always starts on the scene's **spawn
+    /// point** ([`space_scene::scene_anchor`] of this shard's map), so it is
+    /// welcomed — and its ship spawned there — only by the shard that owns
+    /// that point. Every other shard answers with
+    /// [`JoinRefusal::Elsewhere`], a [`JoinRedirect`] naming the owner as its
+    /// own map has it, and the client dials that shard instead
+    /// (`docs/plan-sharding.md` §4). A shard used to put such a player on the
+    /// centre of its own region, a place nobody chose. If the map does not say
+    /// yet where the owner is reached (it was carved or replaced a moment ago
+    /// and the orchestrator's map push is still on its way), the answer is
+    /// [`RejectReason::Starting`]: try again shortly.
+    ///
+    /// **A redirected client.** A client that connects to us while we hold a
+    /// staged handoff whose owner token matches the client's hello token is
+    /// coming *for that entity*: it is welcomed wherever the spawn point is,
+    /// and gets no ship of its own (a placeholder used to sit at the region
+    /// centre until the client reported in, and a client that crashed before
+    /// reporting left a phantom ship there forever). Such a client is
+    /// *awaiting adopt* ([`Client::ship`] is `None`) and gets its ship by
+    /// adopting the staged entity in [`Shard::client_status`]; if adoption
+    /// never comes within [`crate::config::ADOPT_TIMEOUT_TICKS`] it is treated
+    /// as a fresh join after all (`client_timeout_pass`).
     ///
     /// Every client that is admitted — a newcomer and a redirected player's
     /// second connection alike — is queued a [`Message::SceneUpdate`] with the
     /// shard's current scene, so it is the first thing behind the [`Welcome`].
-    pub fn join(&mut self, hello: &Hello) -> Result<Welcome, RejectReason> {
+    ///
+    /// # Errors
+    ///
+    /// [`JoinRefusal::Rejected`] with [`RejectReason::Full`] at capacity;
+    /// for a fresh join on a shard that does not own the spawn point,
+    /// [`JoinRefusal::Elsewhere`] — or `Rejected(Starting)` while the owner's
+    /// address is not known.
+    pub fn join(&mut self, hello: &Hello) -> Result<Welcome, JoinRefusal> {
         if self.clients.len() >= MAX_PLAYERS_PER_SHARD {
-            return Err(RejectReason::Full);
+            return Err(RejectReason::Full.into());
         }
-        let session = self.next_session;
-        self.next_session += 1;
         // Does this hello match a staged transfer's owner? If so the client is
         // the redirected player and gets no placeholder (see the method docs).
         let staged_owner = self
@@ -556,11 +617,19 @@ impl Shard {
             .incoming()
             .values()
             .any(|staged| staged.owner_token == hello.player_token);
-        let ship = if staged_owner {
+        // A fresh join is this shard's only if the spawn point is. (Decided
+        // before a session id is spent on it.)
+        let spawn = if staged_owner {
             None
         } else {
-            Some(self.spawn_player_ship(session))
+            match self.free_spawn_point() {
+                Some(pos) => Some(pos),
+                None => return Err(self.send_elsewhere()),
+            }
         };
+        let session = self.next_session;
+        self.next_session += 1;
+        let ship = spawn.map(|pos| self.spawn_ship_for(session, pos));
         let adopt_deadline = if ship.is_none() {
             Some(self.sim.tick().saturating_add(ADOPT_TIMEOUT_TICKS))
         } else {
@@ -681,11 +750,30 @@ impl Shard {
         guid
     }
 
-    /// Spawn a joining player's ship at a free spawn point (see
-    /// [`Shard::free_spawn_point`]), owned by `session`.
-    fn spawn_player_ship(&mut self, session: u64) -> EntityGuid {
-        let pos = self.free_spawn_point();
-        self.spawn_ship_for(session, pos)
+    /// The shard a new player starts on, as this shard's map has it: the
+    /// owner of the scene's spawn point ([`space_scene::scene_anchor`]).
+    /// `None` for a map with no region at all.
+    #[must_use]
+    pub fn spawn_owner(&self) -> Option<ShardId> {
+        let anchor = space_scene::scene_anchor(&self.shard_map)?;
+        self.shard_map.lookup(&anchor)
+    }
+
+    /// The answer to a fresh join this shard does not take: the redirect to
+    /// the spawn point's owner, or — while this shard's map does not say
+    /// where players reach that owner — "starting, try again"
+    /// ([`Shard::join`]).
+    fn send_elsewhere(&self) -> JoinRefusal {
+        let known = self.spawn_owner().filter(|owner| {
+            *owner != self.config.shard && self.shard_map.client_endpoint_of(*owner).is_some()
+        });
+        match known {
+            Some(shard) => JoinRefusal::Elsewhere(JoinRedirect {
+                shard,
+                shard_map: self.shard_map.clone(),
+            }),
+            None => RejectReason::Starting.into(),
+        }
     }
 
     /// Despawn `guid` — a ship or a body this shard simulates — and drop it
@@ -1336,13 +1424,15 @@ impl Shard {
         }
     }
 
-    /// Clear a redirect that was never confirmed, and give an awaiting-adopt
-    /// client its fallback ship once its adopt budget has run out.
+    /// Clear a redirect that was never confirmed, and settle an awaiting-adopt
+    /// client whose adopt budget has run out: a ship on the spawn point if
+    /// this shard owns it, otherwise a [`JoinRedirect`] to the shard that
+    /// does — as for any fresh join ([`Shard::join`]).
     ///
     /// Both are bounded waits: a redirect that never gets a `NeighbourStatus` must
     /// not hold the client half-redirected forever, and a client we withheld a
     /// placeholder for (because it matched a staged transfer's owner) must not be
-    /// left with no ship at all if adoption never comes.
+    /// left with no ship and no word at all if adoption never comes.
     fn client_timeout_pass(&mut self, tick: SimTick) {
         let sessions: Vec<u64> = self.clients.keys().copied().collect();
         for session in sessions {
@@ -1358,8 +1448,11 @@ impl Shard {
             }
         }
         // An awaiting-adopt client whose deadline passed becomes an ordinary
-        // newcomer: give it a ship at the region centre.
-        let to_spawn: Vec<u64> = self
+        // newcomer, and is treated as `join` treats one: on the shard that
+        // owns the spawn point it gets a ship there; on any other it is sent
+        // to that shard, and is no client of this one any more. (It used to
+        // get a ship at this shard's region centre.)
+        let overdue: Vec<u64> = self
             .clients
             .values()
             .filter(|client| {
@@ -1367,12 +1460,24 @@ impl Shard {
             })
             .map(|client| client.session)
             .collect();
-        for session in to_spawn {
-            let guid = self.spawn_player_ship(session);
-            if let Some(client) = self.clients.get_mut(&session) {
-                client.ship = Some(guid);
-                client.replica = ClientReplica::new(guid);
-                client.adopt_deadline = None;
+        for session in overdue {
+            match self.free_spawn_point() {
+                Some(pos) => {
+                    let guid = self.spawn_ship_for(session, pos);
+                    if let Some(client) = self.clients.get_mut(&session) {
+                        client.ship = Some(guid);
+                        client.replica = ClientReplica::new(guid);
+                        client.adopt_deadline = None;
+                    }
+                }
+                None => {
+                    // The last word on this connection (the front end closes
+                    // it once it is written): where a new player starts, or
+                    // "try again" while that is not known.
+                    let answer = self.send_elsewhere().into_message();
+                    self.send_to(Destination::Client(session), answer);
+                    self.clients.remove(&session);
+                }
             }
         }
     }

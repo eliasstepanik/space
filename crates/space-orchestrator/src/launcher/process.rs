@@ -5,7 +5,8 @@
 //! [`SpawnSpec`]:
 //!
 //! ```text
-//!   space-server --orchestrator <control address> --bind <ip>:<host port> --cluster <id>
+//!   space-server --orchestrator <control address> --bind <ip>:<host port> \
+//!                --client-endpoint 0.0.0.0:<host port> --cluster <id>
 //! ```
 //!
 //! No `--shard`, no region: the shard registers without either and is given
@@ -19,7 +20,9 @@
 //!   out one port per shard from its configured range), on the IP the control
 //!   port is bound to, or loopback when that is the wildcard. That address is
 //!   what its hello advertises, which is how the orchestrator knows which shard
-//!   this launch became ([`ShardHandle::endpoint`]).
+//!   this launch became ([`ShardHandle::endpoint`]). Its **players** are sent
+//!   to `0.0.0.0:<host port>` ([`client_endpoint`]): the host they dialed the
+//!   orchestrator's player port on, and the shard's port.
 //! * **Secret.** The cluster secret is handed over in the child's environment
 //!   (`SPACE_CLUSTER_SECRET`), never on its command line.
 //! * **Environment.** The child inherits the orchestrator's environment
@@ -88,6 +91,22 @@ fn withheld(name: &OsStr) -> bool {
     };
     let name = name.to_ascii_uppercase();
     name.starts_with(WITHHELD_ENV_PREFIX) || WITHHELD_ENV.contains(&name.as_str())
+}
+
+/// The client endpoint a launched shard listening on `endpoint` is given
+/// (`space-server --client-endpoint`): the **unspecified IP** of its address
+/// family and its own port — `0.0.0.0:<host port>`. A client reads that as
+/// "the host I dialed, this port" (`space_protocol::resolve_client_endpoint`):
+/// the shards run on the orchestrator's host, so whatever name or address a
+/// player reached the player port by reaches them too, and no public host
+/// name is configured anywhere.
+#[must_use]
+pub fn client_endpoint(endpoint: SocketAddr) -> SocketAddr {
+    let any = match endpoint {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(any, endpoint.port())
 }
 
 /// One child process.
@@ -301,6 +320,10 @@ impl ProcessLauncher {
             .arg(dialable(spec.control_addr).to_string())
             .arg("--bind")
             .arg(endpoint.to_string())
+            // Where its players dial it: this host — the one the player
+            // reached the orchestrator on — and the shard's own port.
+            .arg("--client-endpoint")
+            .arg(client_endpoint(endpoint).to_string())
             .arg("--cluster")
             .arg(&spec.cluster);
         // The orchestrator's own settings stay with the orchestrator — its
@@ -569,6 +592,8 @@ mod tests {
                 "127.0.0.1:7900",
                 "--bind",
                 "127.0.0.1:7871",
+                "--client-endpoint",
+                "0.0.0.0:7871",
                 "--cluster",
                 "test"
             ]
@@ -610,6 +635,46 @@ mod tests {
             .filter(|(name, value)| *name == "SPACE_CLUSTER_SECRET" && value.is_none())
             .collect();
         assert_eq!(removed.len(), 1);
+    }
+
+    /// A launched shard is told to send its players to **the host they
+    /// dialed** and its own port: `--client-endpoint 0.0.0.0:<host port>` —
+    /// the unspecified IP of the family it binds, never the loopback address
+    /// it listens on (which a player on another machine could not dial) and
+    /// never a host name (none is configured anywhere).
+    ///
+    /// Mutation this catches: passing the bind address as the client
+    /// endpoint, or no client endpoint at all — a client redirected to such a
+    /// shard dials `127.0.0.1` on its own machine.
+    #[test]
+    fn a_launched_shard_sends_its_players_to_the_host_they_dialed() {
+        let any4: SocketAddr = "0.0.0.0:7871".parse().unwrap();
+        assert_eq!(client_endpoint("127.0.0.1:7871".parse().unwrap()), any4);
+        assert_eq!(client_endpoint("192.168.1.5:7871".parse().unwrap()), any4);
+        assert_eq!(
+            client_endpoint("[::1]:7899".parse().unwrap()),
+            "[::]:7899".parse().unwrap()
+        );
+        for (control, bind, players) in [
+            ("127.0.0.1:7900", "127.0.0.1:7872", "0.0.0.0:7872"),
+            ("0.0.0.0:7900", "127.0.0.1:7872", "0.0.0.0:7872"),
+            ("[::1]:7900", "[::1]:7872", "[::]:7872"),
+        ] {
+            let launcher = ProcessLauncher::new("x", "y", control.parse().unwrap());
+            let endpoint = SocketAddr::new(launcher.bind_ip, 7_872);
+            assert_eq!(endpoint, bind.parse().unwrap());
+            let command = launcher.command(&spec(1, 7_872), endpoint, []);
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let at = args
+                .iter()
+                .position(|arg| arg == "--client-endpoint")
+                .expect("the flag is passed");
+            assert_eq!(args[at + 1], players, "{control}");
+            assert_eq!(args[at - 1], bind, "behind --bind {bind}");
+        }
     }
 
     /// A launcher whose executable is not there says so — at startup through

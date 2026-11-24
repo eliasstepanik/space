@@ -1095,7 +1095,9 @@ impl App {
             Net::Connecting(attempt) => state.address.clone_from(&attempt.label),
             Net::Online(session) => {
                 let replica = &session.replica;
+                // The address that was dialed, and the shard it led to.
                 state.address.clone_from(&session.label);
+                state.shard_address = Some(session.link.shard_address().to_string());
                 state.shard = replica.shard.map(|shard| shard.0);
                 state.session = Some(replica.session);
                 state.tick = replica.tick;

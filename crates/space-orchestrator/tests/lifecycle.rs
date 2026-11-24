@@ -211,6 +211,28 @@ async fn join_and_look(
     (welcome.shard_map, seen)
 }
 
+/// Say hello at `endpoint` as a player and return the map the shard there
+/// runs, and the shard it sent the player on to (`None`: it welcomed the
+/// player itself).
+async fn hello_and_map(endpoint: SocketAddr) -> (space_protocol::ShardMap, Option<ShardId>) {
+    let client = space_net::client_endpoint_for(endpoint).expect("client endpoint");
+    let joined = space_net::join(
+        &client,
+        endpoint,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("a-player"),
+    )
+    .await
+    .expect("the shard answers a player");
+    match joined {
+        space_net::Joined::Shard(conn, welcome) => {
+            conn.close(0, "seen enough");
+            (welcome.shard_map, None)
+        }
+        space_net::Joined::Elsewhere(redirect) => (redirect.shard_map, Some(redirect.shard)),
+    }
+}
+
 /// `--min-shards 4` with the in-process launcher, through the real loop: with
 /// nothing started by hand the cluster comes up as four shards, each given its
 /// region at its hello — the root, then the three layout cells beside the
@@ -283,10 +305,19 @@ async fn min_shards_4_through_the_real_loop_ends_with_four_live_shards_in_four_q
     assert_eq!(owner_at(&snapshot, -7.0, -5.0), owners[3]);
 
     // Every shard itself runs the committed map, with every address in it: a
-    // player joining any of them is handed the same four regions.
+    // player who says hello to any of them is handed the same four regions —
+    // by the root's shard with its welcome (it owns the spawn point), by the
+    // other three with the redirect that sends the player there.
+    assert_eq!(snapshot.spawn_owner, Some(owners[0]));
     for region in &snapshot.regions {
         let endpoint = region.endpoint.expect("a registered owner");
-        let (map, _) = join_and_look(endpoint).await;
+        let (map, sent_to) = hello_and_map(endpoint).await;
+        let expected = (region.shard != owners[0]).then_some(owners[0]);
+        assert_eq!(
+            sent_to, expected,
+            "{}: a new player starts on the spawn point's shard",
+            region.shard
+        );
         assert_eq!(map.epoch, 4, "{} runs the committed map", region.shard);
         assert_eq!(map.regions.len(), 4);
         for (node, owner) in [root, cells[0], cells[1], cells[2]]
@@ -490,6 +521,7 @@ async fn a_shard_without_the_cluster_secret_is_refused_for_good() {
         advertise: None,
         claim_region: None,
         cluster: orch.cluster.clone(),
+        client_endpoint: None,
         secret: secret.to_owned(),
     };
     for wrong in ["", "not-the-secret-of-this-cluster"] {
@@ -573,6 +605,7 @@ fn plain_hello(cluster: &str, port: u16, secret: &str) -> ShardHello {
         shard: ShardId::NONE,
         endpoint: SocketAddr::from(([127, 0, 0, 1], port)),
         region: None,
+        client_endpoint: None,
         secret: secret.to_owned(),
     }
 }

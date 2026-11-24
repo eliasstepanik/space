@@ -10,6 +10,9 @@ description = "Cluster orchestrator: shard-id allocation, split/merge topology, 
 space-world = { workspace = true }
 space-protocol = { workspace = true }
 space-sim = { workspace = true }
+# The scene's spawn point (`scene_anchor`): the player port sends a new player
+# to the shard that owns it, and the layout cells are checked against it.
+space-scene = { workspace = true }
 space-net = { path = "../space-net" }
 # `ids` composes `space_server::alloc::ShardIdAllocator` with persistence
 # (plan §1.2: the allocator type stays in space-server; the counter moves here).
@@ -18,10 +21,6 @@ space-net = { path = "../space-net" }
 space-server = { path = "../space-server" }
 quinn = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
-# The layout cells are checked against the scene's anchor rule (topology.rs).
-space-scene = { workspace = true }
 
 [lints]
 workspace = true

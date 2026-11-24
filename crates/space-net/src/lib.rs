@@ -18,7 +18,10 @@
 //!   and surfaced as [`NetError::VersionMismatch`], so the client learns *why*
 //!   it was turned away; [`Conn::reject`] does the same for a refusal the server
 //!   decides itself (a full shard). Both sides of the handshake are bounded by
-//!   [`HANDSHAKE_TIMEOUT`].
+//!   [`HANDSHAKE_TIMEOUT`]. A player says hello with [`join`], which also
+//!   takes the third answer there is — a
+//!   [`JoinRedirect`](space_protocol::JoinRedirect), "a new player starts on
+//!   that shard" ([`Joined::Elsewhere`], sent with [`Conn::turn_away`]).
 //! * **Liveness** — every connection pings each [`KEEP_ALIVE_INTERVAL`] and is
 //!   declared dead after [`IDLE_TIMEOUT`] of silence, so a link with nothing to
 //!   say stays up and a peer that is gone is still noticed.
@@ -61,8 +64,9 @@ pub mod secret;
 pub use crypto::{make_server_config, make_tls_client_config, make_tls_server_config, CertPair};
 pub use endpoint::{
     accept_connection, accept_incoming, accept_incoming_within, client_endpoint,
-    client_endpoint_for, client_endpoint_on, connect, connect_within, hello, server_endpoint,
-    transport_config, Conn, NetError, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, KEEP_ALIVE_INTERVAL,
+    client_endpoint_for, client_endpoint_on, connect, connect_within, hello, join, join_within,
+    server_endpoint, transport_config, Conn, Joined, NetError, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT,
+    KEEP_ALIVE_INTERVAL,
 };
 pub use framed::{
     read_frame, recv_datagram, send_datagram, send_message, send_on_stream, MessageClass,

@@ -35,6 +35,12 @@ pub struct Snapshot {
     pub bind: SocketAddr,
     /// The control address launched shards are told to dial.
     pub control_addr: SocketAddr,
+    /// The player port — the one address players type — if the orchestrator
+    /// serves one (`--player-bind`).
+    pub player_port: Option<PlayerPortView>,
+    /// The shard a new player starts on: the owner of the scene's spawn
+    /// point in the committed map.
+    pub spawn_owner: Option<ShardId>,
     /// Which launcher starts the shards a split creates.
     pub launcher: LauncherKind,
     /// The file the shard-id counter is persisted in.
@@ -79,6 +85,25 @@ pub struct Snapshot {
     pub scene: SceneView,
     /// The recent-events log, newest first.
     pub events: Vec<Event>,
+}
+
+/// The player port ([`crate::player`]): where it listens and what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerPortView {
+    /// Where it listens.
+    pub addr: SocketAddr,
+    /// The shard a client that says hello is sent to right now. `None`: it
+    /// is told "the cluster is starting" — no connected shard owns the spawn
+    /// point (nobody has claimed the root yet, or its owner is being
+    /// replaced).
+    pub sends_to: Option<ShardId>,
+    /// Hellos answered with a redirect since the orchestrator started.
+    pub redirected: u64,
+    /// Hellos answered with "starting".
+    pub turned_away: u64,
+    /// Connections refused unanswered because too many were being served at
+    /// once.
+    pub refused: u64,
 }
 
 /// The cluster's scene: what every shard is told to show.
@@ -228,10 +253,14 @@ pub struct RegionView {
     pub node: NodeRef,
     /// The shard that owns it.
     pub shard: ShardId,
-    /// Where the map says that shard is reachable. `None` while the map only
-    /// holds a placeholder: a new child that has not said hello yet, or the
-    /// root before any shard has claimed it.
+    /// Where the map says that shard is reachable by other shards. `None`
+    /// while the map only holds a placeholder: a new child that has not said
+    /// hello yet, or the root before any shard has claimed it.
     pub endpoint: Option<SocketAddr>,
+    /// Where the map sends that shard's **players** (`None` like `endpoint`).
+    /// An unspecified IP (`0.0.0.0:<port>`) means "the host the player
+    /// dialed, this port".
+    pub client_endpoint: Option<SocketAddr>,
     /// How many regions of the map contain this one (0 for a top-level region).
     pub nesting: u8,
     /// The enclosing region this one was carved out of, and the one a merge
@@ -264,8 +293,14 @@ pub struct ShardView {
     pub connected: bool,
     /// Whether it has said hello since this orchestrator started.
     pub registered: bool,
-    /// The address it advertised in its hello.
+    /// The address it advertised in its hello (an unspecified IP filled in
+    /// with the one its control connection comes from): where other shards
+    /// dial it.
     pub advertised: Option<SocketAddr>,
+    /// Where its players are sent: the client endpoint its hello asked for,
+    /// else `advertised`. An unspecified IP means "the host the player
+    /// dialed".
+    pub client_endpoint: Option<SocketAddr>,
     /// The regions of the committed map it owns.
     pub regions: Vec<NodeRef>,
     /// When it was last heard from, and how.

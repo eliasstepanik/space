@@ -79,7 +79,16 @@ pub struct OrchestratedOptions {
     /// Where to listen (port 0 for "any").
     pub bind: SocketAddr,
     /// The address reported in `ShardHello`, or `None` for the bound address.
+    /// It is the **internal** endpoint, the one other shards dial; with an
+    /// unspecified IP (`0.0.0.0:<port>`) the orchestrator fills in the IP it
+    /// sees this shard's control connection come from.
     pub advertise: Option<SocketAddr>,
+    /// Where **players** are to dial this shard (`--client-endpoint`), if not
+    /// at the advertised address: what the orchestrator puts into the map as
+    /// this shard's client endpoint. An unspecified IP (`0.0.0.0:<port>`)
+    /// means "the host the player dialed, this port". `None` = the advertised
+    /// address.
+    pub client_endpoint: Option<SocketAddr>,
     /// The region to claim, or `None` for "assign me one" (the normal case).
     pub claim_region: Option<NodeRef>,
     /// The cluster id forwarded in `ShardHello`.
@@ -97,6 +106,7 @@ impl std::fmt::Debug for OrchestratedOptions {
             .field("shard", &self.shard)
             .field("bind", &self.bind)
             .field("advertise", &self.advertise)
+            .field("client_endpoint", &self.client_endpoint)
             .field("claim_region", &self.claim_region)
             .field("cluster", &self.cluster)
             .field("secret", &!self.secret.is_empty())
@@ -146,6 +156,14 @@ pub fn classify(err: &NetError) -> HelloFailure {
             refused("the cluster already runs as many shards as it may (--max-shards)")
         }
         NetError::Rejected(RejectReason::Other(why)) => refused(why),
+        // What a *player* is told while a cluster has no shard for it yet.
+        // Nothing a control port says to a shard: the address is a player
+        // entry (the orchestrator's `--player-bind`, or a shard).
+        NetError::Rejected(RejectReason::Starting) => HelloFailure::Final(
+            "that address answers players, not shards: --orchestrator takes the orchestrator's \
+             control port (--bind, default 7900), not its player port"
+                .to_owned(),
+        ),
         NetError::Rejected(RejectReason::VersionMismatch { .. })
         | NetError::VersionMismatch { .. } => HelloFailure::Final(format!(
             "{err}: shard and orchestrator must be built from the same commit"
@@ -200,6 +218,7 @@ pub async fn register_within(
             shard: options.shard,
             endpoint: advertised,
             region: claim.clone(),
+            client_endpoint: options.client_endpoint,
             secret: options.secret.clone(),
         };
         let err = match OrchestratorLink::handshake(orch_addr, hello).await {
@@ -246,8 +265,14 @@ pub struct RunningShard {
     pub shard: ShardId,
     /// The region the orchestrator gave it (owned once the map says so).
     pub region: NodeRef,
-    /// The address clients and peers dial (what the hello advertised).
+    /// The address peers dial: what the hello advertised, as the orchestrator
+    /// recorded it (an unspecified IP filled in with the one it sees the
+    /// shard at).
     pub endpoint: SocketAddr,
+    /// The address players are sent to: the client endpoint the orchestrator
+    /// put into the map for this shard (it may name the unspecified IP, "the
+    /// host the player dialed").
+    pub client_endpoint: SocketAddr,
     /// The shard's live state (tests read it; the serve and tick tasks own the
     /// write side).
     pub state: Arc<Mutex<Shard>>,
@@ -347,10 +372,16 @@ pub async fn start_orchestrated(
     // region it was given is not in that map yet (it is being carved for it),
     // the map names its previous owner and this shard owns nothing until the
     // epoch commits: a shard never acts as the owner of a region before that.
-    let config = ShardConfig::new(welcome.shard, advertised, welcome.region.node);
+    //
+    // Its own two addresses are the orchestrator's word too (the welcome's
+    // region): the internal one may be the advertised address with the IP
+    // filled in that the orchestrator sees this shard at, and the one players
+    // dial is what the orchestrator put into the map for it.
+    let (endpoint, client_endpoint) = (welcome.region.endpoint, welcome.region.client_endpoint);
+    let config = ShardConfig::new(welcome.shard, endpoint, welcome.region.node);
     let mut shard = Shard::new(config);
     shard.set_shard_map(welcome.shard_map.clone());
-    shard.set_endpoint(advertised);
+    shard.set_endpoints(endpoint, client_endpoint);
     let shard = Arc::new(Mutex::new(shard));
 
     // The cluster's peer token: presented to every neighbour, required of
@@ -368,7 +399,8 @@ pub async fn start_orchestrated(
     net.set_orchestrator_sender(link.tx.clone()).await;
 
     println!(
-        "shard {} on {listening} (advertised {advertised}, orchestrated by {orch_addr}), region depth {}",
+        "shard {} on {listening} (reached at {endpoint} by shards, {client_endpoint} by players; \
+         orchestrated by {orch_addr}), region depth {}",
         welcome.shard.0, welcome.region.node.depth
     );
 
@@ -408,7 +440,8 @@ pub async fn start_orchestrated(
     Ok(RunningShard {
         shard: welcome.shard,
         region: welcome.region.node,
-        endpoint: advertised,
+        endpoint,
+        client_endpoint,
         state,
         net,
         serve,
@@ -568,6 +601,7 @@ mod tests {
             shard: ShardId::NONE,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             advertise: None,
+            client_endpoint: None,
             claim_region: None,
             cluster: "c".into(),
             secret: "do-not-print-me".into(),

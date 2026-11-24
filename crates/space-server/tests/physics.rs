@@ -58,6 +58,15 @@ fn addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
+/// Where shard `id` of a hand-wired [`Cluster`] would listen (nothing does:
+/// the shards are driven in process).
+fn listening(id: u32) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        7_100 + u16::try_from(id).expect("a small shard id"),
+    )
+}
+
 /// Shards in one process, sharing one map, wired together by hand.
 struct Cluster {
     shards: Vec<Shard>,
@@ -76,7 +85,9 @@ impl Cluster {
             1,
             regions
                 .iter()
-                .map(|(id, node)| ShardRegion::new(*node, ShardId::new(*id), addr()))
+                // (An address a shard could be dialed at: a map naming port 0
+                // for a shard says "not known yet", and nobody is sent there.)
+                .map(|(id, node)| ShardRegion::new(*node, ShardId::new(*id), listening(*id)))
                 .collect(),
         );
         let shards = regions
@@ -237,6 +248,31 @@ fn join(shard: &mut Shard, token: &str) -> (u64, EntityGuid) {
     (welcome.session, ship)
 }
 
+/// Put `token` on shard `id` as a player who is **already there**.
+///
+/// A new player starts on the scene's spawn point, so only the shard that
+/// owns it takes a fresh join; every other shard answers with a
+/// `JoinRedirect` (`a_fresh_join_is_taken_only_by_the_shard_that_owns_the_spawn_point`
+/// in `acceptance.rs`). In a running cluster a player gets onto such a shard
+/// by flying there. A test that needs somebody on it from its first tick — a
+/// watcher, a player it then places by hand — lets that player in while the
+/// shard runs the map of its own regions alone, in which the spawn point is
+/// its own, and gives it the cluster's map back before anything ticks.
+fn resident(c: &mut Cluster, id: u32, token: &str) -> (u64, EntityGuid) {
+    let shard = c.shard_mut(id);
+    let cluster_map = shard.shard_map().clone();
+    let own: Vec<ShardRegion> = cluster_map
+        .regions
+        .iter()
+        .filter(|r| r.shard == shard.shard())
+        .cloned()
+        .collect();
+    shard.set_shard_map(ShardMap::new(cluster_map.epoch, own));
+    let joined = join(shard, token);
+    shard.set_shard_map(cluster_map);
+    joined
+}
+
 /// A ball of `radius`, `mass` kg, no damping, no gravity, a lively bounce.
 fn ball(radius: f32, mass: f32) -> Body {
     let mut b = Body::dynamic(ShapeRef::Ball { radius });
@@ -288,7 +324,8 @@ const FAR: i64 = 9_765_625_000;
 fn crossing(x0: i64) {
     let mut c = side_by_side(x0);
     let (session_a, _) = join(c.shard_mut(1), "watcher-a");
-    let (session_b, _) = join(c.shard_mut(2), "watcher-b");
+    // (Shard 1 owns the spawn point; shard 2's watcher is there already.)
+    let (session_b, _) = resident(&mut c, 2, "watcher-b");
     let speed = 8.0f32;
     let start = at_border(x0, [-30.0, 40.0, 0.0]);
     let guid = c
@@ -586,6 +623,19 @@ struct Player {
 impl Player {
     fn join(c: &mut Cluster, shard: u32, token: &str) -> Self {
         let (session, ship) = join(c.shard_mut(shard), token);
+        Self {
+            token: token.into(),
+            shard,
+            session,
+            ship,
+            redirected_to: None,
+        }
+    }
+
+    /// A player who is already on `shard`, which does not own the spawn
+    /// point ([`resident`]): the test places its ship by hand.
+    fn resident(c: &mut Cluster, shard: u32, token: &str) -> Self {
+        let (session, ship) = resident(c, shard, token);
         Self {
             token: token.into(),
             shard,
@@ -1056,7 +1106,9 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
     let anchor = c.shards[0].installed_scene().expect("installed").1;
     let floor = space_scene::demo::FLOOR;
     let crate_guid = throw(&mut c, 2);
-    let mut player = Player::join(&mut c, 1, "stander");
+    // (The spawn point is shard 2's: the player is on shard 1 already, and
+    // put where it stands by hand.)
+    let mut player = Player::resident(&mut c, 1, "stander");
     // Half a metre from the border, on shard 1's side of it.
     let stand = WorldPos::from_f64_metres_around(anchor, [16.5, floor + 1.69, BORDER_Z - 0.6]);
     assert_eq!(
@@ -1146,7 +1198,9 @@ fn a_player_running_through_a_split_showcase_leaves_it_settled() {
         assert!(s.set_scene(SceneState::new(Scene::DemoArea.id(), 1)));
     }
     let anchor = c.shards[0].installed_scene().expect("scene").1;
-    let mut player = Player::join(&mut c, 1, "runner");
+    // (The spawn point is shard 2's: the runner is on shard 1 already, and
+    // put on its mark by hand.)
+    let mut player = Player::resident(&mut c, 1, "runner");
     let start = WorldPos::from_f64_metres_around(anchor, [BORDER_X - 3.0, 0.0, 2.8]);
     assert_eq!(
         c.shards[0].shard_map().lookup(&start),
@@ -1785,13 +1839,22 @@ fn a_busy_spawn_point_never_puts_a_ship_across_a_border() {
     );
     assert!(at(spread[25])[2] < BORDER_Z, "{:?}", at(spread[25]));
 
-    // A shard that does not own the spawn point still puts a joiner on the
-    // centre of its own region (until it can send it to the one that does).
-    let (_, elsewhere) = join(four.shard_mut(2), "elsewhere");
-    assert_eq!(
-        four.state(elsewhere).expect("ship").pos,
-        NodeRef::new(64, [1, 1, 0]).center()
-    );
+    // A shard that does not own the spawn point has no place for a joiner:
+    // it sends it to the shard that does, and spawns nothing. (It used to put
+    // the ship on the centre of its own region.)
+    let ships_before = four.shard(2).stats().ships;
+    let refused = four
+        .shard_mut(2)
+        .join(&space_net::hello("elsewhere"))
+        .expect_err("shard 2 does not own the spawn point");
+    let space_server::shard::JoinRefusal::Elsewhere(redirect) = refused else {
+        panic!("expected a redirect to the spawn point's owner, got {refused:?}");
+    };
+    assert_eq!(redirect.shard, ShardId::new(1));
+    assert_eq!(redirect.shard_map, map);
+    assert_eq!(four.shard(2).free_spawn_point(), None);
+    assert_eq!(four.shard(2).stats().ships, ships_before);
+    assert_eq!(four.shard(2).stats().clients, 0);
 }
 
 /// The `Visual` (component 5) a frame entry carries, if any.
@@ -1811,7 +1874,8 @@ fn a_players_ship_is_drawn_as_a_player_everywhere() {
     use space_scene::visual::PLAYER;
     let mut c = side_by_side(0);
     let mut player = Player::join(&mut c, 1, "walker");
-    let (watcher, _) = join(c.shard_mut(2), "watcher");
+    // (Shard 1 owns the spawn point; the watcher is on shard 2 already.)
+    let (watcher, _) = resident(&mut c, 2, "watcher");
     let stray = c
         .shard_mut(1)
         .spawn_ship_for(0, at_border(0, [-40.0, 10.0, 0.0]));

@@ -77,6 +77,18 @@ use crate::messages::Message;
 /// [`crate::RejectReason::Draining`] answer to it means "ask again", and a
 /// shard-to-shard [`crate::Hello`] carries the peer token behind the shard id
 /// in its existing token field (`shard:<id>:<token>`).
+///
+/// **Still version 6** (one address): version 6 has never been released —
+/// nothing built from it has been pushed to `main` — so the layout changes of
+/// the sharding branch all live in it instead of each taking a number.
+/// [`crate::ShardRegion`] carries a **client endpoint** behind its endpoint
+/// (so every message with a shard map in it changed: `Welcome`, `Redirect`,
+/// `DirectoryReply`, `ShardWelcome`, a `ShardHello`'s claim);
+/// [`crate::ShardHello`] carries an optional client endpoint before the
+/// secret, which stays its last field; [`crate::RejectReason::Starting`] and
+/// the message [`crate::JoinRedirect`] (wire tag 28) were appended.
+/// [`crate::Hello`] keeps its layout, as in every version: a peer of another
+/// version is still told so with a readable `Reject`.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Largest accepted frame payload, in bytes (1 MiB).

@@ -105,6 +105,15 @@ const WRITE_QUEUE: usize = 64;
 /// it only bounds growth against a peer that has stopped reading.
 const PEER_QUEUE: usize = 256;
 
+/// How long a client the shard has let go of (see [`ShardNet::serve`]'s
+/// writer) is given to read the shard's last word before its connection is
+/// closed.
+const LAST_WORD_DRAIN: Duration = Duration::from_secs(1);
+
+/// Application close code for a client connection the shard closes after
+/// sending the client on to another shard.
+const SENT_ON_CLOSE_CODE: u32 = 0x25;
+
 /// The `player_token` prefix that marks a connection as coming from another shard.
 pub const PEER_TOKEN_PREFIX: &str = "shard:";
 
@@ -355,10 +364,12 @@ impl ShardNet {
         };
         let welcome = match joined {
             Ok(welcome) => welcome,
-            Err(reason) => {
-                // The refusal has to *arrive*: writing it and returning would
-                // drop the connection and the close would beat the reason there.
-                conn.reject(reason).await;
+            Err(refusal) => {
+                // Not welcomed: refused, or sent to the shard a new player
+                // starts on (`Shard::join`). Either answer has to *arrive*:
+                // writing it and returning would drop the connection and the
+                // close would beat it there.
+                conn.turn_away(&refusal.into_message()).await;
                 return;
             }
         };
@@ -378,7 +389,21 @@ impl ShardNet {
             let dead = Arc::clone(&dead);
             tokio::spawn(async move {
                 while let Some(message) = rx.recv().await {
+                    // The shard's last word to a client it has let go of (one
+                    // that came for a handoff that never completed, on a shard
+                    // that does not own the spawn point): where a new player
+                    // starts, or "try again". Nothing follows it.
+                    let last = matches!(message, Message::JoinRedirect(_) | Message::Reject(_));
                     if conn.send(&message).await.is_err() {
+                        dead.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    if last {
+                        // Given a moment to be read (the client closes when it
+                        // has), then closed from here.
+                        let _ =
+                            tokio::time::timeout(LAST_WORD_DRAIN, conn.connection().closed()).await;
+                        conn.close(SENT_ON_CLOSE_CODE, "sent on");
                         dead.store(true, Ordering::SeqCst);
                         return;
                     }

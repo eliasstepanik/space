@@ -9,11 +9,13 @@
 #   scripts/dev.sh [options] [-- extra space-client arguments]
 #
 #   --topology orchestrated|single|two-shards   (default: orchestrated)
-#       orchestrated  the orchestrator (127.0.0.1:7900, web UI on
-#                     http://127.0.0.1:7980/) plus one shard (127.0.0.1:7777)
-#                     that registers with it. Change the scene for every shard
-#                     and client in the web UI. With --min-shards N the
-#                     orchestrator starts the shards itself instead (below).
+#       orchestrated  the orchestrator: its player port on 127.0.0.1:7777 -
+#                     the one address a client connects to - its control port
+#                     on 127.0.0.1:7900 (shards only) and its web UI on
+#                     http://127.0.0.1:7980/. It starts the shards itself
+#                     (--min-shards, default 1; below) and sends every client
+#                     to the one that owns the spawn point. Change the scene
+#                     for every shard and client in the web UI. Needs curl.
 #       single        one standalone shard on 127.0.0.1:7777
 #       two-shards    two standalone shards that are neighbours along +X
 #                     (7777 owns cell 0, 7778 owns cell 1): fly +X (hold D for
@@ -28,10 +30,12 @@
 #       HTTP API is served on 127.0.0.1:8098. stream: headless, streaming to
 #       browser viewers on --stream (default 127.0.0.1:8099).
 #   --connect-screen     start the client on the connect screen instead of
-#                        connecting to the first shard at once (a client that
-#                        connects at once also reconnects by itself when the
-#                        connection fails or is lost; from the connect screen
-#                        nothing is retried)
+#                        connecting to 127.0.0.1:7777 at once - the
+#                        orchestrator's player port, or the first shard in
+#                        single and two-shards (a client that connects at once
+#                        also reconnects there by itself when the connection
+#                        fails or is lost; from the connect screen nothing is
+#                        retried)
 #   --harness ADDR       serve the harness HTTP API there
 #   --script FILE        run a Lua script against the client; its outcome is
 #                        this script's exit code
@@ -39,15 +43,15 @@
 #                        (default target/dev/harness-out)
 #   --stream ADDR        where the stream client serves viewers
 #   --size WxH  --quality high|medium|low|ci  --glb FILE  --no-vsync
-#   --min-shards N       orchestrated only (default 0 = the one shard above,
-#                        started by this script): the orchestrator starts and
-#                        keeps N shards running by itself (space-orchestrator
-#                        --launcher process --min-shards N), each a space-server
-#                        process on a port from 7870 up, logging to
-#                        target/dev/shard-<port>.log. With 4 the demo area lies
-#                        in four shard areas that meet at pos x = -6 / z = -4.
-#                        A shard that dies is replaced. The client is pointed
-#                        at the shard that owns the spawn point. Needs curl.
+#   --min-shards N       orchestrated only (default 1): the orchestrator starts
+#                        and keeps N shards running by itself
+#                        (space-orchestrator --launcher process --min-shards N),
+#                        each a space-server process on a port from 7870 up,
+#                        logging to target/dev/shard-<port>.log. With 4 the
+#                        demo area lies in four shard areas that meet at pos
+#                        x = -6 / z = -4. A shard that dies is replaced, and a
+#                        client that was on it comes back by itself through
+#                        the player port.
 #   --port-offset N      add N to every port (a second stack beside the first)
 #   --no-build           use the release binaries that are already built
 #   --servers-only       start the server side and return (stop with --stop)
@@ -93,7 +97,8 @@ size=""
 quality="high"
 glb=""
 port_offset=0
-min_shards=0
+min_shards=1
+min_shards_given=0
 connect_screen=0
 no_vsync=0
 no_build=0
@@ -128,7 +133,7 @@ while [ "$#" -gt 0 ]; do
         --quality) need_value "$@"; quality="$2"; shift 2 ;;
         --glb) need_value "$@"; glb="$2"; shift 2 ;;
         --port-offset) need_value "$@"; port_offset="$2"; shift 2 ;;
-        --min-shards) need_value "$@"; min_shards="$2"; shift 2 ;;
+        --min-shards) need_value "$@"; min_shards="$2"; min_shards_given=1; shift 2 ;;
         --connect-screen) connect_screen=1; shift ;;
         --no-vsync) no_vsync=1; shift ;;
         --no-build) no_build=1; shift ;;
@@ -163,10 +168,10 @@ esac
 case "$min_shards" in
     # 8 is the orchestrator's own limit: the root's shard and one per layout
     # cell (it refuses to start with more).
-    [0-8]) ;;
-    *) die "--min-shards must be a number from 0 to 8 (got '$min_shards')" ;;
+    [1-8]) ;;
+    *) die "--min-shards must be a number from 1 to 8 (got '$min_shards')" ;;
 esac
-if [ "$min_shards" -gt 0 ] && [ "$topology" != orchestrated ]; then
+if [ "$min_shards_given" = 1 ] && [ "$topology" != orchestrated ]; then
     die "--min-shards needs the orchestrated topology: it is the orchestrator that starts the shards"
 fi
 
@@ -297,7 +302,11 @@ fi
 
 # Every server address is a literal IPv4 socket address: the servers do not
 # resolve host names.
-shard1="127.0.0.1:$((7777 + port_offset))"
+#
+# $entry is the address a client connects to: the orchestrator's player port
+# in the orchestrated topology (it sends the client on to the shard that owns
+# the spawn point), the first shard itself in the other two.
+entry="127.0.0.1:$((7777 + port_offset))"
 shard2="127.0.0.1:$((7778 + port_offset))"
 orchestrator="127.0.0.1:$((7900 + port_offset))"
 webui="127.0.0.1:$((7980 + port_offset))"
@@ -309,72 +318,67 @@ case "$topology" in
         if [ "$scene_given" = 1 ]; then
             rm -f "$dev_dir/orchestrator.id.scene"
         fi
-        if [ "$min_shards" -gt 0 ]; then
-            # The orchestrator starts the shards itself: one space-server
-            # process each, on a port of this range, logging to target/dev.
-            first_port=$((7870 + port_offset))
-            started=$(date +%s)
-            start_server orchestrator space-orchestrator \
-                --bind "$orchestrator" --state orchestrator.id \
-                --webui "$webui" --scene "$scene" \
-                --launcher process --min-shards "$min_shards" \
-                --host-port-range "$first_port-$((7899 + port_offset))" \
-                --shard-log-dir "$dev_dir"
-            # Wait until every shard has its region, and ask the orchestrator
-            # which one owns the spawn point: that is where a client joins.
-            shard1=""
-            tries=0
-            while [ -z "$shard1" ]; do
-                sleep 0.25
-                state="$(curl -s --max-time 5 "http://$webui/api/state" || true)"
-                regions="$(printf '%s' "$state" | grep -o '"nesting":' | wc -l | tr -d ' ')"
-                live="$(printf '%s' "$state" | grep -o '"role":"owner","connected":true' | wc -l | tr -d ' ')"
-                if [ "$regions" -ge "$min_shards" ] && [ "$live" -ge "$min_shards" ] &&
-                    printf '%s' "$state" | grep -q '"epoch_in_flight":null'; then
-                    # The one region nested in no other is the root.
-                    shard1="$(printf '%s' "$state" | sed -n 's/.*"endpoint":"\([^"]*\)","nesting":0.*/\1/p')"
-                fi
-                tries=$((tries + 1))
-                if [ -z "$shard1" ] && [ "$tries" -ge 240 ]; then
-                    tail -n 20 "$dev_dir/orchestrator.out.log" | sed 's/^/  /'
-                    stop_servers
-                    echo "dev.sh: the orchestrator did not bring up $min_shards shards within 60 s; see $dev_dir/orchestrator.out.log and shard-*.log" >&2
-                    exit 1
-                fi
-            done
-            echo "$min_shards shards started by the orchestrator own $regions regions after $(($(date +%s) - started)) s"
-        else
-            start_server orchestrator space-orchestrator \
-                --bind "$orchestrator" --state orchestrator.id \
-                --webui "$webui" --scene "$scene"
-            # The shard registers without a region and is given the root.
-            start_server shard-1 space-server --orchestrator "$orchestrator" --bind "$shard1"
-        fi
+        # The orchestrator starts the shards itself: one space-server process
+        # each, on a port of this range, logging to target/dev. Players
+        # connect to its player port and are sent on to a shard.
+        first_port=$((7870 + port_offset))
+        started=$(date +%s)
+        start_server orchestrator space-orchestrator \
+            --bind "$orchestrator" --player-bind "$entry" \
+            --state orchestrator.id \
+            --webui "$webui" --scene "$scene" \
+            --launcher process --min-shards "$min_shards" \
+            --host-port-range "$first_port-$((7899 + port_offset))" \
+            --shard-log-dir "$dev_dir"
+        # Wait until every shard has its region and the player port has a
+        # shard to send a client to.
+        ready=0
+        tries=0
+        while [ "$ready" = 0 ]; do
+            sleep 0.25
+            state="$(curl -s --max-time 5 "http://$webui/api/state" || true)"
+            regions="$(printf '%s' "$state" | grep -o '"nesting":' | wc -l | tr -d ' ')"
+            live="$(printf '%s' "$state" | grep -o '"role":"owner","connected":true' | wc -l | tr -d ' ')"
+            if [ "$regions" -ge "$min_shards" ] && [ "$live" -ge "$min_shards" ] &&
+                printf '%s' "$state" | grep -q '"epoch_in_flight":null' &&
+                printf '%s' "$state" | grep -q '"answer":"redirect"'; then
+                ready=1
+            fi
+            tries=$((tries + 1))
+            if [ "$ready" = 0 ] && [ "$tries" -ge 240 ]; then
+                tail -n 20 "$dev_dir/orchestrator.out.log" | sed 's/^/  /'
+                stop_servers
+                echo "dev.sh: the orchestrator did not bring up $min_shards shard(s) within 60 s; see $dev_dir/orchestrator.out.log and shard-*.log" >&2
+                exit 1
+            fi
+        done
+        sends_to="$(printf '%s' "$state" | sed -n 's/.*"sends_to_shard":\([0-9]*\).*/\1/p')"
+        echo "$min_shards shard(s) started by the orchestrator own $regions region(s) after $(($(date +%s) - started)) s; players are sent to shard $sends_to"
         ;;
     single)
         start_server shard-1 space-server \
-            --shard 1 --region 64:0:0:0 --bind "$shard1" --scene "$scene"
+            --shard 1 --region 64:0:0:0 --bind "$entry" --scene "$scene"
         ;;
     two-shards)
         start_server shard-1 space-server \
-            --shard 1 --region 64:0:0:0 --bind "$shard1" \
+            --shard 1 --region 64:0:0:0 --bind "$entry" \
             --peer "2:$shard2:64:1:0:0" --scene "$scene"
         start_server shard-2 space-server \
             --shard 2 --region 64:1:0:0 --bind "$shard2" \
-            --peer "1:$shard1:64:0:0:0" --scene "$scene"
+            --peer "1:$entry:64:0:0:0" --scene "$scene"
         ;;
 esac
 
 echo
-echo "  shard          $shard1 (QUIC; the address to type on the connect screen)"
-if [ "$min_shards" -gt 0 ]; then
-    echo "                 (the shard that owns the spawn point; $min_shards shards on ports from $((7870 + port_offset)), logs in shard-<port>.log)"
+if [ "$topology" = orchestrated ]; then
+    echo "  player port    $entry (QUIC; the address to type on the connect screen)"
+    echo "                 ($min_shards shard(s) behind it on ports from $((7870 + port_offset)), logs in shard-<port>.log)"
+    echo "  web UI         http://$webui/  (scene, shards, players)"
+else
+    echo "  shard          $entry (QUIC; the address to type on the connect screen)"
 fi
 if [ "$topology" = two-shards ]; then
     echo "  second shard   $shard2"
-fi
-if [ "$topology" = orchestrated ]; then
-    echo "  web UI         http://$webui/  (scene, shards, players)"
 fi
 
 if [ "$servers_only" = 1 ]; then
@@ -385,7 +389,7 @@ fi
 
 arguments=(--quality "$quality")
 if [ "$connect_screen" = 0 ]; then
-    arguments+=(--server "$shard1")
+    arguments+=(--server "$entry")
 fi
 if [ -n "$size" ]; then
     arguments+=(--size "$size")

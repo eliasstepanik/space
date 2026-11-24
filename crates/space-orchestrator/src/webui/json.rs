@@ -237,9 +237,34 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         o.string("form_token", form_token);
     });
 
+    // The one address players type (null: the orchestrator serves none), the
+    // shard a new player starts on, and what a hello is answered with now.
+    root.opt_object("player_port", snapshot.player_port, |o, port| {
+        o.display("bind", port.addr);
+        o.string(
+            "answer",
+            if port.sends_to.is_some() {
+                "redirect"
+            } else {
+                "starting"
+            },
+        );
+        o.opt_uint(
+            "sends_to_shard",
+            port.sends_to.map(|shard| u64::from(shard.0)),
+        );
+        o.uint("redirected", port.redirected);
+        o.uint("told_starting", port.turned_away);
+        o.uint("refused_busy", port.refused);
+    });
+
     root.object("map", |o| {
         o.uint("epoch", snapshot.epoch);
         o.uint("max_regions", snapshot.max_regions as u64);
+        o.opt_uint(
+            "spawn_owner",
+            snapshot.spawn_owner.map(|shard| u64::from(shard.0)),
+        );
         match snapshot.last_commit_tick {
             Some(tick) => o.tick("last_commit_tick", tick, now),
             None => o.null("last_commit_tick"),
@@ -248,6 +273,7 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             node(o, "node", region.node);
             o.uint("shard", u64::from(region.shard.0));
             o.opt_display("endpoint", region.endpoint);
+            o.opt_display("client_endpoint", region.client_endpoint);
             o.uint("nesting", u64::from(region.nesting));
             o.opt_string("parent", region.parent.map(node_path).as_deref());
             match region.octant {
@@ -281,6 +307,7 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         o.boolean("registered", shard.registered);
         o.boolean("launched", shard.launched);
         o.opt_display("advertised", shard.advertised);
+        o.opt_display("client_endpoint", shard.client_endpoint);
         o.array("regions", &shard.regions, |out, region| {
             write_string(out, &node_path(*region));
         });

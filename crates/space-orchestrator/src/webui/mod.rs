@@ -1169,6 +1169,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 7_001)),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("the root owner registers");
@@ -1466,6 +1467,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: loopback(),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         });
         let (handle, _port) = crate::ops::channel(orch.snapshot());
@@ -1534,6 +1536,103 @@ mod tests {
         );
         let page = text(&service.handle(&get("/")).await);
         assert!(!page.contains("peer-token-never-shown"));
+    }
+
+    /// The page and the JSON show the one address players type, whom a hello
+    /// there is sent to, and — per shard and per region — where players dial
+    /// it beside where shards do. Without a player port the page says so.
+    ///
+    /// Mutation this catches: a client endpoint that is in the map and
+    /// nowhere an operator can see it (a player sent to the wrong address is
+    /// then debugged from packet captures), or a page that needs a script to
+    /// show it.
+    #[tokio::test]
+    async fn the_page_and_the_json_show_the_player_port_and_each_client_endpoint() {
+        let config = OrchestratorConfig {
+            cluster: "space-test".into(),
+            player_bind: Some(SocketAddr::from(([127, 0, 0, 1], 7_777))),
+            ..OrchestratorConfig::default()
+        };
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                config.bind,
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(MemoryCounterSink::default()));
+        let mut control =
+            ControlPlane::new(config, ids, EpochPublisher::new(map), "peer-token".into());
+        control.set_unclaimed_root_owner(ShardId::new(1));
+        let mut orch = Orchestrator::new(control, Arc::new(NoLauncher));
+
+        // Nobody has claimed the root: players are told the cluster is
+        // starting.
+        let (handle, _port) = crate::ops::channel(orch.snapshot());
+        let service = service_with(handle, None, &[]);
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        assert!(
+            json.contains(
+                "\"player_port\":{\"bind\":\"127.0.0.1:7777\",\"answer\":\"starting\",\
+                 \"sends_to_shard\":null,\"redirected\":0,\"told_starting\":0,\"refused_busy\":0}"
+            ),
+            "{json}"
+        );
+        let page = text(&service.handle(&get("/")).await);
+        assert!(page.contains("player port (QUIC)"), "{page}");
+        assert!(page.contains("127.0.0.1:7777"));
+        assert!(page.contains("the cluster is starting"), "{page}");
+
+        // A shard the process launcher started registers: it listens on
+        // loopback and sends its players to the host they dialed.
+        orch.handle_shard_hello(&ShardHello {
+            cluster: "space-test".into(),
+            shard: ShardId::NONE,
+            endpoint: SocketAddr::from(([127, 0, 0, 1], 7_870)),
+            region: None,
+            client_endpoint: Some(SocketAddr::from(([0, 0, 0, 0], 7_870))),
+            secret: String::new(),
+        })
+        .expect("the root");
+        let (handle, _port) = crate::ops::channel(orch.snapshot());
+        let service = service_with(handle, None, &[]);
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        for needle in [
+            "\"answer\":\"redirect\",\"sends_to_shard\":1",
+            "\"spawn_owner\":1",
+            // The region, and the shard.
+            "\"endpoint\":\"127.0.0.1:7870\",\"client_endpoint\":\"0.0.0.0:7870\"",
+            "\"advertised\":\"127.0.0.1:7870\",\"client_endpoint\":\"0.0.0.0:7870\"",
+        ] {
+            assert!(json.contains(needle), "missing {needle} in {json}");
+        }
+        let page = text(&service.handle(&get("/")).await);
+        for needle in [
+            "players are sent to",
+            "shard 1, which owns the spawn point",
+            "<th>players dial</th>",
+            "0.0.0.0:7870",
+            "the host they dialed, port 7870",
+            "127.0.0.1:7870, players dial 0.0.0.0:7870",
+            "control endpoint (QUIC, shards only)",
+        ] {
+            assert!(page.contains(needle), "missing {needle:?} in {page}");
+        }
+        assert!(!page.contains("<script"), "no script on the page");
+
+        // No player port: the page says so, the JSON says null.
+        let (plain, _port, _) = super::tests::service(None);
+        let json = text(&plain.handle(&get("/api/state")).await);
+        assert!(json.contains("\"player_port\":null"), "{json}");
+        assert!(
+            json.contains("\"client_endpoint\":\"127.0.0.1:7001\""),
+            "a shard that asked for none: players dial its address: {json}"
+        );
+        let page = text(&plain.handle(&get("/")).await);
+        assert!(page.contains("players dial a shard directly"), "{page}");
     }
 
     /// A shard that has sent no report shows as "no report", never as zeros.
@@ -2091,6 +2190,7 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: SocketAddr::from(([127, 0, 0, 1], 7_002)),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("the new shard registers");

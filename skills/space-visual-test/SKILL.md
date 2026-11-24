@@ -12,8 +12,12 @@ The client is online only. To see anything you need a shard; to change the
 scene you need the orchestrator. So the unit of visual testing is always:
 
 ```
-orchestrator (web UI) ── shard(s) ── client ── you (harness API / Lua / browser viewer)
+orchestrator (player port, web UI) ── shard(s) ── client ── you (harness API / Lua / browser viewer)
 ```
+
+A client is given **one address**, the orchestrator's player port. The
+orchestrator sends it on to the shard that owns the scene's spawn point; from
+then on the client talks to shards only.
 
 Everything below was run on Windows 11 (RTX 4080) and on Linux (WSL Ubuntu
 24.04, Mesa 25 lavapipe, no GPU, no display).
@@ -30,25 +34,30 @@ That builds the release binaries and starts, in the background:
 
 | what | where |
 |---|---|
-| orchestrator | `127.0.0.1:7900` (QUIC), **web UI `http://127.0.0.1:7980/`**, JSON at `/api/state` |
-| shard | `127.0.0.1:7777` — the address a client connects to |
-| logs | `target/dev/*.log` |
+| orchestrator | **player port `127.0.0.1:7777`** (QUIC) — the address a client connects to; control port `127.0.0.1:7900` (QUIC, shards only); **web UI `http://127.0.0.1:7980/`**, JSON at `/api/state` |
+| shard(s) | started by the orchestrator, one `space-server` process each on ports from `7870`; a client is sent to them, it is never pointed at one |
+| logs | `target/dev/*.log`, the shards' in `target/dev/shard-<port>.log` |
 
-- `--min-shards 4` / `-MinShards 4` lets the orchestrator start the shards
-  itself (`space-orchestrator --launcher process --min-shards 4`): four
-  `space-server` processes on ports from 7870, logs in
-  `target/dev/shard-<port>.log`, the demo area in four shard areas that meet at
-  HUD `pos` x = -6 / z = -4. The script waits until all four own their regions
-  (about a second) and prints the address of the shard that owns the spawn
-  point: connect a client **there** (the other shards do not put a joiner on
-  the spawn point yet). `--stop` stops those shards too: it reads their pids
-  from `target/dev/launched-shards.pid` — the orchestrator's own list of the
-  shards it has running — and stops each only if its executable lies in this
-  checkout's `target/release` (a pid may belong to something else by now).
-  At most 8: the orchestrator refuses a `--min-shards` it cannot place.
+- The orchestrator always starts its shards itself (`space-orchestrator
+  --player-bind … --launcher process --min-shards N`), one by default.
+  `--min-shards 4` / `-MinShards 4` gives four: the demo area in four shard
+  areas that meet at HUD `pos` x = -6 / z = -4. The script waits until every
+  shard owns its region and the player port has a shard to send a client to
+  (about a second), and says which shard that is. `--stop` stops those shards
+  too: it reads their pids from `target/dev/launched-shards.pid` — the
+  orchestrator's own list of the shards it has running — and stops each only
+  if its executable lies in this checkout's `target/release` (a pid may belong
+  to something else by now). At most 8: the orchestrator refuses a
+  `--min-shards` it cannot place.
+- **Every address leads to the spawn point.** The player port answers a
+  client's hello with the shard that owns the spawn point; a shard that is
+  dialed directly and does not own it does the same. While no shard owns it
+  (the cluster is starting, the root's shard is being replaced) the client is
+  told "the cluster is starting" and, started with `--server`, tries again.
 - `--topology single` is one shard with no orchestrator (scene from
-  `--scene`); `--topology two-shards` is the seamless-handoff setup (fly +X,
-  hold D about 15 s, the HUD goes to `shard 2  handoffs 1`).
+  `--scene`), on `127.0.0.1:7777` itself; `--topology two-shards` is the
+  seamless-handoff setup (fly +X, hold D about 15 s, the HUD goes to
+  `shard 2  handoffs 1`).
 - `--port-offset N` moves every port, for a second stack or when the defaults
   are taken. `--no-build` reuses the binaries. Both scripts honour
   `CARGO_TARGET_DIR`.
@@ -60,14 +69,17 @@ That builds the release binaries and starts, in the background:
 Without the scripts:
 
 ```sh
-space-orchestrator --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
-space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+space-orchestrator --bind 127.0.0.1:7900 --player-bind 127.0.0.1:7777 --state orchestrator.id --webui 127.0.0.1:7980
+space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7870
 # a second, third ... shard is given the next layout cell beside the spawn point:
-space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7778
+space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7871
+space-client --server 127.0.0.1:7777          # the player port; never a shard's address
 ```
 
 A shard names neither id nor region: the orchestrator gives it both (the first
-one the root, so start it first and connect clients to it).
+one the root, and with it the spawn point). Clients connect to the player
+port; `--player-bind` is off unless given, and then a client has to dial a
+shard — any of them: it is sent to the one that owns the spawn point.
 
 ## 2. Drive a client
 
@@ -78,7 +90,7 @@ No window, no display, works on software Vulkan.
 ```sh
 space-client --headless --harness 127.0.0.1:8098            # starts on the connect screen
 curl http://127.0.0.1:8098/                                  # the route list
-curl http://127.0.0.1:8098/state                             # screen, address, shard, position, speed, fps ...
+curl http://127.0.0.1:8098/state                             # screen, address, shard, shard_address, position, speed, fps ...
 curl -o frame.png http://127.0.0.1:8098/frame.png            # what the player sees now (or /frame.jpg)
 curl -X POST http://127.0.0.1:8098/input -d '[{"text":"7"},{"press":"backspace"},{"press":"enter"}]'
 curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'
@@ -89,7 +101,12 @@ curl -X POST http://127.0.0.1:8098/quit
 
 `screen` in `/state` is `connect`, `connecting`, `online` or `error` (with the
 reason in `error`; `retry_in_s` counts down when a `--server` client is
-retrying). While playing, `scene` and `scene_revision` say what the shard
+retrying). `address` is the **entry** address — what was typed or given with
+`--server`, usually the orchestrator's player port — and stays that for the
+whole session; `shard_address` is the `ip:port` of the shard actually being
+played on (`null` while not on one), and `shard` its id: the two change with a
+shard transition and when the client comes back after its shard died, the
+entry address never does. While playing, `scene` and `scene_revision` say what the shard
 shows, `position` is the absolute world position and `scene_position` the same
 in metres from the scene's spawn point (what the HUD prints). The physics:
 `gravity` (m/s² at the ship: 9.81 in the demo area's gravity room, 0 in
@@ -134,7 +151,9 @@ client.type("127.0.0.1:7777")  client.press("enter")
 client.wait_until(function() return client.state().screen == "online" end, 10)
 client.hold("w", 1.5)          client.key_down("d")  client.key_up("d")
 client.turn(30, -10)           -- degrees: yaw left+, pitch up+
-local s = client.state()       -- same fields as GET /state (s.scene, s.scene_position, ...)
+local s = client.state()       -- same fields as GET /state (s.scene, s.scene_position, ...);
+                               -- s.address = the entry address that was dialed, s.shard_address = the
+                               -- shard being played on (nil while not on one), s.shard = its id
 client.wait_until(function() return client.state().scene == "solar" end, 10)   -- after a scene switch
 client.wait(0.5)  client.wait_frames(2)
 client.screenshot("after.png") -- below --out-dir; returns the path
@@ -228,11 +247,22 @@ Check what your change touches, and one step either side of it.
   lands (HUD `gravity 9.81 m/s2  landed`) and lifts off again with Space.
 - **Other scenes:** switch to each one and back.
 - **Players:** a second client must see the first one's character.
+- **One address:** a client given the player port comes online on the shard
+  that owns the spawn point, HUD `pos 0.0 0.0 0.0`; `/state` has the player
+  port as `address` and the shard's as `shard_address`. A second client
+  pointed straight at **another** shard's port ends up on the same shard,
+  beside the first (not in the middle of another cell), and each sees the
+  other's character. `/api/state` → `player_port` (`bind`, `answer`:
+  `redirect` or `starting`, `sends_to_shard`, counters) and
+  `client_endpoint` per region and shard; the page shows the same on its
+  Cluster card and in the shard table's "players dial" column
+  (`0.0.0.0:<port>` = "the host they dialed").
 - **Four shard areas:** `--min-shards 4`. `GET /api/state` (and the page)
   show four regions, each with a connected owner; `fleet` says what the
   orchestrator keeps running and what is starting. From the spawn point
   (`pos 0 0 0`, the root's shard) cross x = -6 and z = -4: the HUD's shard
-  number changes at each crossing and `handoffs` counts up; nothing may
+  number changes at each crossing, `handoffs` counts up and `/state`'s
+  `shard_address` changes with it (`address` does not); nothing may
   vanish or turn black. Stop one shard **by its pid**, never by name:
   `target/dev/launched-shards.pid` lists the pids of exactly the shards the
   orchestrator has running (it rewrites the file whenever one starts, stops
@@ -243,12 +273,15 @@ Check what your change touches, and one step either side of it.
   a **new id**, its epoch commits, the scene's revision rises by one — the
   bodies are built again — and the pid file names the replacement in place of
   the dead one. The replacement listens on **another port** (the next free
-  one of the range; `/api/state` has it), so a client that was on the dead
-  shard does not come back by itself: it keeps retrying the old address and
-  has to be pointed at the new one. That holds for the root's shard too —
-  after it was replaced, the address the dev script printed is stale, and the
-  owner of the spawn point is whatever `/api/state` names for the region with
-  `nesting` 0.
+  one of the range; `/api/state` has it). A client that was on the dead shard
+  **comes back by itself** if it was started with `--server <player port>`:
+  it notices the loss when the transport's idle timeout runs out (about
+  10 s — a killed process says no goodbye), shows `lost the connection`,
+  retries the player port after 2 s and is sent to the shard that owns the
+  spawn point now, where it starts on the spawn point again (`pos 0 0 0`:
+  where a player was is not kept). While the root's shard is being replaced
+  the player port answers "the cluster is starting"; afterwards
+  `player_port.sends_to_shard` names the replacement.
 - **Handoff:** `--topology two-shards`, fly across (the border is at HUD
   `pos` x = 512); the picture must not jump and the scene must stay where it
   was. Players and bodies within 64 m (plus 3 s of their motion) of a border
@@ -268,6 +301,7 @@ Check what your change touches, and one step either side of it.
   --region 64:1:1:0 --peer 1:127.0.0.1:<p1>:63:0:0:0 --scene demo-area`
   (shard 2 owns what lies at z < -4 with x > -6: the bowl end of the gravity
   room; `64:0:1:1` instead is x < -6, the zero-g corner). Connect to shard 1
+  (or to shard 2, which sends you to shard 1: it owns the spawn point)
   — you arrive on the spawn point, `pos 0.0 0.0 0.0` — walk into the room
   and on past the crate stack towards the bowl, over z = -4 (the HUD goes
   to `shard 2  handoffs 1`), and back. The bodies near the player move with
@@ -298,3 +332,7 @@ that you did.
   is refused on a protocol-version mismatch, with a readable reason).
 - On lavapipe expect about 5-10 frames a second at 640x480; give scripts time.
 - Ports already taken: `--port-offset`.
+- Point a client at the **player port** (7777), not at the control port
+  (7900, shards only — a client that dials it is told so on its connect
+  screen) and not at a shard's port from `/api/state` (it works, but after
+  that shard is replaced the address is dead; the player port's never is).

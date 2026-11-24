@@ -40,6 +40,7 @@ fn options() -> OrchestratedOptions {
         shard: ShardId::NONE,
         bind: loopback0(),
         advertise: None,
+        client_endpoint: None,
         claim_region: None,
         cluster: CLUSTER.to_owned(),
         secret: "the-cluster-secret".to_owned(),
@@ -105,7 +106,16 @@ fn scripted_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>
                 }
                 Answer::Welcome(id) => {
                     let shard = ShardId::new(id);
-                    let region = ShardRegion::new(root(), shard, hello.endpoint);
+                    // As the real orchestrator records a shard: an advertised
+                    // address without an IP gets the one the control
+                    // connection comes from, and players are sent where the
+                    // hello asks (else to that same address).
+                    let mut endpoint = hello.endpoint;
+                    if endpoint.ip().is_unspecified() {
+                        endpoint.set_ip(conn.remote_address().ip());
+                    }
+                    let region = ShardRegion::new(root(), shard, endpoint)
+                        .with_client_endpoint(hello.client_endpoint.unwrap_or(endpoint));
                     let welcome = ShardWelcome {
                         shard,
                         region: region.clone(),
@@ -279,6 +289,61 @@ async fn a_shard_stops_when_it_loses_its_orchestrator() {
     .await
     .expect("bounded");
     assert!(refused.is_err(), "a stopped shard welcomes nobody");
+}
+
+/// A shard's two addresses are the orchestrator's word. Its hello carries
+/// what it was started with — an advertised address that may lack an IP, and
+/// the client endpoint it asks for — and it then runs on the region of its
+/// welcome: the internal endpoint as the orchestrator recorded it (IP filled
+/// in), and the client endpoint the orchestrator put into the map. The map a
+/// player is handed names both.
+///
+/// Mutation this catches: the shard writing its *advertised* address back
+/// over the orchestrator's (the map it hands out would name `0.0.0.0` as its
+/// internal endpoint, or lose the client endpoint), or a hello that does not
+/// carry `--client-endpoint`.
+#[tokio::test]
+async fn an_orchestrated_shard_takes_its_two_addresses_from_its_welcome() {
+    let (orch, seen) = scripted_orchestrator(vec![Answer::Welcome(5)]);
+    // The port it will advertise has to be the one it binds: take a free one.
+    let port = {
+        let probe = std::net::UdpSocket::bind(loopback0()).expect("a free port");
+        probe.local_addr().expect("bound").port()
+    };
+    let players_at: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
+    let mut options = options();
+    options.bind = SocketAddr::from(([127, 0, 0, 1], port));
+    options.advertise = Some(SocketAddr::from(([0, 0, 0, 0], port)));
+    options.client_endpoint = Some(players_at);
+    let shard = start_orchestrated(options, orch).await.expect("welcomed");
+
+    {
+        let seen = seen.lock().expect("seen");
+        let hello = &seen.hellos[0].1;
+        assert_eq!(hello.endpoint, SocketAddr::from(([0, 0, 0, 0], port)));
+        assert_eq!(hello.client_endpoint, Some(players_at));
+    }
+    let internal = SocketAddr::from(([127, 0, 0, 1], port));
+    assert_eq!(shard.endpoint, internal, "the IP the orchestrator saw");
+    assert_eq!(shard.client_endpoint, players_at);
+    {
+        let state = shard.state.lock().await;
+        let own = &state.shard_map().regions[0];
+        assert_eq!((own.endpoint, own.client_endpoint), (internal, players_at));
+    }
+    // A player who joins is handed that map (the shard owns the root, and
+    // with it the spawn point).
+    let client = space_net::client_endpoint_for(internal).expect("client endpoint");
+    let (_conn, welcome) =
+        space_net::connect(&client, internal, SERVER_NAME, &space_net::hello("player"))
+            .await
+            .expect("the shard serves");
+    assert_eq!(
+        welcome.shard_map.client_endpoint_of(ShardId::new(5)),
+        Some(players_at)
+    );
+    assert_eq!(welcome.shard_map.regions[0].endpoint, internal);
+    shard.abort();
 }
 
 /// The peer token of the welcome is in force from the first connection: a

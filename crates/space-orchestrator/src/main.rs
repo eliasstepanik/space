@@ -14,6 +14,8 @@
 //!   space-orchestrator --webui 127.0.0.1:7980
 //!   # the scene a fresh cluster shows (default: demo-area)
 //!   space-orchestrator --scene solar
+//!   # the one address players type, and the shards kept running behind it
+//!   space-orchestrator --player-bind 127.0.0.1:7777 --min-shards 4 --launcher process
 //! ```
 //!
 //! There is no argument-parsing dependency (mirrors `space-server`): the grammar
@@ -44,6 +46,37 @@
 //! `127.0.0.1` cannot be told from a local browser: **give the UI a token
 //! before putting any proxy in front of it** ([`space_orchestrator::webui`],
 //! "Without a token").
+//!
+//! # The player port
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--player-bind <addr:port>` | `SPACE_ORCHESTRATOR_PLAYER_BIND` | where players connect; unset = no player port |
+//!
+//! The one address a player types ([`space_orchestrator::player`]). A client
+//! that says hello there is answered with a `JoinRedirect` naming the shard
+//! that owns the scene's spawn point and the map that says where players
+//! reach it — or, while no connected shard owns the spawn point (the cluster
+//! is starting, or that shard is being replaced), with "starting", and the
+//! client tries again. The connection is then closed: game traffic flows
+//! between the client and the shard, never through the orchestrator.
+//!
+//! It is the cluster's **public entry**, not a control surface, so unlike the
+//! control port and the web UI it needs no secret on any bind. In exchange it
+//! can do nothing: it keeps no state per player, reads nothing a peer sends
+//! behind its hello, cannot register a shard and reaches no decision of the
+//! orchestrator — it only ever reads the answer the control loop last
+//! published. The control port (`--bind`) is for shards and tells a player
+//! who dials it so.
+//!
+//! Where a shard's **players** dial it is part of the map: the client
+//! endpoint its hello asks for (`space-server --client-endpoint`), else the
+//! address it advertises. The `process` launcher gives its shards
+//! `0.0.0.0:<host port>`, which a client reads as "the host I dialed, that
+//! port" — so no public host name is configured anywhere. A shard may also
+//! advertise `0.0.0.0:<port>` as its internal address (a container that does
+//! not know its own): the orchestrator then records the IP its control
+//! connection comes from.
 //!
 //! # Limits
 //!
@@ -141,6 +174,7 @@ struct Options {
 
 const USAGE: &str =
     "usage: space-orchestrator [--bind <addr:port>] [--control-addr <addr:port>] [--cluster <id>] \
+                     [--player-bind <addr:port>] \
                      [--state <path>] [--first-id <n>] [--launcher local|process|docker] \
                      [--min-shards <n>] [--max-shards <n>] [--shard-exe <path>] \
                      [--shard-log-dir <dir>] [--host-port-range <a>-<b>] \
@@ -150,6 +184,7 @@ const USAGE: &str =
                      [--webui <addr:port>] [--webui-token <secret> | --webui-token-file <path>] \
                      [--webui-host <name>[:<port>]]... \
      (environment fallbacks: SPACE_ORCHESTRATOR_SCENE for --scene; \
+     SPACE_ORCHESTRATOR_PLAYER_BIND for --player-bind; \
      SPACE_ORCHESTRATOR_MIN_SHARDS, SPACE_ORCHESTRATOR_MAX_SHARDS, SPACE_ORCHESTRATOR_LAUNCHER, \
      SPACE_ORCHESTRATOR_SHARD_EXE, SPACE_ORCHESTRATOR_SHARD_LOG_DIR and \
      SPACE_ORCHESTRATOR_HOST_PORTS for the shard flags; SPACE_CLUSTER_SECRET and \
@@ -160,6 +195,9 @@ const USAGE: &str =
 
 /// Environment fallback for `--scene`.
 const ENV_SCENE: &str = "SPACE_ORCHESTRATOR_SCENE";
+
+/// Environment fallback for `--player-bind`.
+const ENV_PLAYER_BIND: &str = "SPACE_ORCHESTRATOR_PLAYER_BIND";
 
 /// Environment fallback for `--min-shards`.
 const ENV_MIN_SHARDS: &str = "SPACE_ORCHESTRATOR_MIN_SHARDS";
@@ -317,6 +355,7 @@ impl Options {
         let mut peer_token_file: Option<PathBuf> = None;
         let mut webui = WebUiFlags::default();
         let mut scene: Option<String> = None;
+        let mut player_bind: Option<String> = None;
         // The shard flags as given; the environment fills what is missing.
         let mut launcher: Option<String> = None;
         let mut min_shards: Option<String> = None;
@@ -349,6 +388,9 @@ impl Options {
                 }
                 "--cluster" => {
                     config.cluster = value("--cluster")?.clone();
+                }
+                "--player-bind" => {
+                    player_bind = Some(value("--player-bind")?.clone());
                 }
                 "--state" => {
                     config.state_path = PathBuf::from(value("--state")?);
@@ -432,6 +474,23 @@ impl Options {
         // variable counts as unset; a value that makes no sense is an error,
         // never a silent default.
         let set = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+        // The player port: off unless an address is given.
+        if let Some(text) = player_bind.or_else(|| set(ENV_PLAYER_BIND)) {
+            let addr = text
+                .trim()
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("--player-bind ({ENV_PLAYER_BIND}) {text:?}: {e}"))?;
+            if addr.port() != 0 && addr.port() == config.bind.port() {
+                // One UDP port is one listener; said here rather than as a
+                // bind error once the control port is already up.
+                return Err(format!(
+                    "--player-bind {addr} uses the control port's port ({}): players and shards \
+                     connect to different ports",
+                    config.bind
+                ));
+            }
+            config.player_bind = Some(addr);
+        }
         if let Some(name) = launcher.or_else(|| set(ENV_LAUNCHER)) {
             config.launcher = parse_launcher(&name)?;
         }
@@ -589,6 +648,7 @@ async fn serve<L: Launcher + 'static>(
     );
     println!("{}", scene_line(&orchestrator.control.scene, &config));
     println!("{}", shards_line(&config));
+    println!("{}", players_line(&config));
     // The web UI runs in its own task and holds only a handle: it reads the
     // snapshots the loop publishes and offers commands to the loop's queue, so
     // nothing it does (or a client does to it) can hold the loop up. An address
@@ -629,6 +689,20 @@ fn shards_line(config: &OrchestratorConfig) -> String {
         "space-orchestrator: shards: {who}, at most {}; {secret}",
         config.max_shards
     )
+}
+
+/// One line for the startup log: where players connect, or that this
+/// orchestrator has no player port.
+fn players_line(config: &OrchestratorConfig) -> String {
+    match config.player_bind {
+        Some(bind) => format!(
+            "space-orchestrator: players connect to {bind} (the player port): each is sent to \
+             the shard that owns the spawn point"
+        ),
+        None => "space-orchestrator: no player port (--player-bind): players dial a shard \
+                 directly"
+            .to_owned(),
+    }
 }
 
 /// One line for the startup log: the scene the cluster starts with and where
@@ -690,6 +764,59 @@ mod tests {
         assert_eq!(options.config.control_addr, None);
         assert_eq!(options.config.control_addr(), options.config.bind);
         assert!(options.webui.is_none(), "the web UI is off by default");
+    }
+
+    /// The player port is **off unless asked for** — from the flag, else its
+    /// variable — takes any address without a token (it is the public entry,
+    /// not a control surface), and cannot share the control port's port.
+    ///
+    /// Mutation this catches: a player port that is on by default (a second
+    /// public listener nobody asked for), or one that demands a secret on a
+    /// reachable bind like the control surfaces do (no player could connect).
+    #[test]
+    fn the_player_port_is_off_unless_asked_for_and_needs_no_token() {
+        assert_eq!(parse(&[]).expect("parses").config.player_bind, None);
+        let by_flag = parse(&["--player-bind", "127.0.0.1:7777"]).expect("parses");
+        assert_eq!(
+            by_flag.config.player_bind,
+            Some("127.0.0.1:7777".parse().unwrap())
+        );
+        let by_env = parse_with(
+            &[],
+            &[("SPACE_ORCHESTRATOR_PLAYER_BIND", " 0.0.0.0:7777\n")],
+        )
+        .expect("parses");
+        assert_eq!(
+            by_env.config.player_bind,
+            Some("0.0.0.0:7777".parse().unwrap())
+        );
+        // A flag wins over its variable; an empty variable is unset.
+        let both = parse_with(
+            &["--player-bind", "127.0.0.1:7001"],
+            &[("SPACE_ORCHESTRATOR_PLAYER_BIND", "127.0.0.1:7002")],
+        )
+        .expect("parses");
+        assert_eq!(both.config.player_bind.map(|a| a.port()), Some(7_001));
+        let empty = parse_with(&[], &[("SPACE_ORCHESTRATOR_PLAYER_BIND", " ")]).expect("parses");
+        assert_eq!(empty.config.player_bind, None);
+        // Open to the world with nothing else configured: the control port
+        // stays on loopback and needs no secret, the player port none either.
+        for open in ["0.0.0.0:7777", "[::]:7777", "192.168.1.5:7777"] {
+            let options = parse(&["--player-bind", open]).expect(open);
+            assert!(!options.config.secret_required(), "{open}");
+            assert!(options.webui.is_none());
+        }
+        // Nonsense, and the control port's own port.
+        assert!(parse(&["--player-bind", "nope"]).is_err());
+        assert!(parse(&["--player-bind"]).is_err());
+        let err = parse(&["--player-bind", "127.0.0.1:7900"]).expect_err("the control port");
+        assert!(err.contains("control port"), "{err}");
+        let err = parse(&["--bind", "127.0.0.1:7777", "--player-bind", "0.0.0.0:7777"])
+            .expect_err("the same port");
+        assert!(err.contains("different ports"), "{err}");
+        let err = parse_with(&[], &[("SPACE_ORCHESTRATOR_PLAYER_BIND", "x")])
+            .expect_err("nonsense in the environment is an error too");
+        assert!(err.contains("SPACE_ORCHESTRATOR_PLAYER_BIND"), "{err}");
     }
 
     #[test]

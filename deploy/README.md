@@ -69,6 +69,16 @@ compose's `restart: unless-stopped` starts a fresh one). The orchestrator image
 runs `--launcher local`; `--min-shards` / `--launcher process` (the orchestrator
 starts the shards itself) are for a host without containers.
 
+**No player port in the containers yet.** The orchestrator's `--player-bind`
+(the one address of `scripts/dev.*`, 7777/udp there) is not set by either
+compose file, and nothing new is published: players dial `shard-a` directly,
+as before. That still works because `shard-a` is given the root and so owns
+the scene's spawn point; a shard that does not would now send a new player on
+to the one that does, at the address that shard advertises
+(`SHARD_ADVERTISE`, a compose-network address a player outside cannot
+reach). Putting the player port and the shards' public addresses into the
+containers belongs to the Docker launcher work (`docs/plan-sharding.md` §8).
+
 In a container the control port binds `0.0.0.0`, and **a control port that is
 not on loopback takes a shard's hello only with the cluster secret, and the
 orchestrator refuses to start without one**. Both compose files therefore give

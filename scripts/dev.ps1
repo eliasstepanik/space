@@ -10,12 +10,13 @@
 
     Topologies (-Topology):
 
-      orchestrated  (default) the orchestrator (127.0.0.1:7900, web UI on
-                    http://127.0.0.1:7980/) plus one shard (127.0.0.1:7777)
-                    that registers with it and is given the root region.
-                    Change the scene for every shard and client in the web UI.
-                    With -MinShards N the orchestrator starts the shards
-                    itself instead (see below).
+      orchestrated  (default) the orchestrator: its player port on
+                    127.0.0.1:7777 - the one address a client connects to -
+                    its control port on 127.0.0.1:7900 (shards only) and its
+                    web UI on http://127.0.0.1:7980/. It starts the shards
+                    itself (-MinShards, default 1; see below) and sends every
+                    client to the one that owns the spawn point. Change the
+                    scene for every shard and client in the web UI.
       single        one standalone shard on 127.0.0.1:7777
       two-shards    two standalone shards that are neighbours along +X
                     (127.0.0.1:7777 owns cell 0, 127.0.0.1:7778 owns cell 1).
@@ -38,23 +39,24 @@
       stream        headless, streaming to browser viewers on -Stream
                     (default 127.0.0.1:8099); see crates\space-viewer\README.md
 
-    The client connects to the first shard at once, and reconnects by itself
-    when the connection fails or is lost (until the address is edited or Esc
-    is pressed); -ConnectScreen starts it on the connect screen instead (the
-    address is prefilled: press Enter), and then nothing is retried.
+    The client connects to 127.0.0.1:7777 at once - the orchestrator's player
+    port, or the first shard in single and two-shards - and reconnects there
+    by itself when the connection fails or is lost (until the address is
+    edited or Esc is pressed); -ConnectScreen starts it on the connect screen
+    instead (the address is prefilled: press Enter), and then nothing is
+    retried.
 
     Harness (any client): -Harness ADDR serves the control API, -Script FILE
     runs a Lua script and makes its outcome this script's exit code, -OutDir
     DIR is where scripts write screenshots (default target\dev\harness-out).
 
-    -MinShards N (orchestrated only; default 0 = the one shard above, started
-    by this script): the orchestrator starts and keeps N shards running by
-    itself (space-orchestrator --launcher process --min-shards N), each a
-    space-server process on a port from 7870 up, logging to
-    target\dev\shard-<port>.log. With 4 the demo area lies in four shard
-    areas that meet at pos x = -6 / z = -4: walk across and the HUD's shard
-    number changes. A shard that dies is replaced. The client is pointed at the
-    shard that owns the spawn point.
+    -MinShards N (orchestrated only; default 1): the orchestrator starts and
+    keeps N shards running by itself (space-orchestrator --launcher process
+    --min-shards N), each a space-server process on a port from 7870 up,
+    logging to target\dev\shard-<port>.log. With 4 the demo area lies in four
+    shard areas that meet at pos x = -6 / z = -4: walk across and the HUD's
+    shard number changes. A shard that dies is replaced, and a client that was
+    on it comes back by itself through the player port.
 
     -PortOffset N adds N to every port (a second stack beside the first).
 
@@ -62,8 +64,8 @@
 
 .EXAMPLE
     .\scripts\dev.ps1
-    Orchestrator, one shard and the windowed client in the demo area. Open
-    http://127.0.0.1:7980/ to switch the scene while playing.
+    The orchestrator, the one shard it starts and the windowed client in the
+    demo area. Open http://127.0.0.1:7980/ to switch the scene while playing.
 
 .EXAMPLE
     .\scripts\dev.ps1 -Topology two-shards
@@ -117,11 +119,11 @@ param(
     [string]$Glb = '',
     # Add this to every port.
     [int]$PortOffset = 0,
-    # Orchestrated only: let the orchestrator start this many shards itself.
-    # (8 is the orchestrator's own limit: the root's shard and one per layout
-    # cell; it refuses to start with more.)
-    [ValidateRange(0, 8)]
-    [int]$MinShards = 0,
+    # Orchestrated only: how many shards the orchestrator starts and keeps
+    # running. (8 is the orchestrator's own limit: the root's shard and one
+    # per layout cell; it refuses to start with more.)
+    [ValidateRange(1, 8)]
+    [int]$MinShards = 1,
     # Start the client on the connect screen instead of connecting at once.
     [switch]$ConnectScreen,
     # Present as fast as frames render instead of waiting for vsync.
@@ -223,7 +225,7 @@ if ($Stop) {
 New-Item -ItemType Directory -Force $devDir | Out-Null
 Stop-DevServers
 
-if ($MinShards -gt 0 -and $Topology -ne 'orchestrated') {
+if ($PSBoundParameters.ContainsKey('MinShards') -and $Topology -ne 'orchestrated') {
     throw '-MinShards needs the orchestrated topology: it is the orchestrator that starts the shards'
 }
 
@@ -240,7 +242,11 @@ if (-not $NoBuild) {
 
 # Every server address is a literal IPv4 socket address: the servers do not
 # resolve host names.
-$shard1 = "127.0.0.1:$(7777 + $PortOffset)"
+#
+# $entry is the address a client connects to: the orchestrator's player port
+# in the orchestrated topology (it sends the client on to the shard that owns
+# the spawn point), the first shard itself in the other two.
+$entry = "127.0.0.1:$(7777 + $PortOffset)"
 $shard2 = "127.0.0.1:$(7778 + $PortOffset)"
 $orchestrator = "127.0.0.1:$(7900 + $PortOffset)"
 $webui = "127.0.0.1:$(7980 + $PortOffset)"
@@ -252,72 +258,64 @@ switch ($Topology) {
         if ($PSBoundParameters.ContainsKey('Scene')) {
             Remove-Item (Join-Path $devDir 'orchestrator.id.scene') -ErrorAction SilentlyContinue -Confirm:$false
         }
-        if ($MinShards -gt 0) {
-            # The orchestrator starts the shards itself: one space-server
-            # process each, on a port of this range, logging to target\dev.
-            $firstPort = 7870 + $PortOffset
-            $started = Get-Date
-            Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
-                '--bind', $orchestrator, '--state', 'orchestrator.id',
-                '--webui', $webui, '--scene', $Scene,
-                '--launcher', 'process', '--min-shards', "$MinShards",
-                '--host-port-range', "$firstPort-$(7899 + $PortOffset)",
-                '--shard-log-dir', $devDir)
-            # Wait until every shard has its region, and ask the orchestrator
-            # which one owns the spawn point: that is where a client joins.
-            $shard1 = ''
-            $deadline = (Get-Date).AddSeconds(60)
-            while (-not $shard1) {
-                Start-Sleep -Milliseconds 250
-                $state = $null
-                try { $state = Invoke-RestMethod -Uri "http://$webui/api/state" -TimeoutSec 5 } catch { }
-                if ($state) {
-                    $regions = @($state.map.regions)
-                    $live = @($state.shards | Where-Object { $_.connected -and $_.role -eq 'owner' })
-                    if ($regions.Count -ge $MinShards -and $live.Count -ge $MinShards -and -not $state.epoch_in_flight) {
-                        $shard1 = ($regions | Where-Object { $_.nesting -eq 0 } | Select-Object -First 1).endpoint
-                    }
-                }
-                if (-not $shard1 -and (Get-Date) -gt $deadline) {
-                    Get-Content (Join-Path $devDir 'orchestrator.out.log') -Tail 20 | ForEach-Object { Write-Host "  $_" }
-                    Stop-DevServers
-                    throw "the orchestrator did not bring up $MinShards shards within 60 s; see $devDir\orchestrator.out.log and shard-*.log"
-                }
+        # The orchestrator starts the shards itself: one space-server process
+        # each, on a port of this range, logging to target\dev. Players
+        # connect to its player port and are sent on to a shard.
+        $firstPort = 7870 + $PortOffset
+        $started = Get-Date
+        Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
+            '--bind', $orchestrator, '--player-bind', $entry,
+            '--state', 'orchestrator.id',
+            '--webui', $webui, '--scene', $Scene,
+            '--launcher', 'process', '--min-shards', "$MinShards",
+            '--host-port-range', "$firstPort-$(7899 + $PortOffset)",
+            '--shard-log-dir', $devDir)
+        # Wait until every shard has its region and the player port has a
+        # shard to send a client to.
+        $ready = $false
+        $deadline = (Get-Date).AddSeconds(60)
+        while (-not $ready) {
+            Start-Sleep -Milliseconds 250
+            $state = $null
+            try { $state = Invoke-RestMethod -Uri "http://$webui/api/state" -TimeoutSec 5 } catch { }
+            if ($state) {
+                $regions = @($state.map.regions)
+                $live = @($state.shards | Where-Object { $_.connected -and $_.role -eq 'owner' })
+                $ready = $regions.Count -ge $MinShards -and $live.Count -ge $MinShards -and
+                    -not $state.epoch_in_flight -and $state.player_port.answer -eq 'redirect'
             }
-            $took = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
-            Write-Host "$MinShards shards started by the orchestrator own $($regions.Count) regions after $took s"
-        } else {
-            Start-DevServer 'orchestrator' 'space-orchestrator.exe' @(
-                '--bind', $orchestrator, '--state', 'orchestrator.id',
-                '--webui', $webui, '--scene', $Scene)
-            # The shard registers without a region and is given the root.
-            Start-DevServer 'shard-1' 'space-server.exe' @(
-                '--orchestrator', $orchestrator, '--bind', $shard1)
+            if (-not $ready -and (Get-Date) -gt $deadline) {
+                Get-Content (Join-Path $devDir 'orchestrator.out.log') -Tail 20 | ForEach-Object { Write-Host "  $_" }
+                Stop-DevServers
+                throw "the orchestrator did not bring up $MinShards shard(s) within 60 s; see $devDir\orchestrator.out.log and shard-*.log"
+            }
         }
+        $took = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+        Write-Host "$MinShards shard(s) started by the orchestrator own $($regions.Count) region(s) after $took s; players are sent to shard $($state.player_port.sends_to_shard)"
     }
     'single' {
         Start-DevServer 'shard-1' 'space-server.exe' @(
-            '--shard', '1', '--region', '64:0:0:0', '--bind', $shard1, '--scene', $Scene)
+            '--shard', '1', '--region', '64:0:0:0', '--bind', $entry, '--scene', $Scene)
     }
     'two-shards' {
         Start-DevServer 'shard-1' 'space-server.exe' @(
-            '--shard', '1', '--region', '64:0:0:0', '--bind', $shard1,
+            '--shard', '1', '--region', '64:0:0:0', '--bind', $entry,
             '--peer', "2:${shard2}:64:1:0:0", '--scene', $Scene)
         Start-DevServer 'shard-2' 'space-server.exe' @(
             '--shard', '2', '--region', '64:1:0:0', '--bind', $shard2,
-            '--peer', "1:${shard1}:64:0:0:0", '--scene', $Scene)
+            '--peer', "1:${entry}:64:0:0:0", '--scene', $Scene)
     }
 }
 
 Write-Host ''
-Write-Host "  shard          $shard1 (QUIC; the address to type on the connect screen)"
-if ($MinShards -gt 0) {
-    Write-Host "                 (the shard that owns the spawn point; $MinShards shards on ports from $(7870 + $PortOffset), logs in shard-<port>.log)"
+if ($Topology -eq 'orchestrated') {
+    Write-Host "  player port    $entry (QUIC; the address to type on the connect screen)"
+    Write-Host "                 ($MinShards shard(s) behind it on ports from $(7870 + $PortOffset), logs in shard-<port>.log)"
+    Write-Host "  web UI         http://$webui/  (scene, shards, players)"
+} else {
+    Write-Host "  shard          $entry (QUIC; the address to type on the connect screen)"
 }
 if ($Topology -eq 'two-shards') { Write-Host "  second shard   $shard2" }
-if ($Topology -eq 'orchestrated') {
-    Write-Host "  web UI         http://$webui/  (scene, shards, players)"
-}
 
 if ($ServersOnly) {
     Write-Host ''
@@ -326,7 +324,7 @@ if ($ServersOnly) {
 }
 
 $arguments = @('--quality', $Quality)
-if (-not $ConnectScreen) { $arguments += @('--server', $shard1) }
+if (-not $ConnectScreen) { $arguments += @('--server', $entry) }
 if ($Size) { $arguments += @('--size', $Size) }
 if ($Glb) { $arguments += @('--glb', (Resolve-Path $Glb).Path) }
 if ($NoVsync) { $arguments += '--no-vsync' }

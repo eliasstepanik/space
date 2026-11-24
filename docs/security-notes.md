@@ -133,6 +133,51 @@ describes current behaviour, not intent.
    stall map changes for about nine seconds per registration, each costing a
    shard id.
 
+## Player port (`space-orchestrator --player-bind`)
+
+The one address a player dials. Off unless given. It is **public by design**:
+no token on any bind, because all it tells a caller is what a shard would
+tell it anyway.
+
+* **What it does.** It reads one `Hello`, checks the protocol version, and
+  answers with a `JoinRedirect` — the id of the shard that owns the spawn
+  point and the shard map — or with `Reject(Starting)` while no connected
+  shard owns it, then closes. It reads nothing behind the hello, keeps no
+  state per player, issues no session and no token, and has no way into the
+  orchestrator: the run loop publishes the answer (a `watch` value) and the
+  listener only reads it (`player.rs`). A hello that claims to be a shard
+  (`shard:<id>` in the token field) is refused with a sentence saying which
+  port this is. The control port, in turn, refuses a hello that is not a
+  shard's with a readable reason and never hands it to the run loop.
+* **What it exposes.** The shard map: every region, its owner's id, and for
+  each shard the address players dial (the *client endpoint*) **and the
+  address shards dial each other on** (the endpoint) — the same map a shard
+  sends a client in its `Welcome`. So anybody who can reach the player port
+  learns how many shards there are and where they listen. Neither secret is
+  in it, nor the cluster's name, the scene, loads or the event log.
+* **Limits.** At most 256 hellos in flight (more are closed at once and
+  counted as `refused_busy` in `/api/state`), 5 s for a hello to arrive, log
+  lines about bad hellos a few per ten seconds. There is **no rate limit per
+  source address** and no proof of the source beyond QUIC's own handshake:
+  whoever reaches the port can keep it busy, which delays other players'
+  joins and nothing else — shards, the map and players already on a shard do
+  not pass through it.
+* **A shard is believed about its client endpoint** as it is about its
+  endpoint (deferred item 4): a registered shard — any local process on a
+  secretless loopback control port — can advertise any address, and players
+  are then sent there. An unspecified IP (`0.0.0.0:<port>`) is filled in by
+  the *client* with the host it dialed, so it can only ever point back at the
+  entry's own host.
+* **Shards answer the same question.** A shard that does not own the spawn
+  point answers a fresh join with the same `JoinRedirect`; a client follows
+  at most two in a row and then gives up with a readable reason, so two
+  shards that disagree about the map cannot bounce it for ever.
+* **Reachability is not solved here.** Shards started by the `process`
+  launcher bind loopback and advertise `0.0.0.0:<port>` to players; a player
+  on another machine is told to dial `<entry host>:<port>` and reaches
+  nothing unless those ports are forwarded. Publishing shards is a later
+  phase (`docs/plan-sharding.md`).
+
 ## Orchestrator web UI (`space-orchestrator --webui`)
 
 An admin surface: it shows cluster state and can split, merge, pause the

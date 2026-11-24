@@ -290,7 +290,9 @@ became, and where it differs from the bullets above:
   old and the new scene's bodies together for about 0.3 s after the revision is raised; an
   orderly exit of the orchestrator on a signal (its shards notice the lost link after QUIC's idle
   timeout, about 11 s, and stop by themselves; the pid file of a killed orchestrator still lists
-  them).
+  them). **Since phase 2 (section 4)** the player port exists: a client that lost its shard dials
+  its entry address again and is sent to the replacement, and a shard no longer puts a joiner on
+  its region's centre - the two remarks above about that are history.
 
 ## 3. Load and autoscaling
 
@@ -327,6 +329,62 @@ became, and where it differs from the bullets above:
 - A shard may register with an unspecified IP in its internal endpoint; the orchestrator fills in
   the address the control connection comes from (containers). `Inbound::Hello` carries that address.
 - Dev scripts: orchestrator player port 7777, shards from 7870 up. `single` and `two-shards` stay.
+
+**Status: built (phase 2).** What it became, and where it differs from the bullets above:
+
+- **Wire** (`PROTOCOL_VERSION` still 6, which was never released): `Message::JoinRedirect { shard,
+  shard_map }` is tag 28 (`VARIANT_COUNT` 29); `ShardRegion` ends with `client_endpoint`
+  (`ShardRegion::new` sets it to the endpoint; `resolve_client_endpoint(addr, entry_host)` is the
+  one rule: port 0 = none, an unspecified IP = the entry's host, anything else as it is;
+  `ShardMap::client_endpoint_of`); `ShardHello` carries an optional `client_endpoint` before its
+  secret. **Added beyond the plan:** `RejectReason::Starting`, appended, so "the cluster is
+  starting" is a reason a client can tell from a refusal and retries on, not a sentence in `Other`.
+- **Player port** (`space-orchestrator/src/player.rs`, `--player-bind` /
+  `SPACE_ORCHESTRATOR_PLAYER_BIND`, off unless given, no token on any bind, never the control
+  port's port): a listener of its own that reads one hello, checks the version, answers and
+  closes. It holds no reference to the orchestrator: the run loop (`run_with_player`) publishes
+  the current answer after every turn and the listener reads it. 256 hellos in flight at most, 5 s
+  for a hello, no per-player state. **"Starting" is not "until `min-shards` are up"** as the
+  bullet says: the answer is a redirect as soon as the committed map's spawn owner is a connected
+  shard with a client endpoint, and "starting" otherwise (no root yet, the owner dead and not yet
+  replaced). Waiting for all of `min-shards` would keep players out for no reason - the other
+  shards are reached by walking.
+- **The control port refuses players** with a sentence ("this is the control port ...; players
+  dial the player port") instead of treating their hello as a broken shard hello, and counts
+  them; a shard-style hello at the player port is refused the same way.
+- **Shards** (`Shard::join -> Result<Welcome, JoinRefusal>`): a fresh join is taken only when
+  `free_spawn_point()` has a point, which is only on the spawn point's owner; everywhere else the
+  answer is `JoinRedirect` to the owner, or `Reject(Starting)` when the map names no reachable
+  owner (the shard itself is named but does not own the ground yet, or the owner has no client
+  endpoint). No session is spent on a redirect. **The region-centre fallback is gone**, also on
+  the adoption path: a client that said hello for a handoff which then never arrived is, at the
+  adopt timeout, sent the same `JoinRedirect` and its connection closed, and the client joins
+  afresh there. Adoption itself is untouched (H1-H8).
+- **Client** (`link.rs`): `ServerLink::join(entry)` follows at most `MAX_JOIN_REDIRECTS` = 2
+  redirects and names the hops when it gives up; the entry address is what is remembered, retried
+  and shown, the shard's own address is `shard_address` (harness `/state`, Lua). A handoff
+  `Redirect` is dialed at the target's **client** endpoint, resolved against the entry's host.
+  **Added:** the offering shard sends the offer and the client's `Redirect` in the same tick, so
+  the client's hello can reach the accepting shard before the offer does - which used to be
+  covered by the region-centre fallback and is now a `JoinRedirect`/`Starting` answer; the client
+  asks again (5 times, 120 ms apart) before it treats that as the end of the handoff.
+- **Client endpoints in the map**: the orchestrator keeps one per shard beside the endpoint, sets
+  it in every region it gives (hello, carve, replacement) and fills an unspecified **internal**
+  IP from the control connection's source (`ControlPlane::as_seen_from`); a client endpoint's
+  unspecified IP is left as it is - that is its meaning. The `process` launcher starts a shard
+  with `--client-endpoint 0.0.0.0:<its port>`. `/api/state` has `player_port { bind, answer,
+  sends_to_shard, redirected, told_starting, refused_busy }`, `map.spawn_owner` and a
+  `client_endpoint` per region and shard; the page shows the same.
+- **Dev scripts**: the orchestrated topology is always `--launcher process` behind
+  `--player-bind 127.0.0.1:7777` (`-MinShards` default 1); the client is pointed at the player
+  port; the scripts wait for `player_port.answer == "redirect"`.
+- **Not done here**: shards the `process` launcher starts still **bind loopback**, so a player on
+  another machine is sent to `<entry host>:<port>` and reaches nothing - publishing shards is
+  section 8's. The compose files are untouched: they run one hand-started shard without a player
+  port, and players dial that shard as before. A player who comes back after its shard died
+  starts on the spawn point again (nothing of a player is kept across a shard's death). A client
+  notices a dead shard through QUIC's idle timeout (about 10 s) before it dials the entry again.
+  The player port has no per-source rate limit (`docs/security-notes.md`).
 
 ## 5. One cluster tick, seamless crossing
 

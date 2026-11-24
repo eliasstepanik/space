@@ -259,6 +259,7 @@ fn state_is_the_clients_snapshot_as_json() {
         "bodies_in_view",
         "correction_m",
         "correction_max_m",
+        "shard_address",
     ] {
         assert!(now.get(field).is_some(), "no {field} in {now}");
     }

@@ -115,6 +115,12 @@ pub struct OrchestratorConfig {
     /// typically binds `0.0.0.0:7900`, which is not dialable; shards need the
     /// service name / host address instead. See [`Self::control_addr`].
     pub control_addr: Option<SocketAddr>,
+    /// Where the **player port** listens (`--player-bind`); `None` — the
+    /// default — opens none. It is the one address players type: a client's
+    /// hello there is answered with the shard that owns the scene's spawn
+    /// point ([`crate::player`]). Not a control surface: it needs no token on
+    /// any bind, and nothing said on it reaches the cluster's state.
+    pub player_bind: Option<SocketAddr>,
     /// Path of the persisted shard-id counter (H9).
     pub state_path: PathBuf,
     /// First id the allocator hands out when no counter file exists yet.
@@ -183,6 +189,7 @@ impl Default for OrchestratorConfig {
             root_index: [0, 0, 0],
             bind: SocketAddr::from(([127, 0, 0, 1], 7_900)),
             control_addr: None,
+            player_bind: None,
             state_path: PathBuf::from("space-orchestrator.id"),
             first_shard_id: 1,
             host_port_range: (7_870, 7_899),

@@ -63,12 +63,14 @@ pub use control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, Load
 pub use guid::EntityGuid;
 pub use messages::{
     Delta, EntitySnapshot, GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer,
-    HandoffReason, Hello, InputTick, IslandKey, Message, NeighbourStatus, PlayerInput, Redirect,
-    Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
+    HandoffReason, Hello, InputTick, IslandKey, JoinRedirect, Message, NeighbourStatus,
+    PlayerInput, Redirect, Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch,
+    Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
 pub use scene::{Scene, SceneAck, SceneId, SceneState, UnknownScene};
 pub use shard::{
-    AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
+    resolve_client_endpoint, AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId,
+    ShardMap, ShardRegion,
 };
 pub use snapshot::{entity_snapshot, SnapshotBuilder, DEFAULT_BUDGET};

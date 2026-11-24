@@ -3,9 +3,12 @@
 //! The orchestrator is the control plane that owns the *map*: it allocates shard
 //! ids, decides when a region is too hot or too cold, publishes every ownership
 //! change through the epoch protocol, and launches the shards that carry the
-//! regions. It never simulates anything and never reaches a client — a shard
+//! regions. It never simulates anything and carries no game traffic — a shard
 //! learns the new map from the orchestrator, and a client learns it from the
-//! shard it is already talking to (`Redirect`/`Welcome` carry the map).
+//! shard it is already talking to (`Redirect`/`Welcome` carry the map). What
+//! it does for a client is point the way: its **player port** ([`player`]) is
+//! the one address players type, and answers a hello with the shard a new
+//! player starts on (`JoinRedirect`), then closes.
 //!
 //! # The derived guarantees H9–H15
 //!
@@ -44,7 +47,10 @@
 //!   (one `space-server` process per shard); `launcher::docker` is a later slice
 //! * [`scene`] — the cluster's scene, its revision and its persistence (not an
 //!   epoch: see below)
-//! * [`control`] — the control-plane message handlers (QUIC front end later)
+//! * [`control`] — the control-plane message handlers and the control port's
+//!   QUIC front end (shards only)
+//! * [`player`] — the player port: the one address players type, answered
+//!   with the shard that owns the scene's spawn point
 //! * [`orchestrator`] — [`orchestrator::Orchestrator`], the tie-in point
 //! * [`events`] — the bounded recent-events log (pure)
 //! * [`snapshot`] — [`snapshot::Snapshot`], everything the orchestrator knows
@@ -97,6 +103,7 @@ pub mod ids;
 pub mod launcher;
 pub mod ops;
 pub mod orchestrator;
+pub mod player;
 pub mod scene;
 pub mod snapshot;
 pub mod topology;

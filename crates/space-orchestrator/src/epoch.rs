@@ -102,8 +102,10 @@ impl EpochPublisher {
         &self.published
     }
 
-    /// Fill in the real endpoint of every published region whose owner is in
-    /// `endpoints`.
+    /// Fill in the real addresses of every published region whose owner is in
+    /// `endpoints`: its internal endpoint from there, and the endpoint its
+    /// players dial from `client_endpoints` — or, for a shard that has none of
+    /// its own, the internal one.
     ///
     /// A committed epoch's ownership is exact, but a split names its child before
     /// the child's address is known (the region carries a placeholder borrowed
@@ -114,10 +116,15 @@ impl EpochPublisher {
     pub fn set_endpoints(
         &mut self,
         endpoints: &std::collections::BTreeMap<ShardId, std::net::SocketAddr>,
+        client_endpoints: &std::collections::BTreeMap<ShardId, std::net::SocketAddr>,
     ) {
         for region in &mut self.published.regions {
             if let Some(endpoint) = endpoints.get(&region.shard) {
                 region.endpoint = *endpoint;
+                region.client_endpoint = client_endpoints
+                    .get(&region.shard)
+                    .copied()
+                    .unwrap_or(*endpoint);
             }
         }
     }
@@ -742,7 +749,8 @@ mod tests {
         let before = pub_.published().clone();
         let mut endpoints = std::collections::BTreeMap::new();
         endpoints.insert(shard(2), addr(9_002));
-        pub_.set_endpoints(&endpoints);
+        let none = std::collections::BTreeMap::new();
+        pub_.set_endpoints(&endpoints, &none);
         let after = pub_.published();
         assert_eq!(after.epoch, before.epoch);
         assert_eq!(after.regions.len(), before.regions.len());
@@ -750,9 +758,28 @@ mod tests {
             assert_eq!((a.node, a.shard), (b.node, b.shard));
             if a.shard == shard(2) {
                 assert_eq!(a.endpoint, addr(9_002));
+                assert_eq!(
+                    a.client_endpoint,
+                    addr(9_002),
+                    "no client endpoint of its own: players dial the endpoint"
+                );
             } else {
                 assert_eq!(a.endpoint, b.endpoint, "an unknown shard keeps its address");
+                assert_eq!(a.client_endpoint, b.client_endpoint);
             }
         }
+        // A shard with a client endpoint of its own keeps the two apart.
+        let players_at: SocketAddr = "0.0.0.0:9002".parse().unwrap();
+        let client_endpoints = std::collections::BTreeMap::from([(shard(2), players_at)]);
+        pub_.set_endpoints(&endpoints, &client_endpoints);
+        for region in &pub_.published().regions {
+            if region.shard == shard(2) {
+                assert_eq!(
+                    (region.endpoint, region.client_endpoint),
+                    (addr(9_002), players_at)
+                );
+            }
+        }
+        assert_eq!(pub_.published().epoch, before.epoch);
     }
 }

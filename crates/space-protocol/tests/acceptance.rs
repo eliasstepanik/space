@@ -11,10 +11,10 @@ use space_protocol::{
     check_hello, decode_frame, encode_frame, entity_snapshot, try_encode_frame, AdminCommand,
     AdminReply, CodecError, Delta, DirectoryQuery, DirectoryReply, EntityGuid, EntitySnapshot,
     GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer, HandoffReason, Hello,
-    InputTick, IslandKey, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject,
-    RejectReason, Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId, ShardMap, ShardRegion,
-    ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    InputTick, IslandKey, JoinRedirect, LoadReport, Message, NeighbourStatus, PlayerInput,
+    Redirect, Reject, RejectReason, Scene, SceneAck, SceneId, SceneState, ShardHello, ShardId,
+    ShardMap, ShardRegion, ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome,
+    FRAME_HEADER_LEN, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use space_world::{NodeRef, WorldPos};
 
@@ -105,6 +105,9 @@ fn all_messages() -> Vec<Message> {
         }),
         Message::Reject(Reject {
             reason: RejectReason::Other("nope".into()),
+        }),
+        Message::Reject(Reject {
+            reason: RejectReason::Starting,
         }),
         Message::InputTick(InputTick {
             tick: 12,
@@ -242,6 +245,7 @@ fn all_messages() -> Vec<Message> {
             shard: ShardId::NONE,
             endpoint: addr(9),
             region: Some(region(40, [0, 0, 0], 1)),
+            client_endpoint: Some(any_host(7_009)),
             secret: "cluster-secret".into(),
         }),
         Message::ShardWelcome(ShardWelcome {
@@ -255,13 +259,25 @@ fn all_messages() -> Vec<Message> {
             shard: shard(5),
             applied: SceneState::new(Scene::Solar.id(), 4),
         }),
-        Message::SceneUpdate(last_message_state()),
+        Message::SceneUpdate(SceneState::new(Scene::Galaxy.id(), 9)),
+        last_message(),
     ]
 }
 
-/// The payload of the last message in tag order (`SceneUpdate`, tag 27).
-fn last_message_state() -> SceneState {
-    SceneState::new(Scene::Galaxy.id(), 9)
+/// The last message in tag order (`JoinRedirect`, tag 28): the map names the
+/// shard to dial with a client endpoint of its own.
+fn last_message() -> Message {
+    let mut map = sample_map();
+    map.regions[1] = map.regions[1].clone().with_client_endpoint(any_host(7_002));
+    Message::JoinRedirect(JoinRedirect {
+        shard: shard(2),
+        shard_map: map,
+    })
+}
+
+/// `0.0.0.0:port`: a client endpoint that means "the host you dialed".
+fn any_host(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +289,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 36);
+    assert_eq!(messages.len(), 38);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -445,13 +461,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 28, so the valid wire tags are `0..=27`.
-    // The boundary that matters is tag 28 — the first tag past the last variant.
+    // `Message::VARIANT_COUNT` is 29, so the valid wire tags are `0..=28`.
+    // The boundary that matters is tag 29 — the first tag past the last variant.
     // (An earlier revision tested the literals 28/29 while the count was 25:
     // unknown only incidentally, and "passing" for ever as variants were
     // appended — which is why the bound below is the count itself.)
-    assert_eq!(Message::VARIANT_COUNT, 28);
-    let first_invalid = Message::VARIANT_COUNT; // 28
+    assert_eq!(Message::VARIANT_COUNT, 29);
+    let first_invalid = Message::VARIANT_COUNT; // 29
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -463,9 +479,9 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (27, `SceneUpdate`) must decode, proving 28 is the
+    // The last valid tag (28, `JoinRedirect`) must decode, proving 29 is the
     // first rejection and not an off-by-one that also drops the last variant.
-    let last_valid = Message::SceneUpdate(last_message_state());
+    let last_valid = last_message();
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
     assert_eq!(
         decode_frame(&encode_frame(&last_valid)),
@@ -855,13 +871,20 @@ impl Rng {
         (0..self.below(12)).map(|_| self.entity()).collect()
     }
     fn map(&mut self) -> ShardMap {
-        let regions = (0..self.below(6))
-            .map(|_| ShardRegion::new(self.node(), self.shard(), self.addr()))
-            .collect();
+        let regions = (0..self.below(6)).map(|_| self.region()).collect();
         ShardMap::new(self.next_u64(), regions)
     }
+    /// A region: half of them with a client endpoint of their own.
+    fn region(&mut self) -> ShardRegion {
+        let region = ShardRegion::new(self.node(), self.shard(), self.addr());
+        if self.next_u64() & 1 == 0 {
+            region
+        } else {
+            region.with_client_endpoint(self.addr())
+        }
+    }
     fn message(&mut self) -> Message {
-        match self.below(28) {
+        match self.below(29) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -872,7 +895,7 @@ impl Rng {
                 shard_map: self.map(),
             }),
             2 => Message::Reject(Reject {
-                reason: match self.below(5) {
+                reason: match self.below(6) {
                     0 => RejectReason::VersionMismatch {
                         seen: self.u32_below(8),
                         expected: PROTOCOL_VERSION,
@@ -880,6 +903,7 @@ impl Rng {
                     1 => RejectReason::Unauthorized,
                     2 => RejectReason::Full,
                     3 => RejectReason::Draining,
+                    4 => RejectReason::Starting,
                     _ => RejectReason::Other(self.string()),
                 },
             }),
@@ -1035,13 +1059,18 @@ impl Rng {
                 region: if self.next_u64() & 1 == 0 {
                     None
                 } else {
-                    Some(ShardRegion::new(self.node(), self.shard(), self.addr()))
+                    Some(self.region())
+                },
+                client_endpoint: if self.next_u64() & 1 == 0 {
+                    None
+                } else {
+                    Some(self.addr())
                 },
                 secret: self.string(),
             }),
             24 => Message::ShardWelcome(ShardWelcome {
                 shard: self.shard(),
-                region: ShardRegion::new(self.node(), self.shard(), self.addr()),
+                region: self.region(),
                 shard_map: self.map(),
                 peer_token: self.string(),
             }),
@@ -1050,7 +1079,11 @@ impl Rng {
                 shard: self.shard(),
                 applied: self.scene_state(),
             }),
-            _ => Message::SceneUpdate(self.scene_state()),
+            27 => Message::SceneUpdate(self.scene_state()),
+            _ => Message::JoinRedirect(JoinRedirect {
+                shard: self.shard(),
+                shard_map: self.map(),
+            }),
         }
     }
     /// A scene state over the **whole** id space, not just the catalogue: an
@@ -1386,13 +1419,14 @@ fn scene_messages_have_a_pinned_wire_layout() {
 }
 
 /// Protocol 6: a `ShardHello` carries the cluster secret as its **last**
-/// field (a length-prefixed string behind the optional region), and neither
-/// it nor the peer token of a `ShardWelcome` shows in a `Debug` print — a
-/// message may end up in a log line or a panic message.
+/// field (a length-prefixed string behind the optional region and the
+/// optional client endpoint), and neither it nor the peer token of a
+/// `ShardWelcome` shows in a `Debug` print — a message may end up in a log
+/// line or a panic message.
 ///
-/// Mutation this catches: adding the field anywhere but at the end (an
-/// orchestrator would read a v6 hello's region as garbage), leaving the
-/// version at 5 with the changed layout, or deriving `Debug` again.
+/// Mutation this catches: adding a field behind the secret (it is what a
+/// hello is admitted or refused by, and stays the last thing in it), leaving
+/// the version at 5 with the changed layout, or deriving `Debug` again.
 #[test]
 fn a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it() {
     assert_eq!(
@@ -1405,6 +1439,7 @@ fn a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it() {
             shard: ShardId::NONE,
             endpoint: addr(9),
             region: None,
+            client_endpoint: Some(any_host(7_009)),
             secret: secret.into(),
         })
     };
@@ -1532,6 +1567,162 @@ fn an_unknown_scene_id_decodes_and_the_receiver_can_fall_back() {
         };
         assert_eq!(state.scene.known(), Some(scene));
     }
+}
+
+// ---------------------------------------------------------------------------
+// One address: join redirects and client endpoints (protocol 6)
+// ---------------------------------------------------------------------------
+
+/// `JoinRedirect` is the last message of the enum (tag 28), carries the shard
+/// to dial and the sender's map, and reports that map's epoch.
+///
+/// Mutation this catches: inserting the variant anywhere but at the end
+/// (every later tag moves), or dropping the map (the client would have no
+/// address to dial).
+#[test]
+fn a_join_redirect_round_trips_as_the_last_tag() {
+    let message = last_message();
+    assert_eq!(message.wire_tag(), 28);
+    assert_eq!(message.wire_tag(), Message::VARIANT_COUNT - 1);
+    assert_eq!(message.epoch(), Some(sample_map().epoch));
+    let frame = encode_frame(&message);
+    assert_eq!(&payload_of(&frame)[..4], &28u32.to_be_bytes());
+    // The shard id follows the tag, then the map.
+    assert_eq!(&payload_of(&frame)[4..8], &2u32.to_be_bytes());
+    let decoded = decode_frame(&frame).expect("decodes");
+    assert_eq!(decoded, message);
+    let Message::JoinRedirect(redirect) = decoded else {
+        panic!("a join redirect");
+    };
+    assert_eq!(redirect.shard, shard(2));
+    assert_eq!(
+        redirect.shard_map.client_endpoint_of(shard(2)),
+        Some(any_host(7_002)),
+        "the map names where a player dials the shard"
+    );
+}
+
+/// A region carries two addresses: where shards reach its owner and where
+/// players do. Built with `ShardRegion::new` they are the same one; a
+/// different client endpoint crosses the wire as itself, behind the endpoint.
+///
+/// Mutation this catches: a client endpoint that is dropped on the wire (a
+/// redirected player dials the internal address), or `new` leaving it unset
+/// (every static map would name an un-dialable client address).
+#[test]
+fn a_region_carries_a_client_endpoint_beside_its_endpoint() {
+    let plain = region(40, [0, 0, 0], 3);
+    assert_eq!(plain.client_endpoint, plain.endpoint);
+    assert_eq!(plain.client_endpoint, addr(3));
+    let public = plain.clone().with_client_endpoint(any_host(7_171));
+    assert_eq!(public.endpoint, addr(3), "the internal endpoint is kept");
+    assert_eq!(public.client_endpoint, any_host(7_171));
+    assert_ne!(public, plain);
+
+    let welcome = |region: &ShardRegion| {
+        Message::Welcome(Welcome {
+            session: 1,
+            shard: shard(3),
+            shard_map: ShardMap::new(4, vec![region.clone()]),
+        })
+    };
+    for region in [&plain, &public] {
+        let message = welcome(region);
+        assert_eq!(decode_frame(&encode_frame(&message)), Ok(message));
+    }
+    // The client endpoint is the region's last field: the two frames differ
+    // only in their last six bytes (an IPv4 address and a port).
+    let (a, b) = (
+        encode_frame(&welcome(&plain)),
+        encode_frame(&welcome(&public)),
+    );
+    assert_eq!(a.len(), b.len());
+    let same = a.len() - 6;
+    assert_eq!(&a[..same], &b[..same]);
+    assert_eq!(&b[same..], &[0, 0, 0, 0, 0x1C, 0x03], "0.0.0.0:7171");
+
+    // The map's lookup of it skips a region whose address is not known yet.
+    let unresolved = ShardRegion::new(
+        NodeRef::new(41, [0, 0, 0]),
+        shard(9),
+        ShardRegion::UNRESOLVED_ENDPOINT,
+    );
+    let map = ShardMap::new(1, vec![unresolved, public.clone()]);
+    assert_eq!(map.client_endpoint_of(shard(9)), None);
+    assert_eq!(map.client_endpoint_of(shard(3)), Some(any_host(7_171)));
+    assert_eq!(map.client_endpoint_of(shard(77)), None, "not in the map");
+}
+
+/// The rule a client resolves a client endpoint by: an unspecified IP is the
+/// host the player dialed first, port 0 is "not known", anything else is
+/// taken as it is.
+///
+/// Mutation this catches: dialling `0.0.0.0` (which reaches nobody, or the
+/// client's own machine), or resolving a real address against the entry host
+/// (a shard on another host would be dialled on the orchestrator's).
+#[test]
+fn an_unspecified_client_endpoint_means_the_host_the_player_dialed() {
+    use space_protocol::resolve_client_endpoint as resolve;
+    let entry: IpAddr = "203.0.113.7".parse().unwrap();
+    let entry6: IpAddr = "2001:db8::7".parse().unwrap();
+    assert_eq!(
+        resolve(any_host(7_871), entry),
+        Some("203.0.113.7:7871".parse().unwrap())
+    );
+    assert_eq!(
+        resolve("[::]:7871".parse().unwrap(), entry),
+        Some("203.0.113.7:7871".parse().unwrap()),
+        "the unspecified IPv6 address means the same"
+    );
+    assert_eq!(
+        resolve(any_host(7_871), entry6),
+        Some("[2001:db8::7]:7871".parse().unwrap())
+    );
+    // A real address is where the shard is, whatever was dialed.
+    assert_eq!(resolve(addr(4), entry), Some(addr(4)));
+    assert_eq!(
+        resolve("127.0.0.1:7777".parse().unwrap(), entry),
+        Some("127.0.0.1:7777".parse().unwrap())
+    );
+    // Port 0: the owner has not registered an address yet.
+    assert_eq!(resolve(ShardRegion::UNRESOLVED_ENDPOINT, entry), None);
+    assert_eq!(resolve("10.0.0.1:0".parse().unwrap(), entry), None);
+}
+
+/// A `ShardHello` says where players are to dial the shard — or does not, and
+/// then it is the endpoint. Both forms cross the wire, the field sits before
+/// the secret, and the print still hides the secret.
+///
+/// Mutation this catches: a hello whose client endpoint is lost (the map
+/// would send players to the internal address), or the new field moving the
+/// secret off the end.
+#[test]
+fn a_shard_hello_may_ask_for_a_client_endpoint() {
+    let hello = |client_endpoint: Option<SocketAddr>| {
+        Message::ShardHello(ShardHello {
+            cluster: "cluster-a".into(),
+            shard: ShardId::NONE,
+            endpoint: addr(9),
+            region: None,
+            client_endpoint,
+            secret: "s3cr3t-of-the-cluster".into(),
+        })
+    };
+    let (none, some) = (hello(None), hello(Some(any_host(7_871))));
+    for message in [&none, &some] {
+        assert_eq!(decode_frame(&encode_frame(message)).as_ref(), Ok(message));
+        let printed = format!("{message:?}");
+        assert!(!printed.contains("s3cr3t"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+    assert!(format!("{some:?}").contains("0.0.0.0:7871"));
+    // An absent one is one byte (the option's tag); a present IPv4 one adds
+    // the address' own tag (u32), its four bytes and the port. The secret
+    // closes both.
+    let (none, some) = (encode_frame(&none), encode_frame(&some));
+    assert_eq!(some.len(), none.len() + 10);
+    let tail = "s3cr3t-of-the-cluster".as_bytes();
+    assert!(none.ends_with(tail) && some.ends_with(tail));
 }
 
 // ---------------------------------------------------------------------------

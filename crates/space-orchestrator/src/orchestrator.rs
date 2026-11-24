@@ -164,7 +164,9 @@ use std::sync::Arc;
 
 use space_protocol::control::{AdminCommand, AdminReply, LoadReport};
 use space_protocol::shard::{EpochAck, ShardId, ShardMap, ShardRegion};
-use space_protocol::{Message, Scene, SceneAck, SceneState, ShardHello, ShardWelcome};
+use space_protocol::{
+    JoinRedirect, Message, Scene, SceneAck, SceneState, ShardHello, ShardWelcome,
+};
 use space_world::NodeRef;
 
 use crate::autoscale::ScaleAction;
@@ -173,15 +175,16 @@ use crate::config::{
     LAUNCH_REGISTER_TIMEOUT_TICKS, MIN_EPOCH_INTERVAL_TICKS, POLL_INTERVAL_TICKS,
     REPORT_EXPIRY_TICKS, WANTED_TIMEOUT_TICKS,
 };
-use crate::control::{ControlPlane, HelloRefusal};
+use crate::control::{as_seen_from, client_endpoint_of, ControlPlane, HelloRefusal};
 use crate::epoch::{Outbound, Phase};
 use crate::events::{EventKind, EventLog, Severity};
 use crate::launcher::{LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
 use crate::ops::{OperatorCommand, OperatorReply, OperatorRequest, OpsHandle, OpsPort};
+use crate::player::{PlayerAnswer, PlayerServer};
 use crate::scene::{MAX_REVISION_CATCH_UP, SCENE_RESEND_INTERVAL_TICKS};
 use crate::snapshot::{
     node_path, octant_of, octant_signs, AutoscalerView, Decision, EpochInFlight, Heard, HeardKind,
-    RegionView, ReportView, SceneView, ShardRole, ShardView, Snapshot,
+    PlayerPortView, RegionView, ReportView, SceneView, ShardRole, ShardView, Snapshot,
 };
 use crate::topology;
 
@@ -364,8 +367,20 @@ pub struct Orchestrator<L: Launcher> {
     launch_backoff_until: u64,
     /// Messages the async layer must deliver, keyed by destination shard.
     outbox: Vec<(ShardId, Message)>,
-    /// The endpoints learned from each shard's `ShardHello` (for spawn specs).
+    /// The endpoints learned from each shard's `ShardHello`: the **internal**
+    /// address other shards dial it at, with an unspecified IP filled in from
+    /// where its control connection comes from.
     endpoints: BTreeMap<ShardId, std::net::SocketAddr>,
+    /// Where each registered shard's **players** are sent: the client
+    /// endpoint its hello asked for, else its endpoint above. It goes into
+    /// the map beside the endpoint ([`ShardRegion::client_endpoint`]).
+    client_endpoints: BTreeMap<ShardId, std::net::SocketAddr>,
+    /// Where the player port listens, once the run loop serves one.
+    player_addr: Option<SocketAddr>,
+    /// The player port's counters as of the last beat (for the operator
+    /// view): hellos redirected, told "starting", and refused for want of
+    /// room.
+    player_counts: (u64, u64, u64),
     /// The tick each registered shard said hello at. A launch is only ever
     /// matched to a shard that registered **after** the launch was staged
     /// ([`Self::attribute_launches`]).
@@ -518,6 +533,9 @@ impl<L: Launcher> Orchestrator<L> {
             launch_backoff_until: 0,
             outbox: Vec::new(),
             endpoints: BTreeMap::new(),
+            client_endpoints: BTreeMap::new(),
+            player_addr: None,
+            player_counts: (0, 0, 0),
             registered_at: BTreeMap::new(),
             ack_strikes: BTreeMap::new(),
             logged_wait: None,
@@ -651,11 +669,67 @@ impl<L: Launcher> Orchestrator<L> {
             .collect()
     }
 
-    /// The address `shard` advertised in its hello — where clients and other
-    /// shards dial it — if it has registered.
+    /// The address `shard` advertised in its hello — where other shards dial
+    /// it; an unspecified IP filled in with the one its control connection
+    /// comes from — if it has registered.
     #[must_use]
     pub fn endpoint_of(&self, shard: ShardId) -> Option<SocketAddr> {
         self.endpoints.get(&shard).copied()
+    }
+
+    /// Where `shard`'s players are sent — the client endpoint its hello
+    /// asked for, else its endpoint — if it has registered. An unspecified
+    /// IP there means "the host the player dialed".
+    #[must_use]
+    pub fn client_endpoint_of(&self, shard: ShardId) -> Option<SocketAddr> {
+        self.client_endpoints.get(&shard).copied()
+    }
+
+    /// The shard a new player starts on: the owner of the scene's spawn
+    /// point ([`space_scene::scene_anchor`] of the published map).
+    #[must_use]
+    pub fn spawn_owner(&self) -> Option<ShardId> {
+        let map = self.control.map();
+        let spawn = space_scene::scene_anchor(map)?;
+        map.lookup(&spawn)
+    }
+
+    /// What the player port answers a client's hello with right now
+    /// (`docs/plan-sharding.md` §4): a [`JoinRedirect`] naming the shard that
+    /// owns the scene's spawn point, with the published map — or
+    /// [`PlayerAnswer::Starting`] while there is no shard to send a player
+    /// to:
+    ///
+    /// * nobody has claimed the root yet (the cluster is starting);
+    /// * the spawn point's owner holds no control link or is known to be dead
+    ///   (it is being replaced: a redirect would send the player to a shard
+    ///   that is gone);
+    /// * the map does not say where players reach it.
+    ///
+    /// A pure function of the orchestrator's state. The run loop publishes it
+    /// to the player port on every beat ([`crate::player::PlayerServer`]),
+    /// which is all that port ever learns.
+    #[must_use]
+    pub fn player_answer(&self) -> PlayerAnswer {
+        match self.player_target() {
+            Some(shard) => PlayerAnswer::Redirect(JoinRedirect {
+                shard,
+                shard_map: self.control.map().clone(),
+            }),
+            None => PlayerAnswer::Starting,
+        }
+    }
+
+    /// The shard a new player is sent to right now, if there is one (see
+    /// [`Self::player_answer`] for when there is not).
+    #[must_use]
+    pub fn player_target(&self) -> Option<ShardId> {
+        self.spawn_owner().filter(|owner| {
+            self.control.unclaimed_root_owner() != Some(*owner)
+                && self.connected.contains(owner)
+                && !self.dead.contains_key(owner)
+                && self.control.map().client_endpoint_of(*owner).is_some()
+        })
     }
 
     /// The shard the merge in flight will remove once its epoch commits.
@@ -716,9 +790,20 @@ impl<L: Launcher> Orchestrator<L> {
     /// [`Self::handle_shard_hello`] for a hello whose control connection
     /// comes from `seen_from`.
     ///
-    /// The address matters for one decision only: a hello that advertises the
-    /// address of a **live** registered shard takes that shard's place only
-    /// when it comes from that address's host (`take_over_in_place`).
+    /// The address matters for two things:
+    ///
+    /// * a hello that advertises an endpoint **without an IP**
+    ///   (`0.0.0.0:<port>`: a shard in a container that does not know its own
+    ///   address) is recorded with `seen_from` as its IP
+    ///   ([`crate::control::as_seen_from`]) — that is the address other
+    ///   shards are told to dial, and the one every rule below works with;
+    /// * a hello that advertises the address of a **live** registered shard
+    ///   takes that shard's place only when it comes from that address's host
+    ///   (`take_over_in_place`) — which a hello without an IP of its own
+    ///   does by construction, and no other host's can fake.
+    ///
+    /// Where the shard's **players** are sent is recorded here too: the
+    /// client endpoint the hello asks for, else its (filled-in) endpoint.
     ///
     /// # Errors
     ///
@@ -728,11 +813,14 @@ impl<L: Launcher> Orchestrator<L> {
         hello: &ShardHello,
         seen_from: IpAddr,
     ) -> Result<ShardWelcome, HelloRefusal> {
+        let hello = &as_seen_from(hello, seen_from);
         self.noted_wait = None;
         match self.admit(hello, seen_from) {
             Ok(welcome) => {
                 let shard = welcome.shard;
                 self.endpoints.insert(shard, hello.endpoint);
+                self.client_endpoints
+                    .insert(shard, client_endpoint_of(hello));
                 self.registered_at.insert(shard, self.tick);
                 // A hello arrives over a live control link by definition; the
                 // run loop corrects this on every beat from what it sees.
@@ -748,10 +836,11 @@ impl<L: Launcher> Orchestrator<L> {
                     EventKind::Shard,
                     Severity::Good,
                     format!(
-                        "{} registered from {} for region {}",
+                        "{} registered from {} for region {}{}",
                         welcome.shard,
                         hello.endpoint,
-                        node_path(welcome.region.node)
+                        node_path(welcome.region.node),
+                        players_at(hello)
                     ),
                 );
                 Ok(welcome)
@@ -913,7 +1002,7 @@ impl<L: Launcher> Orchestrator<L> {
         // Whatever becomes of it, the request is served by this hello or not
         // at all: a node that can no longer be carved is not asked for again.
         let asked_for = self.wanted.take().is_some();
-        match self.carve(node, &what, hello.endpoint) {
+        match self.carve(node, &what, hello) {
             Ok(welcome) => Ok(welcome),
             Err(why) if asked_for => {
                 self.log(
@@ -1069,10 +1158,10 @@ impl<L: Launcher> Orchestrator<L> {
             .map(|(id, _)| *id)
     }
 
-    /// Plan the carve of `node` for the shard that just said hello from
-    /// `endpoint`: allocate its id, propose the epoch to every shard of the
-    /// map and to it, and build its welcome. `what` words the change up to
-    /// the new owner's name.
+    /// Plan the carve of `node` for the shard that just said `hello`:
+    /// allocate its id, propose the epoch to every shard of the map and to
+    /// it, and build its welcome. `what` words the change up to the new
+    /// owner's name.
     ///
     /// The id is allocated only once a valid plan exists: a carve that cannot
     /// happen burns no id and writes nothing to the counter file.
@@ -1080,7 +1169,7 @@ impl<L: Launcher> Orchestrator<L> {
         &mut self,
         node: NodeRef,
         what: &str,
-        endpoint: SocketAddr,
+        hello: &ShardHello,
     ) -> Result<ShardWelcome, String> {
         // Planned once with a placeholder owner (the owner is irrelevant to
         // whether a plan validates), so a carve that cannot happen burns no id.
@@ -1116,7 +1205,8 @@ impl<L: Launcher> Orchestrator<L> {
         self.control.autoscaler.note_action(plan.from, self.tick);
         Ok(ShardWelcome {
             shard: new_id,
-            region: ShardRegion::new(plan.node, new_id, endpoint),
+            region: ShardRegion::new(plan.node, new_id, hello.endpoint)
+                .with_client_endpoint(client_endpoint_of(hello)),
             // The published map: the node is not the new shard's yet.
             shard_map: self.control.map().clone(),
             peer_token: self.control.peer_token.expose().to_owned(),
@@ -1164,6 +1254,7 @@ impl<L: Launcher> Orchestrator<L> {
             if region.shard == dead {
                 region.shard = new_id;
                 region.endpoint = hello.endpoint;
+                region.client_endpoint = client_endpoint_of(hello);
             }
         }
         if let Err(why) = topology::validate(&map) {
@@ -1193,7 +1284,8 @@ impl<L: Launcher> Orchestrator<L> {
         ));
         Ok(ShardWelcome {
             shard: new_id,
-            region: ShardRegion::new(first, new_id, hello.endpoint),
+            region: ShardRegion::new(first, new_id, hello.endpoint)
+                .with_client_endpoint(client_endpoint_of(hello)),
             shard_map: self.control.map().clone(),
             peer_token: self.control.peer_token.expose().to_owned(),
         })
@@ -1821,6 +1913,7 @@ impl<L: Launcher> Orchestrator<L> {
     fn forget_shard(&mut self, shard: ShardId) {
         self.forget_reports(shard);
         self.endpoints.remove(&shard);
+        self.client_endpoints.remove(&shard);
         self.registered_at.remove(&shard);
         self.ack_strikes.remove(&shard);
         self.last_heard.remove(&shard);
@@ -1881,7 +1974,9 @@ impl<L: Launcher> Orchestrator<L> {
             // the `Redirect` it hands a client point at the child's real address.
             // It rides the same per-shard FIFO as the commit, so a shard always
             // sees the commit first.
-            self.control.publisher.set_endpoints(&self.endpoints);
+            self.control
+                .publisher
+                .set_endpoints(&self.endpoints, &self.client_endpoints);
             let push = Outbound {
                 to: commit.to.clone(),
                 message: Message::DirectoryReply(space_protocol::DirectoryReply {
@@ -3058,7 +3153,9 @@ impl<L: Launcher> Orchestrator<L> {
     /// Put the committed map, with every known shard's current address, into
     /// the outbox for every shard in it.
     fn queue_map_push(&mut self) {
-        self.control.publisher.set_endpoints(&self.endpoints);
+        self.control
+            .publisher
+            .set_endpoints(&self.endpoints, &self.client_endpoints);
         let map = self.control.publisher.published().clone();
         let recipients: BTreeSet<ShardId> = map.regions.iter().map(|r| r.shard).collect();
         for to in recipients {
@@ -3082,6 +3179,17 @@ impl<L: Launcher> Orchestrator<L> {
             cluster: config.cluster.clone(),
             bind: config.bind,
             control_addr: config.control_addr(),
+            player_port: self
+                .player_addr
+                .or(config.player_bind)
+                .map(|addr| PlayerPortView {
+                    addr,
+                    sends_to: self.player_target(),
+                    redirected: self.player_counts.0,
+                    turned_away: self.player_counts.1,
+                    refused: self.player_counts.2,
+                }),
+            spawn_owner: self.spawn_owner(),
             launcher: config.launcher,
             state_path: config.state_path.clone(),
             root: config.root_node(),
@@ -3175,6 +3283,7 @@ impl<L: Launcher> Orchestrator<L> {
             node: region.node,
             shard,
             endpoint: (!placeholder).then_some(region.endpoint),
+            client_endpoint: (!placeholder).then_some(region.client_endpoint),
             nesting,
             parent,
             octant,
@@ -3227,6 +3336,7 @@ impl<L: Launcher> Orchestrator<L> {
                     connected: self.connected.contains(&shard),
                     registered: self.endpoints.contains_key(&shard),
                     advertised: self.endpoints.get(&shard).copied(),
+                    client_endpoint: self.client_endpoints.get(&shard).copied(),
                     regions,
                     last_heard: self.last_heard.get(&shard).copied(),
                     report,
@@ -3321,6 +3431,23 @@ impl<L: Launcher> Orchestrator<L> {
         )?))
     }
 
+    /// Bind the player port on the configured address
+    /// ([`OrchestratorConfig::player_bind`]); `None` when none is configured.
+    /// Split from the run loop for the same reason as [`Self::bind`]: a
+    /// caller that binds port 0 reads the real address before the loop
+    /// starts ([`Self::run_with_player`]).
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] if the player port cannot be bound.
+    pub fn bind_player(&self) -> Result<Option<Arc<PlayerServer>>, std::io::Error> {
+        self.control
+            .config
+            .player_bind
+            .map(|bind| PlayerServer::bind(bind).map(Arc::new))
+            .transpose()
+    }
+
     /// A liveness probe over the launcher (H15's launcher half): report whether
     /// the process behind `shard` is still running. A shard the orchestrator
     /// did not launch has no process it could ask about: `Dead`.
@@ -3349,19 +3476,16 @@ impl<L: Launcher + 'static> Orchestrator<L> {
     ///
     /// # Errors
     ///
-    /// [`std::io::Error`] if the control endpoint cannot be bound.
+    /// [`std::io::Error`] if the control endpoint — or the player port, when
+    /// one is configured — cannot be bound.
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
         let server = self.bind()?;
-        self.run_with(server).await
+        let player = self.bind_player()?;
+        self.run_with_player(server, player).await
     }
 
-    /// Run the event loop over an already-bound `server` until it closes.
-    ///
-    /// Nothing in the loop waits on a peer: messages are *offered* to a shard's
-    /// queue ([`crate::control::ControlServer::send_to`]), and a launch runs in
-    /// its own task. The second matters for more than latency — a launched
-    /// shard registers by sending a `ShardHello` that only **this loop** can
-    /// answer, so awaiting the launch here would wait on ourselves.
+    /// Run the event loop over an already-bound `server` until it closes,
+    /// with no player port ([`Self::run_with_player`] serves one).
     ///
     /// # Errors
     ///
@@ -3370,10 +3494,46 @@ impl<L: Launcher + 'static> Orchestrator<L> {
         &mut self,
         server: Arc<crate::control::ControlServer>,
     ) -> Result<(), std::io::Error> {
+        self.run_with_player(server, None).await
+    }
+
+    /// Run the event loop over an already-bound control `server` — and, if
+    /// given, an already-bound `player` port — until the control endpoint
+    /// closes.
+    ///
+    /// Nothing in the loop waits on a peer: messages are *offered* to a shard's
+    /// queue ([`crate::control::ControlServer::send_to`]), and a launch runs in
+    /// its own task. The second matters for more than latency — a launched
+    /// shard registers by sending a `ShardHello` that only **this loop** can
+    /// answer, so awaiting the launch here would wait on ourselves.
+    ///
+    /// The player port is served by its own tasks ([`PlayerServer`]). All the
+    /// loop does for it is publish what it is to answer
+    /// ([`Self::player_answer`]) whenever something was decided — after every
+    /// inbound message and on every beat. Nothing comes back from it.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` keeps [`Self::run`]'s signature.
+    pub async fn run_with_player(
+        &mut self,
+        server: Arc<crate::control::ControlServer>,
+        player: Option<Arc<PlayerServer>>,
+    ) -> Result<(), std::io::Error> {
         use crate::control::Inbound;
         use std::time::Duration;
 
         let accept = Arc::clone(&server).spawn_accept();
+        let player_accept = player.as_ref().map(|player| {
+            self.player_addr = player.local_addr().ok();
+            player.publish(self.player_answer());
+            Arc::clone(player).spawn_accept()
+        });
+        if player.is_some() {
+            // The operator view shows where the port really listens (a bind
+            // on port 0 has only now become an address).
+            self.publish(true);
+        }
         let mut clock = tokio::time::interval(Duration::from_secs_f64(
             1.0 / f64::from(crate::config::TICK_HZ as u32),
         ));
@@ -3413,9 +3573,22 @@ impl<L: Launcher + 'static> Orchestrator<L> {
                 }
                 _ = clock.tick() => self.beat(&server).await,
             }
+            // What players are told follows what was just decided: a root
+            // that was claimed, a shard found dead, a replacement that
+            // committed.
+            if let Some(player) = &player {
+                player.publish(self.player_answer());
+                self.player_counts = (player.redirected(), player.turned_away(), player.refused());
+            }
         }
         accept.abort();
         server.close();
+        if let Some(accept) = player_accept {
+            accept.abort();
+        }
+        if let Some(player) = &player {
+            player.close();
+        }
         Ok(())
     }
 
@@ -3643,6 +3816,18 @@ fn not_connected(shard: ShardId) -> String {
     format!("{shard} is not connected to the orchestrator, so it could not acknowledge the change")
 }
 
+/// `" (players dial 0.0.0.0:7870: the host they dialed)"` for a hello that
+/// asks for a client endpoint of its own, or nothing.
+fn players_at(hello: &ShardHello) -> String {
+    match hello.client_endpoint {
+        Some(at) if at != hello.endpoint && at.ip().is_unspecified() => {
+            format!(" (players dial {at}: the host they dialed)")
+        }
+        Some(at) if at != hello.endpoint => format!(" (players dial {at})"),
+        _ => String::new(),
+    }
+}
+
 /// `" on port 7870"`, or nothing for a launch without a host port.
 fn on_port(port: u16) -> String {
     if port == 0 {
@@ -3823,6 +4008,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint,
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         }
     }
@@ -4454,6 +4640,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("root shard registers");
@@ -5281,6 +5468,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("the root owner registers");
@@ -5456,6 +5644,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         orch.handle_shard_hello(&hello(&OrchestratorConfig::default().cluster))
@@ -5485,6 +5674,7 @@ mod tests {
             shard: ShardId::new(2),
             endpoint: addr(9_002),
             region: Some(ShardRegion::new(child, ShardId::new(2), addr(9_002))),
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("a known owner registers");
@@ -5821,6 +6011,7 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             };
             assert!(orch.handle_shard_hello(&hello).is_err());
@@ -7877,6 +8068,7 @@ mod tests {
                 shard: ShardId::new(shard),
                 endpoint: addr(port),
                 region,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("a known owner registers");
@@ -8242,6 +8434,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_001),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("the shard registers");
@@ -8478,6 +8671,7 @@ mod tests {
                 shard: ShardId::new(1),
                 endpoint: addr(9_001),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect_err("an id is used by one process, once");
@@ -8619,5 +8813,289 @@ mod tests {
         );
         let _ = std::fs::remove_file(&state_path);
         let _ = std::fs::remove_file(&scene_file);
+    }
+
+    // ------------------------------------------------------------ one address
+
+    /// `0.0.0.0:port`: "the host the player dialed, this port".
+    fn any_host(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+    }
+
+    /// The hello of a shard the `process` launcher started on `port`: it
+    /// listens on loopback and sends its players to the host they dialed.
+    fn process_hello(port: u16) -> ShardHello {
+        ShardHello {
+            client_endpoint: Some(any_host(port)),
+            ..fresh_hello(addr(port))
+        }
+    }
+
+    /// What the player port answers follows the owner of the scene's spawn
+    /// point through its life: "starting" while nobody has claimed the root;
+    /// a redirect to the root's shard, with the published map, once one has;
+    /// "starting" again from the moment that shard is known to be dead — a
+    /// redirect would send the player to a shard that is gone — and a
+    /// redirect to the **replacement**, under its new id, as soon as its
+    /// epoch has committed. Shards that own other ground never change it.
+    ///
+    /// Mutation this catches: answering with the map's owner whether it is
+    /// there or not (players are sent to a dead address and wait out a
+    /// handshake timeout), or with the reserved root id before any shard has
+    /// claimed it (the map names the control port as its address).
+    #[test]
+    fn the_player_port_follows_the_owner_of_the_spawn_point() {
+        let mut orch = process_cluster(2, (7_870, 7_879));
+        assert_eq!(orch.spawn_owner(), Some(ShardId::new(1)));
+        assert_eq!(
+            orch.player_answer(),
+            PlayerAnswer::Starting,
+            "the root is reserved, nobody has claimed it"
+        );
+        assert_eq!(orch.player_target(), None);
+
+        // The root's shard registers: players are sent to it, with the map.
+        orch.tick();
+        let spec = orch.take_pending_spawn().pop().expect("the root's launch");
+        let root = orch
+            .handle_shard_hello(&process_hello(spec.host_port))
+            .expect("the root");
+        orch.note_launch_result(spec.launch, Ok(process_handle(&spec)));
+        assert_eq!(root.shard, ShardId::new(1));
+        let PlayerAnswer::Redirect(redirect) = orch.player_answer() else {
+            panic!("a shard owns the spawn point: {:?}", orch.player_answer());
+        };
+        assert_eq!(redirect.shard, ShardId::new(1));
+        assert_eq!(&redirect.shard_map, orch.map());
+        assert_eq!(
+            redirect.shard_map.client_endpoint_of(ShardId::new(1)),
+            Some(any_host(spec.host_port)),
+            "the host the player dialed, the shard's port"
+        );
+        assert_eq!(redirect.shard_map.regions[0].endpoint, addr(spec.host_port));
+
+        // A second shard takes a layout cell: the spawn point is not in it.
+        orch.tick();
+        let second_spec = orch.take_pending_spawn().pop().expect("the second launch");
+        let second = orch
+            .handle_shard_hello(&process_hello(second_spec.host_port))
+            .expect("a layout cell");
+        orch.note_launch_result(second_spec.launch, Ok(process_handle(&second_spec)));
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 2);
+        assert_eq!(orch.player_target(), Some(ShardId::new(1)));
+        assert_eq!(
+            orch.map().client_endpoint_of(second.shard),
+            Some(any_host(second_spec.host_port)),
+            "a carved shard's client endpoint is in the committed map"
+        );
+        let _ = (orch.drain_outbox(), orch.take_pending_kill());
+
+        // The root's shard dies: nobody to send a player to.
+        orch.declare_dead(ShardId::new(1), "its process exited");
+        assert_eq!(
+            orch.spawn_owner(),
+            Some(ShardId::new(1)),
+            "the map is unchanged"
+        );
+        assert_eq!(orch.player_answer(), PlayerAnswer::Starting);
+        let port = orch.snapshot().player_port;
+        assert_eq!(
+            port, None,
+            "no player port configured: none in the snapshot"
+        );
+
+        // Its replacement registers; until the epoch commits it owns nothing.
+        orch.tick();
+        let replacement_spec = orch
+            .take_pending_spawn()
+            .pop()
+            .expect("a replacement is launched");
+        let replacement = orch
+            .handle_shard_hello(&process_hello(replacement_spec.host_port))
+            .expect("the dead shard's region");
+        orch.note_launch_result(
+            replacement_spec.launch,
+            Ok(process_handle(&replacement_spec)),
+        );
+        assert_eq!(replacement.shard, ShardId::new(3), "a new id");
+        assert_eq!(orch.player_answer(), PlayerAnswer::Starting);
+        assert!(ack_the_prepare(&mut orch) > 0);
+        // Committed: the replacement is the owner, at its own address.
+        let PlayerAnswer::Redirect(redirect) = orch.player_answer() else {
+            panic!("the replacement owns the spawn point");
+        };
+        assert_eq!(redirect.shard, ShardId::new(3));
+        assert_eq!(
+            redirect.shard_map.client_endpoint_of(ShardId::new(3)),
+            Some(any_host(replacement_spec.host_port))
+        );
+        assert_ne!(replacement_spec.host_port, spec.host_port, "another port");
+        assert_eq!(orch.snapshot().spawn_owner, Some(ShardId::new(3)));
+    }
+
+    /// The player port and each shard's client endpoint are in the snapshot:
+    /// where the port listens and whom it sends players to, per region and
+    /// per shard where players dial — beside the internal address.
+    #[test]
+    fn the_snapshot_shows_the_player_port_and_every_client_endpoint() {
+        let player_bind: SocketAddr = "127.0.0.1:7777".parse().expect("an address");
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            player_bind: Some(player_bind),
+            ..OrchestratorConfig::default()
+        });
+        let before = orch.snapshot();
+        let port = before.player_port.expect("a player port is configured");
+        assert_eq!((port.addr, port.sends_to), (player_bind, None));
+        assert_eq!(before.regions[0].client_endpoint, None, "a placeholder");
+
+        orch.handle_shard_hello(&process_hello(7_870))
+            .expect("the root");
+        let after = orch.snapshot();
+        let port = after.player_port.expect("a player port");
+        assert_eq!(port.sends_to, Some(ShardId::new(1)));
+        assert_eq!(after.spawn_owner, Some(ShardId::new(1)));
+        assert_eq!(after.regions[0].endpoint, Some(addr(7_870)));
+        assert_eq!(after.regions[0].client_endpoint, Some(any_host(7_870)));
+        let shard = &after.shards[0];
+        assert_eq!(shard.advertised, Some(addr(7_870)));
+        assert_eq!(shard.client_endpoint, Some(any_host(7_870)));
+        assert_eq!(
+            orch.client_endpoint_of(ShardId::new(1)),
+            Some(any_host(7_870))
+        );
+
+        // A shard that asks for none: players dial the address it advertises.
+        let mut plain = fresh_cluster(OrchestratorConfig::default());
+        plain
+            .handle_shard_hello(&fresh_hello(addr(9_001)))
+            .expect("the root");
+        let snapshot = plain.snapshot();
+        assert_eq!(snapshot.player_port, None);
+        assert_eq!(snapshot.regions[0].client_endpoint, Some(addr(9_001)));
+        assert_eq!(snapshot.shards[0].client_endpoint, Some(addr(9_001)));
+    }
+
+    /// A shard that advertises an address **without an IP** (`0.0.0.0:port`:
+    /// a container that does not know its own) is recorded with the IP its
+    /// control connection comes from: that is what other shards are told to
+    /// dial. The client endpoint keeps its own meaning — there the
+    /// unspecified IP is "the host the player dialed" and is left alone.
+    ///
+    /// The rule of phase 1b holds with the filled-in address: a hello from
+    /// that same host and port takes the live shard's place (it *is* from
+    /// that address), one from another host is simply another address — it
+    /// cannot name the first one's by leaving the IP out.
+    ///
+    /// Mutation this catches: publishing `0.0.0.0` as a shard's internal
+    /// endpoint (no neighbour could dial it), or treating two shards on
+    /// different hosts that both say `0.0.0.0:7870` as one address (the
+    /// second would knock the first out).
+    #[test]
+    fn a_shard_without_an_ip_of_its_own_is_listed_at_the_address_it_is_seen_from() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        let root = orch.config().root_node();
+        let seen_from: IpAddr = "10.1.2.3".parse().expect("an address");
+        let hello = ShardHello {
+            endpoint: any_host(7_870),
+            client_endpoint: Some(any_host(7_870)),
+            ..fresh_hello(addr(0))
+        };
+        let welcome = orch
+            .handle_shard_hello_from(&hello, seen_from)
+            .expect("the root");
+        let observed: SocketAddr = "10.1.2.3:7870".parse().expect("an address");
+        assert_eq!(welcome.region.endpoint, observed);
+        assert_eq!(welcome.region.client_endpoint, any_host(7_870));
+        assert_eq!(orch.endpoint_of(welcome.shard), Some(observed));
+        assert_eq!(orch.map().regions[0].endpoint, observed);
+        assert_eq!(orch.map().regions[0].client_endpoint, any_host(7_870));
+        let snapshot = orch.snapshot();
+        assert_eq!(snapshot.shards[0].advertised, Some(observed));
+        assert_eq!(snapshot.regions[0].endpoint, Some(observed));
+        assert!(
+            event_texts(&orch)[0].contains("registered from 10.1.2.3:7870"),
+            "{:?}",
+            event_texts(&orch)
+        );
+
+        // Without a client endpoint of its own, players dial that address.
+        let mut plain = fresh_cluster(OrchestratorConfig::default());
+        let bare = ShardHello {
+            endpoint: any_host(7_870),
+            ..fresh_hello(addr(0))
+        };
+        plain
+            .handle_shard_hello_from(&bare, seen_from)
+            .expect("the root");
+        assert_eq!(plain.map().regions[0].client_endpoint, observed);
+
+        // Another host that says the same `0.0.0.0:7870` is another address:
+        // it is given a layout cell, and shard 1 is not touched.
+        let other_host: IpAddr = "10.1.2.4".parse().expect("an address");
+        let second = orch
+            .handle_shard_hello_from(&hello, other_host)
+            .expect("a shard of its own");
+        assert_ne!(second.region.node, root);
+        assert_eq!(
+            second.region.endpoint,
+            "10.1.2.4:7870".parse::<SocketAddr>().expect("an address")
+        );
+        assert!(orch.dead_shards().is_empty(), "nobody was knocked out");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 2);
+        let _ = (orch.drain_outbox(), orch.take_pending_kill());
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+
+        // The first host's shard comes back (same host, same port, still
+        // without an IP of its own): it replaces itself in place, under a
+        // new id — the rule for a hello at a live shard's address.
+        let again = orch
+            .handle_shard_hello_from(&hello, seen_from)
+            .expect("it takes its own place");
+        assert_eq!(again.region.node, root);
+        assert_eq!(again.region.endpoint, observed);
+        assert_eq!(again.shard, ShardId::new(3));
+        assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+    }
+
+    /// A replacement's client endpoint goes into the staged map with its
+    /// endpoint, and the map push behind every commit carries both.
+    #[test]
+    fn a_map_push_carries_every_client_endpoint() {
+        let mut orch = fresh_cluster(OrchestratorConfig::default());
+        orch.handle_shard_hello(&process_hello(7_870))
+            .expect("the root");
+        orch.handle_shard_hello(&process_hello(7_871))
+            .expect("a layout cell");
+        let outbox = orch.drain_outbox();
+        for (shard, epoch) in prepares(&outbox) {
+            orch.handle_epoch_ack(shard, epoch);
+        }
+        let pushed: Vec<ShardMap> = orch
+            .drain_outbox()
+            .into_iter()
+            .filter_map(|(_, message)| match message {
+                Message::DirectoryReply(reply) => Some(reply.shard_map),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pushed.len(), 2, "one push per owner");
+        for map in &pushed {
+            assert_eq!(map, orch.map());
+            for (shard, port) in [(1, 7_870), (2, 7_871)] {
+                let region = map
+                    .regions
+                    .iter()
+                    .find(|r| r.shard == ShardId::new(shard))
+                    .expect("in the map");
+                assert_eq!(
+                    (region.endpoint, region.client_endpoint),
+                    (addr(port), any_host(port))
+                );
+            }
+        }
     }
 }

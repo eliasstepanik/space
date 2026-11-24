@@ -101,8 +101,11 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        frame, width, height, fps,
                        gravity, landed, bodies (nearest first: guid, visual, visual_id,
                        position, distance, speed, parts, in_view), bodies_in_view,
-                       correction_m, correction_max_m
-GET  /frame.png        the current picture, lossless PNG
+                       correction_m, correction_max_m,
+                       shard_address (the shard being played on; address is the
+                       entry address that was dialed, which may have sent the
+                       client on)
+GET  /frame.png       the current picture, lossless PNG
 GET  /frame.jpg        the same as JPEG (?quality=1..100)
                        ?wait=1   block until the next frame
                        ?after=N  block until a frame with a number above N

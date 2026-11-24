@@ -278,11 +278,13 @@ impl ControlPlane {
             // shard's goes in at once, so the very first welcome and every
             // client's map name it.
             self.unclaimed_root_owner = None;
-            let mut endpoints = std::collections::BTreeMap::new();
-            endpoints.insert(shard, hello.endpoint);
-            self.publisher.set_endpoints(&endpoints);
+            let endpoints = std::collections::BTreeMap::from([(shard, hello.endpoint)]);
+            let client_endpoints =
+                std::collections::BTreeMap::from([(shard, client_endpoint_of(hello))]);
+            self.publisher.set_endpoints(&endpoints, &client_endpoints);
         }
-        let region = ShardRegion::new(node, shard, hello.endpoint);
+        let region = ShardRegion::new(node, shard, hello.endpoint)
+            .with_client_endpoint(client_endpoint_of(hello));
         Ok(ShardWelcome {
             shard,
             region,
@@ -343,6 +345,36 @@ impl ControlPlane {
             },
         }
     }
+}
+
+/// Where the players of the shard saying `hello` are sent: the client
+/// endpoint it asks for, else the address it advertises
+/// ([`ShardRegion::client_endpoint`]; an unspecified IP there means "the host
+/// the player dialed").
+#[must_use]
+pub fn client_endpoint_of(hello: &ShardHello) -> SocketAddr {
+    hello.client_endpoint.unwrap_or(hello.endpoint)
+}
+
+/// `hello` as the orchestrator records it when its control connection comes
+/// from `seen_from`: an advertised endpoint **without an IP**
+/// (`0.0.0.0:<port>`, `[::]:<port>` — a shard in a container that does not
+/// know its own address) is given the IP the orchestrator sees the shard at.
+/// The client endpoint is left as it is: there the unspecified IP has a
+/// meaning of its own. A hello that names a real address is returned
+/// unchanged, whatever `seen_from` is.
+#[must_use]
+pub fn as_seen_from(hello: &ShardHello, seen_from: std::net::IpAddr) -> ShardHello {
+    let mut hello = hello.clone();
+    if hello.endpoint.ip().is_unspecified() && !seen_from.is_unspecified() {
+        hello.endpoint.set_ip(seen_from.to_canonical());
+        if let Some(claim) = hello.region.as_mut() {
+            if claim.endpoint.ip().is_unspecified() {
+                claim.endpoint.set_ip(seen_from.to_canonical());
+            }
+        }
+    }
+    hello
 }
 
 /// Why a `ShardHello` was not answered with a welcome.
@@ -451,8 +483,9 @@ pub enum Inbound {
     /// channel: the run loop sends the [`ShardWelcome`] on it and registers it
     /// for future epoch traffic.
     Hello {
-        /// The hello.
-        hello: ShardHello,
+        /// The hello (boxed: it is by far the largest thing an event
+        /// carries, and reports and acks are what the queue mostly holds).
+        hello: Box<ShardHello>,
         /// The shard's outbound sender (the run loop registers it under the id
         /// the welcome names). Nothing put into it is written before the
         /// connection is admitted.
@@ -528,7 +561,18 @@ pub struct ControlServer {
     /// How many of those are written to standard error (a registered shard
     /// can send as many as it likes).
     misattributed_lines: space_net::LogBudget,
+    /// Hellos that were a player's, not a shard's, and were refused
+    /// ([`Self::players_refused`]).
+    players_refused: AtomicU64,
+    /// How many of those are written to standard error (anybody who reaches
+    /// the port can send as many as they like).
+    player_lines: space_net::LogBudget,
 }
+
+/// What a player who dials the control port is told ([`RejectReason::Other`]).
+pub const NOT_THE_PLAYER_PORT: &str =
+    "this is the cluster's control port, which is for shards; players connect to the \
+     orchestrator's player port";
 
 /// How many dropped reports and acks ([`ControlServer::misattributed`]) are
 /// written to standard error per [`MISATTRIBUTED_WINDOW`]; the rest are
@@ -559,7 +603,16 @@ impl ControlServer {
                 MISATTRIBUTED_LINES,
                 MISATTRIBUTED_WINDOW,
             ),
+            players_refused: AtomicU64::new(0),
+            player_lines: space_net::LogBudget::new(MISATTRIBUTED_LINES, MISATTRIBUTED_WINDOW),
         })
+    }
+
+    /// How many hellos on the control port were a player's — a client pointed
+    /// at the wrong port — and were refused with [`NOT_THE_PLAYER_PORT`].
+    #[must_use]
+    pub fn players_refused(&self) -> u64 {
+        self.players_refused.load(Ordering::Relaxed)
     }
 
     /// How many reports and acks were dropped because they named another
@@ -745,9 +798,29 @@ impl ControlServer {
     /// what"): hello, verdict, and only then — and only for the id it was
     /// admitted as — reports and acks.
     async fn handle_connection(self: Arc<Self>, incoming: quinn::Incoming) {
-        let Ok((conn, _hello)) = space_net::accept_incoming(incoming).await else {
+        let Ok((conn, hello)) = space_net::accept_incoming(incoming).await else {
             return; // refused at the version gate
         };
+        // A shard's transport hello names it a shard (`shard:<id>`, the form
+        // `space_server::net::peer_hello` builds). Anything else is a player
+        // — a client pointed at the control port by mistake — and is told so,
+        // instead of the placeholder welcome below, which a client took for a
+        // shard's and then sat on a world that never came. Nothing is given
+        // away: the port a player is sent to is not named here.
+        if space_server::net::peer_shard_id(&hello.player_token).is_none() {
+            self.players_refused.fetch_add(1, Ordering::Relaxed);
+            if let Some(held_back) = self.player_lines.admit() {
+                eprintln!(
+                    "space-orchestrator: a player's hello arrived on the control port (from {}) \
+                     and was refused: the control port is for shards{}",
+                    conn.remote_address(),
+                    space_net::held_back_note(held_back)
+                );
+            }
+            conn.reject(RejectReason::Other(NOT_THE_PLAYER_PORT.to_owned()))
+                .await;
+            return;
+        }
         // `space_net::connect` blocks until it sees a Welcome; answer the
         // handshake with a placeholder so the shard's connect() completes, then
         // read the real ShardHello on the control stream.
@@ -775,7 +848,7 @@ impl ControlServer {
         let (tx, mut rx) = mpsc::channel::<Message>(OUT_QUEUE);
         let (verdict, admission) = oneshot::channel::<Admission>();
         let hello = Inbound::Hello {
-            hello,
+            hello: Box::new(hello),
             reply: tx,
             conn: conn.clone(),
             verdict,
@@ -906,6 +979,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         let welcome = plane.handle_shard_hello(&hello).expect("welcome");
@@ -941,6 +1015,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(port),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         let (first, second) = (hello(9_000), hello(9_001));
@@ -963,6 +1038,7 @@ mod tests {
             shard: ShardId::new(2),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&hello).is_err());
@@ -981,6 +1057,7 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         plane.handle_shard_hello(&hello).expect("owner confirms");
@@ -1006,6 +1083,7 @@ mod tests {
             shard: ShardId::new(100),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         let welcome = plane.handle_shard_hello(&claim).expect("claim confirmed");
@@ -1033,6 +1111,7 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("adopts the root");
@@ -1043,6 +1122,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
             secret: String::new(),
         };
         let err = plane
@@ -1080,6 +1160,7 @@ mod tests {
                 shard: issued,
                 endpoint: addr(9_001),
                 region: Some(ShardRegion::new(child, issued, addr(9_001))),
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect_err("no region is created by claiming it");
@@ -1104,6 +1185,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         plane.handle_shard_hello(&hello).expect("adopts");
@@ -1127,6 +1209,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(port),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         let (first, other) = (hello(9_000), hello(9_001));
@@ -1148,6 +1231,7 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                client_endpoint: None,
                 secret: String::new(),
             })
             .expect("adopts the root");
@@ -1158,6 +1242,7 @@ mod tests {
             shard: ShardId::new(u32::MAX - 1),
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
             secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&poison).is_err(), "never issued");
@@ -1185,6 +1270,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: secret.to_owned(),
         };
         let plane_for = |config: OrchestratorConfig| {
@@ -1373,6 +1459,7 @@ mod tests {
             shard: ShardId::new(3),
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
             secret: String::new(),
         };
         let err = plane.handle_shard_hello(&claim).expect_err("refused");
@@ -1411,6 +1498,7 @@ mod tests {
             shard: ShardId::new(100),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         let err = plane
@@ -1425,6 +1513,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
             secret: String::new(),
         };
         let err = plane.handle_shard_hello(&anonymous).expect_err("refused");
@@ -1439,6 +1528,7 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&hello).is_err());
@@ -1458,6 +1548,7 @@ mod tests {
                 ShardId::new(2),
                 addr(9_000),
             )),
+            client_endpoint: None,
             secret: String::new(),
         };
         assert!(

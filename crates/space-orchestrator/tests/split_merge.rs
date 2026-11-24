@@ -85,6 +85,7 @@ fn register(orch: &mut Orchestrator<RecordingLauncher>, spec: &SpawnSpec) -> Sha
             shard: ShardId::NONE,
             endpoint,
             region: None,
+            client_endpoint: None,
             secret: String::new(),
         })
         .expect("the launched shard is welcomed");
@@ -478,6 +479,7 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
         shard: ShardId::NONE,
         endpoint: addr(9_100),
         region: None,
+        client_endpoint: None,
         secret: String::new(),
     };
     let (welcome, _conn) = OrchestratorLink::handshake(bound, hello)
@@ -575,6 +577,7 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
                 advertise: None,
                 claim_region: None,
                 cluster,
+                client_endpoint: None,
                 secret: String::new(),
             },
             control_addr,
@@ -666,6 +669,9 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
         launcher.poll(child_launch).await.expect("poll"),
         Poll::Alive
     );
+    // (Asked as a peer shard asks, with the cluster's peer token: a shard
+    // answers a peer with its own id and map. A *player* who dials the cell's
+    // shard is sent to the one that owns the spawn point — checked below.)
     let client = space_net::client_endpoint().expect("client endpoint");
     let mut child_map = None;
     for _ in 0..100 {
@@ -673,7 +679,7 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
             &client,
             carved.endpoint,
             space_server::net::SERVER_NAME,
-            &space_net::hello("after-the-carve"),
+            &space_server::net::peer_hello_with(shard(1), "secret"),
         )
         .await
         .expect("the cell's shard answers at the address the map names");
@@ -688,6 +694,21 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
     let child_map = child_map.expect("the cell's shard installs the committed map");
     assert_eq!(child_map.lookup(&inside), Some(child));
     assert_eq!(child_map.lookup(&root_node.center()), Some(shard(1)));
+    // A new player starts on the spawn point, which is still the root
+    // shard's: the cell's shard sends a player's hello there.
+    let joined = space_net::join(
+        &client,
+        carved.endpoint,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("after-the-carve"),
+    )
+    .await
+    .expect("the cell's shard answers a player");
+    let space_net::Joined::Elsewhere(redirect) = joined else {
+        panic!("a player was let in by a shard that does not own the spawn point: {joined:?}");
+    };
+    assert_eq!(redirect.shard, shard(1));
+    assert_eq!(redirect.shard_map, child_map);
 
     // --- merge it back. Not before the minimum interval between two commits
     // has passed, and not before the shard is known to be empty: no shard

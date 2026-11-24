@@ -34,6 +34,26 @@
 //! new id, and nothing is orphaned by an orchestrator restart
 //! ([`space_server::orchestrated`]).
 //!
+//! **Two addresses.** `--advertise <addr:port>` is the address the shard
+//! reports instead of the one it bound: the **internal** endpoint the
+//! cluster's other shards dial. With an unspecified IP (`0.0.0.0:<port>`, a
+//! shard in a container that does not know its own address) the orchestrator
+//! fills in the IP it sees the shard's control connection come from.
+//! `--client-endpoint <addr:port>` is where **players** are to dial it, when
+//! that is not the advertised address; `0.0.0.0:<port>` there means "the host
+//! the player dialed, this port" — the shards of a cluster run on the host of
+//! the one address players type (the orchestrator's player port), so no public
+//! host name is configured anywhere. A shard the orchestrator starts itself is
+//! given `--client-endpoint 0.0.0.0:<its port>`. Both flags are for an
+//! orchestrated shard: standalone, the map is the command line's and each
+//! shard in it has one address.
+//!
+//! **Joining.** A new player starts on the scene's spawn point, so only the
+//! shard that owns it welcomes a fresh join; every other shard answers with a
+//! `JoinRedirect` naming that shard (standalone and orchestrated alike), and
+//! the client dials it. A player whose ship is being handed over is welcomed
+//! by the shard taking it, as before.
+//!
 //! The **cluster secret** — needed when the orchestrator's control port is
 //! not on loopback — is read from the environment, never from the command
 //! line: `SPACE_CLUSTER_SECRET`, else the file `SPACE_CLUSTER_SECRET_FILE` or
@@ -80,6 +100,11 @@ struct Options {
     /// `--orchestrator`: a container binds `0.0.0.0:<port>`, which no peer can
     /// dial, so it advertises the address peers and clients can reach it on.
     advertise: Option<SocketAddr>,
+    /// Where players are to dial this shard (`--client-endpoint`), or `None`
+    /// for "at the advertised address". Only meaningful with `--orchestrator`:
+    /// the orchestrator puts it into the map as this shard's client endpoint,
+    /// and `0.0.0.0:<port>` there means "the host the player dialed".
+    client_endpoint: Option<SocketAddr>,
     /// The region this shard owns.
     region: NodeRef,
     /// Every region in the world map, this shard's included.
@@ -110,10 +135,12 @@ const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
                      [--scene demo-area|materials|solar|galaxy] \
                      [--orchestrator <addr:port> [--cluster <id>] [--advertise <addr:port>] \
-                     [--cluster-secret-file <path>] [--claim-region <depth:x:y:z>]] \
+                     [--client-endpoint <addr:port>] [--cluster-secret-file <path>] \
+                     [--claim-region <depth:x:y:z>]] \
                      (with --orchestrator the id and the region are the orchestrator's to give; \
-                     the cluster secret is read from SPACE_CLUSTER_SECRET or the file \
-                     SPACE_CLUSTER_SECRET_FILE / --cluster-secret-file names)";
+                     --client-endpoint is where players dial this shard, 0.0.0.0:<port> meaning \
+                     the host they dialed; the cluster secret is read from SPACE_CLUSTER_SECRET \
+                     or the file SPACE_CLUSTER_SECRET_FILE / --cluster-secret-file names)";
 
 /// The revision a standalone shard's scene is announced at.
 ///
@@ -130,6 +157,7 @@ impl Options {
         let mut region: Option<NodeRef> = None;
         let mut regions: Vec<ShardRegion> = Vec::new();
         let mut advertise: Option<SocketAddr> = None;
+        let mut client_endpoint: Option<SocketAddr> = None;
         let mut orchestrator: Option<SocketAddr> = None;
         let mut claim_region: Option<NodeRef> = None;
         let mut cluster = "space-local".to_owned();
@@ -161,6 +189,16 @@ impl Options {
                 "--advertise" => {
                     let text = value("--advertise")?;
                     advertise = Some(text.parse::<SocketAddr>().map_err(|e| e.to_string())?);
+                }
+                "--client-endpoint" => {
+                    let text = value("--client-endpoint")?;
+                    let addr = text.parse::<SocketAddr>().map_err(|e| e.to_string())?;
+                    if addr.port() == 0 {
+                        return Err(format!(
+                            "--client-endpoint needs a port players can dial (got {addr})"
+                        ));
+                    }
+                    client_endpoint = Some(addr);
                 }
                 "--region" => {
                     let text = value("--region")?;
@@ -217,6 +255,13 @@ impl Options {
         if advertise.is_some() && !orchestrated {
             return Err(format!("--advertise requires --orchestrator\n{USAGE}"));
         }
+        // Standalone, the map is the command line's (`--peer`): every shard
+        // in it has one address, for shards and players alike.
+        if client_endpoint.is_some() && !orchestrated {
+            return Err(format!(
+                "--client-endpoint requires --orchestrator\n{USAGE}"
+            ));
+        }
         if cluster_secret_file.is_some() && !orchestrated {
             return Err(format!(
                 "--cluster-secret-file requires --orchestrator\n{USAGE}"
@@ -244,6 +289,7 @@ impl Options {
             shard,
             bind,
             advertise,
+            client_endpoint,
             region,
             regions,
             orchestrator,
@@ -272,6 +318,7 @@ impl Options {
             shard: self.shard,
             bind: self.bind,
             advertise: self.advertise,
+            client_endpoint: self.client_endpoint,
             claim_region: self.claim_region,
             cluster: self.cluster.clone(),
             secret,
@@ -574,6 +621,67 @@ mod tests {
         ])
         .is_err());
         assert!(parse(&["--orchestrator", "127.0.0.1:7900", "--advertise", "nope"]).is_err());
+    }
+
+    /// `--client-endpoint` says where players dial an orchestrated shard — the
+    /// unspecified IP meaning "the host they dialed" — and is what the hello
+    /// asks the orchestrator for. A standalone shard has one address, from
+    /// its `--bind` and its peers' `--peer`: there the flag is an error, and
+    /// its static map keeps client endpoint = endpoint.
+    ///
+    /// Mutation this catches: a flag that is parsed and dropped (the
+    /// orchestrator would put the internal address into the map for players),
+    /// or one accepted standalone, where nothing would ever read it.
+    #[test]
+    fn the_client_endpoint_is_for_an_orchestrated_shard_and_reaches_the_hello() {
+        let orchestrated = ["--orchestrator", "127.0.0.1:7900"];
+        let with = |extra: &[&str]| parse(&[&orchestrated[..], extra].concat());
+        assert_eq!(
+            with(&[])
+                .expect("parses")
+                .orchestrated(String::new())
+                .client_endpoint,
+            None,
+            "not given: players dial the advertised address"
+        );
+        let options = with(&[
+            "--bind",
+            "127.0.0.1:7871",
+            "--client-endpoint",
+            "0.0.0.0:7871",
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.orchestrated(String::new()).client_endpoint,
+            Some("0.0.0.0:7871".parse().unwrap())
+        );
+        // A port nobody could dial, or no address at all.
+        assert!(with(&["--client-endpoint", "0.0.0.0:0"]).is_err());
+        assert!(with(&["--client-endpoint", "nope"]).is_err());
+        assert!(with(&["--client-endpoint"]).is_err());
+        // Standalone: an error, and the static map has one address per shard.
+        let err = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--client-endpoint",
+            "0.0.0.0:7777",
+        ])
+        .expect_err("standalone");
+        assert!(err.contains("requires --orchestrator"), "{err}");
+        let standalone = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--peer",
+            "2:127.0.0.1:7778:64:1:0:0",
+        ])
+        .expect("parses");
+        for region in &standalone.regions {
+            assert_eq!(region.client_endpoint, region.endpoint);
+        }
     }
 
     /// The secret is never an argument (it would show in the process list):
