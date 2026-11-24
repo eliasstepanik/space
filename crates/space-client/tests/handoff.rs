@@ -177,59 +177,127 @@ async fn join_through_a(a: &Running, b: &Running) -> ServerLink {
 /// spawn point along x: beyond it (`x < BORDER_X`) the ground is A's.
 const BORDER_X: f64 = -6.0;
 
-/// How long a handoff may take from the moment the ship is across the border
-/// until the link plays on the other shard: the handoff's lead (the second
-/// the shards give the client to connect) and one more.
-const HANDOFF_BUDGET: Duration = Duration::from_secs(2);
+/// Seconds per tick.
+fn dt() -> f64 {
+    f64::from(space_sim::dt())
+}
 
-/// How much further the ship may be, between two frames, than its speed and
-/// the time between those frames explain. A ship at 15 m/s moves half a
-/// metre a tick, so this is one tick of arrival jitter — and a jump of a
-/// metre is twice it, at any speed.
-const JUMP_SLACK: f64 = 0.5;
+/// How long a handoff may take from the state that first shows the ship
+/// across the border until the link plays on the other shard, in seconds
+/// **of the shards' ticks** (see [`Flight`], "How the bounds are taken"): the
+/// handoff's lead (the second the shards give the client to connect) and one
+/// more. **Catches:** a handoff that is refused and offered again (the
+/// re-offer pause is two seconds), a redirect the client follows late.
+const HANDOFF_BUDGET: f64 = 2.0;
+
+/// How much further the ship may be, between two states the link showed,
+/// than its speed and the **ticks** between those states explain, metres.
+/// Ordinary flight shows none at all, on any machine (a state `n` ticks
+/// newer is at most `n` ticks at the greater of the two speeds further, and
+/// nothing in the number is a time this process measured), so this is a
+/// floor for rounding and no more. **Catches:** a tick flown twice at the
+/// switch (0.45 m at the 14 m/s of the first crossing, over a metre on the
+/// way back), a ship put back on a spawn point (metres), a state the
+/// accepting shard carried further than the ticks its commit was late by.
+const JUMP_SLACK: f64 = 0.05;
 
 /// How far the ship may be seen to move **against** the way it flies.
 const BACKWARD_SLACK: f64 = 0.1;
+
+/// The most a ship's speed changes in a second, m/s²: full thrust from rest
+/// (`ShipParams::PLACEHOLDER`: thrust / mass). Between two states `t` apart
+/// the speed may have been up to `ACCEL · t / 2` above both ends — when the
+/// pilot turned round in between — which is `ACCEL · t² / 4` of flight; twice
+/// that is allowed (3 mm over one tick).
+const ACCEL: f64 = 6.0;
 
 fn norm(v: [f64; 3]) -> f64 {
     v.iter().map(|c| c * c).sum::<f64>().sqrt()
 }
 
-/// One look at the link's ship: where the newest frame put it, how fast it
-/// was, and when that frame arrived.
+/// One state of the link's ship, as a look found it: where the shard put it,
+/// how fast it was, and the tick that state is from.
 #[derive(Clone, Copy)]
 struct Look {
     pos: [f64; 3],
     vel: [f64; 3],
-    arrived: std::time::Instant,
+    /// The tick of the state ([`space_client::link::Replica::state_tick`]).
+    tick: u64,
+    /// The timeline that tick is on (`Replica::tick_epoch`).
+    epoch: u64,
+    /// The handoffs the link had completed.
+    handoffs: u64,
+    /// When the link last heard a newer tick. **Not part of any bound**: it
+    /// is in the log a failure prints, to tell a late frame from a jump.
+    heard: std::time::Instant,
 }
 
-/// A flight under watch. Every [`Flight::look`] compares the ship with the
-/// look before it and keeps the worst of what it saw:
+/// What two consecutive [`Look`]s say about the flight between them.
+struct Step {
+    /// Ticks from the first state to the second.
+    ticks: i64,
+    /// How far the ship moved, metres.
+    moved: f64,
+    /// How much further that is than its speed and the ticks explain.
+    jump: f64,
+    /// The same against the time between the two states' *arrivals* — what
+    /// this test used to bound. Printed, never asserted.
+    jump_by_arrival: f64,
+    /// How far the ship moved against its velocity; `None` while it turns
+    /// round or rests.
+    back: Option<f64>,
+}
+
+/// A flight under watch. Every [`Flight::look`] notes the state the link
+/// shows when it is a new one; [`Flight::assert_seamless`] then goes through
+/// them in pairs:
 ///
-/// * **a jump**: between two frames the ship was further than its speed times
-///   the time between the frames' *arrivals* explains ([`JUMP_SLACK`]). The
-///   arrival times, not the times of the looks: a look may come any time
-///   after its frame, and that phase would be half a metre of noise;
+/// * **a jump**: between two states the ship was further than its speed and
+///   the ticks between them explain ([`JUMP_SLACK`]);
 /// * **a step back**: the ship moved against its own velocity
 ///   ([`BACKWARD_SLACK`]) — a state from before the handoff's commit shown
 ///   after it;
-/// * **a slow handoff**: the time from the look that first saw the ship
-///   across [`BORDER_X`] to the look that saw the link on the other shard;
+/// * **a slow handoff**: the ticks from the state that first showed the ship
+///   across [`BORDER_X`] to the state the link showed when it had changed
+///   shard ([`HANDOFF_BUDGET`]);
 /// * **a second session**: the most clients the spawn point's shard had at
 ///   once. A player has one session there at a time — and a ship of its own
 ///   only with a session — so more than there are players is a second ship
 ///   somebody was given.
+///
+/// # How the bounds are taken
+///
+/// These tests run real shard loops in real time on whatever machine runs
+/// them, so **nothing is measured against this process's clock** (the rule
+/// of `tests/seamless.rs`, whose module docs say why). A state's time is the
+/// tick the shard stamped it with: both shards count the same ticks
+/// (`clock::run` on the default origin), the flight asserts that the link's
+/// ticks never started over, and a state that is `n` ticks newer is `n/30 s`
+/// of flight further — however late its frame arrived, however many frames
+/// arrived at once and whenever this task got to look.
+///
+/// (The jump used to be taken against the time between the frames'
+/// *arrivals*, with half a metre of slack — "a tick at 15 m/s" — as a maximum
+/// over the whole flight. The ship is at 35 m/s on its way back, a tick is
+/// then 1.17 m, and one frame that is heard 17 ms late followed by one that
+/// is on time is 0.57 m "more than flying explains": on a busy CI runner the
+/// test failed with exactly that, in ordinary flight 16 ticks from any
+/// change of shard and with every state on its tick to the millimetre. A
+/// failure prints the states around it with their ticks and arrival times,
+/// so that it says which of the two it is; `SPACE_HANDOFF_TRACE=1` prints
+/// them for the worst arrival of a flight that passed.)
 struct Flight<'a> {
     link: &'a ServerLink,
     spawn_shard: &'a Running,
-    last: Option<Look>,
-    worst_jump: f64,
-    worst_step_back: f64,
+    /// Every state the looks found, in order.
+    log: Vec<Look>,
     beyond: bool,
-    crossed: Option<std::time::Instant>,
+    /// The tick of the state that first showed the ship across the border,
+    /// until the handoff that follows it.
+    crossed: Option<u64>,
     handoffs: u64,
-    handoff_times: Vec<Duration>,
+    /// How long each handoff took, seconds of ticks.
+    handoff_times: Vec<f64>,
     most_spawn_clients: usize,
 }
 
@@ -240,9 +308,7 @@ impl<'a> Flight<'a> {
         Self {
             link,
             spawn_shard,
-            last: None,
-            worst_jump: f64::MIN,
-            worst_step_back: f64::MIN,
+            log: Vec::new(),
             beyond,
             crossed: None,
             handoffs,
@@ -253,36 +319,32 @@ impl<'a> Flight<'a> {
 
     fn look(&mut self) {
         let replica = self.link.replica();
-        if let (Some(state), Some(arrived)) = (replica.state, replica.tick_seen) {
+        if let (Some(state), Some(heard)) = (replica.state, replica.tick_seen) {
             let now = Look {
                 pos: replica.offset(),
                 vel: state.vel.map(f64::from),
-                arrived,
+                tick: replica.state_tick(),
+                epoch: replica.tick_epoch,
+                handoffs: replica.handoffs,
+                heard,
             };
-            if let Some(last) = self.last.filter(|last| last.arrived != arrived) {
-                let step = [0, 1, 2].map(|i| now.pos[i] - last.pos[i]);
-                let between = arrived.duration_since(last.arrived).as_secs_f64();
-                let speed = norm(now.vel).max(norm(last.vel));
-                self.worst_jump = self.worst_jump.max(norm(step) - speed * between);
-                // Flying one way (not turning round, not at rest): the ship
-                // does not move the other way.
-                let same_way = (0..3).map(|i| now.vel[i] * last.vel[i]).sum::<f64>() > 0.0;
-                if same_way && norm(now.vel) > 1.0 && norm(last.vel) > 1.0 {
-                    let along = (0..3).map(|i| step[i] * now.vel[i]).sum::<f64>() / norm(now.vel);
-                    self.worst_step_back = self.worst_step_back.max(-along);
-                }
+            let known = self.log.last().is_some_and(|last| {
+                (last.epoch, last.tick, last.handoffs) == (now.epoch, now.tick, now.handoffs)
+            });
+            if !known {
+                self.log.push(now);
             }
-            self.last = Some(now);
             let beyond = now.pos[0] < BORDER_X;
             if beyond != self.beyond {
                 self.beyond = beyond;
-                self.crossed = Some(std::time::Instant::now());
+                self.crossed = Some(now.tick);
             }
-        }
-        if replica.handoffs != self.handoffs {
-            self.handoffs = replica.handoffs;
-            let crossed = self.crossed.take().expect("a handoff follows a crossing");
-            self.handoff_times.push(crossed.elapsed());
+            if replica.handoffs != self.handoffs {
+                self.handoffs = replica.handoffs;
+                let crossed = self.crossed.take().expect("a handoff follows a crossing");
+                let took = now.tick.saturating_sub(crossed) as f64 * dt();
+                self.handoff_times.push(took);
+            }
         }
         if let Ok(shard) = self.spawn_shard.shard.try_lock() {
             self.most_spawn_clients = self.most_spawn_clients.max(shard.stats().clients);
@@ -312,28 +374,126 @@ impl<'a> Flight<'a> {
         arrived
     }
 
+    /// What the states `index - 1` and `index` of the log say about the
+    /// flight between them (see [`Step`]).
+    fn step(&self, index: usize) -> Step {
+        let (last, now) = (self.log[index - 1], self.log[index]);
+        let moved = [0, 1, 2].map(|i| now.pos[i] - last.pos[i]);
+        let speed = norm(now.vel).max(norm(last.vel));
+        let ticks = now.tick as i64 - last.tick as i64;
+        // A state that is not newer by its tick explains no flight at all.
+        let flown = ticks.max(0) as f64 * dt();
+        let heard = now.heard.saturating_duration_since(last.heard);
+        // Flying one way (not turning round, not at rest): the ship does not
+        // move the other way.
+        let same_way = (0..3).map(|i| now.vel[i] * last.vel[i]).sum::<f64>() > 0.0;
+        let back = (same_way && norm(now.vel) > 1.0 && norm(last.vel) > 1.0)
+            .then(|| -(0..3).map(|i| moved[i] * now.vel[i]).sum::<f64>() / norm(now.vel));
+        Step {
+            ticks,
+            moved: norm(moved),
+            jump: norm(moved) - speed * flown - ACCEL * flown * flown / 2.0,
+            jump_by_arrival: norm(moved) - speed * heard.as_secs_f64(),
+            back,
+        }
+    }
+
+    /// The log around state `index`, a line a state: what a failure prints,
+    /// so that it says by itself whether it happened at a change of shard or
+    /// in ordinary flight, and how the frames around it arrived.
+    fn around(&self, index: usize) -> String {
+        use std::fmt::Write as _;
+        let switches: Vec<usize> = (1..self.log.len())
+            .filter(|&i| self.log[i].handoffs != self.log[i - 1].handoffs)
+            .collect();
+        let mut text = String::new();
+        let first = index.saturating_sub(8).max(1);
+        let last = (index + 4).min(self.log.len().saturating_sub(1));
+        for i in first..=last {
+            let (look, step) = (self.log[i], self.step(i));
+            let heard = look
+                .heard
+                .saturating_duration_since(self.log[i - 1].heard)
+                .as_secs_f64();
+            // Ticks to the nearest change of shard, before or after.
+            let to_switch = switches
+                .iter()
+                .map(|&s| look.tick as i64 - self.log[s].tick as i64)
+                .min_by_key(|ticks| ticks.abs());
+            let _ = writeln!(
+                text,
+                "  {} state {i:4}: tick {} ({:+} ticks, heard {:+7.1} ms after the one before), \
+                 x {:+8.3} m, {:6.3} m/s, moved {:.4} m, jump {:+.4} m (by arrival {:+.4} m), \
+                 handoffs {}{}{}",
+                if i == index { ">" } else { " " },
+                look.tick,
+                step.ticks,
+                heard * 1e3,
+                look.pos[0],
+                norm(look.vel),
+                step.moved,
+                step.jump,
+                step.jump_by_arrival,
+                look.handoffs,
+                to_switch.map_or(String::new(), |ticks| format!(
+                    ", {ticks:+} ticks from the nearest change of shard"
+                )),
+                if switches.contains(&i) {
+                    " <- the first state from the other shard"
+                } else {
+                    ""
+                },
+            );
+        }
+        text
+    }
+
     /// What the flight must not have shown (see the type docs).
     fn assert_seamless(&self, players: usize) {
+        let steps: Vec<(usize, Step)> = (1..self.log.len()).map(|i| (i, self.step(i))).collect();
+        let worst = |of: &dyn Fn(&Step) -> f64| {
+            steps
+                .iter()
+                .map(|(i, step)| (*i, of(step)))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap_or((0, f64::MIN))
+        };
+        let (jump_at, jump) = worst(&|step| step.jump);
+        let (back_at, back) = worst(&|step| step.back.unwrap_or(f64::MIN));
+        let (arrival_at, by_arrival) = worst(&|step| step.jump_by_arrival);
         // (Shown with `--nocapture`: the numbers behind the bounds.)
         eprintln!(
-            "flight: handoffs {:?}, worst jump {:+.3} m, worst step back {:+.3} m, \
-             most sessions on the spawn shard {}",
-            self.handoff_times, self.worst_jump, self.worst_step_back, self.most_spawn_clients
+            "flight: {} states, handoffs {:.3?} s of ticks, worst jump {jump:+.4} m, worst step \
+             back {back:+.3} m, most sessions on the spawn shard {}; not a bound: against the \
+             arrival times the worst jump would be {by_arrival:+.3} m (state {arrival_at})",
+            self.log.len(),
+            self.handoff_times,
+            self.most_spawn_clients
+        );
+        if std::env::var_os("SPACE_HANDOFF_TRACE").is_some() && arrival_at > 0 {
+            eprintln!("around state {arrival_at}:\n{}", self.around(arrival_at));
+        }
+        // One timeline: the shards count the same ticks, so every tick of
+        // the log can be compared with every other.
+        assert!(
+            self.log.iter().all(|look| look.epoch == self.log[0].epoch),
+            "the link's ticks started over: the states are not on one timeline"
         );
         assert!(
-            self.worst_jump <= JUMP_SLACK,
-            "the ship jumped: {:.2} m more between two frames than flying explains",
-            self.worst_jump
+            jump <= JUMP_SLACK,
+            "the ship jumped: {jump:.3} m more between two states than its speed and the \
+             ticks between them explain\n{}",
+            self.around(jump_at)
         );
         assert!(
-            self.worst_step_back <= BACKWARD_SLACK,
-            "the ship stepped back by {:.2} m",
-            self.worst_step_back
+            back <= BACKWARD_SLACK,
+            "the ship stepped back by {back:.2} m\n{}",
+            self.around(back_at)
         );
         for (n, took) in self.handoff_times.iter().enumerate() {
             assert!(
                 *took <= HANDOFF_BUDGET,
-                "handoff {} took {took:?} from the border to the other shard: {:?}",
+                "handoff {} took {took:.2} s of ticks from the border to the other shard: {:?}",
                 n + 1,
                 self.handoff_times
             );

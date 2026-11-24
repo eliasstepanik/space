@@ -1010,6 +1010,12 @@ fn free_port_range(count: u16) -> (u16, u16) {
 }
 
 /// Stop the process `pid` the hard way, as a crash would.
+///
+/// With what every system this runs on has: `taskkill` is part of Windows,
+/// and elsewhere `kill` is asked of `/bin/sh`, where it is a **builtin** —
+/// not the `kill` program, which a minimal image does not have (the CI's
+/// `rust:1-slim-bookworm` build image has no procps: this test failed there
+/// with "No such file or directory" before it had killed anything).
 fn kill_process(pid: u32) {
     let pid = pid.to_string();
     let status = if cfg!(windows) {
@@ -1018,8 +1024,8 @@ fn kill_process(pid: u32) {
             .stdout(std::process::Stdio::null())
             .status()
     } else {
-        std::process::Command::new("kill")
-            .args(["-9", &pid])
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("kill -9 {pid}")])
             .status()
     };
     assert!(
