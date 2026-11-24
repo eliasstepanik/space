@@ -12,9 +12,11 @@
 //! The rules it enforces (plan §3.3):
 //! * the published map is **never mutated in place** — a commit swaps in the new
 //!   map, an abort leaves the published map byte-identical;
-//! * recipients are every shard named in `changes` **plus** every shard whose
-//!   region is adjacent to a changed node (a shard never told the map moved
-//!   keeps offering handoffs under the old epoch and eats `StaleEpoch` forever);
+//! * recipients are **every shard in the published map** plus every shard
+//!   named in `changes` (a shard never told the map moved keeps offering
+//!   handoffs under the old epoch and eats `StaleEpoch` forever, and with
+//!   regions carved at any depth there is no cheap rule for who "borders" a
+//!   change — so everybody hears it, and everybody must ack);
 //! * `activation_tick = max(observer ticks) + EPOCH_LEAD_TICKS`;
 //! * **one outstanding prepare at a time** — H10, H12 and H14 all depend on it.
 
@@ -100,8 +102,10 @@ impl EpochPublisher {
         &self.published
     }
 
-    /// Fill in the real endpoint of every published region whose owner is in
-    /// `endpoints`.
+    /// Fill in the real addresses of every published region whose owner is in
+    /// `endpoints`: its internal endpoint from there, and the endpoint its
+    /// players dial from `client_endpoints` — or, for a shard that has none of
+    /// its own, the internal one.
     ///
     /// A committed epoch's ownership is exact, but a split names its child before
     /// the child's address is known (the region carries a placeholder borrowed
@@ -112,10 +116,15 @@ impl EpochPublisher {
     pub fn set_endpoints(
         &mut self,
         endpoints: &std::collections::BTreeMap<ShardId, std::net::SocketAddr>,
+        client_endpoints: &std::collections::BTreeMap<ShardId, std::net::SocketAddr>,
     ) {
         for region in &mut self.published.regions {
             if let Some(endpoint) = endpoints.get(&region.shard) {
                 region.endpoint = *endpoint;
+                region.client_endpoint = client_endpoints
+                    .get(&region.shard)
+                    .copied()
+                    .unwrap_or(*endpoint);
             }
         }
     }
@@ -152,43 +161,32 @@ impl EpochPublisher {
                 .is_none_or(|t| tick.saturating_sub(t) >= min_interval)
     }
 
-    /// Every shard that must hear about `changes`: the shards named in the
-    /// changes, the owners of the changed nodes' parents, and every shard whose
-    /// region is adjacent to a changed node (a sibling octant of the changed
-    /// node or its parent — the shards a handoff could be offered to).
+    /// Every shard that must hear about `changes` — and ack them before they
+    /// commit: **every shard in the published map**, and every owner the
+    /// changes name (the new shard of a carve is not in the map yet).
+    ///
+    /// It used to be the changed node's direct parent's owner and the owners
+    /// of sibling and grand-sibling octants: the shards a handoff could be
+    /// offered to when a split only ever carved a direct child. A cell carved
+    /// twenty-four levels below the root has neither a region for a parent nor
+    /// one for a sibling, so that rule reached nobody but the new shard — not
+    /// even the shard losing the cell — and everyone else learned of the
+    /// change from the map push that follows a commit, which is offered to a
+    /// queue and may be dropped. A cluster is a handful of shards
+    /// (`docs/plan-sharding.md` §1), so telling all of them costs nothing and
+    /// makes the prepare/ack/commit exchange the one way a map reaches a shard.
+    ///
+    /// The price: a shard of the map that cannot ack — it is gone, or the
+    /// reserved root owner nobody has claimed yet — holds up every change
+    /// until it is replaced.
     #[must_use]
     pub fn recipients(&self, changes: &[EpochChange]) -> BTreeSet<ShardId> {
-        use space_world::octree;
-        let mut out: BTreeSet<ShardId> = BTreeSet::new();
-        for (node, owner) in changes {
-            out.insert(*owner);
-            // The old owner of the region this node falls under.
-            if let Some(r) = crate::topology::region_of(&self.published, *owner) {
-                out.insert(r.shard);
-            }
-            if let Some(parent) = octree::parent(*node) {
-                for region in &self.published.regions {
-                    if region.node == parent {
-                        out.insert(region.shard);
-                    }
-                }
-            }
-            // Neighbours: owners of the changed node's siblings, and of the
-            // parent's siblings one level up.
-            let mut siblings = Vec::new();
-            if let Some(p) = octree::parent(*node) {
-                siblings.extend(octree::children(p).into_iter().flatten());
-            }
-            if let Some(gp) = octree::parent(*node).and_then(octree::parent) {
-                siblings.extend(octree::children(gp).into_iter().flatten());
-            }
-            for region in &self.published.regions {
-                if siblings.contains(&region.node) {
-                    out.insert(region.shard);
-                }
-            }
-        }
-        out
+        self.published
+            .regions
+            .iter()
+            .map(|region| region.shard)
+            .chain(changes.iter().map(|(_, owner)| *owner))
+            .collect()
     }
 
     /// Propose `changes` as a new epoch.
@@ -208,6 +206,29 @@ impl EpochPublisher {
         observer_ticks: &[(ShardId, u64)],
         tick: u64,
     ) -> Option<Outbound> {
+        self.propose_without(new_map, changes, observer_ticks, tick, &BTreeSet::new())
+    }
+
+    /// [`Self::propose`], with `absent` left out of the recipients: shards the
+    /// orchestrator **knows to be dead**. They are neither sent the prepare nor
+    /// waited for.
+    ///
+    /// This exists for one change only: the one that gives a dead shard's
+    /// regions to its replacement. Every shard of the map must ack a change
+    /// ([`Self::recipients`]), a dead one never will — so without this the
+    /// change that removes it from the map could never commit, and neither
+    /// could any other. Leaving a *live* shard out would break H10 (it would
+    /// run a map nobody told it was replaced), which is why the callers pass
+    /// nothing here for any other change.
+    #[must_use]
+    pub fn propose_without(
+        &mut self,
+        new_map: ShardMap,
+        changes: Vec<EpochChange>,
+        observer_ticks: &[(ShardId, u64)],
+        tick: u64,
+        absent: &BTreeSet<ShardId>,
+    ) -> Option<Outbound> {
         if !matches!(self.phase, Phase::Idle) {
             return None;
         }
@@ -218,7 +239,11 @@ impl EpochPublisher {
         );
         let max_tick = observer_ticks.iter().map(|(_, t)| *t).max().unwrap_or(tick);
         let activation_tick = max_tick + EPOCH_LEAD_TICKS;
-        let awaiting: BTreeSet<ShardId> = self.recipients(&changes);
+        let awaiting: BTreeSet<ShardId> = self
+            .recipients(&changes)
+            .difference(absent)
+            .copied()
+            .collect();
         let recipients = awaiting.clone();
         let epoch = new_map.epoch;
         let outbound = Outbound {
@@ -330,6 +355,16 @@ impl EpochPublisher {
                 reason: AbortReason::Timeout,
             }),
         })
+    }
+
+    /// Abort the outstanding prepare **now**, whatever its deadline: a
+    /// recipient is known to be dead, so the acks can never be complete.
+    /// Returns the `EpochAbort` for every recipient, exactly as
+    /// [`Self::timeout`] does at the deadline; `None` when nothing is in
+    /// flight. The published map is untouched.
+    #[must_use]
+    pub fn abort(&mut self) -> Option<Outbound> {
+        self.timeout(u64::MAX)
     }
 
     /// Return to `Idle` after a commit or abort was delivered, so the next
@@ -531,8 +566,9 @@ mod tests {
 
     #[test]
     fn every_shard_that_must_switch_is_a_prepare_recipient() {
-        // H10's recipient rule: the changed node's owner, the parent's owner,
-        // and the owners of adjacent (sibling) regions.
+        // H10's recipient rule: the changed node's owner and every shard of
+        // the published map — here the parent's owner and an adjacent
+        // sibling's.
         let mut pub_ = EpochPublisher::new(map_with_two());
         let root = NodeRef::new(40, [0, 0, 0]);
         let kids = space_world::octree::children(root).unwrap();
@@ -554,6 +590,100 @@ mod tests {
             "the adjacent sibling's owner must be told"
         );
         assert!(recipients.contains(&shard(3)), "the new owner must be told");
+    }
+
+    /// A cell carved twenty-four levels below the root has no region for a
+    /// parent and none for a sibling, and the shards around it are cells and
+    /// octants at all sorts of depths. Everyone in the map hears about the
+    /// change and must ack it, plus the new owner; the same for the merge that
+    /// takes the cell away again, the shard being merged included.
+    ///
+    /// Mutation this catches: the old rule (the direct parent's owner and the
+    /// owners of sibling and grand-sibling octants), which reaches only the
+    /// new shard here — the root's owner, who loses the cell, would never
+    /// stage the change.
+    #[test]
+    fn a_deep_carve_reaches_every_shard_in_the_map() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = root.center().cell[0];
+        let octant = space_world::octree::children(root).unwrap()[0];
+        let map = ShardMap::new(
+            7,
+            vec![
+                region(40, [0, 0, 0], 1),
+                region(64, [k, k, k - 1], 2),
+                region(64, [k - 1, k, k], 3),
+                region(41, octant.index, 4),
+                // A cell inside that octant, far from the others.
+                region(64, [5, 5, 5], 5),
+            ],
+        );
+        let everyone: BTreeSet<ShardId> = (1..=5).map(shard).collect();
+        let mut pub_ = EpochPublisher::new(map.clone());
+
+        // The carve of the fourth quadrant's cell for a new shard 6.
+        let cell = NodeRef::new(64, [k - 1, k, k - 1]);
+        let mut with_six = everyone.clone();
+        with_six.insert(shard(6));
+        assert_eq!(pub_.recipients(&[(cell, shard(6))]), with_six);
+        let mut next = map.clone();
+        next.epoch = 8;
+        next.regions.push(region(64, cell.index, 6));
+        let prepare = pub_
+            .propose(next.clone(), vec![(cell, shard(6))], &[], 10)
+            .expect("propose");
+        assert_eq!(
+            prepare.to.iter().copied().collect::<BTreeSet<_>>(),
+            with_six,
+            "the prepare goes to all five owners and the new shard"
+        );
+        // It commits only when every one of them has acked — the far cell's
+        // owner (5) as much as the root's.
+        let mut commit = None;
+        for (i, s) in prepare.to.iter().enumerate() {
+            assert!(commit.is_none(), "not before the last ack");
+            assert_eq!(pub_.published().epoch, 7);
+            commit = pub_.ack(*s, 8, 11);
+            assert_eq!(commit.is_some(), i + 1 == prepare.to.len());
+        }
+        let commit = commit.expect("the last ack commits");
+        assert_eq!(
+            commit.to.iter().copied().collect::<BTreeSet<_>>(),
+            with_six,
+            "and the commit goes to everyone in the new map"
+        );
+        assert_eq!(pub_.published(), &next);
+        pub_.reset();
+
+        // The merge of shard 3's cell back into the root's owner: the change
+        // names shard 1, and everyone in the map — shard 3 too, which still
+        // owns its cell until the commit — is a recipient.
+        let gone = NodeRef::new(64, [k - 1, k, k]);
+        assert_eq!(pub_.recipients(&[(gone, shard(1))]), with_six);
+        // No change at all still reaches the whole map (a map push by epoch).
+        assert_eq!(pub_.recipients(&[]), with_six);
+    }
+
+    /// The recipients are a set: an owner of several regions, or one named by
+    /// several changes, is told once.
+    #[test]
+    fn a_recipient_is_listed_once() {
+        let map = ShardMap::new(
+            1,
+            vec![
+                region(40, [0, 0, 0], 1),
+                region(64, [1, 1, 1], 1),
+                region(64, [2, 2, 2], 2),
+            ],
+        );
+        let pub_ = EpochPublisher::new(map);
+        let a = NodeRef::new(64, [3, 3, 3]);
+        let b = NodeRef::new(64, [4, 4, 4]);
+        let recipients = pub_.recipients(&[(a, shard(9)), (b, shard(9)), (b, shard(2))]);
+        assert_eq!(
+            recipients.into_iter().collect::<Vec<_>>(),
+            vec![shard(1), shard(2), shard(9)]
+        );
     }
 
     #[test]
@@ -619,7 +749,8 @@ mod tests {
         let before = pub_.published().clone();
         let mut endpoints = std::collections::BTreeMap::new();
         endpoints.insert(shard(2), addr(9_002));
-        pub_.set_endpoints(&endpoints);
+        let none = std::collections::BTreeMap::new();
+        pub_.set_endpoints(&endpoints, &none);
         let after = pub_.published();
         assert_eq!(after.epoch, before.epoch);
         assert_eq!(after.regions.len(), before.regions.len());
@@ -627,9 +758,28 @@ mod tests {
             assert_eq!((a.node, a.shard), (b.node, b.shard));
             if a.shard == shard(2) {
                 assert_eq!(a.endpoint, addr(9_002));
+                assert_eq!(
+                    a.client_endpoint,
+                    addr(9_002),
+                    "no client endpoint of its own: players dial the endpoint"
+                );
             } else {
                 assert_eq!(a.endpoint, b.endpoint, "an unknown shard keeps its address");
+                assert_eq!(a.client_endpoint, b.client_endpoint);
             }
         }
+        // A shard with a client endpoint of its own keeps the two apart.
+        let players_at: SocketAddr = "0.0.0.0:9002".parse().unwrap();
+        let client_endpoints = std::collections::BTreeMap::from([(shard(2), players_at)]);
+        pub_.set_endpoints(&endpoints, &client_endpoints);
+        for region in &pub_.published().regions {
+            if region.shard == shard(2) {
+                assert_eq!(
+                    (region.endpoint, region.client_endpoint),
+                    (addr(9_002), players_at)
+                );
+            }
+        }
+        assert_eq!(pub_.published().epoch, before.epoch);
     }
 }

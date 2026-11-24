@@ -167,6 +167,10 @@ fn put_f32(out: &mut Vec<u8>, f: f32) {
     out.extend_from_slice(&f.to_bits().to_be_bytes());
 }
 
+/// How many applied inputs a world remembers ([`SimWorld::applied_inputs`]):
+/// a couple of minutes of one ship.
+pub const APPLIED_LOG: usize = 4096;
+
 /// The ticked simulation world.
 #[derive(Debug)]
 pub struct SimWorld {
@@ -197,6 +201,9 @@ pub struct SimWorld {
     /// Highest input tick applied per [`Owner`] session — the `input_ack` a
     /// snapshot/delta carries (see [`SimWorld::input_ack`]).
     input_ack: HashMap<u64, SimTick>,
+    /// The last [`APPLIED_LOG`] inputs applied: the tick and the ship
+    /// ([`SimWorld::applied_inputs`]).
+    applied: std::collections::VecDeque<(SimTick, EntityGuid)>,
     /// The rigid-body world (bubbles, statics, gravity).
     physics: Physics,
 }
@@ -249,6 +256,7 @@ impl SimWorld {
             ships: BTreeSet::new(),
             input_buf: BTreeMap::new(),
             input_ack: HashMap::new(),
+            applied: std::collections::VecDeque::new(),
             physics: Physics::new(Arc::new(ShapeCatalog::new())),
         }
     }
@@ -487,6 +495,36 @@ impl SimWorld {
         self.physics.last_time = None;
         self.world.set_tick(tick.wrapping_add(1));
         self.input_buf.clear();
+    }
+
+    /// Jump forward to `tick` without simulating the ticks in between — for
+    /// a shard that has fallen too far behind its clock to make them up. A
+    /// `tick` at or before the present does nothing.
+    ///
+    /// Unlike [`SimWorld::reset_clock`] this is a jump **on one timeline**:
+    ///
+    /// * scene time is not restarted. The next step runs from where the last
+    ///   one ended to the scene time of the tick it produces, so the orbiting
+    ///   bodies move by the whole of the jump and **carry** what is near
+    ///   them by as much ([`crate::rigid`], step 0) — a ship standing on a
+    ///   moon is still standing on it afterwards. (Restarting scene time
+    ///   moved the moon and left the ship where the moon had been.)
+    /// * only the inputs for the ticks jumped over are dropped; an input
+    ///   filed for a later tick is still applied on it.
+    ///
+    /// Nothing else moves across the jump: velocities, contacts and springs
+    /// see none of the skipped ticks.
+    pub fn skip_to(&mut self, tick: SimTick) {
+        if tick <= self.tick {
+            return;
+        }
+        // (Before the first step there is no "where the last one ended":
+        // the time of the tick the jump starts from.)
+        let from = self.physics.gravity.clock.time_us_at(self.tick);
+        self.physics.last_time.get_or_insert(from);
+        self.tick = tick;
+        self.world.set_tick(tick.wrapping_add(1));
+        self.input_buf.retain(|at, _| *at > tick);
     }
 
     /// Spawn a physics body (not a ship): see [`BodySpawn`]. It is
@@ -860,7 +898,8 @@ impl SimWorld {
             }
         }
         let state = state.ok_or_else(|| PhysicsError::Invalid("no ShipState".into()))?;
-        let ship = controls.is_some() && !ghost;
+        let is_ship = controls.is_some();
+        let ship = is_ship && !ghost;
         let body = match body {
             Some(b) => b,
             None if controls.is_some() => Body::ship(&self.params),
@@ -915,6 +954,7 @@ impl SimWorld {
         if let Err(e) = self
             .physics
             .register(guid, entity, &self.world, ghost, &self.params)
+            .map(|()| self.physics.mark_ship_ghost(guid, ghost && is_ship))
         {
             self.world.despawn(entity);
             return Err(e);
@@ -1034,6 +1074,26 @@ impl SimWorld {
         self.input_ack.get(&owner).copied().unwrap_or(0)
     }
 
+    /// The inputs applied lately, oldest first: `(tick, ship)` for every
+    /// tick a ship's controls were set from a player's input — the last
+    /// [`APPLIED_LOG`] of them. A record for whoever has to show that every
+    /// input was applied **exactly once** (across a handoff, say: the union
+    /// of two shards' records names every tick once); nothing in the
+    /// simulation reads it.
+    pub fn applied_inputs(&self) -> impl Iterator<Item = (SimTick, EntityGuid)> + '_ {
+        self.applied.iter().copied()
+    }
+
+    /// Record that the input of `ship` for `tick` was applied outside
+    /// [`SimWorld::step`] (a handed-over ship brought forward by the shard
+    /// that installs it): see [`SimWorld::applied_inputs`].
+    pub fn note_applied(&mut self, tick: SimTick, ship: EntityGuid) {
+        self.applied.push_back((tick, ship));
+        while self.applied.len() > APPLIED_LOG {
+            self.applied.pop_front();
+        }
+    }
+
     /// How many inputs are currently buffered waiting for their tick.
     ///
     /// Exposed so a caller (and the buffer-bound tests) can observe that
@@ -1055,6 +1115,10 @@ impl SimWorld {
         // order the inputs were buffered in).
         let mut resolved: Vec<(u32, u32, PlayerInput)> = Vec::with_capacity(inputs.len());
         for input in inputs.values() {
+            // (An input filed for a ship that has since been handed away
+            // names its ghost here. A ghost has neither `ShipControls` nor
+            // an `Owner` — `import` gives them to ships only — so nothing
+            // below writes to it: a ghost takes no input.)
             if let Some(entity) = self.entity_of(input.entity) {
                 resolved.push((entity.index(), entity.generation(), *input));
             }
@@ -1082,6 +1146,7 @@ impl SimWorld {
                 controls.thrust = input.thrust;
                 controls.torque = input.torque;
                 controls.fast = input.fast;
+                self.note_applied(next_tick, input.entity);
             }
             // Leaving fast travel drops the ship to its normal top speed at
             // once (rather than coasting on at fast-travel speed).

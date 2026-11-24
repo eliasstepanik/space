@@ -1,14 +1,17 @@
 # Space orchestrator image: builds `space-orchestrator` (release).
 #
 # Build from the REPOSITORY ROOT (the workspace is the build context):
-#   docker build -f deploy/Dockerfile.orchestrator -t space/orchestrator .
+#   docker build -f deploy/Dockerfile.orchestrator -t space/orchestrator \
+#     --build-arg SPACE_SHARD_IMAGE=space/shard:dev .
 #
-# Built and run locally (Docker 28 on Windows, through docker-compose.yaml):
-# see "What is and is not verified" in deploy/README.md.
+# The orchestrator is the cluster's shard manager: with `--launcher docker` (this
+# image's default) it creates, starts, stops and removes one container per shard
+# through the Docker Engine's socket, which has to be mounted into it
+# (/var/run/docker.sock) - see deploy/docker-compose.yaml, where the orchestrator
+# is the only service. WHOEVER CAN USE THAT SOCKET IS ROOT ON THE HOST: read
+# docs/security-notes.md ("The Docker socket") before running this anywhere.
 #
-# The `--launcher docker` mode is DEFERRED (bollard is not in the offline cargo
-# cache; see launcher/docker.rs), so this image runs `--launcher local`: shards
-# are separate containers that register themselves (see docker-compose.yaml).
+# What was built and run where: "What is and is not verified" in deploy/README.md.
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1.100-bookworm AS build
@@ -22,35 +25,77 @@ FROM debian:bookworm-slim AS runtime
 RUN useradd --create-home --uid 10001 orchestrator \
  && mkdir -p /var/lib/space && chown orchestrator /var/lib/space
 COPY --from=build /src/target/release/space-orchestrator /usr/local/bin/space-orchestrator
+# Not root: what lets this user use the mounted socket is the socket's group,
+# added to the container (compose `group_add`, `docker run --group-add`).
 USER orchestrator
 
-# The control port is QUIC (UDP). It binds the wildcard inside the container;
-# ORCHESTRATOR_CONTROL_ADDR is the `ip:port` shards dial (not resolved as a name).
+# The shard image this orchestrator starts its shards from: the one built from
+# THE SAME COMMIT (client, shard and orchestrator are always one build; the hello
+# is refused on a protocol mismatch). The pipeline passes
+# `ghcr.io/eliasstepanik/space-shard:sha-<commit>` and pushes that image before
+# this one's `latest` moves (.github/workflows/release-images.yml). Placed after
+# the build so that it does not invalidate the compile layers.
+ARG SPACE_SHARD_IMAGE=space/shard:dev
+
+# Read by the binary itself (see its `--help` and the module docs of main.rs);
+# each can be overridden at `docker run` / in compose:
+#   SPACE_CLUSTER_SECRET              REQUIRED (>= 16 chars): the control port binds
+#                                     the wildcard in a container, and a hello needs
+#                                     the secret then. The orchestrator hands it to
+#                                     the shards it starts, in their environment.
+#   SPACE_ORCHESTRATOR_LAUNCHER       docker (default here) | local | process
+#   SPACE_ORCHESTRATOR_MIN_SHARDS     shards kept running (4: the demo area's four areas)
+#   SPACE_ORCHESTRATOR_MAX_SHARDS     the most the autoscaler goes up to (8)
+#   SPACE_ORCHESTRATOR_PLAYER_BIND    the player port: the one address players type
+#   SPACE_ORCHESTRATOR_HOST_PORTS     host UDP ports for the shards, one each (7870-7899);
+#                                     each shard container publishes its own
+#   SPACE_ORCHESTRATOR_SHARD_IMAGE    see above
+#   SPACE_ORCHESTRATOR_DOCKER_SOCKET / _DOCKER_NETWORK / _DOCKER_CONTROL_ADDR /
+#   _DOCKER_PUBLISH_IP / _DOCKER_NAME_PREFIX   the docker launcher's settings; the
+#                                     defaults find the network and this container's
+#                                     address by inspecting this container
+#   SPACE_ORCHESTRATOR_DOCKER_SELF    this container's NAME, which is what is
+#                                     inspected (set it in compose; the fallback,
+#                                     $HOSTNAME, is the container's id only until the
+#                                     container is recreated from an older one)
+#   SPACE_ORCHESTRATOR_DOCKER_INSTANCE  what tells this orchestrator's shard containers
+#                                     from another stack's (label space.instance);
+#                                     unset: an id kept on the volume
+#                                     (orchestrator.id.instance)
+#   SPACE_ORCHESTRATOR_SHARD_MEMORY   memory limit per shard container, MiB (2048; 0 = none)
+#   SPACE_ORCHESTRATOR_SHARD_CAPACITY / _SCALE_OUT_LOAD / _SCALE_OUT_AFTER /
+#   _SCALE_IN_LOAD / _SCALE_IN_AFTER / _SCALE_COOLDOWN / _DRAIN_TIMEOUT   the autoscaler
+#   SPACE_ORCHESTRATOR_SCENE          initial scene (demo-area, materials, galaxy); a
+#                                     saved choice on the volume wins
+#   SPACE_ORCHESTRATOR_WEBUI          `ip:port` of the operator web UI; unset or empty
+#                                     = off. In a container it must be the wildcard
+#                                     (0.0.0.0:7980), and then
+#   SPACE_ORCHESTRATOR_WEBUI_TOKEN    (or ..._TOKEN_FILE) is REQUIRED, >= 16 chars.
+#   SPACE_ORCHESTRATOR_WEBUI_HOSTS    extra Host names when a TLS proxy is in front.
+# The web UI is plain HTTP with Basic auth: publish it on loopback or to a TLS
+# proxy only. See docs/security-notes.md.
+ENV ORCHESTRATOR_BIND=0.0.0.0:7900 \
+    SPACE_CLUSTER=space-local \
+    SPACE_ORCHESTRATOR_LAUNCHER=docker \
+    SPACE_ORCHESTRATOR_MIN_SHARDS=4 \
+    SPACE_ORCHESTRATOR_MAX_SHARDS=8 \
+    SPACE_ORCHESTRATOR_PLAYER_BIND=0.0.0.0:7777 \
+    SPACE_ORCHESTRATOR_SHARD_IMAGE=${SPACE_SHARD_IMAGE}
 # The shard-id counter lives on a volume so a restart resumes above the last id
 # (H9); the scene an operator chose is kept next to it (`orchestrator.id.scene`).
-#
-# Read by the binary itself (no flag in the entrypoint below):
-#   SPACE_ORCHESTRATOR_SCENE         initial scene (demo-area, materials,
-#                                    galaxy); a saved choice on the volume wins
-#   SPACE_ORCHESTRATOR_WEBUI         `ip:port` of the operator web UI; unset or
-#                                    empty = off. In a container it must be the
-#                                    wildcard (0.0.0.0:7980), and then
-#   SPACE_ORCHESTRATOR_WEBUI_TOKEN   (or ..._TOKEN_FILE) is REQUIRED, at least 16
-#                                    characters: the orchestrator refuses to
-#                                    start with a non-loopback bind and no token.
-#   SPACE_ORCHESTRATOR_WEBUI_HOSTS   extra Host names (`name[:port]`, comma
-#                                    separated) when a TLS proxy is in front.
-# Plain HTTP, HTTP Basic auth (any user name, the token as password): publish the
-# port on loopback or to a TLS proxy only. See docs/security-notes.md.
-ENV ORCHESTRATOR_BIND=0.0.0.0:7900 \
-    SPACE_CLUSTER=space-local
 VOLUME /var/lib/space
+# The control port (QUIC, UDP): shards only, over the container network. NEVER
+# publish it. The player port (QUIC, UDP): the public entry. The web UI (TCP).
 EXPOSE 7900/udp
+EXPOSE 7777/udp
 EXPOSE 7980/tcp
 
+# `exec`: the orchestrator is PID 1 and hears SIGTERM itself (`docker stop`,
+# compose down, Watchtower): it removes the shard containers it started, then
+# exits. ORCHESTRATOR_CONTROL_ADDR (`ip:port` shards dial) is only for shards
+# started by hand; the docker launcher finds its own.
 ENTRYPOINT ["/bin/sh", "-c", "exec space-orchestrator \
   --bind \"$ORCHESTRATOR_BIND\" \
-  --control-addr \"${ORCHESTRATOR_CONTROL_ADDR:?set ORCHESTRATOR_CONTROL_ADDR=ip:port}\" \
+  ${ORCHESTRATOR_CONTROL_ADDR:+--control-addr \"$ORCHESTRATOR_CONTROL_ADDR\"} \
   --cluster \"$SPACE_CLUSTER\" \
-  --state /var/lib/space/orchestrator.id \
-  --launcher local", "space-orchestrator"]
+  --state /var/lib/space/orchestrator.id", "space-orchestrator"]

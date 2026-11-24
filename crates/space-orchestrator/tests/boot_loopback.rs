@@ -67,6 +67,8 @@ fn options(cluster: &str, claim_region: Option<space_world::NodeRef>) -> Orchest
         advertise: None,
         claim_region,
         cluster: cluster.to_owned(),
+        client_endpoint: None,
+        secret: String::new(),
     }
 }
 
@@ -82,6 +84,26 @@ async fn a_client_is_welcomed_by(endpoint: SocketAddr) {
         .expect("the shard welcomes a real client");
 }
 
+/// A real client says hello at `endpoint` — a shard that serves, but does not
+/// own the scene's spawn point — and must be sent on to `owner`, at the
+/// address the map names for its players.
+async fn a_client_is_sent_on_by(endpoint: SocketAddr, owner: ShardId, owner_at: SocketAddr) {
+    let client = space_net::client_endpoint().expect("client endpoint");
+    let joined = space_net::join(
+        &client,
+        endpoint,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("player"),
+    )
+    .await
+    .expect("the shard answers a real client");
+    let space_net::Joined::Elsewhere(redirect) = joined else {
+        panic!("a new player starts on the spawn point's shard, got {joined:?}");
+    };
+    assert_eq!(redirect.shard, owner);
+    assert_eq!(redirect.shard_map.client_endpoint_of(owner), Some(owner_at));
+}
+
 #[tokio::test]
 async fn an_anonymous_claim_for_a_node_outside_the_map_is_rejected_and_burns_no_id() {
     // `space-server --orchestrator … --claim-region <a node nobody carved>`.
@@ -91,9 +113,10 @@ async fn an_anonymous_claim_for_a_node_outside_the_map_is_rejected_and_burns_no_
     // with the claimed region — but never published it. The shard's own map
     // (the welcome's) still gave the whole root to shard a, so it handed every
     // ship it was given straight to a; a second shard could claim the same
-    // node; and each restart burned another id. A region is created by a split
-    // (whose child says hello with the id allocated for it), so the anonymous
-    // claim is now refused, fast and with the reason.
+    // node; and each restart burned another id. A region is given to a shard
+    // that registers *without* one (the orchestrator picks it and carves it
+    // through an epoch change), never claimed — so the anonymous claim is
+    // refused, fast, for good and with the reason.
     let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("claim").await;
     let root = OrchestratorConfig::default().root_node();
     let child = space_world::octree::children(root).expect("root splits")[0];
@@ -130,44 +153,103 @@ async fn an_anonymous_claim_for_a_node_outside_the_map_is_rejected_and_burns_no_
     let _ = std::fs::remove_file(&state_path);
 }
 
-#[tokio::test]
-async fn a_second_region_less_shard_is_rejected_fast_with_a_clear_reason() {
-    // Defect A, the failure half: the root is owned, so a second region-less
-    // hello is refused. The orchestrator must SAY so (a `Reject` on the hello
-    // connection) instead of dropping it and leaving the shard to time out.
-    let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("reject").await;
+/// Wait until `shard` runs a map of `epoch` in which it owns its region.
+async fn owns_its_region_at(shard: &space_server::orchestrated::RunningShard, epoch: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        {
+            let state = shard.state.lock().await;
+            let map = state.shard_map();
+            if map.epoch >= epoch && map.lookup(&shard.region.center()) == Some(shard.shard) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never owned its region at epoch {epoch}",
+            shard.shard
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_region_less_shard_is_given_the_next_layout_cell() {
+    // Two shards started by hand, each with nothing but the orchestrator's
+    // address — what `space-server --orchestrator <addr>` does. The first gets
+    // the root. The second used to be refused ("the root is already owned"),
+    // and exited; it is now given the first layout cell beside the scene's
+    // spawn point, through an epoch change proposed with it already connected.
+    let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("second").await;
+    let root = OrchestratorConfig::default().root_node();
+    let cell = space_orchestrator::topology::layout_cells(root)[0];
     let a = start_orchestrated(options(&cluster, None), control_addr)
         .await
         .expect("shard a adopts the root");
+    assert_eq!((a.shard, a.region), (ShardId::new(1), root));
 
     let started = Instant::now();
-    let second = tokio::time::timeout(
-        Duration::from_secs(5),
+    let b = tokio::time::timeout(
+        Duration::from_secs(10),
         start_orchestrated(options(&cluster, None), control_addr),
     )
     .await
-    .expect("the rejection arrives well before the 10 s idle timeout");
-    let err = second.expect_err("the root is already owned");
-    assert!(
-        err.contains("rejected") && err.contains("already owned"),
-        "the error names the rejection and its reason, got: {err}"
-    );
+    .expect("the second shard is answered promptly")
+    .expect("and welcomed, not refused");
+    assert_eq!(b.shard, ShardId::new(2), "a freshly allocated id (H9)");
+    assert_eq!(b.region, cell, "the first layout cell");
     assert!(started.elapsed() < Duration::from_secs(5));
 
+    // The welcome did not make it the owner: the epoch does. Both shards end
+    // up running the committed map, in which each owns its own ground.
+    owns_its_region_at(&b, 2).await;
+    owns_its_region_at(&a, 2).await;
+    let map = a.state.lock().await.shard_map().clone();
+    assert_eq!(map.epoch, 2);
+    assert_eq!(map.regions.len(), 2);
+    assert_eq!(map.lookup(&cell.center()), Some(b.shard));
+    let spawn = space_world::WorldPos::from_f64_metres_around(root.center(), [6.0, 512.0, 4.0]);
+    assert_eq!(
+        map.lookup(&spawn),
+        Some(a.shard),
+        "the spawn point stays with the root"
+    );
+    // Each knows where the other listens (the map push behind the commit).
+    assert!(map.regions.iter().all(|r| r.endpoint.port() != 0));
+
+    // Both serve. A new player starts on the spawn point, which is a's: a
+    // welcomes it, and b — dialed directly — sends it to a.
+    a_client_is_welcomed_by(a.endpoint).await;
+    a_client_is_sent_on_by(b.endpoint, a.shard, a.endpoint).await;
+
     a.abort();
+    b.abort();
     orch_task.abort();
     let _ = std::fs::remove_file(&state_path);
 }
 
-#[tokio::test]
-async fn a_restarting_shard_with_the_same_endpoint_rejoins_with_the_same_id() {
-    // Defect B end to end: shard a crashes and restarts with no id, on the same
-    // advertised address (as a compose container does). It must get id 1 back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarting_shard_at_the_same_endpoint_replaces_itself_under_a_new_id() {
+    // Shard a crashes and restarts with no id, on the same advertised address
+    // (as a compose container does). It used to get id 1 back — and with it a
+    // guid counter that starts over, under an id that had minted guids before.
+    // It is welcomed as a NEW shard and given the old one's region through an
+    // epoch change; the scene is re-issued one revision up so its bodies are
+    // built once, afresh.
     let (cluster, control_addr, orch_task, state_path) = boot_orchestrator("restart").await;
     let first = start_orchestrated(options(&cluster, None), control_addr)
         .await
         .expect("adopts the root");
-    let (id, endpoint) = (first.shard, first.endpoint);
+    let (id, endpoint, root) = (first.shard, first.endpoint, first.region);
+    // It learns the scene (revision 1) like any shard.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first.state.lock().await.scene().revision != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the first shard never got the scene"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     first.abort();
 
     // Same advertised endpoint, new socket (the old one is aborted; use the
@@ -177,7 +259,29 @@ async fn a_restarting_shard_with_the_same_endpoint_rejoins_with_the_same_id() {
     let second = start_orchestrated(again, control_addr)
         .await
         .expect("the restarted shard is welcomed, not locked out");
-    assert_eq!(second.shard, id, "same id back");
+    assert_ne!(second.shard, id, "never the old id");
+    assert_eq!(second.shard, ShardId::new(2));
+    assert_eq!(second.region, root, "the old shard's region");
+    owns_its_region_at(&second, 2).await;
+    {
+        let state = second.state.lock().await;
+        assert_eq!(state.shard_map().regions.len(), 1);
+        assert_eq!(state.shard_map().regions[0].shard, second.shard);
+    }
+    // The scene was re-issued: revision 2, the same scene.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let scene = second.state.lock().await.scene();
+        if scene.revision == 2 {
+            assert_eq!(scene.scene, space_protocol::Scene::DEFAULT.id());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replacement never heard the re-issued scene (it runs {scene})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     second.abort();
     orch_task.abort();
@@ -221,6 +325,8 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
             advertise: None,
             claim_region: None,
             cluster,
+            client_endpoint: None,
+            secret: String::new(),
         },
         control_addr,
     )
@@ -333,10 +439,10 @@ async fn a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port(
 /// * the launcher started a bare shard that never dialled the orchestrator, so
 ///   the child never registered and never acked;
 /// * the `EpochPrepare` was published before the child existed and never sent
-///   again, so even a registered child had nothing to ack.
+///   again, so even a registered child had nothing to ack. (The prepare is now
+///   only proposed once the child has registered, so there is no "again".)
 ///
-/// Each one leaves the prepare un-acked: the epoch aborts after three seconds
-/// and the map stays at epoch 1.
+/// Each one leaves the split uncommitted and the map at epoch 1.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
     use space_orchestrator::launcher::Launcher as _;
@@ -382,9 +488,10 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
         "the split is accepted: {reply:?}"
     );
 
-    // --- the loop carries it out: prepare, launch, hello, prepare again, acks,
-    // commit, map push. Done when the *root shard* runs the new map with both
-    // regions at real addresses — i.e. it got the commit and the push.
+    // --- the loop carries it out: launch, the new shard's hello (no id, no
+    // region), the id, the prepare, acks, commit, map push. Done when the
+    // *root shard* runs the new map with both regions at real addresses —
+    // i.e. it got the commit and the push.
     let root_state = Arc::clone(&root.state);
     let committed = async {
         loop {
@@ -432,17 +539,22 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
 
     // The child is a live shard the launcher supervises, at the published
     // address, and it follows the committed map too.
+    let child_launch = launcher
+        .launch_of(child)
+        .await
+        .expect("the launcher started the child");
+    assert_eq!(orchestrator.launch_of(child), Some(child_launch));
     assert_eq!(
-        launcher.poll(child).await.expect("poll"),
+        launcher.poll(child_launch).await.expect("poll"),
         space_orchestrator::launcher::Poll::Alive
     );
+    // (Asked as a peer shard would ask, with the cluster's peer token: the
+    // child answers a peer with its own id and map. A *player* who dials it
+    // is sent to the shard that owns the spawn point — checked below.)
     let client = space_net::client_endpoint().expect("client endpoint");
     let mut seen = None;
     for _ in 0..100 {
-        let hello = Hello {
-            protocol: space_protocol::PROTOCOL_VERSION,
-            player_token: "after-the-split".into(),
-        };
+        let hello = space_server::net::peer_hello_with(root.shard, "secret");
         let (conn, welcome) = space_net::connect(
             &client,
             child_region.endpoint,
@@ -470,8 +582,14 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
         root_map.lookup(&root_node.center()),
         "and agrees with the root shard about everything else"
     );
+    // The spawn point stayed with the root's shard: a player who dials the
+    // child is sent there, the root's shard welcomes it.
+    let spawn = space_scene::scene_anchor(&root_map).expect("a spawn point");
+    assert_eq!(root_map.lookup(&spawn), Some(root.shard));
+    a_client_is_sent_on_by(child_region.endpoint, root.shard, root.endpoint).await;
+    a_client_is_welcomed_by(root.endpoint).await;
 
-    launcher.kill(child).await.expect("kill");
+    launcher.kill(child_launch).await.expect("kill");
     root.abort();
     server.close();
     let _ = std::fs::remove_file(&state_path);

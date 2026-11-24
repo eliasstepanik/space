@@ -36,10 +36,7 @@ use space_protocol::shard::ShardId;
 use space_world::NodeRef;
 
 use super::ServerInfo;
-use crate::autoscale::{
-    MAX_PLAYERS_PER_SHARD, MERGE_DWELL_TICKS, MERGE_THRESHOLD, SCALE_COOLDOWN_TICKS,
-    SPLIT_DWELL_TICKS, SPLIT_THRESHOLD, TICK_BUDGET_MS,
-};
+use crate::autoscale::TICK_BUDGET_MS;
 use crate::config::{
     EPOCH_ACK_TIMEOUT_TICKS, EPOCH_LEAD_TICKS, MIN_EPOCH_INTERVAL_TICKS, REPORT_EXPIRY_TICKS,
     TICK_HZ,
@@ -531,11 +528,73 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
     // ---- cluster
     h.raw("<div class=\"card\"><h2>Cluster</h2>\n<dl>\n");
     h.fact("name", &s.cluster);
-    h.fact("control endpoint (QUIC)", s.bind);
+    // The one address players type, and what a hello there is answered with.
+    match s.player_port {
+        Some(port) => {
+            h.fact("player port (QUIC)", port.addr);
+            match port.sends_to {
+                Some(shard) => h.fact(
+                    "players are sent to",
+                    format_args!("{shard}, which owns the spawn point"),
+                ),
+                None => h.fact(
+                    "players are told",
+                    "the cluster is starting: no connected shard owns the spawn point",
+                ),
+            }
+            h.fact(
+                "player hellos",
+                format_args!(
+                    "{} redirected, {} told to try again{}",
+                    port.redirected,
+                    port.turned_away,
+                    if port.refused == 0 {
+                        String::new()
+                    } else {
+                        format!(", {} refused (busy)", port.refused)
+                    }
+                ),
+            );
+        }
+        None => h.fact(
+            "player port",
+            "none (--player-bind): players dial a shard directly",
+        ),
+    }
+    h.fact("control endpoint (QUIC, shards only)", s.bind);
     if s.control_addr != s.bind {
         h.fact("shards are told to dial", s.control_addr);
     }
     h.fact("launcher", super::launcher_label(s.launcher));
+    h.fact(
+        "shards",
+        format_args!(
+            "{} kept running by the orchestrator, at most {}",
+            if s.min_shards == 0 {
+                "none".to_owned()
+            } else {
+                s.min_shards.to_string()
+            },
+            s.max_shards
+        ),
+    );
+    if s.starting > 0 {
+        h.fact("starting", format_args!("{} shard(s)", s.starting));
+    }
+    if let Some(wanted) = s.wanted {
+        h.fact(
+            "waiting for a shard",
+            format_args!("region {}", node_path(wanted)),
+        );
+    }
+    h.fact(
+        "shard registration",
+        if s.hello_auth_required {
+            "cluster secret required"
+        } else {
+            "no secret: loopback only"
+        },
+    );
     match info.build {
         Some(build) => h.fact(
             "version",
@@ -620,27 +679,37 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
         h.pill("ok", "active");
     }
     h.raw("</dd>\n");
+    let scale = scaler.config;
     h.fact(
         "load",
         format_args!(
-            "max(players / {MAX_PLAYERS_PER_SHARD:.0}, tick p95 / {TICK_BUDGET_MS:.1} ms)"
+            "max(players / {}, tick p95 / {TICK_BUDGET_MS:.1} ms)",
+            scale.capacity
         ),
     );
     h.fact(
-        "split",
+        "scale out",
         format_args!(
-            "load ≥ {SPLIT_THRESHOLD:.2} for {}",
-            span(seconds(SPLIT_DWELL_TICKS))
+            "load ≥ {:.2} for {}: the shard's hot cell is carved for a new shard (up to {} \
+             shards)",
+            scale.out_load,
+            span(seconds(scale.out_dwell_ticks)),
+            s.max_shards
         ),
     );
     h.fact(
-        "merge",
+        "scale in",
         format_args!(
-            "load ≤ {MERGE_THRESHOLD:.2} for {}, 0 players",
-            span(seconds(MERGE_DWELL_TICKS))
+            "a shard and the one it merges into together ≤ {:.2} for {}: merged, drained \
+             (within {}), stopped; only shards the orchestrator started, never the layout \
+             cells, never below {} shards",
+            scale.in_load,
+            span(seconds(scale.in_dwell_ticks)),
+            span(seconds(scale.drain_timeout_ticks)),
+            s.min_shards
         ),
     );
-    h.fact("cooldown per shard", span(seconds(SCALE_COOLDOWN_TICKS)));
+    h.fact("cooldown per shard", span(seconds(scale.cooldown_ticks)));
     if scaler.busy_until > now {
         h.fact(
             "next action",
@@ -859,7 +928,6 @@ fn link_state(view: &ShardView) -> (&'static str, &'static str) {
         (true, _, _) => ("ok", "connected"),
         (false, true, _) => ("bad", "lost"),
         (false, false, ShardRole::ReservedRoot) => ("dim", "not claimed yet"),
-        (false, false, ShardRole::SplitChild) => ("info", "starting"),
         (false, false, _) => ("bad", "never registered"),
     }
 }
@@ -871,21 +939,29 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         "<section class=\"card\"><h2>Shards<span class=\"count\">",
         s.shards.len(),
         "</span></h2>\n<div class=\"scroll\"><table>\n<tr><th>shard</th><th>link</th>\
-         <th>address</th><th>region</th><th>scene</th><th>last message</th>\
-         <th>load report</th><th>autoscaler</th></tr>\n",
+         <th>address (shards dial)</th><th>players dial</th><th>region</th><th>scene</th>\
+         <th>last message</th><th>load report</th><th>autoscaler</th></tr>\n",
     );
     for view in &s.shards {
         h.wrapped("<tr><td class=\"mono\">", view.shard, "</td><td>");
         let (class, label) = link_state(view);
         h.pill(class, label);
         match view.role {
-            ShardRole::SplitChild => {
+            ShardRole::Joining => {
                 h.raw(" ");
-                h.pill("info", "split child, epoch pending");
+                h.pill("info", "new, epoch pending");
+            }
+            ShardRole::Dead => {
+                h.raw(" ");
+                h.pill("bad", "dead, to be replaced");
             }
             ShardRole::Merging => {
                 h.raw(" ");
                 h.pill("info", "being merged away");
+            }
+            ShardRole::Draining => {
+                h.raw(" ");
+                h.pill("info", "draining: merged away, handing over");
             }
             ShardRole::Unowned => {
                 h.raw(" ");
@@ -897,6 +973,12 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         match view.advertised {
             Some(address) => h.text(address),
             None => h.raw("<span class=\"dim\">unknown</span>"),
+        }
+        h.raw("</td><td class=\"mono\">");
+        client_endpoint(h, view.client_endpoint);
+        if s.spawn_owner == Some(view.shard) {
+            h.raw(" ");
+            h.pill("info", "spawn point");
         }
         h.raw("</td><td class=\"mono\">");
         if view.regions.is_empty() {
@@ -929,13 +1011,28 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         }
         h.raw("</td><td>");
         match view.report {
-            Some(report) => h.text(format_args!(
-                "{} player(s), tick p95 {:.1} ms, load {:.2}, {}",
-                report.players,
-                report.tick_p95_ms,
-                report.load_metric,
-                ago(now, report.tick)
-            )),
+            Some(report) => {
+                h.text(format_args!(
+                    "{} player(s), {} entities, tick mean {:.1} / p95 {:.1} / worst {:.1} ms, \
+                     load {:.2}, {}",
+                    report.players,
+                    report.entities,
+                    report.tick_mean_ms,
+                    report.tick_p95_ms,
+                    report.tick_max_ms,
+                    report.load_metric,
+                    ago(now, report.tick)
+                ));
+                if let Some((cell, players)) = report.hot_cell {
+                    h.text(format_args!(
+                        "; {players} in cell {}:{}:{}",
+                        cell[0], cell[1], cell[2]
+                    ));
+                }
+                if report.skipped > 0 {
+                    h.text(format_args!("; {} ticks jumped", report.skipped));
+                }
+            }
             None => h.raw("<span class=\"dim\">no report yet</span>"),
         }
         h.raw("</td><td>");
@@ -948,12 +1045,12 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
                 (Some(since), _) => h.text(format_args!(
                     "hot for {} of {}",
                     span(seconds(now.saturating_sub(since))),
-                    span(seconds(SPLIT_DWELL_TICKS))
+                    span(seconds(s.autoscaler.config.out_dwell_ticks))
                 )),
                 (None, Some(since)) => h.text(format_args!(
                     "cold for {} of {}",
                     span(seconds(now.saturating_sub(since))),
-                    span(seconds(MERGE_DWELL_TICKS))
+                    span(seconds(s.autoscaler.config.in_dwell_ticks))
                 )),
                 (None, None) => h.raw("<span class=\"dim\">within the band</span>"),
             },
@@ -962,6 +1059,23 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         h.raw("</td></tr>\n");
     }
     h.raw("</table></div></section>\n");
+}
+
+/// Where a shard's players are sent, spelled out: an address, or — for the
+/// unspecified IP — "the host they dialed" and the port.
+fn client_endpoint(h: &mut Html, endpoint: Option<std::net::SocketAddr>) {
+    match endpoint {
+        Some(at) if at.ip().is_unspecified() => {
+            h.text(at);
+            h.wrapped(
+                "<div class=\"sub\">",
+                format_args!("the host they dialed, port {}", at.port()),
+                "</div>",
+            );
+        }
+        Some(at) => h.text(at),
+        None => h.raw("<span class=\"dim\">unknown</span>"),
+    }
 }
 
 /// The owner's connection state, looked up in the shard list.
@@ -994,8 +1108,10 @@ fn regions(h: &mut Html, input: &PageInput<'_>) {
          each level halves the edge. A split carves one octant (bit 0 = +x, bit 1 = +y, \
          bit 2 = +z) out of a region for a newly launched shard; the rest stays with its owner. \
          <q>auto</q> takes the first free octant counting from the one that holds the region's \
-         centre, where joining ships spawn. A merge gives a carved region back to the owner of \
-         the region around it. Both go through the epoch protocol: prepare, ack, commit, one \
+         centre, where joining ships spawn. A region can also be carved more than one level \
+         down (a single 1 km cell under the root); it is listed under the region around it. A \
+         merge gives a carved region back to the owner of the region around it. Both go \
+         through the epoch protocol: prepare, ack by every shard of the map, commit, one \
          change at a time.</p></section>\n",
     );
 }
@@ -1024,12 +1140,19 @@ fn region_row(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
         ),
         "",
     );
-    if let (Some(octant), Some(parent)) = (region.octant, region.parent) {
-        h.text(format_args!(
+    match (region.octant, region.parent) {
+        (Some(octant), Some(parent)) => h.text(format_args!(
             ": octant {octant} ({}) of {}",
             octant_signs(octant),
             node_path(parent)
-        ));
+        )),
+        // Carved more than one level down (a single cell under the root).
+        (None, Some(parent)) => h.text(format_args!(
+            ": carved out of {}, {} levels up",
+            node_path(parent),
+            region.node.depth.saturating_sub(parent.depth)
+        )),
+        (_, None) => {}
     }
     h.raw("</div></td>");
     h.wrapped(
@@ -1042,9 +1165,12 @@ fn region_row(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
     let (class, label) = owner_link(s, region.shard);
     h.pill(class, label);
     h.raw("<div class=\"sub mono\">");
-    match region.endpoint {
-        Some(endpoint) => h.text(endpoint),
-        None => h.raw("address not known yet"),
+    match (region.endpoint, region.client_endpoint) {
+        (Some(endpoint), Some(players)) if players != endpoint => {
+            h.text(format_args!("{endpoint}, players dial {players}"));
+        }
+        (Some(endpoint), _) => h.text(endpoint),
+        (None, _) => h.raw("address not known yet"),
     }
     h.raw("</div></td><td>");
     split_cell(h, input, region);
@@ -1115,7 +1241,7 @@ fn merge_cell(h: &mut Html, input: &PageInput<'_>, region: &RegionView) {
     );
     match into {
         Some(shard) => h.text(shard),
-        None => h.raw("its parent"),
+        None => h.raw("the region around it"),
     }
     h.raw("</button></form>");
     if let Some(why) = &region.merge_refusal {

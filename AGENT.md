@@ -57,7 +57,10 @@ You are expected to *use* the game while you build it.
 
 | I want to… | Use |
 |---|---|
-| start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): orchestrator + web UI + shard + client |
+| start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): the orchestrator (player port, web UI), the **four shards** it starts — the demo area in four shard areas that meet at HUD `pos` x = -6 / z = -4 — and a client pointed at the player port. The orchestrator starts the shards itself (one `space-server` process each, logs in `target/dev/shard-<port>.log`), replaces one that dies, and `-Stop` stops them too |
+| run it on one shard, or on more | the same with `-MinShards N` / `--min-shards N` (1 to 8; 1 = no borders anywhere). The client's address stays the player port |
+| watch the cluster scale | the dev scripts with `SPACE_ORCHESTRATOR_SHARD_CAPACITY=2`, `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER=5`, `SPACE_ORCHESTRATOR_SCALE_IN_AFTER=15`, `SPACE_ORCHESTRATOR_SCALE_COOLDOWN=10` in the environment and two clients: a loaded shard's hot cell is carved for a new shard, an idle shard is merged away, drains and stops (`.warren/skills/space-visual-test/SKILL.md`, "Scaling") |
+| run it in containers | `deploy/docker-compose.yaml`: **the orchestrator alone**, which starts its shard containers through the Docker socket (`--launcher docker`, Linux engine only). The dev scripts do not need Docker: they keep `--launcher process` |
 | drive a client without a human | the harness: `space-client --headless --harness 127.0.0.1:8098`, then `GET /state`, `GET /frame.png`, `POST /input`, `POST /script` |
 | script a user | Lua: `space-client --headless --script scripts/harness/smoke.lua` — the exit code is the script's result |
 | watch and play in a browser | `space-client --stream 127.0.0.1:8099` + `cargo run -p xtask -- viewer` → `http://127.0.0.1:8097/` |
@@ -86,10 +89,35 @@ must not be added back to the production stack.
   stopped before you finish; say so in your report. Use spare ports (the dev
   scripts take a port offset) when someone else may be using the defaults.
 - **No secrets in the repository.** Tokens come from the environment or a file
-  outside the tree. The compose files ship with the admin UI off in production.
+  outside the tree — the cluster secret of the compose files too: it has no
+  default. The compose files ship with the admin UI off in production and do
+  not publish the orchestrator's control port.
 - **Admin and control surfaces stay closed by default.** The orchestrator web
   UI and the client harness are off unless asked for, need no credentials on
-  loopback only, and refuse any other bind without a token. Do not weaken that.
+  loopback only, and refuse any other bind without a token. The orchestrator's
+  control port follows the same rule for shards: no secret on loopback, and on
+  any other bind no start without a cluster secret and no hello without it.
+  A control connection is heard only after its hello was welcomed, and then
+  only about the shard it was welcomed as. Shards of one cluster present its
+  peer token to each other. Do not weaken that, and never print a secret: one
+  is held in `space_net::Secret`, and a message that carries one has a `Debug`
+  that leaves it out.
+- **The Docker socket is the orchestrator's alone.** With `--launcher docker`
+  the orchestrator's container holds `/var/run/docker.sock`, which makes it
+  root-equivalent on the host (`docs/security-notes.md`, "The Docker
+  socket"). A shard container never gets the socket, a mount, a capability
+  or a privilege. Nothing a player or a shard sends may reach a Docker API
+  call: image, command, ports, network and labels come from the
+  orchestrator's configuration and its own counters. Only containers that
+  carry this cluster's labels are ever removed. The compose files hold the
+  orchestrator and no shard, and keep the web UI off in production.
+- **The player port is the public entry, not a control surface.** The
+  orchestrator's `--player-bind` (off unless given) needs no token on any
+  bind — and must stay unable to do anything: it answers a client's hello
+  with the shard to dial (or "starting") and closes, keeps no state per
+  player, reads nothing a peer sends behind its hello, and has no way into
+  the orchestrator's state. No shard registers through it, and the control
+  port does not serve players.
 - **Pure Rust.** No C dependencies (`ring` is the one sanctioned exception), no
   JavaScript toolchain; the orchestrator web UI is server-rendered HTML with no
   script at all. A new third-party crate needs a stated reason.
@@ -103,9 +131,10 @@ must not be added back to the production stack.
 
 | port | what |
 |---|---|
-| 7777/udp | first shard (QUIC) — what a client connects to |
+| 7777/udp | what a client connects to (QUIC): the orchestrator's player port (`--player-bind`), which sends the client on to the shard that owns the spawn point — or the shard itself in `single` / `two-shards`. Published on the host by the compose files |
 | 7778/udp | second shard in the two-shard handoff setup |
-| 7900/udp | orchestrator control port (QUIC) |
+| 7870-7899/udp | shards the orchestrator starts itself (`--launcher process`, or `--launcher docker`: then each shard container publishes its own port on the host; `--host-port-range`); players are sent to them by the player port and by handoffs, as `0.0.0.0:<port>` = "the host you dialed". Which one owns the spawn point is `player_port.sends_to_shard` / `map.spawn_owner` in `/api/state` — usually the first port, but not after a first launch that failed or once the root's shard has been replaced |
+| 7900/udp | orchestrator control port (QUIC): shards only (a player who dials it is told so). No credentials on loopback; any other bind needs the cluster secret. Never published by the compose files |
 | 7980/tcp | orchestrator web UI (HTTP) |
 | 8097/tcp | browser viewer page (`xtask viewer`) |
 | 8098/tcp | client harness API (HTTP) |

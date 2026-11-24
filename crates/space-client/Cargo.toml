@@ -33,6 +33,9 @@ env_logger = "0.11"
 
 [dev-dependencies]
 space-server = { path = "../space-server" }
+# `tests/entry.rs`: a client that enters through a real orchestrator's player
+# port (the one address players type) and is sent on to a shard.
+space-orchestrator = { path = "../space-orchestrator" }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 

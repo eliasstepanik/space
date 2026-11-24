@@ -19,12 +19,14 @@
 //! | [`a_stale_epoch_offer_is_refused_and_the_transfer_aborts`] | 7 |
 //! | [`a_snapshot_of_1000_ships_costs_about_158_bytes_per_entity`] | U9 budget |
 //! | [`a_client_can_connect_to_a_running_shard`] | the quinn front end end to end |
+//! | [`a_fresh_join_is_taken_only_by_the_shard_that_owns_the_spawn_point`], [`a_player_being_handed_over_is_welcomed_by_a_shard_that_does_not_own_the_spawn_point`], [`an_adoption_that_never_comes_ends_like_a_fresh_join`] | one address: who takes a fresh join, and who is sent on |
+//! | [`a_fresh_join_over_the_wire_is_sent_to_the_spawn_points_owner`], [`a_client_let_go_of_is_sent_the_redirect_and_its_connection_is_closed`] | the same over real QUIC |
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_protocol::{
-    EntityGuid, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, Scene,
-    SceneState, ShardId, ShardMap, ShardRegion, Welcome, PROTOCOL_VERSION,
+    EntityGuid, Hello, InputTick, Message, NeighbourStatus, PlayerInput, Redirect, RejectReason,
+    Scene, SceneState, ShardId, ShardMap, ShardRegion, Welcome, PROTOCOL_VERSION,
 };
 use space_sim::ShipState;
 use space_world::{NodeRef, WorldPos};
@@ -95,15 +97,19 @@ impl Pair {
     fn new() -> Self {
         let id_a = ShardId::new(1);
         let id_b = ShardId::new(2);
+        // (Addresses a shard could be dialed at — nothing listens there, the
+        // pair is wired in memory. A map naming port 0 for a shard says "not
+        // known yet", and nobody is sent to it.)
+        let listening = |n: u16| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_100 + n);
         let map = ShardMap::new(
             1,
             vec![
-                ShardRegion::new(region(0), id_a, addr()),
-                ShardRegion::new(region(1), id_b, addr()),
+                ShardRegion::new(region(0), id_a, listening(1)),
+                ShardRegion::new(region(1), id_b, listening(2)),
             ],
         );
-        let mut a = Shard::new(ShardConfig::new(id_a, addr(), region(0)));
-        let mut b = Shard::new(ShardConfig::new(id_b, addr(), region(1)));
+        let mut a = Shard::new(ShardConfig::new(id_a, listening(1), region(0)));
+        let mut b = Shard::new(ShardConfig::new(id_b, listening(2), region(1)));
         a.set_shard_map(map.clone());
         b.set_shard_map(map);
         Self {
@@ -248,6 +254,40 @@ fn join(shard: &mut Shard, token: &str) -> (u64, EntityGuid) {
     (welcome.session, ship)
 }
 
+/// Put `tokens` on the pair's shard B as players who are **already there**,
+/// and return their sessions.
+///
+/// Under the pair's map a new player starts on shard A — it owns the scene's
+/// spawn point — and B answers a fresh join with a `JoinRedirect`
+/// ([`a_fresh_join_is_taken_only_by_the_shard_that_owns_the_spawn_point`]). In
+/// a running cluster a player gets onto such a shard by flying there. The
+/// tests that need bystanders on B — a full shard, a client that does not own
+/// the ship being handed over — do not fly a hundred ships across first: the
+/// bystanders are let in while B runs the map of its own region alone, in
+/// which the spawn point is B's own (the centre of its cell), and B is given
+/// the pair's map back. To be called before any ship is on its way to B.
+fn residents_of_b(pair: &mut Pair, tokens: &[String]) -> Vec<u64> {
+    let pair_map = pair.b.shard_map().clone();
+    let own: Vec<ShardRegion> = pair_map
+        .regions
+        .iter()
+        .filter(|r| r.shard == pair.b.shard())
+        .cloned()
+        .collect();
+    pair.b.set_shard_map(ShardMap::new(pair_map.epoch, own));
+    let sessions = tokens
+        .iter()
+        .map(|token| {
+            pair.b
+                .join(&space_net::hello(token.as_str()))
+                .expect("a resident of B joins")
+                .session
+        })
+        .collect();
+    pair.b.set_shard_map(pair_map);
+    sessions
+}
+
 // --------------------------------------------------------------------- tests
 
 /// A client that never speaks the right protocol never reaches the shard.
@@ -361,13 +401,19 @@ fn send_truncated_frame(conn: quinn::Connection) -> BoxFuture {
 }
 
 impl RunningShard {
-    /// Bind on loopback and start serving + ticking.
+    /// Bind on loopback and start serving + ticking: shard 1, alone in the
+    /// world on the region at cell 0.
     async fn start() -> Self {
+        Self::start_as(ShardId::new(1), region(0)).await
+    }
+
+    /// [`Self::start`] as shard `id` on `region`.
+    async fn start_as(id: ShardId, region: NodeRef) -> Self {
         let net = std::sync::Arc::new(space_server::net::ShardNet::bind(addr()).expect("bind"));
         let shard = std::sync::Arc::new(tokio::sync::Mutex::new(Shard::new(ShardConfig::new(
-            ShardId::new(1),
+            id,
             net.local_addr().expect("bound addr"),
-            region(0),
+            region,
         ))));
 
         let serve = {
@@ -1302,6 +1348,327 @@ async fn a_client_can_connect_to_a_running_shard() {
     harness.shutdown();
 }
 
+// ================================================================ one address
+//
+// A new player starts on the scene's spawn point, so a fresh join is taken by
+// the shard that owns it and by no other (`docs/plan-sharding.md` §4).
+
+/// The join rule, on the state machine: the owner of the spawn point welcomes
+/// a newcomer and puts its ship there; a shard that does not own it answers
+/// with a `JoinRedirect` naming the owner as its own map has it — and spends
+/// nothing on the hello: no session, no client, no ship. While its map does
+/// not say where players reach the owner, the answer is "starting". A shard
+/// alone in the world owns the spawn point and behaves as it always did.
+///
+/// Mutation this catches: the old fallback (a ship on the centre of the
+/// region of whatever shard was dialed), or a redirect that allocates a
+/// session per hello (anybody could grow a shard's counters).
+#[test]
+fn a_fresh_join_is_taken_only_by_the_shard_that_owns_the_spawn_point() {
+    use space_server::shard::JoinRefusal;
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let map = pair.a.shard_map().clone();
+    let spawn = space_scene::scene_anchor(&map).expect("an anchor");
+    assert_eq!(map.lookup(&spawn), Some(id_a), "A owns the spawn point");
+    assert_eq!(
+        (pair.a.spawn_owner(), pair.b.spawn_owner()),
+        (Some(id_a), Some(id_a))
+    );
+
+    // The owner: a welcome, and a ship on the spawn point.
+    let (_session, ship) = join(&mut pair.a, "newcomer");
+    assert_eq!(pair.a.sim().ship_state(ship).expect("a ship").pos, spawn);
+
+    // Everybody else: a redirect to the owner, and nothing spent.
+    let sessions_before = pair.b.next_session();
+    let refused = pair
+        .b
+        .join(&space_net::hello("newcomer-2"))
+        .expect_err("B does not own the spawn point");
+    let JoinRefusal::Elsewhere(redirect) = refused else {
+        panic!("expected a redirect, got {refused:?}");
+    };
+    assert_eq!(redirect.shard, id_a);
+    assert_eq!(redirect.shard_map, map, "with B's own map");
+    assert_eq!(pair.b.next_session(), sessions_before, "no session spent");
+    assert_eq!(
+        (pair.b.stats().clients, pair.b.stats().ships),
+        (0, 0),
+        "nobody was let in and nothing was spawned"
+    );
+    assert!(pair.b.take_outbox().is_empty(), "and nothing was queued");
+
+    // The owner's address is not known yet (its region was carved or taken
+    // over a moment ago and the map push has not arrived): try again shortly.
+    let mut unresolved = map.clone();
+    for region in &mut unresolved.regions {
+        if region.shard == id_a {
+            region.endpoint = ShardRegion::UNRESOLVED_ENDPOINT;
+            region.client_endpoint = ShardRegion::UNRESOLVED_ENDPOINT;
+        }
+    }
+    pair.b.set_shard_map(unresolved);
+    assert_eq!(
+        pair.b.join(&space_net::hello("newcomer-3")),
+        Err(JoinRefusal::Rejected(RejectReason::Starting))
+    );
+
+    // A shard alone in the world owns the spawn point: nothing changed there.
+    let mut alone = lone_shard();
+    let (_session, ship) = join(&mut alone, "alone");
+    assert_eq!(
+        alone.sim().ship_state(ship).expect("a ship").pos,
+        region_center(0)
+    );
+    let _ = id_b;
+}
+
+/// A player whose ship is being handed over is **not** a fresh join: the
+/// shard taking the ship welcomes it wherever the spawn point is, and it
+/// adopts the staged ship as before.
+///
+/// Mutation this catches: applying the spawn-point rule to every hello — no
+/// handoff into a shard that does not own the spawn point could ever commit
+/// (the client's second connection would be sent away).
+#[test]
+fn a_player_being_handed_over_is_welcomed_by_a_shard_that_does_not_own_the_spawn_point() {
+    let mut pair = Pair::new();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = offer_and_accept(&mut pair, "owner-token");
+    assert_ne!(pair.b.spawn_owner(), Some(id_b), "B is not the spawn owner");
+
+    let welcome = pair
+        .b
+        .join(&space_net::hello("owner-token"))
+        .expect("the redirected player is let in");
+    assert_eq!(welcome.shard, id_b);
+    assert_eq!(
+        pair.b.ship_of(welcome.session),
+        None,
+        "no placeholder: it is waiting to adopt its ship"
+    );
+    pair.b.client_status(
+        welcome.session,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: true,
+        },
+    );
+    assert_eq!(pair.b.ship_of(welcome.session), Some(guid), "adopted");
+    // Anybody else is still a fresh join, staged ship or not.
+    assert!(matches!(
+        pair.b.join(&space_net::hello("somebody-else")),
+        Err(space_server::shard::JoinRefusal::Elsewhere(_))
+    ));
+}
+
+/// A client that came for a staged ship and never adopted it (the handoff
+/// was called off, or its token merely matched) is treated as a fresh join
+/// once its adopt budget has run out: on a shard that does not own the spawn
+/// point it is told where a new player starts and let go — no ship is put on
+/// the centre of that shard's region — and on the shard that owns the spawn
+/// point it gets a ship there, as before.
+///
+/// Mutation this catches: the old fallback in `client_timeout_pass` (the last
+/// way a player could end up in the middle of a cell nobody chose).
+#[test]
+fn an_adoption_that_never_comes_ends_like_a_fresh_join() {
+    use space_server::config::ADOPT_TIMEOUT_TICKS;
+    // On B, which does not own the spawn point.
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let (_session_a, _guid) = offer_and_accept(&mut pair, "owner-token");
+    let session = pair
+        .b
+        .join(&space_net::hello("owner-token"))
+        .expect("let in for the staged ship")
+        .session;
+    pair.b.take_outbox();
+    let mut last_words = Vec::new();
+    for _ in 0..ADOPT_TIMEOUT_TICKS + 2 {
+        pair.b.tick();
+        for out in pair.b.take_outbox() {
+            if out.dest == Destination::Client(session) {
+                last_words.push(out.message);
+            }
+        }
+    }
+    let redirect = last_words
+        .iter()
+        .find_map(|m| match m {
+            Message::JoinRedirect(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("the client is told where a new player starts");
+    assert_eq!(redirect.shard, id_a);
+    assert!(
+        matches!(last_words.last(), Some(Message::JoinRedirect(_))),
+        "and nothing is said to it after that: {last_words:?}"
+    );
+    assert_eq!(pair.b.stats().clients, 0, "it is no client of B any more");
+    assert_eq!(pair.b.ship_of(session), None);
+    assert_eq!(pair.b.stats().ships, 0, "no ship at B's region centre");
+
+    // On A, which owns it: a ship on the spawn point.
+    let mut pair = Pair::new();
+    let guid = EntityGuid::new(id_b, 77);
+    pair.a.peer_message(
+        id_b,
+        Message::HandoffOffer(space_protocol::HandoffOffer {
+            entity: guid,
+            from: id_b,
+            to: id_a,
+            epoch: pair.a.epoch(),
+            state: Box::new(offer_state(guid, "owner-token")),
+            activation_tick: space_server::handoff::HANDOFF_LEAD,
+        }),
+    );
+    let session = pair
+        .a
+        .join(&space_net::hello("owner-token"))
+        .expect("let in for the staged ship")
+        .session;
+    assert_eq!(pair.a.ship_of(session), None);
+    for _ in 0..ADOPT_TIMEOUT_TICKS + 2 {
+        pair.a.tick();
+        pair.a.take_outbox();
+    }
+    let ship = pair.a.ship_of(session).expect("a ship of its own");
+    assert_ne!(ship, guid);
+    assert_eq!(
+        pair.a.sim().ship_state(ship).expect("alive").pos,
+        region_center(0),
+        "on the spawn point"
+    );
+}
+
+/// The same rule over the wire: a client that says hello to a running shard
+/// which does not own the spawn point is answered with a `JoinRedirect` — in
+/// place of the welcome, with the map that names where players reach the
+/// owner — and the connection is finished.
+///
+/// Mutation this catches: the front end rejecting instead of redirecting (a
+/// client would show an error instead of ending up on the right shard), or
+/// answering and keeping the connection (one held open per misdirected hello).
+#[tokio::test]
+async fn a_fresh_join_over_the_wire_is_sent_to_the_spawn_points_owner() {
+    let (id_a, id_b) = (ShardId::new(1), ShardId::new(2));
+    let harness = RunningShard::start_as(id_b, region(1)).await;
+    let own = harness.net.local_addr().expect("bound addr");
+    // Shard 1 owns the spawn point; players reach it on the host they dialed.
+    let players_at: SocketAddr = "0.0.0.0:7871".parse().expect("addr");
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(region(0), id_a, "10.9.8.7:7871".parse().expect("addr"))
+                .with_client_endpoint(players_at),
+            ShardRegion::new(region(1), id_b, own),
+        ],
+    );
+    harness.shard.lock().await.set_shard_map(map.clone());
+
+    let endpoint = space_net::client_endpoint_for(own).expect("client endpoint");
+    let joined = space_net::join(
+        &endpoint,
+        own,
+        space_server::net::SERVER_NAME,
+        &space_net::hello("newcomer"),
+    )
+    .await
+    .expect("an answer");
+    let space_net::Joined::Elsewhere(redirect) = joined else {
+        panic!("expected a redirect, got {joined:?}");
+    };
+    assert_eq!(redirect.shard, id_a);
+    // The map as a player gets it: the client endpoints, and nothing of
+    // where the shards reach each other (10.9.8.7 never leaves the cluster).
+    assert_eq!(redirect.shard_map, map.for_players());
+    assert!(!format!("{:?}", redirect.shard_map).contains("10.9.8.7"));
+    assert_eq!(
+        redirect.shard_map.client_endpoint_of(id_a),
+        Some(players_at)
+    );
+    harness.settle().await;
+    assert_eq!(harness.clients().await, 0, "nobody was let in");
+    assert_eq!(harness.shard.lock().await.stats().ships, 0);
+
+    // `connect` — a shard's own dial — reports it as what it is.
+    let err = harness.connect("not-a-player").await.expect_err("sent on");
+    assert!(
+        matches!(&err, space_net::NetError::Protocol(why) if why.contains("player entry")),
+        "{err:?}"
+    );
+    harness.shutdown();
+}
+
+/// And the late form of it over the wire: a client let in for a staged ship
+/// that never adopts it is sent the redirect on its open connection, which
+/// the shard then closes.
+#[tokio::test]
+async fn a_client_let_go_of_is_sent_the_redirect_and_its_connection_is_closed() {
+    let (id_a, id_b) = (ShardId::new(1), ShardId::new(2));
+    let harness = RunningShard::start_as(id_b, region(1)).await;
+    let own = harness.net.local_addr().expect("bound addr");
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(region(0), id_a, "127.0.0.1:7871".parse().expect("addr")),
+            ShardRegion::new(region(1), id_b, own),
+        ],
+    );
+    let guid = EntityGuid::new(id_a, 77);
+    {
+        let mut shard = harness.shard.lock().await;
+        shard.set_shard_map(map);
+        let epoch = shard.epoch();
+        let activation_tick = shard.sim().tick() + space_server::handoff::HANDOFF_LEAD;
+        shard.peer_message(
+            id_a,
+            Message::HandoffOffer(space_protocol::HandoffOffer {
+                entity: guid,
+                from: id_a,
+                to: id_b,
+                epoch,
+                state: Box::new(offer_state(guid, "owner-token")),
+                activation_tick,
+            }),
+        );
+    }
+    let (conn, welcome) = harness
+        .connect("owner-token")
+        .await
+        .expect("let in for the staged ship");
+    assert_eq!(welcome.shard, id_b);
+
+    // It never reports in. Within the adopt budget (2 s) and a little, the
+    // redirect arrives on a reliable stream...
+    let redirect = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            match conn.recv_stream().await {
+                Ok(Some(Message::JoinRedirect(redirect))) => break Some(redirect),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .expect("the shard says something within the adopt budget")
+    .expect("and it is the redirect, before the connection ends");
+    assert_eq!(redirect.shard, id_a);
+    // ...and the shard closes the connection (at the latest after its drain).
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        conn.connection().closed(),
+    )
+    .await
+    .expect("the connection is closed from the shard's side");
+    harness.wait_for_clients(0).await.expect("no client left");
+    assert_eq!(harness.shard.lock().await.stats().ships, 0);
+    harness.shutdown();
+}
+
 // ======================================================== Phase 2 remediation
 //
 // One regression test per review blocker. Each test names, in its comment, the
@@ -1371,6 +1738,11 @@ fn a_claim_for_a_staged_entity_requires_the_offered_owner_token() {
     let mut pair = Pair::new();
     let id_a = pair.a.shard();
     let id_b = pair.b.shard();
+    // The wrong-token client: somebody who is on B already, with a ship of
+    // its own. (It used to join B after the transfer was staged; a fresh join
+    // on B is sent to A now, so a client of B is either a resident like this
+    // one or a player whose own ship is being handed to B.)
+    let thief = residents_of_b(&mut pair, &["thief-token".to_owned()])[0];
     let (session_a, guid) = join(&mut pair.a, "owner-token");
 
     // Drive A's ship into B's region so B stages the transfer.
@@ -1389,12 +1761,7 @@ fn a_claim_for_a_staged_entity_requires_the_offered_owner_token() {
     }
     assert!(redirect.is_some(), "A must have offered the ship");
 
-    // The wrong-token client connects and claims the staged guid.
-    let thief = pair
-        .b
-        .join(&space_net::hello("thief-token"))
-        .expect("join B")
-        .session;
+    // The wrong-token client claims the staged guid.
     pair.b.client_status(
         thief,
         NeighbourStatus {
@@ -1419,10 +1786,10 @@ fn a_claim_for_a_staged_entity_requires_the_offered_owner_token() {
         Some(guid),
         "a wrong-token claim must not adopt the staged entity"
     );
-    // The thief got a placeholder of its own instead (it is just a newcomer).
+    // The thief keeps the ship it had and nothing else.
     assert!(
         pair.b.ship_of(thief).is_some_and(|s| s != guid),
-        "the wrong-token client must be treated as an ordinary newcomer"
+        "the wrong-token client keeps its own ship"
     );
 
     // The real owner connects with the token the offer carried and is adopted.
@@ -1821,12 +2188,12 @@ fn a_full_shard_refuses_an_incoming_handoff_with_target_full() {
     let id_b = pair.b.shard();
     let (_session_a, guid) = join(&mut pair.a, "player");
 
-    // Fill B to the cap.
-    for i in 0..space_server::shard::MAX_PLAYERS_PER_SHARD {
-        pair.b
-            .join(&space_net::hello(format!("filler-{i}")))
-            .expect("filler joins");
-    }
+    // Fill B to the cap (with players who are there already: a fresh join on
+    // B is sent to A, which owns the spawn point).
+    let fillers: Vec<String> = (0..space_server::shard::MAX_PLAYERS_PER_SHARD)
+        .map(|i| format!("filler-{i}"))
+        .collect();
+    residents_of_b(&mut pair, &fillers);
     assert_eq!(
         pair.b.stats().clients,
         space_server::shard::MAX_PLAYERS_PER_SHARD,
@@ -1865,6 +2232,50 @@ fn a_full_shard_refuses_an_incoming_handoff_with_target_full() {
     );
     assert_eq!(pair.a.stats().handed_off, 0);
     assert_eq!(pair.b.stats().received, 0, "B took ownership of nothing");
+}
+
+/// A shard's load report counts what is **on its way into** its world: a
+/// transfer it has accepted and staged is in no world yet — the offering
+/// shard lets go of it with the commit — and a shard that reported "nothing
+/// here" in that moment could be retired by the orchestrator
+/// (`ShardRetire` after a drain) with the entity in its hands.
+///
+/// Mutation this catches: counting the simulated entities alone
+/// (`Shard::load_report` without `arriving()`): B reports 0 entities with the
+/// accepted transfer staged.
+#[test]
+fn a_load_report_counts_a_transfer_that_is_staged() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = join(&mut pair.a, "player");
+    let empty = pair.b.load_report();
+    assert_eq!((empty.players, empty.entities), (0, 0), "B holds nothing");
+
+    let offer = space_protocol::HandoffOffer {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        state: Box::new(offer_state(guid, "player")),
+        activation_tick: pair.a.sim().tick() + space_server::handoff::HANDOFF_LEAD,
+    };
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    let accepted = pair
+        .b
+        .take_outbox()
+        .iter()
+        .any(|o| matches!(o.message, Message::HandoffAccept(_)));
+    assert!(accepted, "B accepted the transfer");
+    assert!(
+        pair.b.sim().ship_state(guid).is_none(),
+        "staged: not in B's world yet"
+    );
+    let report = pair.b.load_report();
+    assert_eq!(
+        report.entities, 1,
+        "the staged transfer is counted: {report:?}"
+    );
 }
 
 /// B6: a peer that is not in this shard's map is not a neighbour, and a commit
@@ -2855,11 +3266,11 @@ fn a_refused_offer_is_not_repeated_every_tick() {
     let id_a = pair.a.shard();
     let id_b = pair.b.shard();
     let (session_a, guid) = join(&mut pair.a, "player");
-    for i in 0..space_server::shard::MAX_PLAYERS_PER_SHARD {
-        pair.b
-            .join(&space_net::hello(format!("filler-{i}")))
-            .expect("filler joins");
-    }
+    // (Players who are on B already: a fresh join on B is sent to A.)
+    let fillers: Vec<String> = (0..space_server::shard::MAX_PLAYERS_PER_SHARD)
+        .map(|i| format!("filler-{i}"))
+        .collect();
+    residents_of_b(&mut pair, &fillers);
     pair.b.take_outbox();
 
     let mut offers = 0u64;
@@ -3024,13 +3435,10 @@ fn only_the_owner_can_call_off_a_staged_handoff() {
     let mut pair = Pair::new();
     let id_a = pair.a.shard();
     let id_b = pair.b.shard();
+    // Somebody who is on B already, with a ship of its own. (A fresh join on
+    // B is sent to A, which owns the spawn point.)
+    let stranger = residents_of_b(&mut pair, &["someone-else".to_owned()])[0];
     let (_session_a, guid) = offer_and_accept(&mut pair, "owner-token");
-
-    let stranger = pair
-        .b
-        .join(&space_net::hello("someone-else"))
-        .expect("join B")
-        .session;
     pair.b.take_outbox();
     pair.b.client_status(
         stranger,
@@ -3280,4 +3688,222 @@ fn an_undecodable_handoff_state_is_never_installed_as_a_default() {
         "the ship is where its offer put it, not at the world origin"
     );
     assert_ne!(installed.pos, ShipState::IDENTITY.pos);
+}
+
+/// Only the player who flies a ship is redirected when it is handed over.
+///
+/// Everybody who had the ship in sight used to be sent the `Redirect` too. A
+/// bystander's client then said hello to the accepting shard with its own
+/// token: nothing is staged for it there, so it was sent away again — or, on
+/// the shard that owns the spawn point, welcomed as a new player and given a
+/// second ship for as long as its client kept that connection. A bystander
+/// needs no redirect: it stays on the shard that simulates its own ship and
+/// keeps seeing the ship that left as that shard's ghost of it
+/// ([`an_observer_sees_no_gap_across_a_handoff`]).
+///
+/// Mutation this catches: redirecting every client within the interest
+/// radius of the ship (`redirect_watchers`).
+#[test]
+fn only_the_ships_own_player_is_redirected() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let (mover, guid) = join(&mut pair.a, "mover");
+    let (bystander, bystander_ship) = join(&mut pair.a, "bystander");
+    assert_ne!(guid, bystander_ship);
+
+    let mut redirects: Vec<(u64, Redirect)> = Vec::new();
+    for _ in 0..600 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for (from, session, message) in std::mem::take(&mut pair.client_frames) {
+            if let Message::Redirect(redirect) = message {
+                assert_eq!(from, id_a);
+                redirects.push((session, redirect));
+            }
+        }
+        if !redirects.is_empty() {
+            break;
+        }
+    }
+    // A few more ticks: a redirect to the bystander must not follow either.
+    for _ in 0..10 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for (_, session, message) in std::mem::take(&mut pair.client_frames) {
+            if let Message::Redirect(redirect) = message {
+                redirects.push((session, redirect));
+            }
+        }
+    }
+    assert_eq!(redirects.len(), 1, "one redirect: {redirects:?}");
+    let (session, redirect) = &redirects[0];
+    assert_eq!(*session, mover, "to the ship's own player");
+    assert_eq!(redirect.entity, guid);
+    assert!(
+        pair.a.ship_of(bystander) == Some(bystander_ship),
+        "the bystander is where it was, with the ship it had"
+    );
+}
+
+/// A hello without a player token is refused, by every shard, before
+/// anything is decided on it.
+///
+/// The token is what a staged ship is matched to its player by, and a
+/// transfer that has **no** player (a body; a ship nobody flies) is staged
+/// with the empty token. A hello whose token is empty used to *equal* that:
+/// it was welcomed by a shard that does not own the spawn point as "the
+/// player being handed over", and could then claim the staged entity.
+///
+/// Mutation this catches: dropping the empty-token refusal in `Shard::join`,
+/// or comparing a hello's token to a staged owner token with `==` again.
+#[test]
+fn a_hello_without_a_token_is_refused_and_owns_nothing_that_is_staged() {
+    use space_server::shard::JoinRefusal;
+    let refused = |answer: Result<Welcome, JoinRefusal>| {
+        let Err(JoinRefusal::Rejected(RejectReason::Other(why))) = answer else {
+            panic!("expected a refusal in words, got {answer:?}");
+        };
+        assert!(why.contains("token"), "{why}");
+    };
+    // On the shard that owns the spawn point: no session, no ship.
+    let mut alone = lone_shard();
+    let before = alone.next_session();
+    refused(alone.join(&space_net::hello("")));
+    assert_eq!(alone.next_session(), before, "no session spent");
+    assert_eq!((alone.stats().clients, alone.stats().ships), (0, 0));
+
+    // On a shard that does not own it, with an **ownerless** transfer staged
+    // (the offer's state carries the empty owner token): still nobody's.
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let guid = EntityGuid::new(id_a, 77);
+    let activation_tick = pair.b.sim().tick() + space_server::handoff::HANDOFF_LEAD;
+    pair.b.peer_message(
+        id_a,
+        Message::HandoffOffer(space_protocol::HandoffOffer {
+            entity: guid,
+            from: id_a,
+            to: id_b,
+            epoch: pair.b.epoch(),
+            state: Box::new(offer_state(guid, "")),
+            activation_tick,
+        }),
+    );
+    assert!(
+        pair.b
+            .take_outbox()
+            .iter()
+            .any(|o| matches!(o.message, Message::HandoffAccept(_))),
+        "B staged the ownerless transfer"
+    );
+    refused(pair.b.join(&space_net::hello("")));
+    assert_eq!(pair.b.stats().clients, 0);
+    // A resident of B with a token of its own cannot claim it either — and
+    // neither could one whose token were empty: the staged entity has no
+    // owner at all.
+    let mut pair = Pair::new();
+    let resident = residents_of_b(&mut pair, &["resident".to_owned()])[0];
+    let own_ship = pair.b.ship_of(resident).expect("a ship of its own");
+    pair.b.peer_message(
+        id_a,
+        Message::HandoffOffer(space_protocol::HandoffOffer {
+            entity: guid,
+            from: id_a,
+            to: id_b,
+            epoch: pair.b.epoch(),
+            state: Box::new(offer_state(guid, "")),
+            activation_tick,
+        }),
+    );
+    let _ = pair.b.take_outbox();
+    pair.b.client_status(
+        resident,
+        NeighbourStatus {
+            entity: guid,
+            shard: id_b,
+            connected: true,
+        },
+    );
+    assert_eq!(pair.b.ship_of(resident), Some(own_ship), "nothing adopted");
+    assert!(
+        !pair
+            .b
+            .take_outbox()
+            .iter()
+            .any(|o| matches!(o.message, Message::NeighbourStatus(_))),
+        "and the commit gate of the offering shard was not opened"
+    );
+}
+
+/// The map a player is sent — in a `Welcome`, a `JoinRedirect`, a handoff's
+/// `Redirect` — names where **players** dial each shard and nothing else: the
+/// internal endpoints (where the shards reach each other) are replaced by
+/// the client endpoints. The shard's own map keeps the real ones.
+///
+/// Mutation this catches: sending `self.shard_map.clone()` to a client — every
+/// player who says hello learns the cluster's internal addresses.
+#[test]
+fn a_player_is_sent_client_endpoints_and_no_internal_ones() {
+    use space_server::shard::JoinRefusal;
+    let mut pair = Pair::new();
+    let (id_a, id_b) = (pair.a.shard(), pair.b.shard());
+    let internal =
+        |n: u8| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 8, n)), 7_900 + u16::from(n));
+    let players = |n: u8| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7_870 + u16::from(n));
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(region(0), id_a, internal(1)).with_client_endpoint(players(1)),
+            ShardRegion::new(region(1), id_b, internal(2)).with_client_endpoint(players(2)),
+        ],
+    );
+    pair.a.set_shard_map(map.clone());
+    pair.b.set_shard_map(map.clone());
+    let for_players = map.for_players();
+    assert_eq!(for_players.epoch, map.epoch);
+    let leaks = |sent: &ShardMap| {
+        sent.regions
+            .iter()
+            .any(|r| r.endpoint == internal(1) || r.endpoint == internal(2))
+    };
+    assert!(leaks(&map) && !leaks(&for_players));
+    for (sent, real) in for_players.regions.iter().zip(&map.regions) {
+        assert_eq!((sent.node, sent.shard), (real.node, real.shard));
+        assert_eq!(sent.client_endpoint, real.client_endpoint);
+        assert_eq!(sent.endpoint, real.client_endpoint);
+    }
+    // Everything a client derives from the map is unchanged by it.
+    assert_eq!(
+        space_scene::scene_anchor(&for_players),
+        space_scene::scene_anchor(&map)
+    );
+    assert_eq!(for_players.client_endpoint_of(id_b), Some(players(2)));
+
+    // The welcome.
+    let welcome = pair.a.join(&space_net::hello("mover")).expect("join A");
+    assert_eq!(welcome.shard_map, for_players);
+    // The join redirect of a shard that does not own the spawn point.
+    let Err(JoinRefusal::Elsewhere(sent_on)) = pair.b.join(&space_net::hello("other")) else {
+        panic!("B sends a newcomer to A");
+    };
+    assert_eq!(sent_on.shard_map, for_players);
+    // The handoff's redirect.
+    let mover = welcome.session;
+    let mut redirect = None;
+    for _ in 0..600 {
+        pair.thrust(id_a, mover, 0, 1.0);
+        pair.tick();
+        for message in pair.frames_for(id_a, mover) {
+            if let Message::Redirect(r) = message {
+                redirect = Some(r);
+            }
+        }
+        if redirect.is_some() {
+            break;
+        }
+    }
+    assert_eq!(redirect.expect("a redirect").shard_map, for_players);
+    // The shards themselves still hold, and use, the real map.
+    assert_eq!(pair.a.shard_map(), &map);
+    assert_eq!(pair.b.shard_map(), &map);
 }

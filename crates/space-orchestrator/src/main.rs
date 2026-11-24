@@ -14,6 +14,8 @@
 //!   space-orchestrator --webui 127.0.0.1:7980
 //!   # the scene a fresh cluster shows (default: demo-area)
 //!   space-orchestrator --scene galaxy
+//!   # the one address players type, and the shards kept running behind it
+//!   space-orchestrator --player-bind 127.0.0.1:7777 --min-shards 4 --launcher process
 //! ```
 //!
 //! There is no argument-parsing dependency (mirrors `space-server`): the grammar
@@ -45,11 +47,165 @@
 //! before putting any proxy in front of it** ([`space_orchestrator::webui`],
 //! "Without a token").
 //!
+//! # The player port
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--player-bind <addr:port>` | `SPACE_ORCHESTRATOR_PLAYER_BIND` | where players connect; unset = no player port |
+//!
+//! The one address a player types ([`space_orchestrator::player`]). A client
+//! that says hello there is answered with a `JoinRedirect` naming the shard
+//! that owns the scene's spawn point and the map that says where players
+//! reach it — or, while no connected shard owns the spawn point (the cluster
+//! is starting, or that shard is being replaced), with "starting", and the
+//! client tries again. The connection is then closed: game traffic flows
+//! between the client and the shard, never through the orchestrator.
+//!
+//! It is the cluster's **public entry**, not a control surface, so unlike the
+//! control port and the web UI it needs no secret on any bind. In exchange it
+//! can do nothing: it keeps no state per player, reads nothing a peer sends
+//! behind its hello, cannot register a shard and reaches no decision of the
+//! orchestrator — it only ever reads the answer the control loop last
+//! published. The control port (`--bind`) is for shards and tells a player
+//! who dials it so.
+//!
+//! Where a shard's **players** dial it is part of the map: the client
+//! endpoint its hello asks for (`space-server --client-endpoint`), else the
+//! address it advertises. The `process` launcher gives its shards
+//! `0.0.0.0:<host port>`, which a client reads as "the host I dialed, that
+//! port" — so no public host name is configured anywhere. A shard may also
+//! advertise `0.0.0.0:<port>` as its internal address (a container that does
+//! not know its own): the orchestrator then records the IP its control
+//! connection comes from.
+//!
 //! # Limits
 //!
 //! `--max-regions <n>` (default 64) is the most regions the map may hold; a
 //! split that would exceed it is refused, for the autoscaler and the operator
 //! alike.
+//!
+//! # The cluster's clock
+//!
+//! `--tick-origin <unix microseconds>` is the instant of the cluster's tick
+//! 0. Every shard is handed it in its welcome and counts its ticks from it
+//! (tick `n` is due `n / 30 s` after it), so a tick number names the same
+//! instant on every shard — whenever each was started: each keeps its tick
+//! clock on the host's wall clock (`space_server::clock`), so a replacement
+//! started later is on the same ticks to within milliseconds — and a
+//! player's ship can be handed from one to the next without a step. The
+//! default is a fixed instant (2026-01-01T00:00:00Z, the one a standalone
+//! shard uses too); there is rarely a reason to give another. One that lies
+//! in the future of this host's clock is refused: there is no tick to run
+//! yet.
+//!
+//! # Shards
+//!
+//! Every shard starts without a region and is given one when it registers:
+//! the root first, then the layout cells around the scene, or the regions of
+//! a shard that died. Who starts them is the question here.
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--min-shards <n>` | `SPACE_ORCHESTRATOR_MIN_SHARDS` | how many shards the orchestrator keeps running **by itself**; default 0: it starts none (they are started by hand, or by a split). 4 on the demo area = its four quadrants. At most 8 (the root's shard and one per layout cell), and not more than `--max-shards` or `--max-regions`: anything else is refused at startup |
+//! | `--max-shards <n>` | `SPACE_ORCHESTRATOR_MAX_SHARDS` | the most shards the cluster may have (default 8); one more that registers is refused for good |
+//! | `--launcher local\|process\|docker` | `SPACE_ORCHESTRATOR_LAUNCHER` | how a shard is started: `local` inside this process (the default), `process` as a `space-server` process, `docker` as a container (below) |
+//! | `--shard-exe <path>` | `SPACE_ORCHESTRATOR_SHARD_EXE` | the executable `process` starts; default: the `space-server` lying next to this executable |
+//! | `--shard-log-dir <dir>` | `SPACE_ORCHESTRATOR_SHARD_LOG_DIR` | where `process` writes `shard-<port>.log` per shard and `launched-shards.pid`; default: the working directory |
+//! | `--host-port-range <a>-<b>` | `SPACE_ORCHESTRATOR_HOST_PORTS` | the UDP ports `process` and `docker` hand their shards, one each (default 7870-7899). **Keep it out of the operating system's dynamic port range**; the binary does not check that |
+//!
+//! ## The `docker` launcher
+//!
+//! One container per shard, created, started, stopped and removed through
+//! the Docker Engine's socket ([`space_orchestrator::launcher::docker`]):
+//! the compose file then holds the orchestrator alone. Linux only.
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--docker-socket <path>` | `SPACE_ORCHESTRATOR_DOCKER_SOCKET` | the Engine's socket (default `/var/run/docker.sock`) |
+//! | `--shard-image <ref>` | `SPACE_ORCHESTRATOR_SHARD_IMAGE` | the image a shard container is created from. **No default in the binary**: the orchestrator image has the variable baked in at build time, naming the shard image of its own commit (`…/space-shard:sha-<commit>`), so shard and orchestrator are always the same build. Pulled if it is not on the host; a private image has to be pulled by the operator first (no registry credentials are handled here) |
+//! | `--docker-self <name>` | `SPACE_ORCHESTRATOR_DOCKER_SELF` | the orchestrator's **own container's name** (compose: `container_name`, or `<project>-orchestrator-1`), which it inspects to find the next two; default: `$HOSTNAME`, which is the container's short id only as long as nobody gave it a host name and it was not recreated from an older container's configuration (Watchtower does that). A name the daemon does not know is skipped |
+//! | `--docker-network <name>` | `SPACE_ORCHESTRATOR_DOCKER_NETWORK` | the network the shards join; default: the orchestrator container's own, found by inspecting itself |
+//! | `--docker-control-addr <host:port>` | `SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR` | what the shards dial to reach the control port; default: the orchestrator container's own address on that network and the control port's port. A name (the compose service) works too: `space-server --orchestrator` resolves it |
+//! | `--docker-publish-ip <ip>` | `SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP` | the host address each shard's UDP port is published on (default `0.0.0.0`: every interface — the shards' ports are public, like the player port) |
+//! | `--docker-name-prefix <text>` | `SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX` | container names are this and the host port (default `space-shard-`: `space-shard-7870`) |
+//! | `--docker-instance <id>` | `SPACE_ORCHESTRATOR_DOCKER_INSTANCE` | what tells **this** orchestrator's shard containers from another stack's on the same host (the label `space.instance`). Default: an id made once and kept in `<state file>.instance`, so it is the same at every start as long as the state is kept (a volume) and different for every other stack. Give it (the compose files pass the compose project's name) where the state is not kept. Not a secret |
+//! | `--shard-memory <MiB>` | `SPACE_ORCHESTRATOR_SHARD_MEMORY` | the memory limit of each shard container (default 2048; 0 = none; no swap on top) |
+//!
+//! A shard container gets the cluster secret in its environment (never on
+//! its command line), the labels `space.cluster`, `space.role=shard` and
+//! `space.instance` (and, for the operator's eyes, `space.launch` and
+//! `space.port`), no restart policy (the orchestrator replaces a shard that
+//! dies), no mount, no capability, a read-only root filesystem, a process
+//! limit, the memory limit, the user `10001:10001`, and never the socket. At
+//! start the orchestrator **removes** every container carrying its own three
+//! labels that an earlier run left (a shard cannot join a new orchestrator:
+//! it stops when it loses its own) — never another stack's, also not one
+//! that uses the same cluster name — and on SIGTERM or Ctrl-C it removes the
+//! ones it started before it exits. An image that disappears from the host
+//! while the orchestrator runs is pulled again by the launch that misses it.
+//!
+//! **Whoever can use the Docker socket is root on the host.** Mounting it
+//! makes the orchestrator's container that; see `docs/security-notes.md`.
+//!
+//! # Scaling
+//!
+//! Every shard reports its load once a second; the orchestrator relieves a
+//! loaded shard by carving its **hot cell** (the cell holding most of its
+//! players) for a new one, and merges an idle shard away — its region goes
+//! back, it hands over what it holds, and is stopped when it is empty
+//! ([`space_orchestrator::autoscale`]). Never below `--min-shards`, never
+//! above `--max-shards`; only shards the orchestrator launched itself are
+//! merged away by the autoscaler, never into a shard that has not reported
+//! or has no room for the players of both; a crowd on the spawn point does
+//! not grow the cluster (a region is never smaller than a cell); and while a
+//! merged shard drains the map does not change again.
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--shard-capacity <players>` | `SPACE_ORCHESTRATOR_SHARD_CAPACITY` | players at which a shard counts as full (default 100, which is also the most a shard takes: more is refused at startup). Load = max(players / capacity, tick p95 / 33.3 ms) |
+//! | `--scale-out-load <x>` | `SPACE_ORCHESTRATOR_SCALE_OUT_LOAD` | load at or above which a shard is relieved (default 0.8) |
+//! | `--scale-out-after <s>` | `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER` | … once it has stayed there this long (default 10) |
+//! | `--scale-in-load <x>` | `SPACE_ORCHESTRATOR_SCALE_IN_LOAD` | load of a shard **and** the one it would merge into together, at or below which it is merged away (default 0.35) |
+//! | `--scale-in-after <s>` | `SPACE_ORCHESTRATOR_SCALE_IN_AFTER` | … once they have stayed there this long (default 60) |
+//! | `--scale-cooldown <s>` | `SPACE_ORCHESTRATOR_SCALE_COOLDOWN` | how long a shard is left alone after any change that involved it (default 30) |
+//! | `--drain-timeout <s>` | `SPACE_ORCHESTRATOR_DRAIN_TIMEOUT` | how long a merged shard is given to hand everything over before it is stopped as it is (default 30, at most 45) |
+//!
+//! A shard that dies — its process exits, or its control connection closes —
+//! is replaced: its regions go to a new shard under a **new id**, and the
+//! scene's revision is raised so that its bodies are built once, afresh.
+//!
+//! A shard the `process` launcher starts inherits this process's environment
+//! **without** the variables named `SPACE_ORCHESTRATOR_*` (the web UI token
+//! and the peer token among them) and `SPACE_HARNESS_TOKEN`.
+//!
+//! # Secrets
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--cluster-secret <secret>` | `SPACE_CLUSTER_SECRET` | what a shard's hello must carry |
+//! | `--cluster-secret-file <path>` | `SPACE_CLUSTER_SECRET_FILE` | read it from a file (a container secret) |
+//! | `--peer-token <secret>` | `SPACE_ORCHESTRATOR_PEER_TOKEN` | what shards present to each other (at least 16 characters); default: generated at start |
+//! | `--peer-token-file <path>` | `SPACE_ORCHESTRATOR_PEER_TOKEN_FILE` | read it from a file (a container secret) |
+//!
+//! A secret given as a flag shows in the process list: prefer the variable
+//! or the file.
+//!
+//! The control port follows the web UI's rule. On a loopback bind a hello
+//! needs no secret (unless one is configured). On any other bind a hello
+//! without the right secret is refused, and the orchestrator does not start
+//! without one a shard could present: a configured one of at least 16
+//! characters — the same variable on every shard started by hand — or, with
+//! `--min-shards` 1 or more, one it generates and hands to the shards it
+//! starts (in their environment, never on a command line). A hello that is
+//! refused is told why and its connection closed; one that is welcomed may
+//! from then on report and acknowledge for the shard it was welcomed as, and
+//! for no other.
+//!
+//! The peer token is never optional for an orchestrated cluster: without
+//! `--peer-token` one is generated. A configured one shorter than 16
+//! characters (an empty one would switch peer authentication off without a
+//! word) is refused at startup. Neither secret is printed, and both are held
+//! in a type whose `Debug` does not show them.
 //!
 //! # The scene
 //!
@@ -70,10 +226,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use space_orchestrator::autoscale::ScaleConfig;
 use space_orchestrator::boot::boot;
-use space_orchestrator::config::{LauncherKind, OrchestratorConfig};
-use space_orchestrator::launcher::docker::DockerLauncher;
+use space_orchestrator::config::{LauncherKind, OrchestratorConfig, Secret};
+use space_orchestrator::launcher::docker::{DockerLauncher, DockerOptions};
 use space_orchestrator::launcher::local::LocalLauncher;
+use space_orchestrator::launcher::process::ProcessLauncher;
 use space_orchestrator::launcher::Launcher;
 use space_orchestrator::orchestrator::Orchestrator;
 use space_orchestrator::webui::{WebUi, WebUiConfig};
@@ -82,24 +240,165 @@ use space_orchestrator::webui::{WebUi, WebUiConfig};
 #[derive(Debug)]
 struct Options {
     config: OrchestratorConfig,
-    peer_token: String,
+    /// The peer token given with `--peer-token`; `None`: one is generated.
+    peer_token: Option<Secret>,
     /// The web UI to serve; `None` (the default) serves none.
     webui: Option<WebUiConfig>,
+    /// What the `docker` launcher is given (read only with `--launcher docker`).
+    docker: DockerOptions,
+}
+
+/// The flags that are a name and a value and nothing more: each with its
+/// environment fallback. (`--launcher docker`'s nine, and the seven of the
+/// autoscaler.)
+const TEXT_FLAGS: &[(&str, &str)] = &[
+    ("--docker-socket", "SPACE_ORCHESTRATOR_DOCKER_SOCKET"),
+    ("--shard-image", "SPACE_ORCHESTRATOR_SHARD_IMAGE"),
+    ("--docker-network", "SPACE_ORCHESTRATOR_DOCKER_NETWORK"),
+    (
+        "--docker-control-addr",
+        "SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR",
+    ),
+    (
+        "--docker-publish-ip",
+        "SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP",
+    ),
+    (
+        "--docker-name-prefix",
+        "SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX",
+    ),
+    ("--docker-self", "SPACE_ORCHESTRATOR_DOCKER_SELF"),
+    ("--docker-instance", "SPACE_ORCHESTRATOR_DOCKER_INSTANCE"),
+    ("--shard-memory", "SPACE_ORCHESTRATOR_SHARD_MEMORY"),
+    ("--shard-capacity", "SPACE_ORCHESTRATOR_SHARD_CAPACITY"),
+    ("--scale-out-load", "SPACE_ORCHESTRATOR_SCALE_OUT_LOAD"),
+    ("--scale-out-after", "SPACE_ORCHESTRATOR_SCALE_OUT_AFTER"),
+    ("--scale-in-load", "SPACE_ORCHESTRATOR_SCALE_IN_LOAD"),
+    ("--scale-in-after", "SPACE_ORCHESTRATOR_SCALE_IN_AFTER"),
+    ("--scale-cooldown", "SPACE_ORCHESTRATOR_SCALE_COOLDOWN"),
+    ("--drain-timeout", "SPACE_ORCHESTRATOR_DRAIN_TIMEOUT"),
+];
+
+/// The autoscaler's settings from the flags and the environment (`text`
+/// looks a flag up: the flag's value, else its variable's). Seconds become
+/// ticks; what cannot be run with is an error ([`ScaleConfig::check`]).
+fn parse_scale(text: &dyn Fn(&str) -> Option<String>) -> Result<ScaleConfig, String> {
+    let mut scale = ScaleConfig::default();
+    let number = |flag: &str| -> Result<Option<f64>, String> {
+        text(flag)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .ok_or_else(|| format!("{flag} needs a number (got {value})"))
+            })
+            .transpose()
+    };
+    let seconds = |flag: &str| -> Result<Option<u64>, String> {
+        Ok(number(flag)?.map(|s| {
+            (s * space_orchestrator::config::TICK_HZ as f64)
+                .round()
+                .min(1e12) as u64
+        }))
+    };
+    if let Some(players) = number("--shard-capacity")? {
+        if players.fract() != 0.0 || players > f64::from(u32::MAX) {
+            return Err(format!(
+                "--shard-capacity needs a whole number of players (got {players})"
+            ));
+        }
+        scale.capacity = players as u32;
+    }
+    if let Some(load) = number("--scale-out-load")? {
+        scale.out_load = load;
+    }
+    if let Some(load) = number("--scale-in-load")? {
+        scale.in_load = load;
+    }
+    if let Some(ticks) = seconds("--scale-out-after")? {
+        scale.out_dwell_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--scale-in-after")? {
+        scale.in_dwell_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--scale-cooldown")? {
+        scale.cooldown_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--drain-timeout")? {
+        scale.drain_timeout_ticks = ticks;
+    }
+    scale.check()?;
+    Ok(scale)
 }
 
 const USAGE: &str =
     "usage: space-orchestrator [--bind <addr:port>] [--control-addr <addr:port>] [--cluster <id>] \
-                     [--state <path>] [--first-id <n>] [--launcher local|docker] \
-                     [--peer-token <secret>] [--scene demo-area|materials|galaxy] \
-                     [--max-regions <n>] \
+                     [--player-bind <addr:port>] \
+                     [--state <path>] [--first-id <n>] [--launcher local|process|docker] \
+                     [--min-shards <n>] [--max-shards <n>] [--shard-exe <path>] \
+                     [--shard-log-dir <dir>] [--host-port-range <a>-<b>] \
+                     [--docker-socket <path>] [--shard-image <ref>] [--docker-network <name>] \
+                     [--docker-control-addr <host:port>] [--docker-publish-ip <ip>] \
+                     [--docker-name-prefix <text>] [--docker-self <name>] \
+                     [--docker-instance <id>] [--shard-memory <MiB>] \
+                     [--shard-capacity <players>] [--scale-out-load <x>] [--scale-out-after <s>] \
+                     [--scale-in-load <x>] [--scale-in-after <s>] [--scale-cooldown <s>] \
+                     [--drain-timeout <s>] \
+                     [--cluster-secret <secret> | --cluster-secret-file <path>] \
+                     [--peer-token <secret> | --peer-token-file <path>] \
+                     [--scene demo-area|materials|galaxy] [--max-regions <n>] \
+                     [--tick-origin <unix microseconds>] \
                      [--webui <addr:port>] [--webui-token <secret> | --webui-token-file <path>] \
                      [--webui-host <name>[:<port>]]... \
-     (environment fallbacks: SPACE_ORCHESTRATOR_SCENE for --scene; for the --webui flags \
+     (environment fallbacks: SPACE_ORCHESTRATOR_SCENE for --scene; \
+     SPACE_ORCHESTRATOR_PLAYER_BIND for --player-bind; \
+     SPACE_ORCHESTRATOR_MIN_SHARDS, SPACE_ORCHESTRATOR_MAX_SHARDS, SPACE_ORCHESTRATOR_LAUNCHER, \
+     SPACE_ORCHESTRATOR_SHARD_EXE, SPACE_ORCHESTRATOR_SHARD_LOG_DIR and \
+     SPACE_ORCHESTRATOR_HOST_PORTS for the shard flags; SPACE_ORCHESTRATOR_DOCKER_SOCKET, \
+     SPACE_ORCHESTRATOR_SHARD_IMAGE, SPACE_ORCHESTRATOR_DOCKER_NETWORK, \
+     SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR, SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP, \
+     SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX, SPACE_ORCHESTRATOR_DOCKER_SELF, \
+     SPACE_ORCHESTRATOR_DOCKER_INSTANCE and SPACE_ORCHESTRATOR_SHARD_MEMORY for the docker \
+     launcher; \
+     SPACE_ORCHESTRATOR_SHARD_CAPACITY, SPACE_ORCHESTRATOR_SCALE_OUT_LOAD, \
+     SPACE_ORCHESTRATOR_SCALE_OUT_AFTER, SPACE_ORCHESTRATOR_SCALE_IN_LOAD, \
+     SPACE_ORCHESTRATOR_SCALE_IN_AFTER, SPACE_ORCHESTRATOR_SCALE_COOLDOWN and \
+     SPACE_ORCHESTRATOR_DRAIN_TIMEOUT for scaling; SPACE_CLUSTER_SECRET and \
+     SPACE_CLUSTER_SECRET_FILE for the cluster secret; SPACE_ORCHESTRATOR_PEER_TOKEN and \
+     SPACE_ORCHESTRATOR_PEER_TOKEN_FILE for the peer token; for the --webui flags \
      SPACE_ORCHESTRATOR_WEBUI, SPACE_ORCHESTRATOR_WEBUI_TOKEN, \
      SPACE_ORCHESTRATOR_WEBUI_TOKEN_FILE, SPACE_ORCHESTRATOR_WEBUI_HOSTS)";
 
 /// Environment fallback for `--scene`.
 const ENV_SCENE: &str = "SPACE_ORCHESTRATOR_SCENE";
+
+/// Environment fallback for `--player-bind`.
+const ENV_PLAYER_BIND: &str = "SPACE_ORCHESTRATOR_PLAYER_BIND";
+
+/// Environment fallback for `--min-shards`.
+const ENV_MIN_SHARDS: &str = "SPACE_ORCHESTRATOR_MIN_SHARDS";
+/// Environment fallback for `--max-shards`.
+const ENV_MAX_SHARDS: &str = "SPACE_ORCHESTRATOR_MAX_SHARDS";
+/// Environment fallback for `--launcher`.
+const ENV_LAUNCHER: &str = "SPACE_ORCHESTRATOR_LAUNCHER";
+/// Environment fallback for `--shard-exe`.
+const ENV_SHARD_EXE: &str = "SPACE_ORCHESTRATOR_SHARD_EXE";
+/// Environment fallback for `--shard-log-dir`.
+const ENV_SHARD_LOG_DIR: &str = "SPACE_ORCHESTRATOR_SHARD_LOG_DIR";
+/// Environment fallback for `--host-port-range`.
+const ENV_HOST_PORTS: &str = "SPACE_ORCHESTRATOR_HOST_PORTS";
+/// Environment fallback for `--cluster-secret` (the variable a shard reads its
+/// own from, so one setting serves both).
+const ENV_CLUSTER_SECRET: &str = space_server::orchestrated::ENV_CLUSTER_SECRET;
+/// Environment fallback for `--cluster-secret-file`.
+const ENV_CLUSTER_SECRET_FILE: &str = space_server::orchestrated::ENV_CLUSTER_SECRET_FILE;
+/// Environment fallback for `--peer-token`. (An orchestrator's variable: the
+/// process launcher keeps `SPACE_ORCHESTRATOR_*` out of its children.)
+const ENV_PEER_TOKEN: &str = "SPACE_ORCHESTRATOR_PEER_TOKEN";
+/// Environment fallback for `--peer-token-file`.
+const ENV_PEER_TOKEN_FILE: &str = "SPACE_ORCHESTRATOR_PEER_TOKEN_FILE";
 
 /// Environment fallback for `--webui`.
 const ENV_WEBUI: &str = "SPACE_ORCHESTRATOR_WEBUI";
@@ -170,13 +469,59 @@ impl WebUiFlags {
 
 /// The token in `path`: the file's content without surrounding whitespace.
 fn read_token_file(path: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("web UI token file {}: {e}", path.display()))?;
+    read_secret_file("web UI token file", path)
+}
+
+/// The secret in `path` (`what` names the file in an error): its content
+/// without surrounding whitespace.
+fn read_secret_file(what: &str, path: &Path) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("{what} {}: {e}", path.display()))?;
     let token = text.trim();
     if token.is_empty() {
-        return Err(format!("web UI token file {} is empty", path.display()));
+        return Err(format!("{what} {} is empty", path.display()));
     }
     Ok(token.to_owned())
+}
+
+/// Parse `--launcher`'s value.
+fn parse_launcher(name: &str) -> Result<LauncherKind, String> {
+    match name.trim() {
+        "local" => Ok(LauncherKind::Local),
+        "process" => Ok(LauncherKind::Process),
+        "docker" => Ok(LauncherKind::Docker),
+        other => Err(format!(
+            "unknown launcher {other} (local, process or docker)"
+        )),
+    }
+}
+
+/// Parse `--host-port-range`'s value: `<first>-<last>`, both inclusive.
+///
+/// Only the form is checked. **Whether the range lies outside the operating
+/// system's dynamic port range is not** — and it must
+/// ([`OrchestratorConfig::host_port_range`] says why: a shard bound to
+/// `127.0.0.1:<p>` takes over the datagrams of a socket the system gave port
+/// `<p>` on the wildcard address). That rule is the operator's to keep; the
+/// default, 7870-7899, keeps it.
+fn parse_port_range(text: &str) -> Result<(u16, u16), String> {
+    let bad = || format!("the host port range must be <first>-<last>, e.g. 7870-7899 (got {text})");
+    let (lo, hi) = text.trim().split_once('-').ok_or_else(bad)?;
+    let lo = lo.trim().parse::<u16>().map_err(|_| bad())?;
+    let hi = hi.trim().parse::<u16>().map_err(|_| bad())?;
+    if lo == 0 || hi < lo {
+        return Err(bad());
+    }
+    Ok((lo, hi))
+}
+
+/// Parse a shard count (`--min-shards`, `--max-shards`).
+fn parse_count(flag: &str, text: &str, at_least: usize) -> Result<usize, String> {
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= at_least)
+        .ok_or_else(|| format!("{flag} needs a number from {at_least} up (got {text})"))
 }
 
 impl Options {
@@ -184,9 +529,23 @@ impl Options {
     /// process environment in production, a table in tests).
     fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
         let mut config = OrchestratorConfig::default();
-        let mut peer_token = String::new();
+        let mut peer_token: Option<String> = None;
+        let mut peer_token_file: Option<PathBuf> = None;
         let mut webui = WebUiFlags::default();
         let mut scene: Option<String> = None;
+        let mut player_bind: Option<String> = None;
+        // The shard flags as given; the environment fills what is missing.
+        let mut launcher: Option<String> = None;
+        let mut min_shards: Option<String> = None;
+        let mut max_shards: Option<String> = None;
+        let mut shard_exe: Option<String> = None;
+        let mut shard_log_dir: Option<String> = None;
+        let mut host_ports: Option<String> = None;
+        let mut cluster_secret: Option<String> = None;
+        let mut cluster_secret_file: Option<PathBuf> = None;
+        // The plain name-and-value flags (`TEXT_FLAGS`), as given.
+        let mut texts: std::collections::BTreeMap<&'static str, String> =
+            std::collections::BTreeMap::new();
         let mut i = 0;
         while i < args.len() {
             let flag = args[i].as_str();
@@ -211,6 +570,9 @@ impl Options {
                 "--cluster" => {
                     config.cluster = value("--cluster")?.clone();
                 }
+                "--player-bind" => {
+                    player_bind = Some(value("--player-bind")?.clone());
+                }
                 "--state" => {
                     config.state_path = PathBuf::from(value("--state")?);
                 }
@@ -220,17 +582,43 @@ impl Options {
                         .map_err(|e| e.to_string())?;
                 }
                 "--launcher" => {
-                    config.launcher = match value("--launcher")?.as_str() {
-                        "local" => LauncherKind::Local,
-                        "docker" => LauncherKind::Docker,
-                        other => return Err(format!("unknown launcher {other}")),
-                    };
+                    launcher = Some(value("--launcher")?.clone());
+                }
+                "--min-shards" => {
+                    min_shards = Some(value("--min-shards")?.clone());
+                }
+                "--max-shards" => {
+                    max_shards = Some(value("--max-shards")?.clone());
+                }
+                "--shard-exe" => {
+                    shard_exe = Some(value("--shard-exe")?.clone());
+                }
+                "--shard-log-dir" => {
+                    shard_log_dir = Some(value("--shard-log-dir")?.clone());
+                }
+                "--host-port-range" => {
+                    host_ports = Some(value("--host-port-range")?.clone());
+                }
+                "--cluster-secret" => {
+                    cluster_secret = Some(value("--cluster-secret")?.clone());
+                }
+                "--cluster-secret-file" => {
+                    cluster_secret_file = Some(PathBuf::from(value("--cluster-secret-file")?));
                 }
                 "--peer-token" => {
-                    peer_token = value("--peer-token")?.clone();
+                    peer_token = Some(value("--peer-token")?.clone());
+                }
+                "--peer-token-file" => {
+                    peer_token_file = Some(PathBuf::from(value("--peer-token-file")?));
                 }
                 "--scene" => {
                     scene = Some(value("--scene")?.clone());
+                }
+                "--tick-origin" => {
+                    config.tick_origin_us =
+                        value("--tick-origin")?.parse::<i64>().map_err(|e| {
+                            format!("--tick-origin: {e} (microseconds since the Unix epoch)")
+                        })?;
                 }
                 "--max-regions" => {
                     config.max_regions = value("--max-regions")?
@@ -251,7 +639,12 @@ impl Options {
                 "--webui-host" => {
                     webui.hosts.push(value("--webui-host")?.clone());
                 }
-                other => return Err(format!("unknown argument {other}\n{USAGE}")),
+                other => match TEXT_FLAGS.iter().find(|(name, _)| *name == other) {
+                    Some((name, _)) => {
+                        texts.insert(name, value(name)?.clone());
+                    }
+                    None => return Err(format!("unknown argument {other}\n{USAGE}")),
+                },
             }
             i += if flag == "--help" || flag == "-h" {
                 1
@@ -269,10 +662,222 @@ impl Options {
                 .parse::<space_protocol::Scene>()
                 .map_err(|e| format!("--scene ({ENV_SCENE}): {e}"))?;
         }
+        // The shards: each flag, else its variable, else the default. An empty
+        // variable counts as unset; a value that makes no sense is an error,
+        // never a silent default.
+        let set = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+        // The player port: off unless an address is given.
+        if let Some(text) = player_bind.or_else(|| set(ENV_PLAYER_BIND)) {
+            let addr = text
+                .trim()
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("--player-bind ({ENV_PLAYER_BIND}) {text:?}: {e}"))?;
+            if addr.port() != 0 && addr.port() == config.bind.port() {
+                // One UDP port is one listener; said here rather than as a
+                // bind error once the control port is already up.
+                return Err(format!(
+                    "--player-bind {addr} uses the control port's port ({}): players and shards \
+                     connect to different ports",
+                    config.bind
+                ));
+            }
+            config.player_bind = Some(addr);
+        }
+        if let Some(name) = launcher.or_else(|| set(ENV_LAUNCHER)) {
+            config.launcher = parse_launcher(&name)?;
+        }
+        if let Some(text) = min_shards.or_else(|| set(ENV_MIN_SHARDS)) {
+            config.min_shards = parse_count("--min-shards", &text, 0)?;
+        }
+        if let Some(text) = max_shards.or_else(|| set(ENV_MAX_SHARDS)) {
+            config.max_shards = parse_count("--max-shards", &text, 1)?;
+        }
+        // A `--min-shards` the orchestrator could not keep — above
+        // `--max-shards`, above `--max-regions`, or more shards than it has
+        // regions to give — is refused here: started anyway, the shard that
+        // is one too many would be launched, refused and launched again.
+        config.check_shard_counts()?;
+        if let Some(path) = shard_exe.or_else(|| set(ENV_SHARD_EXE)) {
+            config.shard_exe = Some(PathBuf::from(path.trim()));
+        }
+        if let Some(dir) = shard_log_dir.or_else(|| set(ENV_SHARD_LOG_DIR)) {
+            config.shard_log_dir = PathBuf::from(dir.trim());
+        }
+        if let Some(range) = host_ports.or_else(|| set(ENV_HOST_PORTS)) {
+            config.host_port_range = parse_port_range(&range)?;
+        }
+        // A plain flag's value: the flag, else its variable.
+        let text = |flag: &str| -> Option<String> {
+            texts.get(flag).cloned().or_else(|| {
+                TEXT_FLAGS
+                    .iter()
+                    .find(|(name, _)| *name == flag)
+                    .and_then(|(_, variable)| set(variable))
+            })
+        };
+        config.scale = parse_scale(&text)?;
+        // The docker launcher's settings. Only the control address is
+        // checked here (it ends up on a shard's command line); the rest is
+        // the launcher's to find wanting, when it is the one chosen.
+        let defaults = DockerOptions::default();
+        let docker = DockerOptions {
+            socket: text("--docker-socket").map_or(defaults.socket, |p| PathBuf::from(p.trim())),
+            image: text("--shard-image").map_or_else(String::new, |i| i.trim().to_owned()),
+            network: text("--docker-network").map(|n| n.trim().to_owned()),
+            control: text("--docker-control-addr").map(|c| c.trim().to_owned()),
+            control_port: config.bind.port(),
+            publish_ip: text("--docker-publish-ip")
+                .map_or(defaults.publish_ip, |ip| ip.trim().to_owned()),
+            name_prefix: text("--docker-name-prefix")
+                .map_or(defaults.name_prefix, |p| p.trim().to_owned()),
+            cluster: config.cluster.clone(),
+            // Empty: `run` reads it from (or makes it in) the file next to
+            // the state file.
+            instance: text("--docker-instance").map_or_else(String::new, |i| i.trim().to_owned()),
+            self_container: text("--docker-self").map(|name| name.trim().to_owned()),
+            // A container's host name is the start of its id unless somebody
+            // chose another, or it was recreated from an older container.
+            self_hostname: env("HOSTNAME")
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            memory_mib: match text("--shard-memory") {
+                None => defaults.memory_mib,
+                Some(value) => value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|mib| {
+                        *mib == 0 || (MIN_SHARD_MEMORY_MIB..=MAX_SHARD_MEMORY_MIB).contains(mib)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "--shard-memory needs a whole number of MiB from \
+                             {MIN_SHARD_MEMORY_MIB} up, or 0 for no limit (got {value})"
+                        )
+                    })?,
+            },
+        };
+        if config.launcher == LauncherKind::Docker {
+            if docker.image.is_empty() {
+                return Err(
+                    "--launcher docker needs the shard image: --shard-image <ref> \
+                     (SPACE_ORCHESTRATOR_SHARD_IMAGE; the orchestrator image sets it to the shard \
+                     image of its own commit)"
+                        .to_owned(),
+                );
+            }
+            if !docker.publish_ip.is_empty()
+                && docker.publish_ip.parse::<std::net::IpAddr>().is_err()
+            {
+                return Err(format!(
+                    "--docker-publish-ip {:?} is not an IP address",
+                    docker.publish_ip
+                ));
+            }
+            let plain = |text: &str| {
+                !text.is_empty()
+                    && text
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-:[]".contains(c))
+            };
+            if docker
+                .control
+                .as_deref()
+                .is_some_and(|c| !plain(c) || !c.contains(':'))
+            {
+                return Err("--docker-control-addr needs a host:port".to_owned());
+            }
+            if !plain(&docker.name_prefix) || docker.name_prefix.contains(':') {
+                return Err(
+                    "--docker-name-prefix may hold letters, digits, '.', '_' and '-'".to_owned(),
+                );
+            }
+            if docker
+                .self_container
+                .as_deref()
+                .is_some_and(|name| !valid_label_word(name))
+            {
+                return Err(
+                    "--docker-self needs the orchestrator container's name (letters, digits, \
+                     '.', '_' and '-')"
+                        .to_owned(),
+                );
+            }
+            if !docker.instance.is_empty() && !valid_label_word(&docker.instance) {
+                return Err(
+                    "--docker-instance may hold up to 64 letters, digits, '.', '_' and '-'"
+                        .to_owned(),
+                );
+            }
+        }
+        // The cluster secret: a flag wins over the environment, the secret
+        // itself over a file naming it.
+        let secret = match (cluster_secret, cluster_secret_file) {
+            (Some(_), Some(_)) => {
+                return Err("give --cluster-secret or --cluster-secret-file, not both".to_owned());
+            }
+            (Some(secret), None) => Some(secret),
+            (None, Some(path)) => Some(read_secret_file("cluster secret file", &path)?),
+            (None, None) => match (set(ENV_CLUSTER_SECRET), set(ENV_CLUSTER_SECRET_FILE)) {
+                (Some(secret), _) => Some(secret.trim().to_owned()),
+                (None, Some(path)) => Some(read_secret_file(
+                    "cluster secret file",
+                    Path::new(path.trim()),
+                )?),
+                (None, None) => None,
+            },
+        };
+        if secret.as_ref().is_some_and(String::is_empty) {
+            return Err("the cluster secret is empty".to_owned());
+        }
+        config.cluster_secret = secret.map(Secret::new);
+        // Refused here, before anything starts: a control port that is not on
+        // loopback and no secret a shard could present.
+        config.check_secret()?;
+        // The peer token, the same way: a flag wins over the environment, the
+        // token itself over a file naming it. None at all is fine — one is
+        // generated at start. One that is given must be a secret: an empty
+        // token means "no peer token" to a shard, which then lets every peer
+        // in, so a short or empty one is an error and never a quiet "off".
+        let peer_token = match (peer_token, peer_token_file) {
+            (Some(_), Some(_)) => {
+                return Err("give --peer-token or --peer-token-file, not both".to_owned());
+            }
+            (Some(token), None) => Some(token),
+            (None, Some(path)) => Some(read_secret_file("peer token file", &path)?),
+            (None, None) => match (set(ENV_PEER_TOKEN), set(ENV_PEER_TOKEN_FILE)) {
+                (Some(token), _) => Some(token.trim().to_owned()),
+                (None, Some(path)) => {
+                    Some(read_secret_file("peer token file", Path::new(path.trim()))?)
+                }
+                (None, None) => None,
+            },
+        };
+        if let Some(token) = &peer_token {
+            if token.len() < OrchestratorConfig::MIN_SECRET_LEN {
+                return Err(format!(
+                    "the peer token is too short: use at least {} characters, or give none and \
+                     one is generated ({ENV_PEER_TOKEN}, --peer-token-file)",
+                    OrchestratorConfig::MIN_SECRET_LEN
+                ));
+            }
+            // It travels in every shard-to-shard hello, and a hello is read
+            // with a small size limit (`space_net::MAX_HELLO_PAYLOAD`): a
+            // token that does not fit would have every peer hello refused,
+            // unreadably. Said here instead.
+            if token.len() > space_net::MAX_SECRET_LEN {
+                return Err(format!(
+                    "the peer token is too long: use at most {} characters \
+                     ({ENV_PEER_TOKEN}, --peer-token-file)",
+                    space_net::MAX_SECRET_LEN
+                ));
+            }
+        }
         Ok(Self {
             config,
-            peer_token,
+            peer_token: peer_token.map(Secret::new),
             webui: webui.resolve(env)?,
+            docker,
         })
     }
 }
@@ -292,20 +897,136 @@ fn main() -> Result<(), String> {
 /// Build the control plane and run the loop until the endpoint is closed.
 async fn run(options: Options, started: Instant) -> Result<(), String> {
     let Options {
-        config,
+        mut config,
         peer_token,
         webui,
+        docker,
     } = options;
     let webui = webui.map(|webui| webui.with_started(started));
+    // A tick origin that has not come yet: every shard would refuse its
+    // welcome (there is no tick to run). Say so here, once, instead.
+    if let Some(why) = space_protocol::SceneClock::origin_refusal(
+        config.tick_origin_us,
+        space_server::config::wall_clock_us(),
+    ) {
+        return Err(format!("--tick-origin: {why}"));
+    }
+    // The peer token shards present to each other: the one given, else one
+    // made now (from the web UI form token's source). Never printed.
+    let peer_token = peer_token
+        .map_or_else(space_orchestrator::webui::auth::random_token, |token| {
+            token.expose().to_owned()
+        });
     match config.launcher {
         LauncherKind::Local => serve(config, peer_token, webui, LocalLauncher::new()).await,
-        LauncherKind::Docker => {
-            // Deferred (bollard is not in the offline cache): fail fast with the
-            // launcher's own error rather than at the first split.
-            let launcher = DockerLauncher::new();
+        LauncherKind::Process => {
+            let exe = match &config.shard_exe {
+                Some(exe) => exe.clone(),
+                None => ProcessLauncher::default_exe().map_err(|e| e.to_string())?,
+            };
+            let launcher = ProcessLauncher::new(exe, &config.shard_log_dir, config.bind);
+            // Fail now, with the path, rather than at the first launch.
             launcher.ensure_available().map_err(|e| e.to_string())?;
+            println!(
+                "space-orchestrator: shards are started as {} (logs in {})",
+                launcher.exe().display(),
+                config.shard_log_dir.display()
+            );
             serve(config, peer_token, webui, launcher).await
         }
+        LauncherKind::Docker => {
+            let mut docker = docker;
+            // Fail now rather than at the first launch: no socket (before
+            // anything is written), no network to put the shards on, no
+            // image. What an earlier run left behind is removed here, before
+            // anything is started.
+            DockerLauncher::new(docker.clone())
+                .ensure_available()
+                .map_err(|e| e.to_string())?;
+            if docker.instance.is_empty() {
+                // Not told which orchestrator this is: the id kept next to
+                // the state file, made now if this is the first start.
+                docker.instance = docker_instance(&config.state_path)?;
+            }
+            config.launcher_note = format!("containers of {}", docker.image);
+            let launcher = DockerLauncher::new(docker);
+            let found = launcher.prepare().await.map_err(|e| e.to_string())?;
+            println!("space-orchestrator: {found}");
+            serve(config, peer_token, webui, launcher).await
+        }
+    }
+}
+
+/// The smallest memory limit `--shard-memory` takes, in MiB (0 = no limit is
+/// taken too). Below this a shard does not start at all.
+const MIN_SHARD_MEMORY_MIB: u64 = 64;
+/// The largest, in MiB (a terabyte: beyond it the number is a typing error).
+const MAX_SHARD_MEMORY_MIB: u64 = 1024 * 1024;
+
+/// Whether `text` can be a container name or an instance id: 1 to 64 letters,
+/// digits, `.`, `_` and `-`.
+fn valid_label_word(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// Where the docker launcher's instance id is kept: the state path with
+/// `.instance` appended (next to `.scene`).
+fn instance_path(state: &Path) -> PathBuf {
+    let mut name = state.as_os_str().to_owned();
+    name.push(".instance");
+    PathBuf::from(name)
+}
+
+/// The id that tells this orchestrator's shard containers from every other
+/// stack's on the host (`space.instance`): read from the file next to the
+/// state file, or made — once — and written there. So it is the same at
+/// every start for as long as the state is kept, and two stacks, each with a
+/// state of its own, never share one.
+///
+/// It is **not a secret** and is derived from none: sixteen hexadecimal
+/// digits out of the generator the web UI's form tokens come from, used here
+/// only because they do not repeat.
+fn docker_instance(state: &Path) -> Result<String, String> {
+    let path = instance_path(state);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let id = text.trim();
+            if valid_label_word(id) {
+                Ok(id.to_owned())
+            } else {
+                Err(format!(
+                    "{} does not hold an instance id (up to 64 letters, digits, '.', '_', '-'). \
+                     Delete it to have a new one made - shard containers an earlier run left \
+                     behind are then not recognised and have to be removed by hand - or pass \
+                     --docker-instance",
+                    path.display()
+                ))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let id: String = space_orchestrator::webui::auth::random_token()
+                .chars()
+                .take(16)
+                .collect();
+            // Through a sibling and a rename: never a half-written id.
+            let mut tmp = path.clone().into_os_string();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, format!("{id}\n"))
+                .and_then(|()| std::fs::rename(&tmp, &path))
+                .map_err(|e| {
+                    format!(
+                        "{}: cannot keep the docker launcher's instance id ({e}); make the state \
+                         directory writable or pass --docker-instance",
+                        path.display()
+                    )
+                })?;
+            Ok(id)
+        }
+        Err(err) => Err(format!("{}: {err}", path.display())),
     }
 }
 
@@ -329,6 +1050,8 @@ async fn serve<L: Launcher + 'static>(
         config.cluster, config.bind
     );
     println!("{}", scene_line(&orchestrator.control.scene, &config));
+    println!("{}", shards_line(&config));
+    println!("{}", players_line(&config));
     // The web UI runs in its own task and holds only a handle: it reads the
     // snapshots the loop publishes and offers commands to the loop's queue, so
     // nothing it does (or a client does to it) can hold the loop up. An address
@@ -344,7 +1067,85 @@ async fn serve<L: Launcher + 'static>(
         }
         None => None,
     };
-    orchestrator.run().await.map_err(|e| e.to_string())
+    // Told to stop (SIGTERM from `docker stop` / compose, Ctrl-C): the loop
+    // ends, and before it returns the launcher stops and removes the shards
+    // it started — an orchestrator that is stopped leaves none behind.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    orchestrator.stop_on(stop_rx);
+    tokio::spawn(async move {
+        let signal = stop_signal().await;
+        println!("space-orchestrator: {signal}: stopping, and stopping the shards it started");
+        let _ = stop_tx.send(true);
+        // (Kept: dropping the sender would read as "nobody will ever say stop".)
+        std::future::pending::<()>().await;
+    });
+    orchestrator.run().await.map_err(|e| e.to_string())?;
+    println!("space-orchestrator: stopped");
+    Ok(())
+}
+
+/// Wait for the signal that tells this process to stop, and name it.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => tokio::select! {
+                _ = terminate.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "interrupted",
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "interrupted"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be installed: never told to stop this way.
+            std::future::pending::<()>().await;
+        }
+        "interrupted"
+    }
+}
+
+/// One line for the startup log: who starts the shards, and whether a shard
+/// has to present the cluster secret. (Never the secret.)
+fn shards_line(config: &OrchestratorConfig) -> String {
+    let who = if config.min_shards == 0 {
+        "none is started by the orchestrator (start them by hand; a split starts its own)"
+            .to_owned()
+    } else {
+        format!(
+            "{} kept running by the orchestrator ({} launcher)",
+            config.min_shards,
+            space_orchestrator::webui::launcher_label(config.launcher)
+        )
+    };
+    let secret = if config.secret_required() {
+        "a hello must carry the cluster secret"
+    } else {
+        "a hello needs no secret (loopback control port)"
+    };
+    format!(
+        "space-orchestrator: shards: {who}, at most {}; {secret}",
+        config.max_shards
+    )
+}
+
+/// One line for the startup log: where players connect, or that this
+/// orchestrator has no player port.
+fn players_line(config: &OrchestratorConfig) -> String {
+    match config.player_bind {
+        Some(bind) => format!(
+            "space-orchestrator: players connect to {bind} (the player port): each is sent to \
+             the shard that owns the spawn point"
+        ),
+        None => "space-orchestrator: no player port (--player-bind): players dial a shard \
+                 directly"
+            .to_owned(),
+    }
 }
 
 /// One line for the startup log: the scene the cluster starts with and where
@@ -410,6 +1211,59 @@ mod tests {
         assert!(options.webui.is_none(), "the web UI is off by default");
     }
 
+    /// The player port is **off unless asked for** — from the flag, else its
+    /// variable — takes any address without a token (it is the public entry,
+    /// not a control surface), and cannot share the control port's port.
+    ///
+    /// Mutation this catches: a player port that is on by default (a second
+    /// public listener nobody asked for), or one that demands a secret on a
+    /// reachable bind like the control surfaces do (no player could connect).
+    #[test]
+    fn the_player_port_is_off_unless_asked_for_and_needs_no_token() {
+        assert_eq!(parse(&[]).expect("parses").config.player_bind, None);
+        let by_flag = parse(&["--player-bind", "127.0.0.1:7777"]).expect("parses");
+        assert_eq!(
+            by_flag.config.player_bind,
+            Some("127.0.0.1:7777".parse().unwrap())
+        );
+        let by_env = parse_with(
+            &[],
+            &[("SPACE_ORCHESTRATOR_PLAYER_BIND", " 0.0.0.0:7777\n")],
+        )
+        .expect("parses");
+        assert_eq!(
+            by_env.config.player_bind,
+            Some("0.0.0.0:7777".parse().unwrap())
+        );
+        // A flag wins over its variable; an empty variable is unset.
+        let both = parse_with(
+            &["--player-bind", "127.0.0.1:7001"],
+            &[("SPACE_ORCHESTRATOR_PLAYER_BIND", "127.0.0.1:7002")],
+        )
+        .expect("parses");
+        assert_eq!(both.config.player_bind.map(|a| a.port()), Some(7_001));
+        let empty = parse_with(&[], &[("SPACE_ORCHESTRATOR_PLAYER_BIND", " ")]).expect("parses");
+        assert_eq!(empty.config.player_bind, None);
+        // Open to the world with nothing else configured: the control port
+        // stays on loopback and needs no secret, the player port none either.
+        for open in ["0.0.0.0:7777", "[::]:7777", "192.168.1.5:7777"] {
+            let options = parse(&["--player-bind", open]).expect(open);
+            assert!(!options.config.secret_required(), "{open}");
+            assert!(options.webui.is_none());
+        }
+        // Nonsense, and the control port's own port.
+        assert!(parse(&["--player-bind", "nope"]).is_err());
+        assert!(parse(&["--player-bind"]).is_err());
+        let err = parse(&["--player-bind", "127.0.0.1:7900"]).expect_err("the control port");
+        assert!(err.contains("control port"), "{err}");
+        let err = parse(&["--bind", "127.0.0.1:7777", "--player-bind", "0.0.0.0:7777"])
+            .expect_err("the same port");
+        assert!(err.contains("different ports"), "{err}");
+        let err = parse_with(&[], &[("SPACE_ORCHESTRATOR_PLAYER_BIND", "x")])
+            .expect_err("nonsense in the environment is an error too");
+        assert!(err.contains("SPACE_ORCHESTRATOR_PLAYER_BIND"), "{err}");
+    }
+
     #[test]
     fn the_region_limit_has_a_default_and_a_flag() {
         assert_eq!(
@@ -427,8 +1281,17 @@ mod tests {
 
     #[test]
     fn control_addr_is_parsed_and_distinct_from_bind() {
-        let options =
-            parse(&["--bind", "0.0.0.0:7900", "--control-addr", "10.0.0.2:7900"]).expect("parses");
+        // (A control port that is not on loopback needs a cluster secret to
+        // start at all; that rule has a test of its own.)
+        let options = parse(&[
+            "--bind",
+            "0.0.0.0:7900",
+            "--control-addr",
+            "10.0.0.2:7900",
+            "--cluster-secret",
+            "a-long-enough-cluster-secret",
+        ])
+        .expect("parses");
         assert_eq!(options.config.bind, "0.0.0.0:7900".parse().unwrap());
         assert_eq!(
             options.config.control_addr(),
@@ -437,13 +1300,282 @@ mod tests {
         assert!(parse(&["--control-addr", "nope"]).is_err());
     }
 
+    /// The docker launcher's settings: an image is required (the binary has
+    /// no default: the orchestrator image names the shard image of its own
+    /// commit), everything else has one, and each has a variable.
+    ///
+    /// Mutations this catches: a default image in the binary (an orchestrator
+    /// would start shards of whatever `latest` is — another commit, refused
+    /// at the protocol gate at best); a control address or a name prefix that
+    /// is passed on unchecked.
+    #[test]
+    fn the_docker_launcher_is_configured_by_flags_or_variables() {
+        let err = parse(&["--launcher", "docker"]).expect_err("no image");
+        assert!(err.contains("--shard-image"), "{err}");
+        // The image alone is enough; the rest are the defaults.
+        let options = parse_with(
+            &[
+                "--launcher",
+                "docker",
+                "--bind",
+                "0.0.0.0:7900",
+                "--min-shards",
+                "4",
+            ],
+            &[
+                (
+                    "SPACE_ORCHESTRATOR_SHARD_IMAGE",
+                    "ghcr.io/x/space-shard:sha-abc1234",
+                ),
+                ("HOSTNAME", "0123456789ab"),
+            ],
+        )
+        .expect("parses");
+        assert_eq!(options.config.launcher, LauncherKind::Docker);
+        let docker = &options.docker;
+        assert_eq!(docker.image, "ghcr.io/x/space-shard:sha-abc1234");
+        assert_eq!(docker.socket, PathBuf::from("/var/run/docker.sock"));
+        assert_eq!(
+            (docker.network.as_deref(), docker.control.as_deref()),
+            (None, None)
+        );
+        assert_eq!(docker.control_port, 7900);
+        assert_eq!(docker.publish_ip, "0.0.0.0");
+        assert_eq!(docker.name_prefix, "space-shard-");
+        assert_eq!(docker.cluster, options.config.cluster);
+        // The host name is the fallback, never "the name it was told".
+        assert_eq!(docker.self_container, None);
+        assert_eq!(docker.self_hostname.as_deref(), Some("0123456789ab"));
+        // Not told which instance it is: decided at start, from the state.
+        assert_eq!(docker.instance, "");
+        assert_eq!(docker.memory_mib, 2_048);
+        // Flags win over variables.
+        let options = parse_with(
+            &[
+                "--launcher",
+                "docker",
+                "--shard-image",
+                "space-dev/shard:local",
+                "--docker-socket",
+                "/run/docker.sock",
+                "--docker-network",
+                "space_net",
+                "--docker-control-addr",
+                "orchestrator:7900",
+                "--docker-publish-ip",
+                "127.0.0.1",
+                "--docker-name-prefix",
+                "space-test-",
+                "--cluster",
+                "c1",
+            ],
+            &[("SPACE_ORCHESTRATOR_SHARD_IMAGE", "other:tag")],
+        )
+        .expect("parses");
+        let docker = &options.docker;
+        assert_eq!(docker.image, "space-dev/shard:local");
+        assert_eq!(docker.socket, PathBuf::from("/run/docker.sock"));
+        assert_eq!(docker.network.as_deref(), Some("space_net"));
+        assert_eq!(docker.control.as_deref(), Some("orchestrator:7900"));
+        assert_eq!(docker.publish_ip, "127.0.0.1");
+        assert_eq!(docker.name_prefix, "space-test-");
+        assert_eq!(docker.cluster, "c1");
+        let with = |flag: &str, value: &str| {
+            parse(&["--launcher", "docker", "--shard-image", "i:t", flag, value])
+        };
+        assert!(with("--docker-publish-ip", "everywhere").is_err());
+        assert!(with("--docker-control-addr", "no-port").is_err());
+        assert!(with("--docker-control-addr", "a b:7900").is_err());
+        assert!(with("--docker-name-prefix", "bad/name").is_err());
+        // Not asked for, not checked: another launcher needs no image.
+        assert!(parse(&["--launcher", "process"]).is_ok());
+    }
+
+    /// The orchestrator's own container's name, the instance and the shards'
+    /// memory limit: flags or variables, the name before the host name, and
+    /// nonsense refused.
+    ///
+    /// Mutation this catches: taking `HOSTNAME` for the container's name when
+    /// one is given (the launcher asks the daemon for the name first); a
+    /// memory limit the daemon would refuse (under its minimum) passed on.
+    #[test]
+    fn the_docker_launcher_is_told_its_own_name_its_instance_and_the_memory_limit() {
+        let options = parse_with(
+            &["--launcher", "docker", "--shard-image", "i:t"],
+            &[
+                ("SPACE_ORCHESTRATOR_DOCKER_SELF", "space-orchestrator"),
+                ("SPACE_ORCHESTRATOR_DOCKER_INSTANCE", "space-prod"),
+                ("SPACE_ORCHESTRATOR_SHARD_MEMORY", "512"),
+                ("HOSTNAME", "0123456789ab"),
+            ],
+        )
+        .expect("parses");
+        let docker = &options.docker;
+        assert_eq!(docker.self_container.as_deref(), Some("space-orchestrator"));
+        assert_eq!(docker.self_hostname.as_deref(), Some("0123456789ab"));
+        assert_eq!(docker.instance, "space-prod");
+        assert_eq!(docker.memory_mib, 512);
+        let with = |flag: &str, value: &str| {
+            parse(&["--launcher", "docker", "--shard-image", "i:t", flag, value])
+        };
+        assert_eq!(
+            with("--docker-self", "a_b.c-1")
+                .unwrap()
+                .docker
+                .self_container
+                .as_deref(),
+            Some("a_b.c-1")
+        );
+        assert_eq!(with("--shard-memory", "0").unwrap().docker.memory_mib, 0);
+        assert!(with("--docker-self", "a/b").is_err());
+        assert!(with("--docker-self", "a b").is_err());
+        assert!(with("--docker-instance", "a=b").is_err());
+        assert!(with("--docker-instance", &"x".repeat(65)).is_err());
+        for bad in ["5", "-1", "1.5", "lots", "9999999999"] {
+            let err = with("--shard-memory", bad).expect_err(bad);
+            assert!(err.contains("--shard-memory"), "{err}");
+        }
+    }
+
+    /// The instance id that tells this orchestrator's shard containers from
+    /// another stack's: made once, kept next to the state file, the same at
+    /// every later start - and another one for another state. It is not the
+    /// cluster's name, and a file that holds something else is an error, not
+    /// a new id.
+    ///
+    /// Mutation this catches: making a fresh id at every start (the shards a
+    /// killed orchestrator left would never be recognised, and would hold
+    /// their names and ports for good); deriving it from the cluster name
+    /// (two stacks left at the default name remove each other's shards).
+    #[test]
+    fn the_docker_instance_is_made_once_and_kept_with_the_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "space-orch-instance-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let one = dir.join("one.id");
+        let two = dir.join("two.id");
+        let first = docker_instance(&one).expect("made");
+        assert_eq!(first.len(), 16);
+        assert!(valid_label_word(&first), "{first}");
+        assert_eq!(instance_path(&one), dir.join("one.id.instance"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("one.id.instance")).unwrap(),
+            format!("{first}\n")
+        );
+        assert!(!dir.join("one.id.instance.tmp").exists());
+        assert_eq!(
+            docker_instance(&one).expect("read"),
+            first,
+            "the same again"
+        );
+        assert_eq!(docker_instance(&one).expect("read"), first);
+        let other = docker_instance(&two).expect("made");
+        assert_ne!(other, first, "another stack, another instance");
+        // What an operator wrote there is taken as it is ...
+        std::fs::write(dir.join("two.id.instance"), "  staging-2 \n").unwrap();
+        assert_eq!(docker_instance(&two).expect("read"), "staging-2");
+        // ... unless it is no id: said, and not replaced.
+        std::fs::write(dir.join("two.id.instance"), "not an id\n").unwrap();
+        let err = docker_instance(&two).expect_err("no id");
+        assert!(
+            err.contains("two.id.instance") && err.contains("--docker-instance"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("two.id.instance")).unwrap(),
+            "not an id\n"
+        );
+        // Nowhere to keep it: an error that says what to do.
+        let err = docker_instance(&dir.join("no-such-dir").join("x.id")).expect_err("no dir");
+        assert!(err.contains("--docker-instance"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a platform without the Docker socket the launcher says so at
+    /// startup, with what to use instead.
+    #[cfg(not(unix))]
     #[tokio::test]
-    async fn the_docker_launcher_is_an_unavailable_error_not_a_panic() {
-        let options = parse(&["--launcher", "docker"]).expect("parses");
+    async fn the_docker_launcher_refuses_to_start_where_it_cannot_run() {
+        let options = parse(&["--launcher", "docker", "--shard-image", "i:t"]).expect("parses");
         let err = run(options, Instant::now())
             .await
-            .expect_err("docker is deferred");
-        assert!(err.contains("bollard"), "{err}");
+            .expect_err("no unix socket here");
+        assert!(err.contains("--launcher process"), "{err}");
+    }
+
+    /// The autoscaler's thresholds are flags (seconds on the command line,
+    /// ticks inside), with variables, and settings that cannot work are
+    /// refused at startup.
+    ///
+    /// Mutations this catches: seconds taken as ticks (a 10 s dwell would be
+    /// a third of a second); a flag that parses and is not applied.
+    #[test]
+    fn the_autoscaler_is_configured_by_flags_or_variables() {
+        let defaults = parse(&[]).expect("parses").config.scale;
+        assert_eq!(defaults, ScaleConfig::default());
+        assert_eq!(
+            (defaults.capacity, defaults.out_load, defaults.in_load),
+            (100, 0.8, 0.35)
+        );
+        assert_eq!(
+            (
+                defaults.out_dwell_ticks,
+                defaults.in_dwell_ticks,
+                defaults.cooldown_ticks,
+                defaults.drain_timeout_ticks
+            ),
+            (300, 1_800, 900, 900)
+        );
+        let scale = parse_with(
+            &[
+                "--shard-capacity",
+                "2",
+                "--scale-out-load",
+                "0.9",
+                "--scale-out-after",
+                "5",
+                "--scale-in-load",
+                "0.4",
+                "--scale-cooldown",
+                "7.5",
+            ],
+            &[
+                ("SPACE_ORCHESTRATOR_SCALE_IN_AFTER", "20"),
+                ("SPACE_ORCHESTRATOR_DRAIN_TIMEOUT", "45"),
+                ("SPACE_ORCHESTRATOR_SCALE_OUT_AFTER", "99"),
+            ],
+        )
+        .expect("parses")
+        .config
+        .scale;
+        assert_eq!(
+            scale,
+            ScaleConfig {
+                capacity: 2,
+                out_load: 0.9,
+                out_dwell_ticks: 150,
+                in_load: 0.4,
+                in_dwell_ticks: 600,
+                cooldown_ticks: 225,
+                drain_timeout_ticks: 1_350,
+            }
+        );
+        for (flag, value) in [
+            ("--shard-capacity", "0"),
+            ("--shard-capacity", "2.5"),
+            ("--scale-in-load", "0.9"),
+            ("--scale-out-load", "0.2"),
+            ("--scale-out-after", "0"),
+            ("--drain-timeout", "46"),
+            ("--scale-cooldown", "soon"),
+            ("--scale-in-after", "-1"),
+        ] {
+            assert!(parse(&[flag, value]).is_err(), "{flag} {value}");
+        }
     }
 
     #[test]
@@ -458,13 +1590,332 @@ mod tests {
             "--launcher",
             "local",
             "--peer-token",
-            "s3cret",
+            "a-long-enough-peer-token",
         ])
         .expect("parses");
         assert_eq!(options.config.bind.port(), 9_000);
         assert_eq!(options.config.cluster, "test");
         assert_eq!(options.config.first_shard_id, 10);
-        assert_eq!(options.peer_token, "s3cret");
+        assert_eq!(
+            options.peer_token.as_ref().map(Secret::expose),
+            Some("a-long-enough-peer-token")
+        );
+        assert!(
+            parse(&[]).expect("parses").peer_token.is_none(),
+            "no peer token given: one is generated at start"
+        );
+    }
+
+    /// The peer token: from the flag, a file or the environment, like the
+    /// cluster secret — and a configured one must be a secret. An empty token
+    /// is what a shard takes for "this cluster has no peer token", and it
+    /// then lets every peer in.
+    ///
+    /// Mutation this catches: accepting `--peer-token ""` (peer
+    /// authentication silently off for the whole cluster), or a token that
+    /// can only be given where the process list shows it.
+    #[test]
+    fn a_configured_peer_token_is_a_secret_or_an_error() {
+        const TOKEN: &str = "a-long-enough-peer-token";
+        let token_of = |options: &Options| {
+            options
+                .peer_token
+                .as_ref()
+                .map(|token| token.expose().to_owned())
+        };
+        for short in ["", "x", "short"] {
+            let err = parse(&["--peer-token", short]).expect_err(short);
+            assert!(err.contains("peer token is too short"), "{short:?}: {err}");
+        }
+        let err = parse_with(&[], &[("SPACE_ORCHESTRATOR_PEER_TOKEN", "short")])
+            .expect_err("from the environment too");
+        assert!(err.contains("peer token is too short"), "{err}");
+        let err = parse(&["--peer-token", "fifteen-chars-a"]).expect_err("15 characters");
+        assert!(err.contains("at least 16"), "{err}");
+        assert!(
+            parse(&["--peer-token", "sixteen-chars-ab"]).is_ok(),
+            "16 are enough"
+        );
+        // And it has to fit a hello, which is read with a small size limit.
+        let longest = "t".repeat(space_net::MAX_SECRET_LEN);
+        assert!(parse(&["--peer-token", &longest]).is_ok());
+        let err = parse(&["--peer-token", &format!("{longest}t")]).expect_err("too long");
+        assert!(err.contains("peer token is too long"), "{err}");
+
+        let by_env = parse_with(
+            &[],
+            &[(
+                "SPACE_ORCHESTRATOR_PEER_TOKEN",
+                " a-long-enough-peer-token\n",
+            )],
+        )
+        .expect("parses");
+        assert_eq!(token_of(&by_env).as_deref(), Some(TOKEN));
+        assert!(
+            !format!("{by_env:?}").contains(TOKEN),
+            "the token is never printed"
+        );
+        // An empty variable is unset: one is generated, as without it.
+        let unset = parse_with(&[], &[("SPACE_ORCHESTRATOR_PEER_TOKEN", " ")]).expect("parses");
+        assert_eq!(token_of(&unset), None);
+
+        let path = std::env::temp_dir().join(format!(
+            "space-orch-peer-token-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, format!("{TOKEN}\n")).expect("write the token file");
+        let file = path.to_str().expect("a UTF-8 temp path");
+        let by_file = parse(&["--peer-token-file", file]).expect("parses");
+        assert_eq!(token_of(&by_file).as_deref(), Some(TOKEN));
+        let by_env_file =
+            parse_with(&[], &[("SPACE_ORCHESTRATOR_PEER_TOKEN_FILE", file)]).expect("parses");
+        assert_eq!(token_of(&by_env_file).as_deref(), Some(TOKEN));
+        // A flag wins over the environment; both flags at once are ambiguous.
+        let both = parse_with(
+            &["--peer-token", "the-flags-own-peer-token"],
+            &[("SPACE_ORCHESTRATOR_PEER_TOKEN", TOKEN)],
+        )
+        .expect("parses");
+        assert_eq!(token_of(&both).as_deref(), Some("the-flags-own-peer-token"));
+        assert!(parse(&["--peer-token", TOKEN, "--peer-token-file", file]).is_err());
+        std::fs::write(&path, "short\n").expect("shorten the token file");
+        let err = parse(&["--peer-token-file", file]).expect_err("a short token in a file");
+        assert!(err.contains("peer token is too short"), "{err}");
+        std::fs::remove_file(&path).ok();
+        assert!(parse(&["--peer-token-file", file]).is_err(), "no file");
+    }
+
+    /// `--min-shards` is refused at startup when the orchestrator could not
+    /// keep it: above `--max-shards`, above `--max-regions`, or more shards
+    /// than it has regions to give (the root and seven layout cells).
+    ///
+    /// Mutation this catches: checking only `min <= max` — `--min-shards 9
+    /// --max-shards 9` started, and the ninth shard was launched, refused for
+    /// good and launched again, for ever.
+    #[test]
+    fn a_min_shards_that_cannot_be_kept_is_refused_at_startup() {
+        let ok = parse(&["--min-shards", "8"]).expect("eight fit").config;
+        assert_eq!((ok.min_shards, ok.max_shards), (8, 8));
+        let err = parse(&["--min-shards", "9", "--max-shards", "9"]).expect_err("no ninth cell");
+        assert!(
+            err.contains("--min-shards 9") && err.contains("layout cell"),
+            "{err}"
+        );
+        let err = parse(&["--min-shards", "9", "--max-shards", "12"]).expect_err("nor so");
+        assert!(err.contains("layout cell"), "{err}");
+        let err = parse(&["--min-shards", "4", "--max-regions", "3"]).expect_err("no room");
+        assert!(err.contains("--max-regions 3"), "{err}");
+        let err = parse_with(
+            &["--max-regions", "2"],
+            &[("SPACE_ORCHESTRATOR_MIN_SHARDS", "3")],
+        )
+        .expect_err("from the environment too");
+        assert!(err.contains("--max-regions 2"), "{err}");
+        assert!(parse(&["--min-shards", "4", "--max-regions", "4"]).is_ok());
+    }
+
+    /// The shard flags: each from its flag, else its variable, else the
+    /// default; a flag wins, an empty variable is unset, nonsense is an error.
+    ///
+    /// Mutation this catches: a flag that is parsed and dropped, the default
+    /// `--min-shards` becoming non-zero (an orchestrator that suddenly starts
+    /// shards nobody asked for), or min above max going unnoticed.
+    #[test]
+    fn the_shard_flags_come_from_the_flag_then_the_environment_then_the_default() {
+        let defaults = parse(&[]).expect("parses").config;
+        assert_eq!(defaults.min_shards, 0, "nothing is launched unless asked");
+        assert_eq!(defaults.max_shards, 8);
+        assert_eq!(defaults.launcher, LauncherKind::Local);
+        assert_eq!(defaults.host_port_range, (7_870, 7_899));
+        assert_eq!(defaults.shard_exe, None);
+        assert_eq!(defaults.shard_log_dir, PathBuf::from("."));
+
+        let flags = parse(&[
+            "--min-shards",
+            "4",
+            "--max-shards",
+            "6",
+            "--launcher",
+            "process",
+            "--shard-exe",
+            "bin/space-server",
+            "--shard-log-dir",
+            "target/dev",
+            "--host-port-range",
+            "8170-8199",
+        ])
+        .expect("parses")
+        .config;
+        assert_eq!((flags.min_shards, flags.max_shards), (4, 6));
+        assert_eq!(flags.launcher, LauncherKind::Process);
+        assert_eq!(flags.shard_exe, Some(PathBuf::from("bin/space-server")));
+        assert_eq!(flags.shard_log_dir, PathBuf::from("target/dev"));
+        assert_eq!(flags.host_port_range, (8_170, 8_199));
+
+        let env = [
+            ("SPACE_ORCHESTRATOR_MIN_SHARDS", "2"),
+            ("SPACE_ORCHESTRATOR_MAX_SHARDS", "3"),
+            ("SPACE_ORCHESTRATOR_LAUNCHER", "process"),
+            ("SPACE_ORCHESTRATOR_SHARD_EXE", "/opt/space-server"),
+            ("SPACE_ORCHESTRATOR_SHARD_LOG_DIR", "/var/log/space"),
+            ("SPACE_ORCHESTRATOR_HOST_PORTS", " 9000-9007 "),
+        ];
+        let by_env = parse_with(&[], &env).expect("parses").config;
+        assert_eq!((by_env.min_shards, by_env.max_shards), (2, 3));
+        assert_eq!(by_env.launcher, LauncherKind::Process);
+        assert_eq!(by_env.shard_exe, Some(PathBuf::from("/opt/space-server")));
+        assert_eq!(by_env.shard_log_dir, PathBuf::from("/var/log/space"));
+        assert_eq!(by_env.host_port_range, (9_000, 9_007));
+        // A flag wins over its variable; an empty variable is unset.
+        let both = parse_with(&["--min-shards", "1"], &env)
+            .expect("parses")
+            .config;
+        assert_eq!(both.min_shards, 1);
+        let empty = parse_with(&[], &[("SPACE_ORCHESTRATOR_MIN_SHARDS", " ")]).expect("parses");
+        assert_eq!(empty.config.min_shards, 0);
+
+        for bad in [
+            &["--min-shards", "x"] as &[&str],
+            &["--min-shards", "-1"],
+            &["--max-shards", "0"],
+            &["--min-shards", "9"], // more than the default maximum of 8
+            &["--min-shards", "3", "--max-shards", "2"],
+            &["--host-port-range", "7870"],
+            &["--host-port-range", "7899-7870"],
+            &["--host-port-range", "0-10"],
+            &["--launcher", "kubernetes"],
+            &["--min-shards"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        let err = parse_with(&[], &[("SPACE_ORCHESTRATOR_MIN_SHARDS", "many")])
+            .expect_err("nonsense in the environment is an error too");
+        assert!(err.contains("--min-shards"), "{err}");
+    }
+
+    /// The cluster secret: from the flag, a file, or the environment — and a
+    /// control port that is not on loopback does not start without one a shard
+    /// could present.
+    ///
+    /// Mutation this catches: an open control port starting with no secret
+    /// (the state before this change), or a secret showing in a `Debug` print
+    /// of the options.
+    #[test]
+    fn the_cluster_secret_is_configured_and_required_off_loopback() {
+        const SECRET: &str = "a-long-enough-cluster-secret";
+        let secret_of = |options: &Options| {
+            options
+                .config
+                .cluster_secret
+                .as_ref()
+                .map(|secret| secret.expose().to_owned())
+        };
+        let none = parse(&[]).expect("parses");
+        assert_eq!(secret_of(&none), None);
+        assert!(!none.config.secret_required(), "loopback needs none");
+
+        let by_flag = parse(&["--cluster-secret", SECRET]).expect("parses");
+        assert_eq!(secret_of(&by_flag).as_deref(), Some(SECRET));
+        assert!(
+            by_flag.config.secret_required(),
+            "a configured secret is required, on loopback too"
+        );
+        assert!(
+            !format!("{by_flag:?}").contains(SECRET),
+            "the secret is never printed"
+        );
+        let by_env = parse_with(
+            &[],
+            &[("SPACE_CLUSTER_SECRET", " a-long-enough-cluster-secret\n")],
+        )
+        .expect("parses");
+        assert_eq!(secret_of(&by_env).as_deref(), Some(SECRET));
+
+        let path = std::env::temp_dir().join(format!(
+            "space-orch-cluster-secret-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, format!("{SECRET}\n")).expect("write the secret file");
+        let file = path.to_str().expect("a UTF-8 temp path");
+        let by_file = parse(&["--cluster-secret-file", file]).expect("parses");
+        assert_eq!(secret_of(&by_file).as_deref(), Some(SECRET));
+        let by_env_file = parse_with(&[], &[("SPACE_CLUSTER_SECRET_FILE", file)]).expect("parses");
+        assert_eq!(secret_of(&by_env_file).as_deref(), Some(SECRET));
+        assert!(parse(&["--cluster-secret", SECRET, "--cluster-secret-file", file]).is_err());
+        std::fs::remove_file(&path).ok();
+        assert!(parse(&["--cluster-secret-file", file]).is_err(), "no file");
+
+        // Off loopback.
+        for open in ["0.0.0.0:7900", "[::]:7900", "192.168.1.5:7900"] {
+            let err = parse(&["--bind", open]).expect_err(open);
+            assert!(err.contains("without a cluster secret"), "{err}");
+            let err = parse(&["--bind", open, "--cluster-secret", "short"]).expect_err(open);
+            assert!(err.contains("too short"), "{err}");
+            let with = parse(&["--bind", open, "--cluster-secret", SECRET]).expect("a secret");
+            assert!(with.config.secret_required());
+            let by_env = parse_with(&["--bind", open], &[("SPACE_CLUSTER_SECRET", SECRET)])
+                .expect("a secret from the environment");
+            assert!(by_env.config.secret_required());
+            // Or shards it starts itself, which are handed a generated one.
+            let managed = parse(&["--bind", open, "--min-shards", "4"]).expect("managed");
+            assert!(managed.config.secret_required());
+            assert_eq!(secret_of(&managed), None, "generated at boot, not here");
+        }
+    }
+
+    /// `--launcher process` without the executable it would start is an error
+    /// at startup that names the path, not a failure at the first launch.
+    #[tokio::test]
+    async fn the_process_launcher_without_its_executable_is_a_startup_error() {
+        let missing = std::env::temp_dir()
+            .join("no-such-dir-for-space")
+            .join("space-server");
+        let options = parse(&[
+            "--launcher",
+            "process",
+            "--shard-exe",
+            missing.to_str().expect("a UTF-8 temp path"),
+        ])
+        .expect("parses");
+        let err = run(options, Instant::now())
+            .await
+            .expect_err("nothing to start");
+        assert!(
+            err.contains("does not exist") && err.contains("no-such-dir-for-space"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_startup_line_says_who_starts_the_shards_and_never_a_secret() {
+        let config = parse(&["--cluster-secret", "a-long-enough-cluster-secret"])
+            .expect("parses")
+            .config;
+        let line = shards_line(&config);
+        assert!(
+            line.contains("none is started by the orchestrator")
+                && line.contains("at most 8")
+                && line.contains("must carry the cluster secret"),
+            "{line}"
+        );
+        assert!(!line.contains("a-long-enough"), "{line}");
+        let config = parse(&["--min-shards", "4", "--launcher", "process"])
+            .expect("parses")
+            .config;
+        let line = shards_line(&config);
+        assert!(
+            line.contains("4 kept running by the orchestrator (process launcher)")
+                && line.contains("needs no secret"),
+            "{line}"
+        );
     }
 
     /// Mutation this catches: a `--scene` that is parsed and dropped, the

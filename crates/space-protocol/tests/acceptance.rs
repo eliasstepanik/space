@@ -11,10 +11,10 @@ use space_protocol::{
     check_hello, decode_frame, encode_frame, entity_snapshot, try_encode_frame, AdminCommand,
     AdminReply, CodecError, Delta, DirectoryQuery, DirectoryReply, EntityGuid, EntitySnapshot,
     GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer, HandoffReason, Hello,
-    InputTick, IslandKey, LoadReport, Message, NeighbourStatus, PlayerInput, Redirect, Reject,
-    RejectReason, Scene, SceneAck, SceneClock, SceneId, SceneState, ShardHello, ShardId, ShardMap,
-    ShardRegion, ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome, FRAME_HEADER_LEN,
-    MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    InputTick, IslandKey, JoinRedirect, LoadReport, Message, NeighbourStatus, PlayerInput,
+    Redirect, Reject, RejectReason, Scene, SceneAck, SceneClock, SceneId, SceneState, ShardHello,
+    ShardId, ShardMap, ShardRegion, ShardWelcome, Snapshot, SnapshotBuilder, StaleEpoch, Welcome,
+    FRAME_HEADER_LEN, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use space_world::{NodeRef, WorldPos};
 
@@ -106,6 +106,9 @@ fn all_messages() -> Vec<Message> {
         Message::Reject(Reject {
             reason: RejectReason::Other("nope".into()),
         }),
+        Message::Reject(Reject {
+            reason: RejectReason::Starting,
+        }),
         Message::InputTick(InputTick {
             tick: 12,
             seq: 34,
@@ -133,6 +136,7 @@ fn all_messages() -> Vec<Message> {
             epoch: 7,
             entities: (0..5).map(|i| entity(1, i, 3)).collect(),
             input_ack: 98,
+            more: false,
         }),
         Message::Delta(Delta {
             tick: 100,
@@ -213,6 +217,12 @@ fn all_messages() -> Vec<Message> {
             players: 87,
             tick_p95_ms: 21.5,
             load: 0.645_7,
+            entities: 412,
+            tick_mean_ms: 9.25,
+            tick_max_ms: 30.5,
+            skipped: 3,
+            hot_cell: [-1, 0, 549_755_813_887],
+            hot_cell_players: 61,
         }),
         Message::DirectoryQuery(DirectoryQuery {}),
         Message::DirectoryReply(DirectoryReply {
@@ -244,12 +254,15 @@ fn all_messages() -> Vec<Message> {
             shard: ShardId::NONE,
             endpoint: addr(9),
             region: Some(region(40, [0, 0, 0], 1)),
+            client_endpoint: Some(any_host(7_009)),
+            secret: "cluster-secret".into(),
         }),
         Message::ShardWelcome(ShardWelcome {
             shard: shard(5),
             region: region(40, [0, 0, 0], 5),
             shard_map: sample_map(),
             peer_token: "peer-secret".into(),
+            tick_origin_us: 1_763_900_000_000_000,
         }),
         Message::SceneSet(SceneState::new(Scene::Galaxy.id(), 4)),
         Message::SceneAck(SceneAck {
@@ -257,13 +270,58 @@ fn all_messages() -> Vec<Message> {
             applied: SceneState::new(Scene::Galaxy.id(), 4),
         }),
         Message::SceneUpdate(SceneState::new(Scene::Materials.id(), 9)),
-        Message::SceneClock(last_message_clock()),
+        Message::SceneClock(SceneClock::new(1234, 1_763_900_000_123_456)),
+        join_redirect_message(),
+        Message::FarInterest(space_protocol::FarInterest {
+            from: shard(4),
+            tick: 77,
+            players: vec![space_protocol::FarPlayer {
+                cell: [1, -2, 3],
+                local: [0.5, -100.0, 511.0],
+            }],
+            missing: vec![guid(4, 9)],
+        }),
+        far_update_message(),
+        last_message(),
     ]
 }
 
-/// The payload of the last message in tag order (`SceneClock`, tag 28).
-fn last_message_clock() -> SceneClock {
-    SceneClock::new(1234, 1_763_900_000_123_456)
+/// The last message in tag order (`ShardRetire`, tag 32).
+fn last_message() -> Message {
+    Message::ShardRetire(space_protocol::ShardRetire {
+        shard: shard(5),
+        reason: "its region was merged away and it is drained".into(),
+    })
+}
+
+/// `FarUpdate` (tag 31).
+fn far_update_message() -> Message {
+    Message::FarUpdate(space_protocol::FarUpdate {
+        from: shard(2),
+        tick: 31,
+        new: vec![entity(2, 5, 3)],
+        changed: vec![entity(2, 6, 1)],
+        removed: vec![guid(2, 7)],
+        refresh: true,
+        held: vec![guid(2, 5), guid(2, 6)],
+        more: false,
+    })
+}
+
+/// `JoinRedirect` (tag 29): the map names the shard to dial with a client
+/// endpoint of its own.
+fn join_redirect_message() -> Message {
+    let mut map = sample_map();
+    map.regions[1] = map.regions[1].clone().with_client_endpoint(any_host(7_002));
+    Message::JoinRedirect(JoinRedirect {
+        shard: shard(2),
+        shard_map: map,
+    })
+}
+
+/// `0.0.0.0:port`: a client endpoint that means "the host you dialed".
+fn any_host(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +333,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 37);
+    assert_eq!(messages.len(), 42);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -398,6 +456,7 @@ fn oversized_rejected() {
         epoch: 1,
         entities: (0..200_000u64).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     });
     let err = try_encode_frame(&huge).expect_err("must not encode an oversized frame");
     assert!(matches!(err, CodecError::Oversized { .. }), "{err:?}");
@@ -412,6 +471,7 @@ fn truncated_rejected() {
         epoch: 1,
         entities: (0..4).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     }));
 
     // Shorter than the header.
@@ -447,13 +507,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 29, so the valid wire tags are `0..=28`.
-    // The boundary that matters is tag 29 — the first tag past the last variant.
+    // `Message::VARIANT_COUNT` is 33, so the valid wire tags are `0..=32`.
+    // The boundary that matters is tag 33 — the first tag past the last variant.
     // (An earlier revision tested the literals 28/29 while the count was 25:
     // unknown only incidentally, and "passing" for ever as variants were
     // appended — which is why the bound below is the count itself.)
-    assert_eq!(Message::VARIANT_COUNT, 29);
-    let first_invalid = Message::VARIANT_COUNT; // 29
+    assert_eq!(Message::VARIANT_COUNT, 33);
+    let first_invalid = Message::VARIANT_COUNT; // 33
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -465,9 +525,9 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (28, `SceneClock`) must decode, proving 29 is the
+    // The last valid tag (32, `ShardRetire`) must decode, proving 33 is the
     // first rejection and not an off-by-one that also drops the last variant.
-    let last_valid = Message::SceneClock(last_message_clock());
+    let last_valid = last_message();
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
     assert_eq!(
         decode_frame(&encode_frame(&last_valid)),
@@ -600,6 +660,7 @@ fn guid_stable_across_handoff() {
         epoch: 7,
         entities: vec![entity(1, original.serial, 2)],
         input_ack: 0,
+        more: false,
     });
     let Message::Snapshot(back) = decode_frame(&encode_frame(&snap)).expect("snapshot decodes")
     else {
@@ -857,13 +918,20 @@ impl Rng {
         (0..self.below(12)).map(|_| self.entity()).collect()
     }
     fn map(&mut self) -> ShardMap {
-        let regions = (0..self.below(6))
-            .map(|_| ShardRegion::new(self.node(), self.shard(), self.addr()))
-            .collect();
+        let regions = (0..self.below(6)).map(|_| self.region()).collect();
         ShardMap::new(self.next_u64(), regions)
     }
+    /// A region: half of them with a client endpoint of their own.
+    fn region(&mut self) -> ShardRegion {
+        let region = ShardRegion::new(self.node(), self.shard(), self.addr());
+        if self.next_u64() & 1 == 0 {
+            region
+        } else {
+            region.with_client_endpoint(self.addr())
+        }
+    }
     fn message(&mut self) -> Message {
-        match self.below(29) {
+        match self.below(33) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -874,7 +942,7 @@ impl Rng {
                 shard_map: self.map(),
             }),
             2 => Message::Reject(Reject {
-                reason: match self.below(5) {
+                reason: match self.below(6) {
                     0 => RejectReason::VersionMismatch {
                         seen: self.u32_below(8),
                         expected: PROTOCOL_VERSION,
@@ -882,6 +950,7 @@ impl Rng {
                     1 => RejectReason::Unauthorized,
                     2 => RejectReason::Full,
                     3 => RejectReason::Draining,
+                    4 => RejectReason::Starting,
                     _ => RejectReason::Other(self.string()),
                 },
             }),
@@ -905,6 +974,7 @@ impl Rng {
                 epoch: self.next_u64(),
                 entities: self.entities(),
                 input_ack: self.next_u64(),
+                more: false,
             }),
             5 => Message::Delta(Delta {
                 tick: self.next_u64(),
@@ -1000,6 +1070,12 @@ impl Rng {
                 },
             }),
             17 => Message::LoadReport(LoadReport {
+                entities: self.u32_below(5_000),
+                tick_mean_ms: self.f32(),
+                tick_max_ms: self.f32(),
+                skipped: self.next_u64(),
+                hot_cell: [self.next_u64() as i64, self.next_u64() as i64, -3],
+                hot_cell_players: self.u32_below(100),
                 shard: self.shard(),
                 players: self.u32_below(1_000),
                 tick_p95_ms: self.f32(),
@@ -1038,14 +1114,21 @@ impl Rng {
                 region: if self.next_u64() & 1 == 0 {
                     None
                 } else {
-                    Some(ShardRegion::new(self.node(), self.shard(), self.addr()))
+                    Some(self.region())
                 },
+                client_endpoint: if self.next_u64() & 1 == 0 {
+                    None
+                } else {
+                    Some(self.addr())
+                },
+                secret: self.string(),
             }),
             24 => Message::ShardWelcome(ShardWelcome {
                 shard: self.shard(),
-                region: ShardRegion::new(self.node(), self.shard(), self.addr()),
+                region: self.region(),
                 shard_map: self.map(),
                 peer_token: self.string(),
+                tick_origin_us: self.next_u64() as i64,
             }),
             25 => Message::SceneSet(self.scene_state()),
             26 => Message::SceneAck(SceneAck {
@@ -1053,7 +1136,36 @@ impl Rng {
                 applied: self.scene_state(),
             }),
             27 => Message::SceneUpdate(self.scene_state()),
-            _ => Message::SceneClock(SceneClock::new(self.next_u64(), self.next_u64() as i64)),
+            28 => Message::SceneClock(SceneClock::new(self.next_u64(), self.next_u64() as i64)),
+            29 => Message::JoinRedirect(JoinRedirect {
+                shard: self.shard(),
+                shard_map: self.map(),
+            }),
+            30 => Message::FarInterest(space_protocol::FarInterest {
+                from: self.shard(),
+                tick: self.next_u64(),
+                players: (0..self.below(4))
+                    .map(|_| space_protocol::FarPlayer {
+                        cell: [self.next_u64() as i64, self.next_u64() as i64, 7],
+                        local: [self.below(500) as f32, -1.5, 0.0],
+                    })
+                    .collect(),
+                missing: (0..self.below(4)).map(|_| self.guid()).collect(),
+            }),
+            31 => Message::FarUpdate(space_protocol::FarUpdate {
+                from: self.shard(),
+                tick: self.next_u64(),
+                new: self.entities(),
+                changed: self.entities(),
+                removed: (0..self.below(4)).map(|_| self.guid()).collect(),
+                refresh: self.below(2) == 0,
+                held: (0..self.below(4)).map(|_| self.guid()).collect(),
+                more: self.below(2) == 0,
+            }),
+            _ => Message::ShardRetire(space_protocol::ShardRetire {
+                shard: self.shard(),
+                reason: self.string(),
+            }),
         }
     }
     /// A scene state over the **whole** id space, not just the catalogue: an
@@ -1116,15 +1228,17 @@ fn delta_size_sanity() {
     assert!(frame.len() < 20 * 1024 + FRAME_HEADER_LEN);
 
     // The same corpus as a Snapshot costs less: a `Delta` additionally carries
-    // `base_tick` (8 B) and the `removed` length prefix (8 B when empty).
+    // `base_tick` (8 B) and the `removed` length prefix (8 B when empty); a
+    // `Snapshot` carries `more` (1 B: "further chunks follow", protocol 7).
     let snap = Message::Snapshot(Snapshot {
         tick: 1_000,
         shard: shard(1),
         epoch: 7,
         entities: (0..100u64).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     });
-    assert_eq!(encode_frame(&snap).len() + 16, frame.len());
+    assert_eq!(encode_frame(&snap).len() + 15, frame.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1268,7 @@ fn remediation_fields_roundtrip() {
         epoch: 2,
         entities: Vec::new(),
         input_ack: 9,
+        more: false,
     });
     let Message::Snapshot(back) = decode_frame(&encode_frame(&m)).unwrap() else {
         unreachable!()
@@ -1388,6 +1503,119 @@ fn scene_messages_have_a_pinned_wire_layout() {
     }
 }
 
+/// Protocol 7: a `ShardHello` carries the cluster secret as its **last**
+/// field (a length-prefixed string behind the optional region and the
+/// optional client endpoint), and neither it nor the peer token of a
+/// `ShardWelcome` shows in a `Debug` print — a message may end up in a log
+/// line or a panic message.
+///
+/// Mutation this catches: adding a field behind the secret (it is what a
+/// hello is admitted or refused by, and stays the last thing in it), leaving
+/// the version at 6 with the changed layout, or deriving `Debug` again.
+#[test]
+fn a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it() {
+    assert_eq!(
+        PROTOCOL_VERSION, 7,
+        "the hello's layout changed with protocol 7"
+    );
+    let hello = |secret: &str| {
+        Message::ShardHello(ShardHello {
+            cluster: "cluster-a".into(),
+            shard: ShardId::NONE,
+            endpoint: addr(9),
+            region: None,
+            client_endpoint: Some(any_host(7_009)),
+            secret: secret.into(),
+        })
+    };
+    let secret = "s3cr3t-of-the-cluster";
+    let (without, with) = (encode_frame(&hello("")), encode_frame(&hello(secret)));
+    let (without, with) = (payload_of(&without), payload_of(&with));
+    assert_eq!(hello("").wire_tag(), 23);
+    assert_eq!(&with[..4], &23u32.to_be_bytes());
+    // Everything before the secret is the same bytes; the secret is its
+    // length (u64, big endian) and then its bytes, and nothing follows.
+    let head = without.len() - 8;
+    assert_eq!(&with[..head], &without[..head]);
+    assert_eq!(&without[head..], &0u64.to_be_bytes());
+    let tail = [&(secret.len() as u64).to_be_bytes()[..], secret.as_bytes()].concat();
+    assert_eq!(&with[head..], &tail[..]);
+    assert_eq!(
+        decode_frame(&encode_frame(&hello(secret))),
+        Ok(hello(secret))
+    );
+
+    let printed = format!("{:?}", hello(secret));
+    assert!(!printed.contains(secret), "{printed}");
+    assert!(printed.contains("<redacted>"), "{printed}");
+    assert!(
+        format!("{:?}", hello("")).contains("<none>"),
+        "an absent secret is said to be absent"
+    );
+    let welcome = Message::ShardWelcome(ShardWelcome {
+        shard: shard(5),
+        region: region(40, [0, 0, 0], 5),
+        shard_map: sample_map(),
+        peer_token: "peer-s3cr3t-token".into(),
+        tick_origin_us: 0,
+    });
+    let printed = format!("{welcome:?}");
+    assert!(!printed.contains("peer-s3cr3t-token"), "{printed}");
+    assert!(printed.contains("<redacted>"), "{printed}");
+}
+
+/// The first message on every connection carries a credential in its token
+/// field — a player's token, or between shards `shard:<id>:<peer token>` —
+/// and a hello is printed: an endpoint that expected something else logs
+/// "got {message:?}". Its `Debug` keeps what is not secret (the version, the
+/// shard id a peer names) and nothing else. The wire form is untouched.
+///
+/// Mutation this catches: deriving `Debug` on `Hello` again (a shard that is
+/// sent a stray hello would write the cluster's peer token to its log).
+#[test]
+fn a_hello_never_prints_its_token() {
+    let hello = |token: &str| {
+        Message::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            player_token: token.into(),
+        })
+    };
+    for (token, shown, hidden) in [
+        (
+            "shard:7:the-peer-token-of-the-cluster",
+            "shard:7:<redacted>",
+            "the-peer-token",
+        ),
+        (
+            "shard:12:with:colons:in:it",
+            "shard:12:<redacted>",
+            "colons",
+        ),
+        ("a-players-own-token", "<redacted>", "players-own"),
+        // Not a peer hello (no numeric id): nothing of it is shown.
+        ("shard:x:looks-like-a-peer", "<redacted>", "looks-like"),
+        ("shard::no-id-at-all", "<redacted>", "no-id-at-all"),
+    ] {
+        let printed = format!("{:?}", hello(token));
+        assert!(printed.contains(shown), "{token}: {printed}");
+        assert!(!printed.contains(hidden), "{token}: {printed}");
+        assert!(
+            printed.contains(&format!("protocol: {PROTOCOL_VERSION}")),
+            "{printed}"
+        );
+        // Printing is all that changed: the token still travels whole.
+        assert_eq!(decode_frame(&encode_frame(&hello(token))), Ok(hello(token)));
+    }
+    // A peer hello without a token has nothing to hide, and no token is said
+    // to be none.
+    let printed = format!("{:?}", hello("shard:3"));
+    assert!(
+        printed.contains("shard:3") && !printed.contains("redacted"),
+        "{printed}"
+    );
+    assert!(format!("{:?}", hello("")).contains("<none>"));
+}
+
 /// A scene id this build does not know is **not** a decode error: the frame
 /// decodes, the id is reported as unknown, and the receiver's fallback is the
 /// default scene. (The catalogue grows; an older client must survive a newer
@@ -1426,6 +1654,161 @@ fn an_unknown_scene_id_decodes_and_the_receiver_can_fall_back() {
         };
         assert_eq!(state.scene.known(), Some(scene));
     }
+}
+
+// ---------------------------------------------------------------------------
+// One address: join redirects and client endpoints (protocol 7)
+// ---------------------------------------------------------------------------
+
+/// `JoinRedirect` keeps tag 29 (the last message until the far replicas were
+/// appended behind it), carries the shard to dial and the sender's map, and
+/// reports that map's epoch.
+///
+/// Mutation this catches: inserting a variant before it (its tag moves), or
+/// dropping the map (the client would have no address to dial).
+#[test]
+fn a_join_redirect_round_trips_at_tag_29() {
+    let message = join_redirect_message();
+    assert_eq!(message.wire_tag(), 29);
+    assert_eq!(message.epoch(), Some(sample_map().epoch));
+    let frame = encode_frame(&message);
+    assert_eq!(&payload_of(&frame)[..4], &29u32.to_be_bytes());
+    // The shard id follows the tag, then the map.
+    assert_eq!(&payload_of(&frame)[4..8], &2u32.to_be_bytes());
+    let decoded = decode_frame(&frame).expect("decodes");
+    assert_eq!(decoded, message);
+    let Message::JoinRedirect(redirect) = decoded else {
+        panic!("a join redirect");
+    };
+    assert_eq!(redirect.shard, shard(2));
+    assert_eq!(
+        redirect.shard_map.client_endpoint_of(shard(2)),
+        Some(any_host(7_002)),
+        "the map names where a player dials the shard"
+    );
+}
+
+/// A region carries two addresses: where shards reach its owner and where
+/// players do. Built with `ShardRegion::new` they are the same one; a
+/// different client endpoint crosses the wire as itself, behind the endpoint.
+///
+/// Mutation this catches: a client endpoint that is dropped on the wire (a
+/// redirected player dials the internal address), or `new` leaving it unset
+/// (every static map would name an un-dialable client address).
+#[test]
+fn a_region_carries_a_client_endpoint_beside_its_endpoint() {
+    let plain = region(40, [0, 0, 0], 3);
+    assert_eq!(plain.client_endpoint, plain.endpoint);
+    assert_eq!(plain.client_endpoint, addr(3));
+    let public = plain.clone().with_client_endpoint(any_host(7_171));
+    assert_eq!(public.endpoint, addr(3), "the internal endpoint is kept");
+    assert_eq!(public.client_endpoint, any_host(7_171));
+    assert_ne!(public, plain);
+
+    let welcome = |region: &ShardRegion| {
+        Message::Welcome(Welcome {
+            session: 1,
+            shard: shard(3),
+            shard_map: ShardMap::new(4, vec![region.clone()]),
+        })
+    };
+    for region in [&plain, &public] {
+        let message = welcome(region);
+        assert_eq!(decode_frame(&encode_frame(&message)), Ok(message));
+    }
+    // The client endpoint is the region's last field: the two frames differ
+    // only in their last six bytes (an IPv4 address and a port).
+    let (a, b) = (
+        encode_frame(&welcome(&plain)),
+        encode_frame(&welcome(&public)),
+    );
+    assert_eq!(a.len(), b.len());
+    let same = a.len() - 6;
+    assert_eq!(&a[..same], &b[..same]);
+    assert_eq!(&b[same..], &[0, 0, 0, 0, 0x1C, 0x03], "0.0.0.0:7171");
+
+    // The map's lookup of it skips a region whose address is not known yet.
+    let unresolved = ShardRegion::new(
+        NodeRef::new(41, [0, 0, 0]),
+        shard(9),
+        ShardRegion::UNRESOLVED_ENDPOINT,
+    );
+    let map = ShardMap::new(1, vec![unresolved, public.clone()]);
+    assert_eq!(map.client_endpoint_of(shard(9)), None);
+    assert_eq!(map.client_endpoint_of(shard(3)), Some(any_host(7_171)));
+    assert_eq!(map.client_endpoint_of(shard(77)), None, "not in the map");
+}
+
+/// The rule a client resolves a client endpoint by: an unspecified IP is the
+/// host the player dialed first, port 0 is "not known", anything else is
+/// taken as it is.
+///
+/// Mutation this catches: dialling `0.0.0.0` (which reaches nobody, or the
+/// client's own machine), or resolving a real address against the entry host
+/// (a shard on another host would be dialled on the orchestrator's).
+#[test]
+fn an_unspecified_client_endpoint_means_the_host_the_player_dialed() {
+    use space_protocol::resolve_client_endpoint as resolve;
+    let entry: IpAddr = "203.0.113.7".parse().unwrap();
+    let entry6: IpAddr = "2001:db8::7".parse().unwrap();
+    assert_eq!(
+        resolve(any_host(7_871), entry),
+        Some("203.0.113.7:7871".parse().unwrap())
+    );
+    assert_eq!(
+        resolve("[::]:7871".parse().unwrap(), entry),
+        Some("203.0.113.7:7871".parse().unwrap()),
+        "the unspecified IPv6 address means the same"
+    );
+    assert_eq!(
+        resolve(any_host(7_871), entry6),
+        Some("[2001:db8::7]:7871".parse().unwrap())
+    );
+    // A real address is where the shard is, whatever was dialed.
+    assert_eq!(resolve(addr(4), entry), Some(addr(4)));
+    assert_eq!(
+        resolve("127.0.0.1:7777".parse().unwrap(), entry),
+        Some("127.0.0.1:7777".parse().unwrap())
+    );
+    // Port 0: the owner has not registered an address yet.
+    assert_eq!(resolve(ShardRegion::UNRESOLVED_ENDPOINT, entry), None);
+    assert_eq!(resolve("10.0.0.1:0".parse().unwrap(), entry), None);
+}
+
+/// A `ShardHello` says where players are to dial the shard — or does not, and
+/// then it is the endpoint. Both forms cross the wire, the field sits before
+/// the secret, and the print still hides the secret.
+///
+/// Mutation this catches: a hello whose client endpoint is lost (the map
+/// would send players to the internal address), or the new field moving the
+/// secret off the end.
+#[test]
+fn a_shard_hello_may_ask_for_a_client_endpoint() {
+    let hello = |client_endpoint: Option<SocketAddr>| {
+        Message::ShardHello(ShardHello {
+            cluster: "cluster-a".into(),
+            shard: ShardId::NONE,
+            endpoint: addr(9),
+            region: None,
+            client_endpoint,
+            secret: "s3cr3t-of-the-cluster".into(),
+        })
+    };
+    let (none, some) = (hello(None), hello(Some(any_host(7_871))));
+    for message in [&none, &some] {
+        assert_eq!(decode_frame(&encode_frame(message)).as_ref(), Ok(message));
+        let printed = format!("{message:?}");
+        assert!(!printed.contains("s3cr3t"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+    assert!(format!("{some:?}").contains("0.0.0.0:7871"));
+    // An absent one is one byte (the option's tag); a present IPv4 one adds
+    // the address' own tag (u32), its four bytes and the port. The secret
+    // closes both.
+    let (none, some) = (encode_frame(&none), encode_frame(&some));
+    assert_eq!(some.len(), none.len() + 10);
+    let tail = "s3cr3t-of-the-cluster".as_bytes();
+    assert!(none.ends_with(tail) && some.ends_with(tail));
 }
 
 // ---------------------------------------------------------------------------

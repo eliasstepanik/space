@@ -31,9 +31,10 @@
 //! 5. build one frame per client ([`crate::replicate::build_frame`]) — every
 //!    tick, even when nothing changed: the frame is also the client's clock.
 //!
-//! The loop itself lives in the front end ([`net`]): tick, then
-//! [`net::ShardNet::flush`], which never waits on a queue, so neither a slow
-//! client nor a dead neighbour can stop the simulation; and
+//! The loop itself is [`clock::run`]: every tick when the cluster's clock
+//! says it is due (so a tick number names the same instant on every shard),
+//! then [`net::ShardNet::flush`], which never waits on a queue, so neither a
+//! slow client nor a dead neighbour can stop the simulation; and
 //! [`net::supervise`] ends the process if the tick loop ever dies.
 //!
 //! # Seamless handoff
@@ -51,8 +52,11 @@
 //! * [`config`] — [`ShardConfig`] and the tuning constants
 //! * [`alloc`] — monotonic, never-reused [`ShardId`] allocation
 //! * [`border`] — physics across shard borders: ghosts, islands, hysteresis
+//! * [`clock`] — the cluster's tick clock: one tick number, one instant, on
+//!   every shard
 //! * [`replicate`] — interest grid, change-tick deltas, the frame budget
 //! * [`handoff`] — the seamless handoff state machine
+//! * [`load`] — what a shard reports to its orchestrator once a second
 //! * [`shard`] — [`Shard`], the state the tick loop drives
 //! * [`net`] — the quinn front end that turns frames into [`Shard`] calls
 //!
@@ -63,9 +67,11 @@
 
 pub mod alloc;
 pub mod border;
+pub mod clock;
 pub mod config;
 pub mod epoch;
 pub mod handoff;
+pub mod load;
 pub mod net;
 pub mod orchestrated;
 pub mod replicate;

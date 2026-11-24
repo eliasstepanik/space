@@ -18,6 +18,60 @@
 //! an error rather than a setting that would silently lose. Shards wired
 //! together by hand with `--peer` should all be given the same `--scene`.
 //!
+//! `--tick-origin <unix microseconds>` is the instant a **standalone** shard
+//! counts its ticks from: tick `n` is due `n / 30 s` after it
+//! ([`space_server::clock`]). The default is a fixed instant
+//! ([`space_protocol::SceneClock::DEFAULT_ORIGIN_US`]), so shards started by
+//! hand at different times count the same ticks without being told anything
+//! — which is what lets one hand a ship to the other without a step. Give
+//! `--peer` shards the same origin if you give one at all. An orchestrated
+//! shard takes none: its welcome names the cluster's. An origin that lies in
+//! the future of this host's clock is refused, here and in a welcome: there
+//! is no tick to run yet, and a shard that waited for one would let players
+//! into a world that does not move.
+//!
+//! # Orchestrated
+//!
+//! ```text
+//!   space-server --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+//! ```
+//!
+//! With `--orchestrator` the shard starts **without an id and without a
+//! region** and is given both when it registers: the root while nobody owns
+//! it, otherwise a node the orchestrator carves for it. While the
+//! orchestrator is in the middle of another map change the shard is told "not
+//! yet" and asks again; any other refusal (another cluster, a wrong cluster
+//! secret, the cluster is full) is final and ends the process. A shard that
+//! loses its orchestrator stops and exits non-zero — it is replaced under a
+//! new id, and nothing is orphaned by an orchestrator restart
+//! ([`space_server::orchestrated`]).
+//!
+//! **Two addresses.** `--advertise <addr:port>` is the address the shard
+//! reports instead of the one it bound: the **internal** endpoint the
+//! cluster's other shards dial. With an unspecified IP (`0.0.0.0:<port>`, a
+//! shard in a container that does not know its own address) the orchestrator
+//! fills in the IP it sees the shard's control connection come from.
+//! `--client-endpoint <addr:port>` is where **players** are to dial it, when
+//! that is not the advertised address; `0.0.0.0:<port>` there means "the host
+//! the player dialed, this port" — the shards of a cluster run on the host of
+//! the one address players type (the orchestrator's player port), so no public
+//! host name is configured anywhere. A shard the orchestrator starts itself is
+//! given `--client-endpoint 0.0.0.0:<its port>`. Both flags are for an
+//! orchestrated shard: standalone, the map is the command line's and each
+//! shard in it has one address.
+//!
+//! **Joining.** A new player starts on the scene's spawn point, so only the
+//! shard that owns it welcomes a fresh join; every other shard answers with a
+//! `JoinRedirect` naming that shard (standalone and orchestrated alike), and
+//! the client dials it. A player whose ship is being handed over is welcomed
+//! by the shard taking it, as before.
+//!
+//! The **cluster secret** — needed when the orchestrator's control port is
+//! not on loopback — is read from the environment, never from the command
+//! line: `SPACE_CLUSTER_SECRET`, else the file `SPACE_CLUSTER_SECRET_FILE` or
+//! `--cluster-secret-file <path>` names. A shard the orchestrator starts
+//! itself is handed it that way.
+//!
 //! A region is the octree node a shard is authoritative for, written
 //! `depth:x:y:z` ([`NodeRef::new`]). The world map is assembled from the
 //! command line — this shard's own region plus one `--peer` per neighbour —
@@ -34,7 +88,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use space_protocol::{Scene, SceneState, ShardId, ShardMap, ShardRegion};
 use space_world::NodeRef;
@@ -58,6 +111,11 @@ struct Options {
     /// `--orchestrator`: a container binds `0.0.0.0:<port>`, which no peer can
     /// dial, so it advertises the address peers and clients can reach it on.
     advertise: Option<SocketAddr>,
+    /// Where players are to dial this shard (`--client-endpoint`), or `None`
+    /// for "at the advertised address". Only meaningful with `--orchestrator`:
+    /// the orchestrator puts it into the map as this shard's client endpoint,
+    /// and `0.0.0.0:<port>` there means "the host the player dialed".
+    client_endpoint: Option<SocketAddr>,
     /// The region this shard owns.
     region: NodeRef,
     /// Every region in the world map, this shard's included.
@@ -74,18 +132,32 @@ struct Options {
     claim_region: Option<NodeRef>,
     /// The cluster id forwarded in `ShardHello`.
     cluster: String,
+    /// A file holding the cluster secret (`--cluster-secret-file`); the
+    /// environment is looked at first ([`space_server::orchestrated::cluster_secret`]).
+    cluster_secret_file: Option<std::path::PathBuf>,
     /// The scene a standalone shard shows (`--scene`, default
     /// [`Scene::DEFAULT`]). Never set together with `orchestrator`: there the
     /// orchestrator says which scene it is.
     scene: Scene,
+    /// The tick origin a standalone shard counts from (`--tick-origin`, µs of
+    /// UTC since the Unix epoch; default
+    /// [`SceneClock::DEFAULT_ORIGIN_US`](space_protocol::SceneClock::DEFAULT_ORIGIN_US),
+    /// the same for every shard that is given none). Never set together with
+    /// `orchestrator`: there the orchestrator's welcome names it.
+    tick_origin_us: i64,
 }
 
 /// The usage line, printed for `--help` and for any parse error.
 const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
-                     [--scene demo-area|materials|galaxy] \
-                     [--orchestrator <addr:port> [--claim-region <depth:x:y:z>] [--cluster <id>] \
-                     [--advertise <addr:port>]]";
+                     [--scene demo-area|materials|galaxy] [--tick-origin <unix microseconds>] \
+                     [--orchestrator <addr:port> [--cluster <id>] [--advertise <addr:port>] \
+                     [--client-endpoint <addr:port>] [--cluster-secret-file <path>] \
+                     [--claim-region <depth:x:y:z>]] \
+                     (with --orchestrator the id and the region are the orchestrator's to give; \
+                     --client-endpoint is where players dial this shard, 0.0.0.0:<port> meaning \
+                     the host they dialed; the cluster secret is read from SPACE_CLUSTER_SECRET \
+                     or the file SPACE_CLUSTER_SECRET_FILE / --cluster-secret-file names)";
 
 /// The revision a standalone shard's scene is announced at.
 ///
@@ -102,10 +174,13 @@ impl Options {
         let mut region: Option<NodeRef> = None;
         let mut regions: Vec<ShardRegion> = Vec::new();
         let mut advertise: Option<SocketAddr> = None;
+        let mut client_endpoint: Option<SocketAddr> = None;
         let mut orchestrator: Option<SocketAddr> = None;
         let mut claim_region: Option<NodeRef> = None;
         let mut cluster = "space-local".to_owned();
+        let mut cluster_secret_file: Option<std::path::PathBuf> = None;
         let mut scene: Option<Scene> = None;
+        let mut tick_origin: Option<i64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -133,6 +208,16 @@ impl Options {
                     let text = value("--advertise")?;
                     advertise = Some(text.parse::<SocketAddr>().map_err(|e| e.to_string())?);
                 }
+                "--client-endpoint" => {
+                    let text = value("--client-endpoint")?;
+                    let addr = text.parse::<SocketAddr>().map_err(|e| e.to_string())?;
+                    if addr.port() == 0 {
+                        return Err(format!(
+                            "--client-endpoint needs a port players can dial (got {addr})"
+                        ));
+                    }
+                    client_endpoint = Some(addr);
+                }
                 "--region" => {
                     let text = value("--region")?;
                     region = Some(parse_node(text)?);
@@ -143,7 +228,7 @@ impl Options {
                 }
                 "--orchestrator" => {
                     let text = value("--orchestrator")?;
-                    orchestrator = Some(text.parse::<SocketAddr>().map_err(|e| e.to_string())?);
+                    orchestrator = Some(control_address(text)?);
                 }
                 "--claim-region" => {
                     let text = value("--claim-region")?;
@@ -152,9 +237,19 @@ impl Options {
                 "--cluster" => {
                     cluster = value("--cluster")?.clone();
                 }
+                "--cluster-secret-file" => {
+                    cluster_secret_file =
+                        Some(std::path::PathBuf::from(value("--cluster-secret-file")?));
+                }
                 "--scene" => {
                     let text = value("--scene")?;
                     scene = Some(text.parse::<Scene>().map_err(|e| format!("--scene: {e}"))?);
+                }
+                "--tick-origin" => {
+                    let text = value("--tick-origin")?;
+                    tick_origin = Some(text.parse::<i64>().map_err(|e| {
+                        format!("--tick-origin: {e} (microseconds since the Unix epoch)")
+                    })?);
                 }
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
@@ -184,6 +279,24 @@ impl Options {
         if advertise.is_some() && !orchestrated {
             return Err(format!("--advertise requires --orchestrator\n{USAGE}"));
         }
+        // Standalone, the map is the command line's (`--peer`): every shard
+        // in it has one address, for shards and players alike.
+        if client_endpoint.is_some() && !orchestrated {
+            return Err(format!(
+                "--client-endpoint requires --orchestrator\n{USAGE}"
+            ));
+        }
+        if cluster_secret_file.is_some() && !orchestrated {
+            return Err(format!(
+                "--cluster-secret-file requires --orchestrator\n{USAGE}"
+            ));
+        }
+        if tick_origin.is_some() && orchestrated {
+            return Err(format!(
+                "--tick-origin is for a standalone shard; with --orchestrator the cluster's \
+                 tick origin is the orchestrator's (space-orchestrator --tick-origin)\n{USAGE}"
+            ));
+        }
         if scene.is_some() && orchestrated {
             return Err(format!(
                 "--scene is for a standalone shard; with --orchestrator the scene is the \
@@ -206,18 +319,39 @@ impl Options {
             shard,
             bind,
             advertise,
+            client_endpoint,
             region,
             regions,
             orchestrator,
             claim_region,
             cluster,
+            cluster_secret_file,
             scene: scene.unwrap_or(Scene::DEFAULT),
+            tick_origin_us: tick_origin.unwrap_or(space_protocol::SceneClock::DEFAULT_ORIGIN_US),
         })
     }
 }
 
 /// The root depth a `--claim-region`-less orchestrated launch falls back to.
 ///
+/// The orchestrator's control address from `--orchestrator`: an `ip:port`,
+/// or a `name:port` that is looked up **once, now** (a container reaches the
+/// orchestrator by its service or container name on their network; the
+/// first address the name resolves to is the one dialed, and a shard that
+/// loses its orchestrator stops rather than look again).
+fn control_address(text: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    use std::net::ToSocketAddrs;
+    text.to_socket_addrs()
+        .map_err(|e| {
+            format!("--orchestrator {text}: not an ip:port, and not a name that resolves ({e})")
+        })?
+        .next()
+        .ok_or_else(|| format!("--orchestrator {text}: the name resolves to no address"))
+}
+
 /// Matches the orchestrator's default root depth so a bare `--orchestrator`
 /// claims the root; the orchestrator overrides the placement in its welcome
 /// anyway (the value here only seeds the standalone map before the welcome).
@@ -226,14 +360,17 @@ fn space_orchestrator_root_depth() -> u8 {
 }
 
 impl Options {
-    /// The orchestrated-boot options this command line describes.
-    fn orchestrated(&self) -> space_server::orchestrated::OrchestratedOptions {
+    /// The orchestrated-boot options this command line describes, presenting
+    /// `secret` as the cluster secret.
+    fn orchestrated(&self, secret: String) -> space_server::orchestrated::OrchestratedOptions {
         space_server::orchestrated::OrchestratedOptions {
             shard: self.shard,
             bind: self.bind,
             advertise: self.advertise,
+            client_endpoint: self.client_endpoint,
             claim_region: self.claim_region,
             cluster: self.cluster.clone(),
+            secret,
         }
     }
 }
@@ -302,6 +439,12 @@ async fn run(options: Options) -> Result<(), String> {
         return run_orchestrated(options, orch_addr).await;
     }
 
+    // Where this shard is on its tick timeline — or the reason it cannot be
+    // on it (an origin that has not come yet), before anything is bound and
+    // any player let in.
+    let clock = space_server::clock::TickClock::new(options.tick_origin_us)
+        .map_err(|why| format!("--tick-origin: {why}"))?;
+
     let net =
         Arc::new(ShardNet::bind(options.bind).map_err(|e| format!("bind {}: {e}", options.bind))?);
     let bound = net.local_addr().map_err(|e| e.to_string())?;
@@ -346,26 +489,12 @@ async fn run(options: Options) -> Result<(), String> {
         tokio::spawn(async move { net.serve(shard).await })
     };
 
-    // The 30 Hz loop: one step, then everything the step queued goes out. The
-    // interval's first tick fires immediately, which is what a cold start wants
-    // — an empty world stepped once costs nothing and the first client to
-    // connect is served on the tick it joins.
-    let ticking = tokio::spawn(async move {
-        let mut clock = tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-        // A tick that overruns must not be made up in a burst: the simulation
-        // would run ahead of the network for free. Skip it instead.
-        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            clock.tick().await;
-            {
-                let mut shard = shard.lock().await;
-                shard.tick();
-                // The scene clock follows the wall clock (re-anchored only on drift).
-                shard.sync_scene_clock(space_server::config::wall_clock_us());
-            }
-            net.flush(&shard).await;
-        }
-    });
+    // The 30 Hz loop, on the tick clock (`space_server::clock`): every tick
+    // when it is due on the timeline that starts at the tick origin, then
+    // everything the step queued goes out. Standalone shards started at
+    // different times — the two of a handoff setup — therefore count the same
+    // ticks, as the shards of an orchestrator's cluster do.
+    let ticking = tokio::spawn(space_server::clock::run(shard, net, clock));
 
     // `serve` returns only when the endpoint is closed, so in practice the
     // process runs until it is killed. The tick loop is watched too: if it ever
@@ -375,10 +504,16 @@ async fn run(options: Options) -> Result<(), String> {
 }
 
 /// Serve as an orchestrated shard: register with the orchestrator, adopt the id,
-/// region and map it hands back, and follow every epoch it publishes. The boot
-/// itself lives in [`space_server::orchestrated`] so tests can run it in-process.
+/// region and map it hands back, and follow every epoch it publishes — until
+/// the orchestrator is lost, which ends the shard with an error (the process
+/// exits non-zero). The boot itself lives in [`space_server::orchestrated`] so
+/// tests can run it in-process.
 async fn run_orchestrated(options: Options, orch_addr: SocketAddr) -> Result<(), String> {
-    space_server::orchestrated::run_orchestrated(options.orchestrated(), orch_addr).await
+    let secret = space_server::orchestrated::cluster_secret(
+        options.cluster_secret_file.as_deref(),
+        &|name| std::env::var(name).ok(),
+    )?;
+    space_server::orchestrated::run_orchestrated(options.orchestrated(secret), orch_addr).await
 }
 
 #[cfg(test)]
@@ -387,6 +522,30 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Options, String> {
         Options::parse(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    /// `--orchestrator` takes an address or a name; a name that does not
+    /// resolve is refused with the flag in the message, not dialed.
+    ///
+    /// Mutation this catches: parsing only a `SocketAddr` (a shard container
+    /// given `orchestrator:7900` would not start).
+    #[test]
+    fn the_orchestrator_is_named_by_address_or_by_name() {
+        assert_eq!(
+            control_address("10.1.2.3:7900"),
+            Ok("10.1.2.3:7900".parse().unwrap())
+        );
+        let by_name = control_address("localhost:7900").expect("localhost resolves");
+        assert!(
+            by_name.ip().is_loopback() && by_name.port() == 7900,
+            "{by_name}"
+        );
+        let err = control_address("no-such-host.invalid:7900").expect_err("no such name");
+        assert!(
+            err.contains("--orchestrator no-such-host.invalid:7900"),
+            "{err}"
+        );
+        assert!(control_address("localhost").is_err(), "a port is required");
     }
 
     #[test]
@@ -499,7 +658,7 @@ mod tests {
     fn the_advertised_address_defaults_to_the_bound_address() {
         let options = parse(&["--orchestrator", "127.0.0.1:7900"]).expect("parses");
         let bound: SocketAddr = "127.0.0.1:41234".parse().unwrap();
-        assert_eq!(options.orchestrated().advertised(bound), bound);
+        assert_eq!(options.orchestrated(String::new()).advertised(bound), bound);
     }
 
     #[test]
@@ -515,7 +674,7 @@ mod tests {
         .expect("parses");
         let bound: SocketAddr = "0.0.0.0:7870".parse().unwrap();
         assert_eq!(
-            options.orchestrated().advertised(bound),
+            options.orchestrated(String::new()).advertised(bound),
             "10.0.0.5:7870".parse().unwrap()
         );
     }
@@ -532,6 +691,107 @@ mod tests {
         ])
         .is_err());
         assert!(parse(&["--orchestrator", "127.0.0.1:7900", "--advertise", "nope"]).is_err());
+    }
+
+    /// `--client-endpoint` says where players dial an orchestrated shard — the
+    /// unspecified IP meaning "the host they dialed" — and is what the hello
+    /// asks the orchestrator for. A standalone shard has one address, from
+    /// its `--bind` and its peers' `--peer`: there the flag is an error, and
+    /// its static map keeps client endpoint = endpoint.
+    ///
+    /// Mutation this catches: a flag that is parsed and dropped (the
+    /// orchestrator would put the internal address into the map for players),
+    /// or one accepted standalone, where nothing would ever read it.
+    #[test]
+    fn the_client_endpoint_is_for_an_orchestrated_shard_and_reaches_the_hello() {
+        let orchestrated = ["--orchestrator", "127.0.0.1:7900"];
+        let with = |extra: &[&str]| parse(&[&orchestrated[..], extra].concat());
+        assert_eq!(
+            with(&[])
+                .expect("parses")
+                .orchestrated(String::new())
+                .client_endpoint,
+            None,
+            "not given: players dial the advertised address"
+        );
+        let options = with(&[
+            "--bind",
+            "127.0.0.1:7871",
+            "--client-endpoint",
+            "0.0.0.0:7871",
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.orchestrated(String::new()).client_endpoint,
+            Some("0.0.0.0:7871".parse().unwrap())
+        );
+        // A port nobody could dial, or no address at all.
+        assert!(with(&["--client-endpoint", "0.0.0.0:0"]).is_err());
+        assert!(with(&["--client-endpoint", "nope"]).is_err());
+        assert!(with(&["--client-endpoint"]).is_err());
+        // Standalone: an error, and the static map has one address per shard.
+        let err = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--client-endpoint",
+            "0.0.0.0:7777",
+        ])
+        .expect_err("standalone");
+        assert!(err.contains("requires --orchestrator"), "{err}");
+        let standalone = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--peer",
+            "2:127.0.0.1:7778:64:1:0:0",
+        ])
+        .expect("parses");
+        for region in &standalone.regions {
+            assert_eq!(region.client_endpoint, region.endpoint);
+        }
+    }
+
+    /// The secret is never an argument (it would show in the process list):
+    /// only the *file* it is in can be named, and only for an orchestrated
+    /// shard.
+    #[test]
+    fn the_cluster_secret_is_named_by_file_only_and_only_when_orchestrated() {
+        let options = parse(&[
+            "--orchestrator",
+            "127.0.0.1:7900",
+            "--cluster-secret-file",
+            "/run/secrets/cluster",
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.cluster_secret_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/cluster"))
+        );
+        assert_eq!(
+            options.orchestrated("s3cret".into()).secret,
+            "s3cret",
+            "what the environment or the file said is what the hello presents"
+        );
+        assert!(parse(&["--orchestrator", "127.0.0.1:7900"])
+            .expect("parses")
+            .cluster_secret_file
+            .is_none());
+        assert!(parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--cluster-secret-file",
+            "x"
+        ])
+        .is_err());
+        assert!(
+            parse(&["--orchestrator", "127.0.0.1:7900", "--cluster-secret", "x"]).is_err(),
+            "there is no flag that takes the secret itself"
+        );
     }
 
     #[test]
@@ -577,6 +837,40 @@ mod tests {
         assert!(err.contains("standalone"), "{err}");
         // Without the flag an orchestrated shard parses as before.
         assert!(parse(&["--orchestrator", "127.0.0.1:7900"]).is_ok());
+    }
+
+    /// A standalone shard counts from the fixed default origin unless told
+    /// another; an orchestrated one is told by its orchestrator, so the flag
+    /// there is an error.
+    ///
+    /// Mutation this catches: a default taken from the clock at start (two
+    /// shards started by hand would count different ticks).
+    #[test]
+    fn the_tick_origin_is_the_fixed_default_or_the_flags() {
+        let alone = &["--shard", "1", "--region", "64:0:0:0"];
+        assert_eq!(
+            parse(alone).expect("parses").tick_origin_us,
+            space_protocol::SceneClock::DEFAULT_ORIGIN_US
+        );
+        let given = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--tick-origin",
+            "1763900000000000",
+        ])
+        .expect("parses");
+        assert_eq!(given.tick_origin_us, 1_763_900_000_000_000);
+        for bad in ["soon", "1.5", ""] {
+            let mut args = alone.to_vec();
+            args.extend(["--tick-origin", bad]);
+            let err = parse(&args).expect_err(bad);
+            assert!(err.contains("--tick-origin"), "{bad:?}: {err}");
+        }
+        let err = parse(&["--orchestrator", "127.0.0.1:7900", "--tick-origin", "0"])
+            .expect_err("an orchestrated shard is told its origin");
+        assert!(err.contains("standalone"), "{err}");
     }
 
     #[test]

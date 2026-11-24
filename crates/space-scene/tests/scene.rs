@@ -26,19 +26,26 @@ fn region(depth: u8, index: [i64; 3], shard: u32) -> ShardRegion {
     ShardRegion::new(NodeRef::new(depth, index), ShardId(shard), addr)
 }
 
-/// The anchor is the centre of the shallowest region (ties: lowest shard,
-/// then node index) — `space-client`'s `link::map_anchor`, on the same maps
-/// its own test uses.
+/// The anchor is a point of the shallowest region (ties: lowest shard, then
+/// node index) — `space-client`'s `link::map_anchor`, on the same maps its
+/// own test uses.
 #[test]
 fn the_anchor_rule_is_the_clients() {
     let root = region(0, [0, 0, 0], 1);
-    let centre = root.node.center();
+    // The whole cell space: its centre corner is the lower corner of cell 0,
+    // and the anchor 6 m, 512 m and 4 m from it.
+    let off_the_corner = WorldPos {
+        cell: [0; 3],
+        local: [-506.0, 0.0, -508.0],
+    };
     let single = ShardMap::new(1, vec![root]);
-    assert_eq!(space_scene::scene_anchor(&single), Some(centre));
+    assert_eq!(space_scene::scene_anchor(&single), Some(off_the_corner));
     for map in [
         single,
         ShardMap::new(2, vec![region(1, [0, 0, 0], 2), region(1, [-1, 0, 0], 3)]),
         ShardMap::new(3, vec![region(63, [5, 0, 0], 7), region(63, [0, 0, 0], 4)]),
+        ShardMap::new(4, vec![region(64, [5, 0, 0], 7), region(64, [0, 0, 0], 4)]),
+        ShardMap::new(5, vec![region(64, [1, 1, 1], 2), region(63, [0, 0, 0], 4)]),
     ] {
         assert_eq!(
             space_scene::scene_anchor(&map),
@@ -50,6 +57,141 @@ fn the_anchor_rule_is_the_clients() {
         space_scene::scene_anchor(&ShardMap::new(1, Vec::new())),
         None
     );
+}
+
+/// Where the anchor lies in the root (`docs/plan-sharding.md` §1):
+///
+/// * a root of one cell (depth 64): the cell's centre;
+/// * any larger root: its centre corner plus (6 m, 512 m, 4 m). With `k` the
+///   corner's cell index the spawn point is strictly inside cell `[k,k,k]`,
+///   no horizontal border lies within 512 m of the scene, the vertical ones
+///   pass at scene x = −6 and z = −4, and the four cells that meet on that
+///   line are `[k,k,k]`, `[k,k,k−1]`, `[k−1,k,k]` and `[k−1,k,k−1]`.
+///
+/// Mutations this catches: the old rule (the corner itself: borders through
+/// the spawn point on all three planes, one of them at eye height); an
+/// offset applied to a one-cell root too (a standalone shard's scene would
+/// move off its cell centre and 6 m from nothing).
+#[test]
+fn the_anchor_lies_beside_and_above_the_corner_where_the_roots_cells_meet() {
+    assert_eq!(space_scene::ANCHOR_OFFSET, [6.0, 512.0, 4.0]);
+    // One cell: its centre, wherever the cell is.
+    for cell in [[0i64, 0, 0], [1, 1, 1], [-7, 3, 9_765_625_000]] {
+        let node = NodeRef::new(64, cell);
+        let anchor = space_scene::anchor_in(node);
+        assert_eq!((anchor.cell, anchor.local), (cell, [0.0; 3]));
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(1, vec![region(64, cell, 1)])),
+            Some(anchor)
+        );
+    }
+    // More than one cell: off the centre corner, at every size from two
+    // cells to the whole cell space, on both sides of the origin.
+    for node in [
+        NodeRef::new(63, [0, 0, 0]),
+        NodeRef::new(63, [-1, 4, -9]),
+        NodeRef::new(40, [0, 0, 0]),
+        NodeRef::new(40, [3, -2, 5]),
+        NodeRef::new(1, [-1, 0, -1]),
+        NodeRef::ROOT,
+    ] {
+        let corner = node.center();
+        assert_eq!(
+            corner.local, [-512.0; 3],
+            "{node:?}: the corner of eight cells"
+        );
+        let k = corner.cell;
+        let anchor = space_scene::anchor_in(node);
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(1, vec![region(node.depth, node.index, 1)])),
+            Some(anchor),
+            "{node:?}"
+        );
+        assert_eq!(
+            WorldPos::delta(corner, anchor),
+            [6.0, 512.0, 4.0],
+            "{node:?}"
+        );
+        // Exact: whole metres in the cell's own frame.
+        assert_eq!((anchor.cell, anchor.local), (k, [-506.0, 0.0, -508.0]));
+        assert!(space_world::octree::contains(node, anchor));
+        // The cell of a point `d` metres from the spawn point.
+        let cell_at = |d: [f64; 3]| WorldPos::from_f64_metres_around(anchor, d).cell;
+        // The four cells that meet on the line x = -6, z = -4, at every
+        // height of the scene's cell layer.
+        for y in [-511.9, -100.0, 0.0, 100.0, 511.9] {
+            assert_eq!(cell_at([0.0, y, 0.0]), k, "the spawn point's cell");
+            assert_eq!(cell_at([-5.99, y, -3.99]), k);
+            assert_eq!(cell_at([-5.99, y, -4.01]), [k[0], k[1], k[2] - 1]);
+            assert_eq!(cell_at([-6.01, y, -3.99]), [k[0] - 1, k[1], k[2]]);
+            assert_eq!(cell_at([-6.01, y, -4.01]), [k[0] - 1, k[1], k[2] - 1]);
+            // A border belongs to the cell above it.
+            assert_eq!(cell_at([-6.0, y, -4.0]), k);
+        }
+        // No other vertical border for a kilometre: the cell reaches 1018 m
+        // along +x and 1020 m along +z.
+        assert_eq!(cell_at([1017.9, 0.0, 1019.9]), k);
+        assert_eq!(cell_at([1018.0, 0.0, 0.0]), [k[0] + 1, k[1], k[2]]);
+        assert_eq!(cell_at([0.0, 0.0, 1020.0]), [k[0], k[1], k[2] + 1]);
+        // The horizontal borders are half a cell away, above and below.
+        assert_eq!(cell_at([0.0, -512.0, 0.0]), k);
+        assert_eq!(cell_at([0.0, -512.01, 0.0]), [k[0], k[1] - 1, k[2]]);
+        assert_eq!(cell_at([0.0, 512.0, 0.0]), [k[0], k[1] + 1, k[2]]);
+    }
+    // The root decides, whoever owns the cell the anchor lies in and
+    // whatever was carved out around it.
+    let root = NodeRef::new(40, [0, 0, 0]);
+    let k = root.center().cell[0];
+    let anchor = space_scene::anchor_in(root);
+    for regions in [
+        vec![region(40, [0, 0, 0], 1), region(64, [k, k, k], 2)],
+        vec![
+            region(64, [k, k, k - 1], 2),
+            region(64, [k - 1, k, k], 3),
+            region(40, [0, 0, 0], 9),
+            region(64, [k - 1, k, k - 1], 4),
+            region(41, [1, 1, 1], 5),
+        ],
+    ] {
+        assert_eq!(
+            space_scene::scene_anchor(&ShardMap::new(7, regions)),
+            Some(anchor)
+        );
+    }
+    // Nothing of the demo area's showcase comes near a horizontal border:
+    // every static and body of it is placed well inside the 512 m to the cell
+    // layer's floor and ceiling. The demo area's **sky** (the solar system
+    // merged into it: Earth, Moon, Sun, planets) is the other kind of static
+    // — thousands of kilometres away and larger than any cell, so it spans
+    // shard borders by nature. That is sound because a static is no entity:
+    // every shard builds every static of the scene itself, at the same place
+    // (this anchor) and moved by the same scene clock, and none is ever
+    // handed over.
+    let statics = space_scene::statics(Scene::DemoArea);
+    // (The far content's rocks are the furthest of the rest: 1.2 km out,
+    // inside one cell each — `the_far_content_keeps_to_its_cells_and_steps`.)
+    let far = |s: &&StaticDef| s.offset.iter().map(|c| c * c).sum::<f64>().sqrt() > 2_000.0;
+    let sky: Vec<&StaticDef> = statics.iter().filter(far).collect();
+    assert_eq!(
+        sky.len(),
+        space_scene::solar::sky_bodies().len(),
+        "what lies beyond two kilometres is exactly the sky's bodies"
+    );
+    for body in &sky {
+        let distance = body.offset.iter().map(|c| c * c).sum::<f64>().sqrt();
+        assert!(distance > 1.0e6, "a sky body {distance} m away");
+    }
+    let heights = statics
+        .iter()
+        .filter(|s| !far(s))
+        .map(|s| s.offset[1])
+        .chain(
+            space_scene::body_defs(Scene::DemoArea)
+                .iter()
+                .map(|b| b.offset[1]),
+        )
+        .fold((f64::MAX, f64::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+    assert!(heights.0 > -400.0 && heights.1 < 400.0, "{heights:?}");
 }
 
 /// The Kestrel's collider is the LOD1 GLB: 11,585 triangles, its bounds those
@@ -491,6 +633,310 @@ fn the_planetoid_holds_its_crates_and_moons_and_lets_a_player_land() {
     assert!(up > 2.0, "a second of lift raised the player only {up} m");
 }
 
+// ------------------------------------------------------------ far content
+
+/// The names of the far content's bodies and, for each, the update step a
+/// view from the spawn point has it at and the cell it lies in, as the signs
+/// of its scene x + 6 and z + 4 (`demo`'s module docs, "Far content").
+const FAR_CONTENT: [(&str, u8, [f64; 2]); 5] = [
+    ("drift pair a", 1, [1.0, -1.0]),
+    ("drift pair b", 1, [1.0, -1.0]),
+    ("drift crate", 1, [1.0, -1.0]),
+    ("far moon", 2, [-1.0, 1.0]),
+    ("giant moon", 3, [-1.0, -1.0]),
+];
+
+/// The far content over five minutes, simulated on its own (nothing else of
+/// the scene is within 100 m of any of it):
+///
+/// * **every body keeps to its cell and to its step.** Under a root of more
+///   than one cell the scene's cells end at x = −6 and −1030, z = −4 and
+///   −1028 and y = ±512. Every far body stays further from each of those
+///   faces than a border ghost reaches — 64 m plus three seconds of its
+///   motion (`space-server`'s `border.rs`) — so no shard but its own ever
+///   holds it as a ghost and it never changes shard; and its distance from a
+///   player within 25 m of the spawn point stays inside the band of one
+///   update step (`space_protocol::far`), hysteresis included, so its rate
+///   does not flip;
+/// * the **moons** keep their orbits (within 1 % of the radius) and sweep
+///   what Kepler says (within 1 %);
+/// * the **spring pair** swings between 12 m and 20 m apart with a period of
+///   6 s, in the last minute as in the first: nothing damps it and nothing
+///   pumps it;
+/// * the **tumbling crates** turn at the rate they were given and stay
+///   exactly where they are;
+/// * the spawn point, the zero-g corner and the planetoid's moons feel
+///   nothing of the two rocks: their pull is exactly zero there.
+///
+/// Mutations this catches (each run, each fails here): the far rock moved to
+/// x = −60 (54 m from the border: its moons are ghosts on the neighbours);
+/// the giant rock's outer orbit 104 m out (its moon comes within 84 m of
+/// its cell's far face, the reach of a border ghost at its speed); the
+/// drifters 100 m out (the nearest crate flips between the 30 Hz
+/// and the 10 Hz step); a spring damping of 0.2 % of critical (the swing has
+/// lost two fifths after a minute); an angular damping of 0.02 on the
+/// tumbling crates; a moon's speed 2 % off `√(GM/r)`.
+#[test]
+fn the_far_content_keeps_to_its_cells_and_steps() {
+    use space_protocol::far;
+    const TICKS: usize = 9_000;
+    let anchor = WorldPos::from_metres([-5_000_000_000, 12_000, 800_000_000_000]);
+    let mut sim = SimWorld::new(ShardId(9));
+    space_scene::install_environment(&mut sim, Scene::DemoArea, anchor).unwrap();
+    let placed = space_scene::bodies(Scene::DemoArea, anchor, &mut minter());
+    let mine: Vec<(&space_scene::SceneBody, u8, [f64; 2])> = placed
+        .iter()
+        .filter_map(|b| {
+            FAR_CONTENT
+                .iter()
+                .find(|(name, ..)| *name == b.name)
+                .map(|(_, step, cell)| (b, *step, *cell))
+        })
+        .collect();
+    assert_eq!(mine.len(), 11, "two on a spring, three tumbling, six moons");
+    assert_eq!(placed.len(), 46, "the showcase's 35 and the far content");
+    assert!(
+        placed[35..]
+            .iter()
+            .all(|b| mine.iter().any(|m| m.0.guid == b.guid)),
+        "the far content is appended: the showcase's bodies keep their indices"
+    );
+    for (b, ..) in &mine {
+        sim.spawn_body(b.guid, b.spawn.clone()).unwrap();
+    }
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let rel = |sim: &SimWorld, guid: EntityGuid| -> [f64; 3] {
+        WorldPos::delta(anchor, sim.state_of(guid).unwrap().pos)
+    };
+    // How far `p` is inside its cell (from the nearest face), given the
+    // cell by the signs of x + 6 and z + 4; negative: outside it.
+    let inside = |p: [f64; 3], cell: [f64; 2]| -> f64 {
+        let x = (p[0] + 6.0) * cell[0];
+        let z = (p[2] + 4.0) * cell[1];
+        [x, 1024.0 - x, z, 1024.0 - z, 512.0 - p[1].abs()]
+            .into_iter()
+            .fold(f64::MAX, f64::min)
+    };
+    // The band of distances from the player in which `step` is the step
+    // whatever came before, and a player's 25 m of roaming.
+    let band = |step: u8| -> (f64, f64) {
+        let lo = far::STEPS[usize::from(step) - 1].0 * far::STEP_HYSTERESIS;
+        (lo + 25.0, far::STEPS[usize::from(step)].0 - 25.0)
+    };
+    let moons = |name: &str| -> Vec<EntityGuid> {
+        mine.iter()
+            .filter(|m| m.0.name == name)
+            .map(|m| m.0.guid)
+            .collect()
+    };
+    let rocks = [
+        (
+            moons("far moon"),
+            demo::FAR_ROCK_CENTER,
+            demo::FAR_ROCK_ORBITS,
+            demo::FAR_ROCK_GM,
+        ),
+        (
+            moons("giant moon"),
+            demo::GIANT_ROCK_CENTER,
+            demo::GIANT_ROCK_ORBITS,
+            demo::GIANT_ROCK_GM,
+        ),
+    ];
+    let from = |c: [f64; 3], p: [f64; 3]| [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    let mut swept = [[0.0f64; 3]; 2];
+    let mut last: Vec<Vec<[f64; 3]>> = rocks
+        .iter()
+        .map(|(guids, c, ..)| guids.iter().map(|g| from(*c, rel(&sim, *g))).collect())
+        .collect();
+    let pair = (moons("drift pair a")[0], moons("drift pair b")[0]);
+    let tumblers = moons("drift crate");
+    let tumbler_start: Vec<space_sim::ShipState> =
+        tumblers.iter().map(|g| sim.state_of(*g).unwrap()).collect();
+    let mut apart = Vec::with_capacity(TICKS);
+    for tick in 0..TICKS {
+        sim.step();
+        for (b, step, cell) in &mine {
+            let state = sim.state_of(b.guid).unwrap();
+            let p = WorldPos::delta(anchor, state.pos);
+            let margin = 64.0 + 3.0 * len(state.vel.map(f64::from));
+            let room = inside(p, *cell);
+            assert!(
+                room > margin,
+                "{} at {p:?} is {room:.1} m inside its cell at tick {tick}: within the \
+                 {margin:.1} m a border ghost reaches",
+                b.name
+            );
+            let (lo, hi) = band(*step);
+            let d = len(p);
+            assert!(
+                d > lo && d < hi,
+                "{} is {d:.1} m from the spawn point at tick {tick}: step {step} is \
+                 certain from {lo} to {hi} m",
+                b.name
+            );
+            assert_eq!(far::step_for(d), *step);
+        }
+        for (r, (guids, c, orbits, _)) in rocks.iter().enumerate() {
+            for (i, g) in guids.iter().enumerate() {
+                let d = from(*c, rel(&sim, *g));
+                assert!(
+                    (len(d) - orbits[i]).abs() < orbits[i] * 0.01,
+                    "moon {i} of rock {r} is {} m out at tick {tick}, not {}",
+                    len(d),
+                    orbits[i]
+                );
+                let l = last[r][i];
+                let cos = (0..3).map(|k| d[k] * l[k]).sum::<f64>() / (len(d) * len(l));
+                swept[r][i] += cos.clamp(-1.0, 1.0).acos();
+                last[r][i] = d;
+            }
+        }
+        apart.push(len(from(rel(&sim, pair.0), rel(&sim, pair.1))));
+    }
+    let seconds = TICKS as f64 / 30.0;
+    for (r, (_, _, orbits, gm)) in rocks.iter().enumerate() {
+        for (i, s) in swept[r].iter().enumerate() {
+            let period = std::f64::consts::TAU * (orbits[i].powi(3) / gm).sqrt();
+            let expected = std::f64::consts::TAU * seconds / period;
+            assert!(
+                (s - expected).abs() / expected < 0.01,
+                "moon {i} of rock {r} swept {s} rad in {seconds} s, Kepler says {expected}"
+            );
+            assert!(expected > 4.0 * std::f64::consts::TAU, "a few times round");
+        }
+    }
+    // The swing: 12 m to 20 m, the same in the last minute as in the first,
+    // fifty times in the five minutes.
+    let reach = |range: std::ops::Range<usize>| {
+        apart[range]
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), d| (l.min(*d), h.max(*d)))
+    };
+    let (first, final_) = (reach(0..1_800), reach(TICKS - 1_800..TICKS));
+    let rest = f64::from(demo::DRIFT_PAIR_REST);
+    for (lo, hi) in [first, final_] {
+        assert!(
+            (lo - (2.0 * rest - demo::DRIFT_PAIR_START)).abs() < 0.05
+                && (hi - demo::DRIFT_PAIR_START).abs() < 0.05,
+            "the pair swings between {lo} and {hi} m apart"
+        );
+    }
+    assert!(
+        (first.1 - first.0 - (final_.1 - final_.0)).abs() < 0.02,
+        "the swing changed: {first:?} in the first minute, {final_:?} in the last"
+    );
+    let swings = apart
+        .windows(2)
+        .filter(|w| w[0] < rest && w[1] >= rest)
+        .count();
+    assert!(
+        (49..=51).contains(&swings),
+        "{swings} swings in five minutes"
+    );
+    // The tumbling crates: where they were, turning as fast as they did,
+    // turned.
+    for (g, start) in tumblers.iter().zip(&tumbler_start) {
+        let now = sim.state_of(*g).unwrap();
+        assert_eq!(now.pos, start.pos, "a tumbling crate moved");
+        assert_eq!(now.vel, [0.0; 3]);
+        assert_eq!(now.ang_vel, start.ang_vel, "its spin changed");
+        assert_ne!(now.quat, start.quat);
+    }
+    // Weightless where it was: the spawn point, the zero-g corner, the
+    // planetoid's orbits and the drifters.
+    let mut probes = vec![[0.0; 3], [-15.5, 0.0, -5.5], demo::DRIFT_CENTER];
+    let c = demo::PLANETOID_CENTER;
+    probes.push([c[0] + demo::PLANETOID_REACH + 0.1, c[1], c[2]]);
+    for p in probes {
+        let at = WorldPos::from_f64_metres_around(anchor, p);
+        let g = sim.gravity().at(at, sim.tick());
+        assert!(g.iter().all(|v| v.to_bits() == 0), "{p:?}: {g:?}");
+    }
+    // And the rocks pull as they say on their surfaces.
+    for (c, r, want) in [
+        (
+            demo::FAR_ROCK_CENTER,
+            demo::FAR_ROCK_RADIUS,
+            demo::FAR_ROCK_SURFACE_GRAVITY,
+        ),
+        (
+            demo::GIANT_ROCK_CENTER,
+            demo::GIANT_ROCK_RADIUS,
+            demo::GIANT_ROCK_SURFACE_GRAVITY,
+        ),
+    ] {
+        let top = WorldPos::from_f64_metres_around(anchor, [c[0], c[1] + r, c[2]]);
+        let g = sim.gravity().at(top, sim.tick());
+        assert!((len(g) - want).abs() < 1e-6 && g[1] < 0.0, "{g:?}");
+    }
+}
+
+/// A player comes down on the far rock and on the giant rock as on the
+/// planetoid: falls onto the top, stands there, feels the pull, and lifts
+/// off with the lift engines.
+///
+/// Mutation this catches: a rock without its static collider (the player
+/// falls through to the centre), or without its gravity (it never lands).
+#[test]
+fn a_player_lands_on_the_far_rocks_and_lifts_off() {
+    use space_protocol::PlayerInput;
+    let anchor = WorldPos::from_metres([3_000_000_000, -7_000, 9_000_000_000_000]);
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    for (c, r, gm) in [
+        (
+            demo::FAR_ROCK_CENTER,
+            demo::FAR_ROCK_RADIUS,
+            demo::FAR_ROCK_GM,
+        ),
+        (
+            demo::GIANT_ROCK_CENTER,
+            demo::GIANT_ROCK_RADIUS,
+            demo::GIANT_ROCK_GM,
+        ),
+    ] {
+        let mut sim = SimWorld::new(ShardId(9));
+        space_scene::install_environment(&mut sim, Scene::DemoArea, anchor).unwrap();
+        let player = EntityGuid::new(ShardId(9), 1000);
+        let over = WorldPos::from_f64_metres_around(anchor, [c[0], c[1] + r + 1.7 + 1.0, c[2]]);
+        sim.spawn_ship(player, 1, space_sim::ShipState::at_rest(over));
+        let height = |sim: &SimWorld| {
+            let d = WorldPos::delta(anchor, sim.state_of(player).unwrap().pos);
+            len([d[0] - c[0], d[1] - c[1], d[2] - c[2]]) - r - 1.7
+        };
+        sim.step_n(300);
+        let stood = sim.state_of(player).unwrap();
+        assert!(
+            height(&sim).abs() < 0.05,
+            "the player's feet are {} m off the top",
+            height(&sim)
+        );
+        assert!(len(stood.vel.map(f64::from)) < 0.05, "{:?}", stood.vel);
+        let g = len(sim.gravity().at(stood.pos, sim.tick()));
+        let at_eye = gm / (r + 1.7 + height(&sim)).powi(2);
+        assert!((g - at_eye).abs() < 1e-9 && g > 2.5, "{g} m/s2 at the eye");
+        for _ in 0..30 {
+            let tick = sim.tick() + 1;
+            sim.apply_inputs(
+                tick,
+                &[PlayerInput {
+                    entity: player,
+                    thrust: [0.0, 1.0, 0.0],
+                    torque: [0.0; 3],
+                    tick,
+                    fast: false,
+                }],
+            );
+            sim.step();
+        }
+        assert!(
+            height(&sim) > 2.0,
+            "a second of lift raised the player only {} m",
+            height(&sim)
+        );
+    }
+}
+
 // ---------------------------------------------------------------- the sky
 
 /// The demo area's solar system, as the physics has it: Earth fixed eight
@@ -549,9 +995,10 @@ fn the_sky_moves_on_its_orbits_and_leaves_the_demo_area_alone() {
         let p = moon_static.place_at(t_us);
         let c = body("Moon").center_at(0, t_us);
         assert_eq!((p.origin, p.offset), (c.origin, c.offset));
-        // Nothing of it reaches the demo area.
+        // Nothing of it reaches the demo area (whose own three rocks are
+        // checked where they are defined).
         for b in &env.gravity.bodies {
-            if b.name == "planetoid" {
+            if matches!(b.name.as_str(), "planetoid" | "far rock" | "giant rock") {
                 continue;
             }
             let d = len(b.center_at(0, t_us).delta_to(anchor));

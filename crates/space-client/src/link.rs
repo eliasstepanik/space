@@ -1,12 +1,29 @@
 //! The multiplayer seam: a normal `space-net` player connection.
 //!
-//! [`ServerLink::connect`] is the same client path a native client uses:
-//! [`space_net::client_endpoint_for`] + [`space_net::connect`] with a
+//! [`ServerLink::join`] is the same client path a native client uses:
+//! [`space_net::client_endpoint_for`] + [`space_net::join`] with a
 //! [`space_net::hello`] (so the `PROTOCOL_VERSION` gate is the transport's, not
 //! reimplemented here). No server protocol is added: the link sends
 //! [`Message::InputTick`] batches (datagrams) and reads the replicated
 //! [`Message::Snapshot`] / [`Message::Delta`] frames the shard sends every
 //! client.
+//!
+//! # One address
+//!
+//! The address a player types — the **entry** address — need not be a shard.
+//! Every address is treated alike: a `Welcome` means it is one; a
+//! `JoinRedirect` (the orchestrator's player port answers with one, and so
+//! does a shard that does not own the scene's spawn point) names the shard a
+//! new player starts on, and the link dials that shard's **client endpoint**
+//! in the redirect's map — [`MAX_JOIN_REDIRECTS`] times at most. A client
+//! endpoint without an IP (`0.0.0.0:port`) means "the host of the entry
+//! address, this port": the shards run where the player port does, so no
+//! host name is configured anywhere. The same rule resolves the address of a
+//! handoff's [`Message::Redirect`]. The link keeps the entry address for
+//! that ([`ServerLink::entry`]) and says where it is really playing
+//! ([`ServerLink::shard_address`]); whoever keeps a connection up joins again
+//! through the **entry** address, never through a shard's — the shard may be
+//! gone, the entry knows who owns the spawn point now.
 //!
 //! Three kinds of task run on the caller's tokio runtime: an input sender (one
 //! batch per simulation tick) and, per connection, a reader for the
@@ -34,9 +51,20 @@
 //!    the new connection shows its ship, now owned by the new session. That
 //!    frame is the switch: inputs go to the new shard from then on and the old
 //!    connection is closed. "Its ship" is the ship it has been flying, by
-//!    guid: a connection that reaches the accepting shard before the shards'
-//!    own offer does is given a placeholder ship there, and a frame showing
-//!    *that* is not the switch (the old shard still simulates the real one).
+//!    guid. The shard sends the redirect only once the accepting shard has
+//!    staged the ship, so the hello there is recognised (by the token) and
+//!    the client is given no ship of its own. Should the accepting shard have
+//!    dropped the transfer again by then (an abort that crossed the hello),
+//!    it answers like for a fresh join: it sends the client on (the attempt
+//!    is over, see below) or — the shard that owns the spawn point — lets it
+//!    in with a **new** ship. A frame showing that ship is not the switch;
+//!    it is the sign that this connection is of no use, and the link closes
+//!    it at once, which removes the ship.
+//!
+//! Only a redirect for the **own** ship is followed. A shard sends one to
+//! the ship's player and to nobody else; a redirect naming any other entity
+//! is ignored (there is nothing a second connection could do for a ship this
+//! client does not fly — it is seen through the own shard's ghost of it).
 //!
 //! The ship keeps its guid and its world position across the switch, so
 //! [`Replica::offset`] — and with it the camera — is continuous: the
@@ -44,11 +72,42 @@
 //! new shard cannot be reached, or the handoff is aborted, nothing changes:
 //! the old connection was never given up.
 //!
+//! ## One timeline across the switch
+//!
+//! The shards of a cluster count the same ticks (the cluster's clock,
+//! `space_server::clock`): a tick number names the same instant on the shard
+//! the ship leaves and on the one that takes it. The link relies on that:
+//!
+//! * **Inputs go to both shards** from the moment the second connection is
+//!   up until the switch — the same batch, tagged with the same tick. The old
+//!   shard applies the ones up to its commit; the new one keeps what it is
+//!   sent for a ship that is on its way and applies the rest from the tick it
+//!   installs the ship on. Nothing a player does around the switch is lost,
+//!   and nothing is applied twice (a shard only ever steps the ship it
+//!   simulates).
+//! * **The view continues.** At the switch the new shard's frames take over,
+//!   and nothing else changes: the tick the link counts by, the inputs it has
+//!   sent ([`ServerLink::take_sent`] — the app's prediction keeps replaying
+//!   them), the `input_ack`, and the motion histories of every entity the
+//!   new shard reports too, merged by guid ([`Tracked::history`]): a body
+//!   or a player seen before and after is one object with one history, not a
+//!   new one that starts where the old one stopped.
+//!
+//! Whether the new shard's ticks do continue the old one's is checked at the
+//! switch, against the link's own estimate of the present tick
+//! ([`SWITCH_TOLERANCE`]). Between shards that count differently — standalone
+//! shards given different tick origins, shards driven by loops of their own —
+//! the link starts over instead, as it always did: new ticks, new histories,
+//! and [`Replica::tick_epoch`] goes up, which tells the app to restart its
+//! clock and its prediction.
+//!
 //! # The anchor
 //!
 //! Every client must agree on *where* the scene is, so it is tied to the map
-//! and not to the client: the scene's spawn point lies on the **anchor**, the
-//! centre of the map's root region ([`map_anchor`]). Every shard hands its
+//! and not to the client: the scene's spawn point lies on the **anchor**, a
+//! point of the map's root region ([`map_anchor`]: the centre of a one-cell
+//! root, else a few metres beside and half a cell above the corner where the
+//! root's cells meet, clear of every shard border). Every shard hands its
 //! clients the same map in the `Welcome`, so every client derives the same
 //! point, whichever shard it joined through. The link takes it from the first
 //! `Welcome` and keeps it ([`Replica::anchor`]): a handoff, a split or a merge
@@ -98,7 +157,8 @@
 //! keeps the mapping of the shard being played on ([`Replica::scene_clock`]);
 //! during a handoff the accepting shard's is held back and taken at the
 //! switch, together with that shard's ticks — a mapping is only meaningful
-//! with the ticks of the shard that made it.
+//! with the ticks of the shard that made it. (The shards of one cluster all
+//! tell the same mapping: it is the cluster's clock, see below.)
 //!
 //! # Prediction
 //!
@@ -120,10 +180,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use space_ecs::{ComponentDef, ComponentId};
-use space_net::{client_endpoint_for, connect, hello, Conn, NetError};
+use space_net::{client_endpoint_for, hello, join, Conn, Joined, NetError};
 use space_protocol::{
-    EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus, PlayerInput, Redirect,
-    SceneClock, SceneState, ShardId, ShardMap,
+    far, resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
+    Origin, OriginKind, PlayerInput, Redirect, SceneClock, SceneState, ShardId, ShardMap, Welcome,
+    ORIGIN_COMPONENT,
 };
 use space_sim::articulation::{decode_articulation, decode_part_states};
 use space_sim::body::{decode_body, decode_residual, decode_visual};
@@ -155,14 +216,133 @@ pub const INPUT_LEAD: u64 = 3;
 /// ticks the server has not simulated yet instead of all being stale.
 const MAX_TICK_EXTRAPOLATION: u64 = 30;
 
+/// The most ticks one input batch covers: the ticks since the last batch,
+/// each with its own input (see [`inputs_for`]). After a longer stall the
+/// ticks before these are in the past and get none.
+const MAX_INPUT_FILL: u64 = 4;
+
+/// The ticks an input batch sent now carries inputs for: `first..=last`.
+///
+/// `estimate` is the tick the link's clock says an input sent now belongs to
+/// ([`input_tick`]); `sent` the last tick an input was sent for. A batch goes
+/// out every thirtieth of a second, but the estimate comes from frames that
+/// arrive with jitter: read naively it names the same tick twice now and
+/// then, and skips one as often. A tick without an input **coasts** on the
+/// shard — in fast travel that is a fifteenth of the speed gone, for
+/// nothing. So the link gives every tick exactly one input: it continues
+/// where it stopped (`sent + 1`), runs at most one tick ahead of its clock
+/// (`None`: nothing to send this time), and when the clock has moved on by
+/// more than one it fills the ticks in between, [`MAX_INPUT_FILL`] at most.
+fn inputs_for(estimate: u64, sent: Option<u64>) -> Option<(u64, u64)> {
+    let Some(sent) = sent else {
+        return Some((estimate, estimate));
+    };
+    let first = sent + 1;
+    if first > estimate + 1 {
+        return None;
+    }
+    let last = estimate.max(first);
+    Some((first.max(last.saturating_sub(MAX_INPUT_FILL - 1)), last))
+}
+
 /// The most sent inputs the link keeps for an app that does not take them
 /// ([`ServerLink::take_sent`]): ten seconds' worth.
 const SENT_LOG: usize = 300;
+
+/// How many of the inputs sent last the link keeps to say again to a shard
+/// it has just connected to for a handoff ([`resend_tail`]): the ticks a
+/// commit can be ahead of the connection — the input lead, a batch's fill
+/// and what the estimate of the present tick may be off by.
+const RESEND_LOG: usize = (INPUT_LEAD + MAX_INPUT_FILL + SWITCH_TOLERANCE) as usize;
+
+/// The inputs the shard that is taking the ship over has to be sent the
+/// moment its connection is up: of the `recent` ones, those for ticks after
+/// `newest_frame_tick` — the ticks the old shard may not have stepped yet.
+///
+/// Inputs are tagged [`INPUT_LEAD`] ticks ahead and each goes out once.
+/// Those sent just **before** the second connection existed went to the old
+/// shard only; if the commit follows the connect within the lead, some of
+/// them are for ticks the *new* shard simulates, and it never heard them:
+/// the ship coasted for up to three ticks at every crossing with a quick
+/// commit. So the link says them again, once, to the new shard. A tick the
+/// old shard did step is not applied twice: a shard only applies an input
+/// for a tick it simulates the ship on (the new one keeps what it is sent
+/// for a staged ship and files what is for ticks after its install), and
+/// one input per tick is kept.
+fn resend_tail(recent: &VecDeque<PlayerInput>, newest_frame_tick: u64) -> Vec<PlayerInput> {
+    recent
+        .iter()
+        .filter(|input| input.tick > newest_frame_tick)
+        .copied()
+        .collect()
+}
 
 /// How long a connection opened for a redirect may wait for the handoff to
 /// complete before it is abandoned (the shards time a handoff out long before
 /// this; a later redirect then starts afresh).
 const REDIRECT_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How far the first tick heard from the shard that took the ship over may be
+/// from the tick the link expects at that moment, in ticks, for the two
+/// shards to count as being on one timeline (see the module docs, "One
+/// timeline across the switch"). On the cluster's clock the difference is the
+/// delivery of a frame or two; anything like this far apart is two clocks.
+pub const SWITCH_TOLERANCE: u64 = 6;
+
+/// The most [`JoinRedirect`](space_protocol::JoinRedirect)s one join follows:
+/// the entry address may send the player on (the orchestrator's player port
+/// does), and the shard it names may once more (its map was a moment behind).
+/// A third is not a path to a shard any more — it is a loop or a
+/// misconfigured cluster — and ends the attempt with a readable reason.
+pub const MAX_JOIN_REDIRECTS: usize = 2;
+
+/// Why a join did not end on a shard, and at which address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinError {
+    /// The address that was being dialed when it failed: the entry address,
+    /// or the shard a redirect named.
+    pub at: SocketAddr,
+    /// What went wrong there.
+    pub failure: JoinFailure,
+}
+
+/// What went wrong at one address of a join ([`JoinError`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinFailure {
+    /// The connection or the hello failed, or was refused.
+    Net(NetError),
+    /// The address sent the player on once more than
+    /// [`MAX_JOIN_REDIRECTS`] allow; these are the shards named, in order.
+    TooManyRedirects(Vec<ShardId>),
+    /// The redirect named a shard its map gives no address for.
+    NoAddress(ShardId),
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.failure {
+            JoinFailure::Net(error) => write!(f, "{}: {error}", self.at),
+            JoinFailure::TooManyRedirects(chain) => {
+                let chain: Vec<String> = chain.iter().map(ToString::to_string).collect();
+                write!(
+                    f,
+                    "{} sent this client on a {}. time (to {}); a join follows at most {}",
+                    self.at,
+                    chain.len(),
+                    chain.join(", then "),
+                    MAX_JOIN_REDIRECTS
+                )
+            }
+            JoinFailure::NoAddress(shard) => write!(
+                f,
+                "{} sent this client to {shard}, and its map names no address for it",
+                self.at
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
 
 /// A fresh player token: the prefix plus 64 process-unique random bits.
 #[must_use]
@@ -174,17 +354,24 @@ pub fn unique_player_token() -> String {
     format!("{PLAYER_TOKEN_PREFIX}{:016x}", hasher.finish())
 }
 
-/// Where a scene's spawn point lies in the world of `map`: the centre of the
-/// map's **root region**.
+/// Where a scene's spawn point lies in the world of `map`: the **anchor** of
+/// the map's **root region**.
 ///
 /// The root region is the shallowest region of the map — the one every split
-/// carved its octants out of. Splits only *add* a deeper region and merges
-/// only remove one (`space-orchestrator`'s topology), so the root, and with it
-/// this point, stays where it is for as long as the cluster lives, and it is
-/// where the root's shard spawns the ships of the players who join it. A map
-/// without a single root (standalone shards side by side, all of one depth)
-/// takes the region of the lowest shard id; the node index breaks what ties
-/// are left. `None` for a map with no region at all.
+/// and carve took its node out of. Carves only *add* a deeper region and
+/// merges only remove one (`space-orchestrator`'s topology), so the root, and
+/// with it this point, stays where it is for as long as the cluster lives,
+/// and it is where the shard that owns it spawns the ships of the players who
+/// join it. A map without a single root (standalone shards side by side, all
+/// of one depth) takes the region of the lowest shard id; the node index
+/// breaks what ties are left. `None` for a map with no region at all.
+///
+/// Within the root the anchor is the centre of a root of one cell, and for a
+/// larger one the corner where its cells meet moved by
+/// [`space_scene::ANCHOR_OFFSET`] — 6 m, half a cell up, 4 m — so that no
+/// horizontal shard border comes within 512 m of the scene and the vertical
+/// ones pass beside the spawn point (at `pos` x = −6 and z = −4 on the HUD),
+/// not through it ([`space_scene::anchor_in`]).
 ///
 /// A pure function of the map: two clients handed the same map — by whichever
 /// shards — get the same point. It is [`space_scene::scene_anchor`], the rule
@@ -199,9 +386,12 @@ pub fn map_anchor(map: &ShardMap) -> Option<WorldPos> {
 pub const HISTORY_TICKS: usize = 10;
 
 /// A gap between two updates of a *moving* entity longer than this, in
-/// ticks, is not interpolated across: the entity left the interest range and
-/// came back, or was moved by hand. Its history starts over.
-const MAX_INTERPOLATION_GAP: u64 = 15;
+/// ticks, is not interpolated across: its history starts over. Far things
+/// are sent as rarely as once a second (`space_protocol::far`), and a sample
+/// may be a tick late or wait a tick for room in a frame: two such spacings
+/// and a little is the longest gap that is still one motion. (It was 15
+/// ticks while everything was sent every tick.)
+const MAX_INTERPOLATION_GAP: u64 = 75;
 
 /// Below this speed (m/s) and spin (rad/s) an entity counts as resting: a
 /// shard sends nothing for a resting entity until it moves again, so the gap
@@ -335,6 +525,11 @@ pub struct Replica {
     pub frames: u64,
     /// Completed shard transitions.
     pub handoffs: u64,
+    /// How often the ticks started over: it goes up at a shard transition
+    /// onto a shard that does not continue the previous one's ticks (see the
+    /// module docs, "One timeline across the switch"). While it stays, every
+    /// tick of this view is on one timeline.
+    pub tick_epoch: u64,
     /// The scene the server says to draw, and the revision it was chosen at
     /// ([`SceneState::UNSET`] until the first [`Message::SceneUpdate`]). It
     /// survives a shard transition; compare it with the value last drawn to
@@ -370,6 +565,36 @@ pub struct OtherShip {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ShipView {
     ships: Vec<Tracked>,
+    /// A snapshot that is arriving in several chunks
+    /// ([`space_protocol::Snapshot::more`]): the tick of its first chunk and
+    /// every entity its chunks have named so far. `None` between snapshots.
+    arriving: Option<(u64, Vec<EntityGuid>)>,
+}
+
+/// Which copy of an entity the shard being played on sends (its
+/// [`Origin`] component, or none).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+    /// The shard simulates it.
+    #[default]
+    Local,
+    /// A neighbouring shard does, near the border: the shard's ghost of it.
+    Ghost,
+    /// Another shard does, beyond its ghosts' reach: a far replica, relayed
+    /// for seeing only, its samples sparser with the distance.
+    Far,
+}
+
+impl Source {
+    /// `"local"`, `"ghost"` or `"far"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Source::Local => "local",
+            Source::Ghost => "ghost",
+            Source::Far => "far",
+        }
+    }
 }
 
 /// One entity a shard replicates — a ship or a physics body — as the client
@@ -389,9 +614,22 @@ pub struct Tracked {
     /// Its replicated component list as last received (what a prediction
     /// world builds its copy of the entity from).
     pub components: Arc<Vec<(ComponentId, Vec<u8>)>>,
+    /// Where its state is from when the shard does not simulate it itself
+    /// (`None`: it does).
+    pub origin: Option<Origin>,
 }
 
 impl Tracked {
+    /// Which copy of the entity this is.
+    #[must_use]
+    pub fn source(&self) -> Source {
+        match self.origin.map(|origin| origin.kind) {
+            None => Source::Local,
+            Some(OriginKind::Ghost) => Source::Ghost,
+            Some(OriginKind::Far) => Source::Far,
+        }
+    }
+
     /// Whether this is a physics body rather than a ship
     /// ([`Physical::is_body`]).
     #[must_use]
@@ -492,10 +730,24 @@ impl ShipView {
         // same tick on) stays, with its history.
         match message {
             // A snapshot is the whole interest set: what it does not name is
-            // gone — unless a newer frame has already said otherwise.
-            Message::Snapshot(_) => self
-                .ships
-                .retain(|seen| seen.tick > tick || named(seen.ship.guid)),
+            // gone — unless a newer frame has already said otherwise. The
+            // **whole** snapshot: one that does not fit a frame arrives in
+            // chunks, a tick apart, and only the last of them (`more` is
+            // false) ends it. Until then the names are collected and nothing
+            // is dropped; taking each chunk for the whole kept only the last
+            // chunk's entities, for good — the shard counts every entity it
+            // sent as known and does not send one at rest again.
+            Message::Snapshot(snapshot) => {
+                let (first_tick, mut names) =
+                    self.arriving.take().unwrap_or_else(|| (tick, Vec::new()));
+                names.extend(entities.iter().map(|e| e.guid));
+                if snapshot.more {
+                    self.arriving = Some((first_tick, names));
+                } else {
+                    self.ships
+                        .retain(|seen| seen.tick > first_tick || names.contains(&seen.ship.guid));
+                }
+            }
             Message::Delta(d) => self.ships.retain(|seen| {
                 seen.tick > tick || !d.removed.contains(&seen.ship.guid) || named(seen.ship.guid)
             }),
@@ -534,6 +786,15 @@ impl ShipView {
                 owner: owner_of(&entity).unwrap_or(0),
                 state,
             };
+            // The tick the state is the state of: the frame's — except for
+            // a far replica, whose sample was taken on the shard that
+            // simulates it a tick or two before this frame was built (never
+            // after it).
+            let origin = component(&entity, ORIGIN_COMPONENT).and_then(Origin::decode);
+            let at = match origin {
+                Some(origin) if origin.kind == OriginKind::Far => origin.tick.min(tick),
+                _ => tick,
+            };
             match held {
                 Some(i) => {
                     let seen = &mut self.ships[i];
@@ -541,7 +802,8 @@ impl ShipView {
                     let parts = seen.physics.as_ref().map_or(1, |p| p.part_count());
                     seen.ship = ship;
                     seen.tick = tick;
-                    seen.record(sample_of(&entity, state, tick, parts));
+                    seen.origin = origin;
+                    seen.record(sample_of(&entity, state, at, parts));
                     seen.components = Arc::new(entity.components);
                 }
                 None => {
@@ -553,11 +815,43 @@ impl ShipView {
                         physics,
                         history: VecDeque::new(),
                         components: Arc::new(Vec::new()),
+                        origin,
                     };
-                    seen.record(sample_of(&entity, state, tick, parts));
+                    seen.record(sample_of(&entity, state, at, parts));
                     seen.components = Arc::new(entity.components);
                     self.ships.push(seen);
                 }
+            }
+        }
+    }
+}
+
+impl ShipView {
+    /// Make this view — what the shard that took the ship over has reported
+    /// — the continuation of `previous`, the view of the shard played on
+    /// until now, on the same tick timeline: every entity both report keeps
+    /// the motion `previous` recorded before this view's first word on it.
+    /// What only `previous` knew is not this shard's to report and is gone.
+    fn continue_from(&mut self, previous: &ShipView) {
+        for seen in &mut self.ships {
+            let Some(before) = previous
+                .ships
+                .iter()
+                .find(|old| old.ship.guid == seen.ship.guid)
+            else {
+                continue;
+            };
+            let first = seen.history.front().map_or(u64::MAX, |sample| sample.tick);
+            let news = std::mem::take(&mut seen.history);
+            seen.history = before
+                .history
+                .iter()
+                .filter(|sample| sample.tick < first)
+                .cloned()
+                .collect();
+            // Through `record`, so a gap is treated as on one connection.
+            for sample in news {
+                seen.record(sample);
             }
         }
     }
@@ -682,6 +976,21 @@ impl Replica {
         })
     }
 
+    /// Whether `message` is a frame carrying a ship owned by `session` that
+    /// is **not** `guid`: a ship the shard made for this session itself.
+    fn frame_has_other_ship_of(message: &Message, session: u64, guid: EntityGuid) -> bool {
+        let entities = match message {
+            Message::Snapshot(s) => &s.entities,
+            Message::Delta(d) => &d.entities,
+            _ => return false,
+        };
+        entities.iter().any(|entity| {
+            entity.guid != guid
+                && owner_of(entity) == Some(session)
+                && ship_state_of(entity).is_some()
+        })
+    }
+
     /// Whether the own ship is in fast travel, as the shard last said (its
     /// replicated `ShipControls`).
     #[must_use]
@@ -710,18 +1019,30 @@ impl Replica {
         ship_state_of(entity)
     }
 
-    /// Continue this view on another shard after a handoff: a new session and
-    /// a new tick domain (every shard runs its own clock), the same ship, the
-    /// same origin and the same scene. `ships` is what the new shard has
-    /// reported on its connection so far (its ticks are that shard's).
-    fn switch_to(&mut self, session: u64, shard: ShardId, ships: ShipView) {
+    /// Continue this view on another shard after a handoff: a new session,
+    /// the same ship, the same origin and the same scene. `ships` is what the
+    /// new shard has reported on its connection so far.
+    ///
+    /// `continuous`: the new shard's ticks continue the old one's (the
+    /// cluster's clock). Then nothing but the session changes — the tick, the
+    /// ship's last state and its `input_ack` stand until the new shard's next
+    /// word, and the entities both shards report keep their histories
+    /// ([`ShipView::continue_from`]). Otherwise the ticks start over
+    /// ([`Replica::tick_epoch`] goes up) and the view is the new shard's
+    /// alone.
+    fn switch_to(&mut self, session: u64, shard: ShardId, mut ships: ShipView, continuous: bool) {
         self.session = session;
         self.shard = Some(shard);
-        self.tick = 0;
-        self.state_tick = 0;
-        self.input_ack = 0;
-        self.frame_ack = 0;
         self.handoffs += 1;
+        if continuous {
+            ships.continue_from(&self.ships);
+        } else {
+            self.tick = 0;
+            self.state_tick = 0;
+            self.input_ack = 0;
+            self.frame_ack = 0;
+            self.tick_epoch += 1;
+        }
         self.ships = ships;
     }
 
@@ -784,6 +1105,37 @@ impl Replica {
         })
     }
 
+    /// How far `tracked` is from the own ship, metres (0 before the ship is
+    /// known): what its distance step and its draw delay follow.
+    #[must_use]
+    pub fn distance_to(&self, tracked: &Tracked) -> f64 {
+        self.state.map_or(0.0, |own| {
+            WorldPos::distance(own.pos, tracked.ship.state.pos)
+        })
+    }
+
+    /// How many ticks further in the past than the near range something as
+    /// far away as `tracked` is drawn (`space_protocol::far::draw_delay`):
+    /// things far away are sent less often, and are drawn far enough behind
+    /// to have the next sample in hand. A function of the distance alone, so
+    /// it does not step when an entity turns from a far replica into a ghost
+    /// and into an entity of the shard being played on. (The app takes the
+    /// distance to where it draws the two, `crate::bodies::draw_time`; this
+    /// is the same from the shard's last word on both.)
+    #[must_use]
+    pub fn extra_delay(&self, tracked: &Tracked) -> f64 {
+        far::draw_delay(self.distance_to(tracked)) - far::NEAR_DELAY
+    }
+
+    /// How old the newest sample of `tracked` is, ticks: the newest tick
+    /// heard minus the tick the sample is the state of.
+    #[must_use]
+    pub fn sample_age(&self, tracked: &Tracked) -> f64 {
+        tracked
+            .latest()
+            .map_or(0.0, |sample| self.tick.saturating_sub(sample.tick) as f64)
+    }
+
     /// The ship's displacement from where it first appeared, metres.
     #[must_use]
     pub fn offset(&self) -> [f64; 3] {
@@ -824,6 +1176,9 @@ struct Pending {
     /// The entity the redirect was about: the ship being handed over.
     entity: EntityGuid,
     opened: Instant,
+    /// The highest tick of a frame heard on this connection (0: none yet):
+    /// what the inputs sent to this shard acknowledge.
+    tick: u64,
     /// The newest scene this shard has announced on this connection, kept for
     /// the moment it becomes the shard being played on.
     scene: Option<SceneState>,
@@ -847,9 +1202,21 @@ struct Shared {
     fast: bool,
     /// Input batches sent.
     seq: u64,
+    /// The last tick an input was sent for ([`inputs_for`]); `None` before
+    /// the first, and after a switch onto a shard that counts other ticks.
+    input_sent: Option<u64>,
     /// The inputs sent since the app last took them ([`ServerLink::take_sent`]),
-    /// in the clock of the shard being played on (cleared at a switch).
+    /// in the clock of the shard being played on (cleared at a switch onto a
+    /// shard that counts other ticks).
     sent: VecDeque<PlayerInput>,
+    /// The last [`RESEND_LOG`] inputs sent, whether or not the app took
+    /// them: what a shard connected to for a handoff is told again
+    /// ([`resend_tail`]).
+    recent: VecDeque<PlayerInput>,
+    /// The address the player dialed first — what was typed, or `--server`.
+    /// A client endpoint without an IP (`0.0.0.0:port`) means "this host,
+    /// that port", for a join redirect and a handoff redirect alike.
+    entry: SocketAddr,
     /// The connection being played on: inputs go here, its frames are the view.
     active: Conn,
     /// Which reader generation belongs to `active`.
@@ -888,26 +1255,64 @@ pub struct ServerLink {
 }
 
 impl ServerLink {
-    /// Connect as an ordinary player and start the sender/reader tasks. Must be
-    /// called inside a tokio runtime.
+    /// Join the world through `entry` as an ordinary player and start the
+    /// sender/reader tasks. Must be called inside a tokio runtime.
+    ///
+    /// Every address is treated alike (`docs/plan-sharding.md` §4). Whatever
+    /// listens at `entry` answers the hello with one of three things:
+    ///
+    /// * a `Welcome` — it is a shard, and this is where the player plays;
+    /// * a `JoinRedirect` — it is the orchestrator's player port, or a shard
+    ///   that does not own the scene's spawn point: the link dials the shard
+    ///   it names, at the **client endpoint** its map gives for that shard
+    ///   (an endpoint without an IP, `0.0.0.0:port`, meaning `entry`'s host
+    ///   and that port), and says hello again there — at most
+    ///   [`MAX_JOIN_REDIRECTS`] times in one join;
+    /// * a `Reject` — the reason is the error.
+    ///
+    /// The link remembers `entry` for as long as it lives ([`Self::entry`]):
+    /// it is what a later handoff's client endpoints are resolved against.
     ///
     /// # Errors
     ///
-    /// [`NetError`] when the transport or the hello handshake fails (including
-    /// [`NetError::VersionMismatch`]).
-    pub async fn connect(addr: SocketAddr) -> Result<Self, NetError> {
+    /// [`JoinError`]: the address that was being dialed and what went wrong
+    /// there — the transport or the hello failed or was refused (including
+    /// [`NetError::VersionMismatch`]), a redirect too many, or a redirect to a
+    /// shard the map names no address for.
+    pub async fn join(entry: SocketAddr) -> Result<Self, JoinError> {
         let player_token: Arc<str> = unique_player_token().into();
-        let endpoint = client_endpoint_for(addr).map_err(|e| NetError::Handshake(e.to_string()))?;
-        let (conn, welcome) =
-            connect(&endpoint, addr, SERVER_NAME, &hello(player_token.as_ref())).await?;
-        // `endpoint` may drop: the connection keeps the endpoint driver alive.
+        let (conn, welcome) = join_through(entry, &player_token).await?;
+        Ok(Self::start(entry, player_token, conn, &welcome))
+    }
+
+    /// [`Self::join`], with a failure reduced to its [`NetError`] (a redirect
+    /// too many, or to nowhere, is a [`NetError::Protocol`] that says so).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::join`].
+    pub async fn connect(addr: SocketAddr) -> Result<Self, NetError> {
+        Self::join(addr).await.map_err(|err| match err.failure {
+            JoinFailure::Net(error) => error,
+            JoinFailure::TooManyRedirects(_) | JoinFailure::NoAddress(_) => {
+                NetError::Protocol(err.to_string())
+            }
+        })
+    }
+
+    /// Start the link's tasks on a connection a shard welcomed.
+    fn start(entry: SocketAddr, player_token: Arc<str>, conn: Conn, welcome: &Welcome) -> Self {
+        // (The client endpoint may drop: the connection keeps its driver alive.)
         let shared = Arc::new(Mutex::new(Shared {
             replica: Replica::joined(welcome.session, welcome.shard, &welcome.shard_map),
             tick_seen: Instant::now(),
             thrust: [0.0; 3],
             fast: false,
             seq: 0,
+            input_sent: None,
             sent: VecDeque::new(),
+            recent: VecDeque::new(),
+            entry,
             active: conn.clone(),
             active_generation: 0,
             next_generation: 1,
@@ -921,16 +1326,32 @@ impl ServerLink {
             spawn_reader(&shared, &player_token, conn, 0, true),
         ];
         lock(&shared).tasks = tasks;
-        Ok(Self {
+        Self {
             shared,
             player_token,
-        })
+        }
     }
 
     /// The player token this link presents to every shard.
     #[must_use]
     pub fn player_token(&self) -> &str {
         &self.player_token
+    }
+
+    /// The address this link was joined through: what the player dialed
+    /// first. It never changes — not with a join redirect, not with a
+    /// handoff.
+    #[must_use]
+    pub fn entry(&self) -> SocketAddr {
+        lock(&self.shared).entry
+    }
+
+    /// The address of the shard being played on right now: the entry address
+    /// itself when that is a shard, otherwise where a redirect led — and
+    /// after a handoff, the shard that took the ship.
+    #[must_use]
+    pub fn shard_address(&self) -> SocketAddr {
+        lock(&self.shared).active.remote_address()
     }
 
     /// Set the thrust intent sent with every following input batch.
@@ -944,9 +1365,11 @@ impl ServerLink {
     }
 
     /// The inputs sent since the last call, oldest first, each tagged with
-    /// the tick the shard is to apply it at (in the clock of the shard being
-    /// played on: a shard transition drops what was sent to the old one). A
-    /// prediction replays them on top of the shard's last word.
+    /// the tick the shard is to apply it at. A prediction replays them on top
+    /// of the shard's last word — across a shard transition too: the shards
+    /// of a cluster count the same ticks, and around the switch every input
+    /// went to both. (Only a transition onto a shard that counts other ticks
+    /// drops what was sent to the old one: [`Replica::tick_epoch`].)
     pub fn take_sent(&self) -> Vec<PlayerInput> {
         lock(&self.shared).sent.drain(..).collect()
     }
@@ -999,6 +1422,50 @@ impl Drop for ServerLink {
     }
 }
 
+/// Say hello at `addr` as the player `player_token`.
+async fn hello_at(addr: SocketAddr, player_token: &str) -> Result<Joined, NetError> {
+    let endpoint = client_endpoint_for(addr).map_err(|e| NetError::Handshake(e.to_string()))?;
+    join(&endpoint, addr, SERVER_NAME, &hello(player_token)).await
+}
+
+/// Where a player dials `shard` according to `map`, when it entered through
+/// `entry`: the shard's client endpoint, an endpoint without an IP meaning
+/// `entry`'s host ([`resolve_client_endpoint`]). `None` when the map names no
+/// address for the shard.
+fn client_address(map: &ShardMap, shard: ShardId, entry: SocketAddr) -> Option<SocketAddr> {
+    resolve_client_endpoint(map.client_endpoint_of(shard)?, entry.ip())
+}
+
+/// Say hello at `entry` and follow what it answers until a shard welcomes
+/// the player (see [`ServerLink::join`]).
+async fn join_through(entry: SocketAddr, player_token: &str) -> Result<(Conn, Welcome), JoinError> {
+    let mut at = entry;
+    let mut sent_on: Vec<ShardId> = Vec::new();
+    loop {
+        let fail = |failure| JoinError { at, failure };
+        match hello_at(at, player_token).await {
+            Ok(Joined::Shard(conn, welcome)) => {
+                if at != entry {
+                    log::info!(
+                        "space-client: {entry} sent this client to shard {} at {at}",
+                        welcome.shard.0
+                    );
+                }
+                return Ok((conn, welcome));
+            }
+            Ok(Joined::Elsewhere(redirect)) => {
+                sent_on.push(redirect.shard);
+                if sent_on.len() > MAX_JOIN_REDIRECTS {
+                    return Err(fail(JoinFailure::TooManyRedirects(sent_on)));
+                }
+                at = client_address(&redirect.shard_map, redirect.shard, entry)
+                    .ok_or_else(|| fail(JoinFailure::NoAddress(redirect.shard)))?;
+            }
+            Err(error) => return Err(fail(JoinFailure::Net(error))),
+        }
+    }
+}
+
 /// Ticks of simulation time in `elapsed`.
 fn ticks_in(elapsed: Duration) -> u64 {
     (elapsed.as_secs_f64() / f64::from(space_sim::dt())) as u64
@@ -1017,7 +1484,7 @@ async fn send_inputs(shared: SharedRef) {
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         clock.tick().await;
-        let (conn, batch) = {
+        let (conn, batch, also) = {
             let mut s = lock(&shared);
             if s.active.is_closed() {
                 return;
@@ -1035,29 +1502,53 @@ async fn send_inputs(shared: SharedRef) {
             let Some(entity) = s.replica.ship else {
                 continue;
             };
-            let tick = input_tick(s.replica.tick, s.tick_seen.elapsed());
-            s.seq += 1;
-            let input = PlayerInput {
-                entity,
-                thrust: s.thrust,
-                torque: [0.0; 3],
-                tick,
-                fast: s.fast,
+            // One input for every tick, and none twice.
+            let estimate = input_tick(s.replica.tick, s.tick_seen.elapsed());
+            let Some((first, tick)) = inputs_for(estimate, s.input_sent) else {
+                continue;
             };
-            s.sent.push_back(input);
+            s.input_sent = Some(tick);
+            s.seq += 1;
+            let inputs: Vec<PlayerInput> = (first..=tick)
+                .map(|tick| PlayerInput {
+                    entity,
+                    thrust: s.thrust,
+                    torque: [0.0; 3],
+                    tick,
+                    fast: s.fast,
+                })
+                .collect();
+            s.sent.extend(inputs.iter().copied());
             while s.sent.len() > SENT_LOG {
                 s.sent.pop_front();
+            }
+            s.recent.extend(inputs.iter().copied());
+            while s.recent.len() > RESEND_LOG {
+                s.recent.pop_front();
             }
             let batch = InputTick {
                 tick,
                 seq: s.seq,
-                inputs: vec![input],
+                inputs,
                 ack_tick: s.replica.tick,
             };
-            (s.active.clone(), batch)
+            // A handoff in flight: the shard that is taking the ship over
+            // gets the same input (see the module docs, "One timeline across
+            // the switch"), acknowledging what *it* has sent so far.
+            let also = s.pending.as_ref().filter(|p| !p.conn.is_closed()).map(|p| {
+                let batch = InputTick {
+                    ack_tick: p.tick,
+                    ..batch.clone()
+                };
+                (p.conn.clone(), batch)
+            });
+            (s.active.clone(), batch, also)
         };
         // A failed send on a live connection is a lost input, like any other.
         let _ = conn.send(&Message::InputTick(batch)).await;
+        if let Some((conn, batch)) = also {
+            let _ = conn.send(&Message::InputTick(batch)).await;
+        }
     }
 }
 
@@ -1096,20 +1587,91 @@ async fn read_frames(
             Ok(Some(Message::Redirect(redirect))) => {
                 follow_redirect(&shared, &player_token, generation, redirect);
             }
+            // The shard's last word to a client it has let go of: this
+            // connection is over (the shard closes it too). It names where a
+            // new player starts — or, while it does not know that, says
+            // "starting" (a `Reject`): the same last word without an address.
+            Ok(Some(Message::JoinRedirect(redirect))) => {
+                let_go(&shared, generation, Some(redirect.shard));
+                return;
+            }
+            Ok(Some(Message::Reject(_))) => {
+                let_go(&shared, generation, None);
+                return;
+            }
             Ok(Some(Message::SceneUpdate(update))) => on_scene(&shared, generation, update),
             Ok(Some(Message::SceneClock(clock))) => on_scene_clock(&shared, generation, clock),
             Ok(Some(message)) => on_frame(&shared, generation, &message),
-            // Peer gone.
-            Ok(None) => return,
+            // Peer gone. (A handoff's connection that ended is no longer a
+            // way to its shard: forget it, so the next redirect dials anew.)
+            Ok(None) => {
+                forget_closed_pending(&shared, generation);
+                return;
+            }
             // A bad frame ends nothing; the connection state is the authority
             // on whether to carry on.
             Err(e) => {
                 log::warn!("space-client: server frame: {e}");
                 if conn.is_closed() {
+                    forget_closed_pending(&shared, generation);
                     return;
                 }
             }
         }
+    }
+}
+
+/// The shard on the connection with reader `generation` has let go of this
+/// client — a `JoinRedirect` on an established connection, naming `owner` as
+/// where a new player starts, or a `Reject` (`owner` unknown: "starting"):
+/// it had let the client in for a handoff that never completed.
+///
+/// For the connection of a handoff in flight that is the end of that attempt
+/// and nothing more — the old shard was never given up, and offers the ship
+/// again if it still should go. For the connection being played on it is the
+/// end of the session: the link closes, and whoever keeps it up (the app,
+/// for a client started with a server address) joins again through the
+/// entry address.
+fn let_go(shared: &SharedRef, generation: u64, owner: Option<ShardId>) {
+    let mut s = lock(shared);
+    if generation == s.active_generation {
+        let starts = owner.map_or_else(
+            || "the cluster is starting".to_owned(),
+            |owner| format!("a new player starts on shard {}", owner.0),
+        );
+        log::warn!(
+            "space-client: the shard let go of this client ({starts}); the connection is closed"
+        );
+        s.active.close(0, "let go");
+        return;
+    }
+    if s.pending
+        .as_ref()
+        .is_some_and(|p| p.generation == generation)
+    {
+        if let Some(pending) = s.pending.take() {
+            log::info!(
+                "space-client: shard {} did not take the ship over; staying where it is",
+                pending.shard.0
+            );
+            pending.conn.close(0, "handoff did not complete");
+        }
+    }
+}
+
+/// The connection with reader `generation` has ended. If it was the
+/// connection of a handoff in flight, that attempt is over: the entry is
+/// dropped, so a later redirect to the same shard opens a new connection
+/// instead of "reporting in again" on a dead one (which would keep every
+/// further handoff to that shard from completing until the entry's patience
+/// ran out, ten seconds later).
+fn forget_closed_pending(shared: &SharedRef, generation: u64) {
+    let mut s = lock(shared);
+    if s.pending
+        .as_ref()
+        .is_some_and(|p| p.generation == generation && p.conn.is_closed())
+    {
+        s.pending = None;
     }
 }
 
@@ -1183,10 +1745,33 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
         return;
     };
     pending.ships.apply(message);
+    let heard = match message {
+        Message::Snapshot(frame) => Some(frame.tick),
+        Message::Delta(frame) => Some(frame.tick),
+        _ => None,
+    };
+    pending.tick = pending.tick.max(heard.unwrap_or(0));
     // The ship we have been flying — or, before any frame has named it, the
     // one the redirect was about.
     let ours = flying.unwrap_or(pending.entity);
     if !Replica::frame_has_ship_of(message, pending.session, ours) {
+        // A *different* ship under our new session: this shard did not take
+        // us for the player of the ship being handed over (it had dropped
+        // the transfer by the time we said hello) and let us in as a
+        // newcomer, with a ship on the spawn point. That connection can
+        // never become the switch, and while it lives there are two ships
+        // of this player. Close it now; the shard removes the ship with it.
+        // The old shard was never given up, and offers the ship again.
+        if Replica::frame_has_other_ship_of(message, pending.session, ours) {
+            if let Some(pending) = s.pending.take() {
+                log::info!(
+                    "space-client: shard {} let this client in as a new player instead of \
+                     taking the ship over; leaving it again",
+                    pending.shard.0
+                );
+                pending.conn.close(0, "not a handoff");
+            }
+        }
         return;
     }
     // The switch: the new shard is simulating our ship.
@@ -1195,14 +1780,33 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     };
     let retired = std::mem::replace(&mut s.active, pending.conn);
     s.active_generation = pending.generation;
+    // Does this shard count the ticks the old one counted? Its frame's tick
+    // against the tick the link expects now: on one cluster clock they are a
+    // frame's delivery apart.
+    let expected = s.replica.tick + ticks_in(s.tick_seen.elapsed()).min(MAX_TICK_EXTRAPOLATION);
+    let continuous =
+        s.replica.tick > 0 && heard.is_some_and(|tick| tick.abs_diff(expected) <= SWITCH_TOLERANCE);
+    let before = s.replica.tick;
     s.replica
-        .switch_to(pending.session, pending.shard, pending.ships);
+        .switch_to(pending.session, pending.shard, pending.ships, continuous);
     s.replica.apply(message);
-    let now = Instant::now();
-    s.tick_seen = now;
-    s.replica.tick_seen = Some(now);
-    // What was sent to the old shard is in its clock, not this one's.
-    s.sent.clear();
+    if !continuous || s.replica.tick != before {
+        let now = Instant::now();
+        s.tick_seen = now;
+        s.replica.tick_seen = Some(now);
+    }
+    if !continuous {
+        // What was sent to the old shard is in its clock, not this one's.
+        s.sent.clear();
+        s.recent.clear();
+        s.input_sent = None;
+        log::info!(
+            "space-client: shard {} counts other ticks than the shard before it (tick {} where \
+             {expected} was expected); starting over",
+            pending.shard.0,
+            heard.unwrap_or(0)
+        );
+    }
     // What the new shard announced while the handoff was in flight now comes
     // from the shard being played on. (A newer revision was taken when it
     // arrived; an older one still changes nothing.)
@@ -1240,6 +1844,20 @@ fn follow_redirect(
         }
         if s.replica.shard == Some(redirect.new_shard) {
             return;
+        }
+        // Only the ship this client flies is followed anywhere (see the
+        // module docs). Before the first frame has named it, the redirect is
+        // taken at its word: a shard redirects a ship's own player only.
+        if s.replica.ship.is_some_and(|ours| ours != redirect.entity) {
+            log::debug!(
+                "space-client: ignoring a redirect for {:?}, which is not this client's ship",
+                redirect.entity
+            );
+            return;
+        }
+        // A connection to that shard that has ended is not a way there.
+        if s.pending.as_ref().is_some_and(|p| p.conn.is_closed()) {
+            s.pending = None;
         }
         // Already connected there: the shards re-offered (the first attempt
         // timed out or was refused), so just report in again.
@@ -1289,19 +1907,33 @@ async fn open_redirect(
     generation: u64,
     redirect: &Redirect,
 ) -> Result<(), String> {
-    let addr = redirect
-        .shard_map
-        .regions
-        .iter()
-        .find(|region| region.shard == redirect.new_shard)
-        .map(|region| region.endpoint)
-        .filter(|addr| !addr.ip().is_unspecified() && addr.port() != 0)
+    // Where players reach the accepting shard: its client endpoint in the
+    // redirect's map, one without an IP meaning the host this client entered
+    // through — the rule a join redirect follows.
+    let entry = lock(shared).entry;
+    let addr = client_address(&redirect.shard_map, redirect.new_shard, entry)
         .ok_or("the shard map has no reachable endpoint for it")?;
-    let endpoint = client_endpoint_for(addr).map_err(|e| e.to_string())?;
-    let (conn, welcome) = connect(&endpoint, addr, SERVER_NAME, &hello(player_token.as_ref()))
-        .await
-        .map_err(|e| format!("{addr}: {e}"))?;
-    {
+    // One hello. The offering shard sends the redirect only after the
+    // accepting shard has staged the ship and said so (`HandoffAccept`), so
+    // that shard knows whose hello this is. (While the redirect went out
+    // together with the offer the hello could get there first, and the link
+    // asked up to five times; that order no longer exists.) What is left is
+    // a transfer the accepting shard has dropped again in between — an abort
+    // or a map change that crossed our hello. Then it answers as it answers
+    // a fresh join, and that is the end of this attempt, not something to
+    // ask again about: nothing was given up, and the old shard offers the
+    // ship anew (with a new redirect) if it still should go.
+    let (conn, welcome) = match hello_at(addr, player_token).await {
+        Ok(Joined::Shard(conn, welcome)) => (conn, welcome),
+        Ok(Joined::Elsewhere(sent_on)) => {
+            return Err(format!(
+                "{addr} does not take this client (a new player starts on shard {})",
+                sent_on.shard.0
+            ));
+        }
+        Err(e) => return Err(format!("{addr}: {e}")),
+    };
+    let tail = {
         let mut s = lock(shared);
         if let Some(previous) = s.pending.replace(Pending {
             conn: conn.clone(),
@@ -1310,6 +1942,7 @@ async fn open_redirect(
             shard: redirect.new_shard,
             entity: redirect.entity,
             opened: Instant::now(),
+            tick: 0,
             scene: None,
             scene_clock: None,
             ships: ShipView::default(),
@@ -1320,6 +1953,21 @@ async fn open_redirect(
             let reader = spawn_reader(shared, player_token, conn.clone(), generation, datagrams);
             s.track(reader);
         }
+        // From here on the sender gives this shard every batch too. What
+        // went out just before, for ticks still to come, it has not heard.
+        let tail = resend_tail(&s.recent, s.replica.tick);
+        s.seq += 1;
+        tail.last().map(|last| InputTick {
+            tick: last.tick,
+            seq: s.seq,
+            inputs: tail.clone(),
+            ack_tick: 0,
+        })
+    };
+    // Before the status that opens the commit's gate: the inputs for the
+    // ticks the commit may fall on ([`resend_tail`]).
+    if let Some(batch) = tail {
+        let _ = conn.send(&Message::InputTick(batch)).await;
     }
     // The gate the shards' commit waits for.
     conn.send_reliable(&neighbour_status(redirect))
@@ -1331,6 +1979,135 @@ async fn open_redirect(
 mod tests {
     use super::*;
     use space_protocol::Snapshot;
+
+    /// Every tick gets one input: the sender continues where it stopped,
+    /// fills what the clock skipped, and waits when it is a tick ahead.
+    ///
+    /// Mutation this catches: tagging each batch with the clock's estimate
+    /// alone (a tick the estimate skips gets no input and the ship coasts
+    /// through it; one it names twice gets two).
+    #[test]
+    fn every_tick_gets_exactly_one_input() {
+        assert_eq!(inputs_for(100, None), Some((100, 100)), "the first");
+        assert_eq!(inputs_for(101, Some(100)), Some((101, 101)), "in step");
+        assert_eq!(inputs_for(100, Some(100)), Some((101, 101)), "one ahead");
+        assert_eq!(inputs_for(100, Some(101)), None, "not two ahead");
+        assert_eq!(inputs_for(103, Some(100)), Some((101, 103)), "filled");
+        assert_eq!(
+            inputs_for(200, Some(100)),
+            Some((197, 200)),
+            "after a stall: the last few, not a hundred"
+        );
+        // Whatever the estimates do (a jittery clock: repeats, skips), the
+        // ticks sent are consecutive.
+        let estimates = [10, 10, 12, 13, 13, 13, 16, 17, 19, 19, 20, 22, 22, 23];
+        let (mut sent, mut all) = (None, Vec::new());
+        for estimate in estimates {
+            if let Some((first, last)) = inputs_for(estimate, sent) {
+                all.extend(first..=last);
+                sent = Some(last);
+            }
+        }
+        assert_eq!(
+            all,
+            (10..=24).collect::<Vec<u64>>(),
+            "consecutive, one ahead at most"
+        );
+    }
+
+    /// What a shard that has just been connected to for a handoff is told
+    /// again: the inputs already sent for ticks that are still to come — and
+    /// nothing older.
+    ///
+    /// Mutation this catches: saying nothing again (the inputs tagged up to
+    /// the lead ahead before the connection existed reach only the old
+    /// shard: a commit within the lead leaves the new shard without the
+    /// ticks right after it), saying everything again (ticks long stepped).
+    #[test]
+    fn a_shard_joined_for_a_handoff_is_told_the_inputs_still_to_come() {
+        let ship = EntityGuid::new(ShardId::new(1), 1);
+        let input = |tick| PlayerInput {
+            entity: ship,
+            thrust: [1.0, 0.0, 0.0],
+            torque: [0.0; 3],
+            tick,
+            fast: false,
+        };
+        // The newest frame is of tick 100; inputs were sent up to 103 (the
+        // lead), and the log still holds older ones.
+        let recent: VecDeque<PlayerInput> = (92..=103).map(input).collect();
+        let tail = resend_tail(&recent, 100);
+        assert_eq!(
+            tail.iter().map(|i| i.tick).collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        assert!(
+            resend_tail(&recent, 103).is_empty(),
+            "nothing still to come"
+        );
+        assert!(resend_tail(&VecDeque::new(), 100).is_empty());
+        assert!(
+            RESEND_LOG as u64 >= INPUT_LEAD + MAX_INPUT_FILL,
+            "the log covers what one batch can be ahead"
+        );
+    }
+
+    fn chunk(tick: u64, entities: Vec<EntitySnapshot>, more: bool) -> Message {
+        let Message::Snapshot(mut snapshot) = frame(tick, entities) else {
+            unreachable!("`frame` builds a snapshot");
+        };
+        snapshot.more = more;
+        Message::Snapshot(snapshot)
+    }
+
+    /// A snapshot that arrives in three chunks is one snapshot: every entity
+    /// of every chunk is held afterwards, and what none of them named is
+    /// dropped — when the last chunk arrives, not before.
+    ///
+    /// Mutation this catches: taking every chunk for the whole interest set
+    /// (after the third chunk only its entities are left — and the shard,
+    /// which counts all of them as known, never sends the others again while
+    /// they rest), never ending a snapshot (the stale entity stays for good).
+    #[test]
+    fn a_snapshot_in_three_chunks_is_one_snapshot() {
+        let guid = |n| EntityGuid::new(ShardId::new(1), n);
+        let mut r = Replica::new(7, ShardId::new(1));
+        // Held from before: the own ship and something the new snapshot will
+        // not name.
+        r.apply(&chunk(
+            10,
+            vec![ship(guid(1), 7, 0.0), ship(guid(99), 0, 5.0)],
+            false,
+        ));
+        assert_eq!(r.tracked().count(), 2);
+        // A new snapshot, a tick per chunk.
+        r.apply(&chunk(
+            20,
+            vec![ship(guid(1), 7, 1.0), ship(guid(2), 0, 2.0)],
+            true,
+        ));
+        r.apply(&chunk(
+            21,
+            vec![ship(guid(3), 0, 3.0), ship(guid(4), 0, 4.0)],
+            true,
+        ));
+        assert!(
+            r.entity(guid(99)).is_some(),
+            "nothing is dropped before the snapshot is complete"
+        );
+        r.apply(&chunk(22, vec![ship(guid(5), 0, 5.0)], false));
+        let mut held: Vec<u64> = r.tracked().map(|t| t.ship.guid.serial).collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            vec![1, 2, 3, 4, 5],
+            "every chunk's entities, no other"
+        );
+        assert_eq!(r.ship, Some(guid(1)), "the own ship among them");
+        // The next snapshot starts afresh: one chunk, and it is the whole.
+        r.apply(&chunk(30, vec![ship(guid(1), 7, 1.5)], false));
+        assert_eq!(r.tracked().count(), 1);
+    }
 
     #[test]
     fn server_name_matches_the_shards_certificate() {
@@ -1344,6 +2121,7 @@ mod tests {
             epoch: 1,
             entities,
             input_ack: 0,
+            more: false,
         })
     }
 
@@ -1373,6 +2151,62 @@ mod tests {
         let mut r = Replica::new(7, ShardId::new(1));
         assert!(!r.apply(&frame(5, vec![])));
         assert_eq!((r.tick, r.ship, r.offset()), (5, None, [0.0; 3]));
+    }
+
+    /// Where a redirect — a join redirect or a handoff's — is dialed: the
+    /// named shard's **client** endpoint, never its internal one; without an
+    /// IP it is the host of the address the player dialed first, with the
+    /// endpoint's port; a port of 0 is no address at all.
+    ///
+    /// Mutation this catches: dialing the internal endpoint (unreachable
+    /// from outside the cluster's host), dialing `0.0.0.0`, or resolving
+    /// against anything but the entry address.
+    #[test]
+    fn a_redirect_is_dialed_at_the_client_endpoint_on_the_entry_host() {
+        let entry: SocketAddr = "203.0.113.7:7777".parse().expect("an address");
+        let node = space_world::NodeRef::new(40, [0, 0, 0]);
+        let region = |shard: u32, internal: &str, players: &str| {
+            space_protocol::ShardRegion::new(
+                node,
+                ShardId::new(shard),
+                internal.parse().expect("an address"),
+            )
+            .with_client_endpoint(players.parse().expect("an address"))
+        };
+        let map = ShardMap::new(
+            1,
+            vec![
+                region(1, "127.0.0.1:7870", "0.0.0.0:7870"),
+                region(2, "127.0.0.1:7871", "198.51.100.9:7871"),
+                region(3, "127.0.0.1:7872", "0.0.0.0:0"),
+                region(4, "10.0.0.4:7873", "[::]:7873"),
+            ],
+        );
+        let dialed = |shard: u32| client_address(&map, ShardId::new(shard), entry);
+        assert_eq!(dialed(1), Some("203.0.113.7:7870".parse().unwrap()));
+        assert_eq!(dialed(2), Some("198.51.100.9:7871".parse().unwrap()));
+        assert_eq!(dialed(3), None, "not known yet");
+        assert_eq!(dialed(4), Some("203.0.113.7:7873".parse().unwrap()));
+        assert_eq!(dialed(5), None, "not in the map");
+        // Entered over IPv6: the same rule.
+        let entry6: SocketAddr = "[2001:db8::7]:7777".parse().expect("an address");
+        assert_eq!(
+            client_address(&map, ShardId::new(1), entry6),
+            Some("[2001:db8::7]:7870".parse().unwrap())
+        );
+        // A map built with `ShardRegion::new` has one address per shard.
+        let plain = ShardMap::new(
+            1,
+            vec![space_protocol::ShardRegion::new(
+                node,
+                ShardId::new(1),
+                "127.0.0.1:7778".parse().expect("an address"),
+            )],
+        );
+        assert_eq!(
+            client_address(&plain, ShardId::new(1), entry),
+            Some("127.0.0.1:7778".parse().unwrap())
+        );
     }
 
     #[test]
@@ -1413,7 +2247,7 @@ mod tests {
         let from_new = frame(40, vec![ship(guid, 3, 512.5)]);
         assert!(!r.apply(&from_new), "not ours until the switch");
         assert!(Replica::frame_has_ship_of(&from_new, 3, guid));
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         assert!(r.apply(&from_new));
         assert_eq!(
             (r.session, r.shard, r.handoffs),
@@ -1423,14 +2257,16 @@ mod tests {
         assert!((r.offset()[0] - 512.5).abs() < 1e-3, "{:?}", r.offset());
     }
 
-    /// A client that reaches the accepting shard before the shards' own offer
-    /// does is given a placeholder ship there. A frame showing that ship is
-    /// not the switch: the ship being handed over is still simulated by the
-    /// old shard, and switching would abandon it there.
+    /// A client whose hello the accepting shard did not recognise (the
+    /// transfer was dropped before the hello arrived) is, on the shard that
+    /// owns the spawn point, let in as a new player with a ship of its own.
+    /// A frame showing that ship is not the switch: the ship being handed
+    /// over is still simulated by the old shard, and switching would abandon
+    /// it there. It is what tells the link to leave that shard again
+    /// (`frame_has_other_ship_of`).
     ///
-    /// Mutation this catches: switching on any ship the new session owns — the
-    /// player (or a bystander redirected because it was watching the ship)
-    /// jumps to the accepting shard's spawn point.
+    /// Mutation this catches: switching on any ship the new session owns —
+    /// the player jumps to the accepting shard's spawn point.
     #[test]
     fn a_placeholder_ship_on_the_accepting_shard_is_not_the_switch() {
         let ours = EntityGuid::new(ShardId::new(1), 1);
@@ -1439,6 +2275,26 @@ mod tests {
         let with_placeholder = frame(5, vec![ship(placeholder, new_session, 512.0)]);
         assert!(!Replica::frame_has_ship_of(
             &with_placeholder,
+            new_session,
+            ours
+        ));
+        // It is a ship of this session that is not the one flown: the sign
+        // of a connection to leave. Other players' ships, and our own under
+        // whatever session, are not.
+        assert!(Replica::frame_has_other_ship_of(
+            &with_placeholder,
+            new_session,
+            ours
+        ));
+        let others = frame(5, vec![ship(placeholder, 8, 512.0), ship(ours, 9, 0.0)]);
+        assert!(!Replica::frame_has_other_ship_of(
+            &others,
+            new_session,
+            ours
+        ));
+        let adopted = frame(5, vec![ship(ours, new_session, 0.0)]);
+        assert!(!Replica::frame_has_other_ship_of(
+            &adopted,
             new_session,
             ours
         ));
@@ -1503,7 +2359,7 @@ mod tests {
         assert_eq!(r.scene, scene(Scene::Materials, 3));
 
         // The handoff itself keeps the scene.
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         assert_eq!(r.scene, scene(Scene::Materials, 3));
         assert_eq!(r.handoffs, 1);
     }
@@ -1554,14 +2410,19 @@ mod tests {
         )
     }
 
-    /// The anchor is the centre of the root region: the spawn point of the
-    /// first shard in each of the topologies the dev scripts start, the same
-    /// for every client whatever the order of the map's entries, and the
-    /// same before and after a split or a merge.
+    /// The anchor is a point of the root region — the centre of a one-cell
+    /// root, and for a larger one 6 m, 512 m up and 4 m from the corner where
+    /// its cells meet: the spawn point of the shard that owns it in each of
+    /// the topologies the dev scripts start, the same for every client
+    /// whatever the order of the map's entries, and the same before and after
+    /// a split or a merge.
     #[test]
-    fn the_anchor_is_the_centre_of_the_maps_root_region() {
+    fn the_anchor_is_a_point_of_the_maps_root_region() {
         use space_world::NodeRef;
-        let centre = |depth, index| NodeRef::new(depth, index).center();
+        // Beside and above the centre corner of a root of several cells.
+        let off_the_corner = |depth, index| {
+            WorldPos::from_f64_metres_around(NodeRef::new(depth, index).center(), [6.0, 512.0, 4.0])
+        };
         // One standalone shard: its cell's centre, the world origin.
         let single = ShardMap::new(1, vec![region(64, [0, 0, 0], 1)]);
         assert_eq!(map_anchor(&single), Some(WorldPos::ZERO));
@@ -1578,7 +2439,7 @@ mod tests {
         let root = region(40, [3, -2, 5], 7);
         let before = ShardMap::new(4, vec![root.clone()]);
         let anchor = map_anchor(&before);
-        assert_eq!(anchor, Some(centre(40, [3, -2, 5])));
+        assert_eq!(anchor, Some(off_the_corner(40, [3, -2, 5])));
         let child = NodeRef::new(41, [7, -4, 11]);
         assert!(space_world::octree::children(root.node)
             .expect("children")
@@ -1595,13 +2456,39 @@ mod tests {
                 region(42, [14, -8, 22], 9),
                 region(41, [6, -4, 10], 10),
             ],
+            // Single cells carved out of the root, the one the anchor lies in
+            // among them: the anchor is the root's, whoever owns its cell.
+            vec![
+                region(64, [7 << 23, -3 << 23, 11 << 23], 3),
+                root.clone(),
+                region(64, [(7 << 23) - 1, -3 << 23, 11 << 23], 4),
+            ],
         ] {
             assert_eq!(map_anchor(&ShardMap::new(5, split)), anchor);
         }
-        assert_eq!(map_anchor(&ShardMap::new(6, vec![root])), anchor);
+        assert_eq!(map_anchor(&ShardMap::new(6, vec![root.clone()])), anchor);
+        // The anchor lies strictly inside one cell: the lowest cell of the
+        // root's +x+y+z octant, 6 m and 4 m from its faces towards -x and -z
+        // and in the middle of its height.
+        let at = anchor.expect("an anchor");
+        assert_eq!(at.cell, [7 << 23, -3 << 23, 11 << 23]);
+        assert_eq!(at.cell, root.node.center().cell, "the centre corner's cell");
+        assert_eq!(at.local, [-506.0, 0.0, -508.0]);
+        assert!(space_world::octree::contains(
+            NodeRef::new(41, [7, -3, 11]),
+            at
+        ));
         // The handoff test's topology: A owns the node, B an octant of it.
         let carved = ShardMap::new(1, vec![region(63, [0, 0, 0], 1), region(64, [1, 1, 1], 2)]);
-        assert_eq!(map_anchor(&carved), Some(centre(63, [0, 0, 0])));
+        assert_eq!(map_anchor(&carved), Some(off_the_corner(63, [0, 0, 0])));
+        assert_eq!(
+            map_anchor(&carved),
+            Some(WorldPos {
+                cell: [1, 1, 1],
+                local: [-506.0, 0.0, -508.0]
+            }),
+            "inside B's cell"
+        );
         // No region, no anchor.
         assert_eq!(map_anchor(&ShardMap::new(1, Vec::new())), None);
     }
@@ -1618,7 +2505,7 @@ mod tests {
         assert_eq!(r.anchor(), anchor, "known before any frame");
         r.apply(&frame(10, vec![ship(guid, 7, 300.0)]));
         assert_eq!(r.anchor(), anchor, "not where the ship appeared");
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         r.apply(&frame(4, vec![ship(guid, 3, 400.0)]));
         assert_eq!(r.anchor(), anchor);
 
@@ -1774,6 +2661,83 @@ mod tests {
     /// A ship marked with the player visual is a player whatever its owner
     /// (the ghost of a player on a neighbouring shard arrives with owner 0);
     /// one without it and without an owner is a ship nobody flies.
+    /// One entity, three copies in turn: a far replica (its samples at the
+    /// tick its origin names), the shard's ghost of it, an entity of the
+    /// shard itself — one history, in order, and a delay that depends on the
+    /// distance alone.
+    ///
+    /// Mutation this catches: taking a far sample for the state of the
+    /// frame's tick (it is the state of a tick or two earlier: the entity
+    /// would be drawn that much of its motion behind, and jump forward by
+    /// it when it becomes a ghost); reading the source off anything but the
+    /// newest word (an entity that was far once stays "far").
+    #[test]
+    fn a_far_replicas_samples_are_of_the_tick_its_origin_names() {
+        use space_protocol::Origin;
+        let shard = ShardId::new(1);
+        let other = ShardId::new(2);
+        let (me, it) = (EntityGuid::new(shard, 1), EntityGuid::new(other, 5));
+        let with = |x: f64, origin: Option<Origin>| {
+            let mut e = ship(it, 0, x);
+            e.components.retain(|(id, _)| *id == ShipState::ID);
+            match origin {
+                Some(origin) => e.components.push((ORIGIN_COMPONENT, origin.encode())),
+                // (A delta says a component went away with an empty payload.)
+                None => e.components.push((ORIGIN_COMPONENT, Vec::new())),
+            }
+            e
+        };
+        let mut r = Replica::new(7, shard);
+        r.apply(&frame(
+            100,
+            vec![ship(me, 7, 0.0), with(300.0, Some(Origin::far(other, 98)))],
+        ));
+        let seen = r.entity(it).expect("held");
+        assert_eq!(seen.source(), Source::Far);
+        assert_eq!(seen.latest().expect("a sample").tick, 98);
+        assert_eq!(seen.tick, 100, "the frame's tick still orders the frames");
+        assert_eq!(r.sample_age(seen), 2.0);
+        assert_eq!(r.distance_to(seen), 300.0);
+        assert_eq!(
+            r.extra_delay(seen),
+            far::draw_delay(300.0) - far::NEAR_DELAY
+        );
+        // The next sample, six ticks on; a far tick from the future is held
+        // to the frame's.
+        r.apply(&delta(
+            106,
+            vec![with(290.0, Some(Origin::far(other, 104)))],
+            vec![],
+        ));
+        r.apply(&delta(
+            107,
+            vec![with(289.0, Some(Origin::far(other, 900)))],
+            vec![],
+        ));
+        // It comes into the border margin: the shard's ghost of it; then it
+        // is handed over: the shard's own.
+        r.apply(&delta(
+            109,
+            vec![with(280.0, Some(Origin::ghost(other)))],
+            vec![],
+        ));
+        assert_eq!(r.entity(it).expect("held").source(), Source::Ghost);
+        r.apply(&delta(110, vec![with(279.0, None)], vec![]));
+        let seen = r.entity(it).expect("held");
+        assert_eq!(seen.source(), Source::Local);
+        assert!(seen
+            .components
+            .iter()
+            .all(|(id, _)| *id != ORIGIN_COMPONENT));
+        // (It is at rest in every sample, so the history also holds where it
+        // stood until each next one.)
+        let ticks: Vec<u64> = seen.history.iter().map(|s| s.tick).collect();
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]), "in order: {ticks:?}");
+        for tick in [98, 104, 107, 109, 110] {
+            assert!(ticks.contains(&tick), "one history: {ticks:?}");
+        }
+    }
+
     #[test]
     fn the_player_visual_makes_a_ghost_a_player() {
         use space_sim::Visual;
@@ -1806,7 +2770,13 @@ mod tests {
     /// A shard sends nothing for an entity at rest; when it moves again, the
     /// history holds its rest pose up to the tick before, so the move is not
     /// smeared back over the quiet ticks — and a long gap of a moving entity
-    /// starts the history over.
+    /// starts the history over. "Long" is longer than two spacings of the
+    /// coarsest distance step: something far off is sent once a second, and
+    /// 39 ticks between two of its samples are one motion (they were a
+    /// restart while everything was sent every tick).
+    ///
+    /// Mutation this catches: the old limit of 15 ticks — everything beyond
+    /// a kilometre would start over at every sample and be drawn in jumps.
     #[test]
     fn a_resting_entity_holds_until_it_moves() {
         let guid = EntityGuid::new(ShardId::new(1), 3);
@@ -1824,15 +2794,26 @@ mod tests {
         };
         moving.components[1].1 = space_sim::wire::encode_ship_state(&state);
         r.apply(&frame(21, vec![moving.clone()]));
-        r.apply(&frame(60, vec![moving]));
-        let ticks: Vec<u64> = r
-            .entity(guid)
-            .unwrap()
-            .history
-            .iter()
-            .map(|s| s.tick)
-            .collect();
-        assert_eq!(ticks, [60], "a moving entity's long gap starts over");
+        r.apply(&frame(60, vec![moving.clone()]));
+        let ticks = |r: &Replica| -> Vec<u64> {
+            r.entity(guid)
+                .unwrap()
+                .history
+                .iter()
+                .map(|s| s.tick)
+                .collect()
+        };
+        assert_eq!(
+            ticks(&r),
+            [10, 19, 20, 21, 60],
+            "39 ticks: a sparse sample of one motion"
+        );
+        r.apply(&frame(60 + MAX_INTERPOLATION_GAP + 1, vec![moving]));
+        assert_eq!(
+            ticks(&r),
+            [60 + MAX_INTERPOLATION_GAP + 1],
+            "a moving entity's long gap starts over"
+        );
     }
 
     /// The inputs the link sends are kept for the prediction, and the frame's
@@ -1870,10 +2851,120 @@ mod tests {
         // The frame that shows our ship there is an ordinary delta.
         let switch = delta(4, vec![ship(ours, 9, 1.0)], vec![]);
         pending.apply(&switch);
-        r.switch_to(9, ShardId::new(2), pending);
+        r.switch_to(9, ShardId::new(2), pending, false);
         r.apply(&switch);
         assert_eq!(r.others().map(|s| s.guid).collect::<Vec<_>>(), [other]);
         assert_eq!(r.ship, Some(ours));
+    }
+
+    /// A switch onto a shard that counts the same ticks changes the session
+    /// and nothing else: the tick, the ship's last state and its `input_ack`
+    /// stand, every entity the new shard reports too keeps the motion the
+    /// old one showed, and what only the old shard knew is gone.
+    ///
+    /// Mutation this catches: zeroing the ticks at every switch (the app's
+    /// clock snaps and its prediction is rebuilt — `tick_epoch` is how it
+    /// would notice), taking the new shard's view as it is (every body and
+    /// player starts a new history: drawn two ticks behind, it stands still
+    /// for those two ticks and then jumps), keeping what the new shard never
+    /// reported (a ghost that nobody will ever remove).
+    #[test]
+    fn a_switch_on_one_timeline_keeps_the_ticks_and_the_histories() {
+        let (ours, both, old_only, new_only) = (
+            EntityGuid::new(ShardId::new(1), 1),
+            EntityGuid::new(ShardId::new(1), 2),
+            EntityGuid::new(ShardId::new(1), 3),
+            EntityGuid::new(ShardId::new(2), 5),
+        );
+        let mut r = Replica::new(7, ShardId::new(1));
+        for tick in 96..=100 {
+            let x = tick as f64;
+            let mut f = delta(
+                tick,
+                vec![
+                    ship(ours, 7, x),
+                    ship(both, 0, 2.0 * x),
+                    ship(old_only, 0, 5.0),
+                ],
+                vec![],
+            );
+            if let Message::Delta(d) = &mut f {
+                d.input_ack = tick;
+            }
+            r.apply(&f);
+        }
+        let history = |r: &Replica, guid| -> Vec<u64> {
+            r.entity(guid)
+                .map(|t| t.history.iter().map(|s| s.tick).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(history(&r, both), [96, 97, 98, 99, 100]);
+        // The new shard's first frame: the tick after, our ship under its
+        // session, the entity both report as its ghost, one of its own.
+        let mut switch = frame(
+            101,
+            vec![
+                ship(ours, 9, 101.0),
+                ship(both, 0, 202.0),
+                ship(new_only, 4, 0.0),
+            ],
+        );
+        if let Message::Snapshot(s) = &mut switch {
+            s.input_ack = 100;
+        }
+        let mut pending = ShipView::default();
+        pending.apply(&switch);
+        r.switch_to(9, ShardId::new(2), pending, true);
+        assert_eq!((r.tick, r.state_tick(), r.input_ack()), (100, 100, 100));
+        assert_eq!((r.tick_epoch, r.handoffs, r.session), (0, 1, 9));
+        assert!(
+            r.apply(&switch),
+            "the frame names our ship under the new session"
+        );
+        assert_eq!((r.tick, r.state_tick(), r.input_ack()), (101, 101, 100));
+        assert_eq!(r.ship, Some(ours));
+        assert_eq!(history(&r, both), [96, 97, 98, 99, 100, 101], "one history");
+        assert_eq!(history(&r, ours), [96, 97, 98, 99, 100, 101]);
+        assert_eq!(history(&r, new_only), [101]);
+        assert!(r.entity(old_only).is_none(), "not this shard's to report");
+        assert_eq!(
+            r.others().map(|s| s.guid).collect::<Vec<_>>(),
+            [both, new_only]
+        );
+        // A sample the old shard had for a tick the new one reports too (or
+        // a later one) is not kept beside it.
+        let mut later = Replica::new(7, ShardId::new(1));
+        for tick in 100..=103 {
+            later.apply(&delta(
+                tick,
+                vec![ship(ours, 7, 0.0), ship(both, 0, tick as f64)],
+                vec![],
+            ));
+        }
+        let mut pending = ShipView::default();
+        pending.apply(&frame(102, vec![ship(ours, 9, 0.0), ship(both, 0, 102.0)]));
+        later.switch_to(9, ShardId::new(2), pending, true);
+        assert_eq!(history(&later, both), [100, 101, 102]);
+        assert_eq!(later.tick, 103, "the clock does not run backwards");
+
+        // Onto a shard that counts other ticks: everything starts over, and
+        // the app is told.
+        let mut other = Replica::new(7, ShardId::new(1));
+        other.apply(&delta(
+            100,
+            vec![ship(ours, 7, 0.0), ship(both, 0, 1.0)],
+            vec![],
+        ));
+        let mut pending = ShipView::default();
+        let first = frame(5_000, vec![ship(ours, 9, 0.0), ship(both, 0, 1.0)]);
+        pending.apply(&first);
+        other.switch_to(9, ShardId::new(2), pending, false);
+        assert_eq!(
+            (other.tick, other.state_tick(), other.tick_epoch),
+            (0, 0, 1)
+        );
+        other.apply(&first);
+        assert_eq!(history(&other, both), [5_000]);
     }
 
     /// Inputs are tagged ahead of the server's clock even when frames stop

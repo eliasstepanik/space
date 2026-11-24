@@ -362,6 +362,7 @@ pub struct ServerInfo {
 pub const fn launcher_label(kind: LauncherKind) -> &'static str {
     match kind {
         LauncherKind::Local => "local",
+        LauncherKind::Process => "process",
         LauncherKind::Docker => "docker",
     }
 }
@@ -1107,7 +1108,7 @@ mod tests {
     use crate::control::ControlPlane;
     use crate::epoch::EpochPublisher;
     use crate::ids::{MemoryCounterSink, PersistentShardIdAllocator};
-    use crate::launcher::{LaunchError, Launcher, Poll, ShardHandle, SpawnSpec};
+    use crate::launcher::{LaunchError, LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
     use crate::ops::OpsPort;
     use crate::orchestrator::Orchestrator;
     use crate::OrchestratorConfig;
@@ -1126,15 +1127,16 @@ mod tests {
     impl Launcher for NoLauncher {
         async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
             Ok(ShardHandle {
-                shard: spec.shard,
-                endpoint: spec.region.endpoint,
+                launch: spec.launch,
+                shard: None,
+                endpoint: spec.control_addr,
                 process: "none".into(),
             })
         }
-        async fn kill(&self, _shard: ShardId) -> Result<(), LaunchError> {
+        async fn kill(&self, _launch: LaunchId) -> Result<(), LaunchError> {
             Ok(())
         }
-        async fn poll(&self, _shard: ShardId) -> Result<Poll, LaunchError> {
+        async fn poll(&self, _launch: LaunchId) -> Result<Poll, LaunchError> {
             Ok(Poll::Alive)
         }
     }
@@ -1167,6 +1169,8 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 7_001)),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         })
         .expect("the root owner registers");
         orch.note_connected([ShardId::new(1)]);
@@ -1462,6 +1466,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: loopback(),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         });
         let (handle, _port) = crate::ops::channel(orch.snapshot());
         let service = service_with(handle, None, &[]);
@@ -1489,6 +1495,7 @@ mod tests {
             players: 3,
             tick_p95_ms: f32::NAN,
             load: f32::INFINITY,
+            ..Default::default()
         });
         orch.tick();
         let (handle, _port) = crate::ops::channel(orch.snapshot());
@@ -1528,6 +1535,103 @@ mod tests {
         );
         let page = text(&service.handle(&get("/")).await);
         assert!(!page.contains("peer-token-never-shown"));
+    }
+
+    /// The page and the JSON show the one address players type, whom a hello
+    /// there is sent to, and — per shard and per region — where players dial
+    /// it beside where shards do. Without a player port the page says so.
+    ///
+    /// Mutation this catches: a client endpoint that is in the map and
+    /// nowhere an operator can see it (a player sent to the wrong address is
+    /// then debugged from packet captures), or a page that needs a script to
+    /// show it.
+    #[tokio::test]
+    async fn the_page_and_the_json_show_the_player_port_and_each_client_endpoint() {
+        let config = OrchestratorConfig {
+            cluster: "space-test".into(),
+            player_bind: Some(SocketAddr::from(([127, 0, 0, 1], 7_777))),
+            ..OrchestratorConfig::default()
+        };
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                config.bind,
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(MemoryCounterSink::default()));
+        let mut control =
+            ControlPlane::new(config, ids, EpochPublisher::new(map), "peer-token".into());
+        control.set_unclaimed_root_owner(ShardId::new(1));
+        let mut orch = Orchestrator::new(control, Arc::new(NoLauncher));
+
+        // Nobody has claimed the root: players are told the cluster is
+        // starting.
+        let (handle, _port) = crate::ops::channel(orch.snapshot());
+        let service = service_with(handle, None, &[]);
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        assert!(
+            json.contains(
+                "\"player_port\":{\"bind\":\"127.0.0.1:7777\",\"answer\":\"starting\",\
+                 \"sends_to_shard\":null,\"redirected\":0,\"told_starting\":0,\"refused_busy\":0}"
+            ),
+            "{json}"
+        );
+        let page = text(&service.handle(&get("/")).await);
+        assert!(page.contains("player port (QUIC)"), "{page}");
+        assert!(page.contains("127.0.0.1:7777"));
+        assert!(page.contains("the cluster is starting"), "{page}");
+
+        // A shard the process launcher started registers: it listens on
+        // loopback and sends its players to the host they dialed.
+        orch.handle_shard_hello(&ShardHello {
+            cluster: "space-test".into(),
+            shard: ShardId::NONE,
+            endpoint: SocketAddr::from(([127, 0, 0, 1], 7_870)),
+            region: None,
+            client_endpoint: Some(SocketAddr::from(([0, 0, 0, 0], 7_870))),
+            secret: String::new(),
+        })
+        .expect("the root");
+        let (handle, _port) = crate::ops::channel(orch.snapshot());
+        let service = service_with(handle, None, &[]);
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        for needle in [
+            "\"answer\":\"redirect\",\"sends_to_shard\":1",
+            "\"spawn_owner\":1",
+            // The region, and the shard.
+            "\"endpoint\":\"127.0.0.1:7870\",\"client_endpoint\":\"0.0.0.0:7870\"",
+            "\"advertised\":\"127.0.0.1:7870\",\"client_endpoint\":\"0.0.0.0:7870\"",
+        ] {
+            assert!(json.contains(needle), "missing {needle} in {json}");
+        }
+        let page = text(&service.handle(&get("/")).await);
+        for needle in [
+            "players are sent to",
+            "shard 1, which owns the spawn point",
+            "<th>players dial</th>",
+            "0.0.0.0:7870",
+            "the host they dialed, port 7870",
+            "127.0.0.1:7870, players dial 0.0.0.0:7870",
+            "control endpoint (QUIC, shards only)",
+        ] {
+            assert!(page.contains(needle), "missing {needle:?} in {page}");
+        }
+        assert!(!page.contains("<script"), "no script on the page");
+
+        // No player port: the page says so, the JSON says null.
+        let (plain, _port, _) = super::tests::service(None);
+        let json = text(&plain.handle(&get("/api/state")).await);
+        assert!(json.contains("\"player_port\":null"), "{json}");
+        assert!(
+            json.contains("\"client_endpoint\":\"127.0.0.1:7001\""),
+            "a shard that asked for none: players dial its address: {json}"
+        );
+        let page = text(&plain.handle(&get("/")).await);
+        assert!(page.contains("players dial a shard directly"), "{page}");
     }
 
     /// A shard that has sent no report shows as "no report", never as zeros.
@@ -2021,10 +2125,16 @@ mod tests {
         assert_eq!(response.header("x-space-result"), Some("accepted"));
         let location = response.header("location").expect("a redirect").to_owned();
         assert!(location.starts_with("../?refresh=10&notice="), "{location}");
-        assert!(text(&response).starts_with("accepted: epoch 2 proposed"));
+        assert!(
+            text(&response).starts_with("accepted: region 41:1:1:1 is wanted for a new shard"),
+            "{}",
+            text(&response)
+        );
 
-        // The page the redirect leads to shows the outcome and the change in
-        // flight (nobody acks here, so it stays in flight).
+        // The page the redirect leads to shows the outcome and what is under
+        // way: the octant waits for its shard, and one is being started
+        // (nobody registers here, so that is where it stays — nothing is
+        // proposed before a shard is there to take the octant).
         let page = text(
             &service
                 .handle(&get(location.trim_start_matches("..")))
@@ -2034,16 +2144,16 @@ mod tests {
             page.contains("class=\"notice ok\""),
             "the outcome is on top"
         );
-        assert!(page.contains("Epoch change in flight"));
-        assert!(page.contains("41:1:1:1"));
-        assert!(page.contains("split child, epoch pending"));
+        assert!(page.contains("<dt>waiting for a shard</dt><dd>region 41:1:1:1</dd>"));
+        assert!(page.contains("<dt>starting</dt><dd>1 shard(s)</dd>"));
+        assert!(!page.contains("Epoch change in flight"));
 
-        // A second change while one is in flight is refused, and says why.
+        // A second change while one is under way is refused, and says why.
         let response = service.handle(&post("/action/split", &body)).await;
         assert_eq!(response.status, 303);
         assert_eq!(response.header("x-space-result"), Some("refused"));
         assert!(
-            text(&response).contains("still in flight"),
+            text(&response).contains("still waiting for its new shard"),
             "{}",
             text(&response)
         );
@@ -2055,6 +2165,115 @@ mod tests {
         );
         assert!(page.contains("class=\"notice bad\""));
         assert!(page.contains("one change at a time"));
+    }
+
+    /// A region carved more than one level down — one cell under the
+    /// depth-40 root — is listed under the region around it, the page and the
+    /// JSON say what it would be merged into, and the page's merge button
+    /// carries the merge out.
+    ///
+    /// Mutation this catches: taking "the region around it" to be the parent
+    /// *node* (the cell would be listed as a top-level region with no merge
+    /// button, and its merge refused for want of a parent).
+    #[tokio::test]
+    async fn a_carved_cell_is_listed_under_its_region_and_merged_from_the_page() {
+        let mut orch = orchestrator("space-test");
+        let root = orch.config().root_node();
+        let k = root.center().cell;
+        let cell = space_world::NodeRef::new(64, [k[0] - 1, k[1], k[2]]);
+        orch.begin_carve(cell).expect("the cell is inside the root");
+        // The shard for it registers (no id, no region) and is given the cell.
+        let new = orch
+            .handle_shard_hello(&ShardHello {
+                cluster: "space-test".to_owned(),
+                shard: ShardId::NONE,
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 7_002)),
+                region: None,
+                client_endpoint: None,
+                secret: String::new(),
+            })
+            .expect("the new shard registers");
+        assert_eq!((new.shard, new.region.node), (ShardId::new(2), cell));
+        // While its epoch is in flight the page says so.
+        {
+            let (handle, _port) = crate::ops::channel(orch.snapshot());
+            let page = text(&service_with(handle, None, &[]).handle(&get("/")).await);
+            assert!(page.contains("Epoch change in flight"));
+            assert!(page.contains("new, epoch pending"));
+            assert!(page.contains(&format!(
+                "carve of region {} for new shard 2",
+                crate::snapshot::node_path(cell)
+            )));
+        }
+        for shard in [ShardId::new(1), new.shard] {
+            orch.handle_epoch_ack(shard, 2);
+        }
+        assert_eq!(orch.map().epoch, 2, "the carve committed");
+        for _ in 0..crate::config::MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        // The cell's shard says it is empty, and the root's shard — which
+        // would take the cell back — has reported too (a merge needs both).
+        for shard in [new.shard, ShardId::new(1)] {
+            orch.handle_load_report(&LoadReport {
+                shard,
+                players: 0,
+                tick_p95_ms: 1.0,
+                load: 0.0,
+                ..Default::default()
+            });
+        }
+        let path = crate::snapshot::node_path(cell);
+        let (handle, port) = crate::ops::channel(orch.snapshot());
+        run_loop(orch, port, ShardAnswers::Promptly);
+        let service = service_with(handle, None, &[]);
+
+        let json = text(&service.handle(&get("/api/state")).await);
+        check_json(&json).unwrap_or_else(|why| panic!("{why}\n{json}"));
+        let entry = json
+            .split("{\"node\":")
+            .find(|region| region.starts_with(&format!("{{\"path\":\"{path}\"")))
+            .unwrap_or_else(|| panic!("the cell is not among the regions of {json}"));
+        for needle in [
+            "\"depth\":64",
+            "\"shard\":2",
+            // Nested in the root, whose node is its enclosing region although
+            // it is 24 levels up; it is nobody's octant.
+            "\"nesting\":1,\"parent\":\"40:0:0:0\",\"octant\":null,\"free_octants\":[]",
+            "\"split_refused_because\":\"region at depth 64 (edge 1024 m) is below the split floor\"",
+            "\"merge_refused_because\":null",
+        ] {
+            assert!(entry.contains(needle), "missing {needle} in {entry}");
+        }
+
+        let page = text(&service.handle(&get("/")).await);
+        assert!(page.contains(&path), "the cell has a row");
+        assert!(
+            page.contains(": carved out of 40:0:0:0, 24 levels up"),
+            "the row says where the cell was carved from"
+        );
+        // One region can be merged — the cell — and its button is live.
+        assert_eq!(page.matches("action=\"action/merge\"").count(), 1);
+        assert!(
+            page.contains("<button title=\"Give this region back")
+                && page.contains(">merge into shard 1</button>"),
+            "an enabled merge button naming the root's owner"
+        );
+
+        let body = format!("csrf={}&epoch=2&shard=2", service.form_token);
+        let response = service.handle(&post("/action/merge", &body)).await;
+        assert_eq!(response.status, 303, "{}", text(&response));
+        assert_eq!(response.header("x-space-result"), Some("accepted"));
+        assert!(
+            text(&response).starts_with(&format!(
+                "accepted: epoch 3 proposed, region {path} goes back to shard 1"
+            )),
+            "{}",
+            text(&response)
+        );
+        let page = follow(&service, &response).await;
+        assert!(page.contains("Epoch change in flight"));
+        assert!(page.contains("merge of shard 2"));
     }
 
     /// Mutation this catches: trusting the browser's credentials alone. A page

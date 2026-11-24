@@ -159,6 +159,12 @@ impl SnapshotBuilder {
     /// made it replay its whole pending queue. The `removed`/`input_ack` fields
     /// are real now.
     pub fn finish_snapshot(&mut self, input_ack: u64) -> Snapshot {
+        self.finish_snapshot_chunk(input_ack, false)
+    }
+
+    /// Finish the batch as one chunk of a snapshot that goes out in several:
+    /// `more` says whether further chunks follow ([`Snapshot::more`]).
+    pub fn finish_snapshot_chunk(&mut self, input_ack: u64, more: bool) -> Snapshot {
         let entities = std::mem::take(&mut self.entities);
         self.used = 0;
         Snapshot {
@@ -167,6 +173,7 @@ impl SnapshotBuilder {
             epoch: self.epoch,
             entities,
             input_ack,
+            more,
         }
     }
 
@@ -274,6 +281,7 @@ mod tests {
                 epoch,
                 entities: Vec::new(),
                 input_ack: tick,
+                more: false,
             });
             let delta = Message::Delta(Delta {
                 tick,

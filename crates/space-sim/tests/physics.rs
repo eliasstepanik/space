@@ -1003,6 +1003,70 @@ fn export_import_round_trip_and_hostile_lists() {
     }
 }
 
+/// Inputs that were filed for a ship while this world simulated it are not
+/// applied once the ship has been handed away and is a ghost here: the ghost
+/// keeps the controls and the velocity its owner reports.
+///
+/// This holds because a ghost is given neither `ShipControls` nor an
+/// `Owner` when it is imported, and every write of `drain_inputs` goes
+/// through one of the two.
+///
+/// Mutation this catches: a ghost that is imported like a ship, with
+/// controls and an owner (the old player's input then leaves fast travel
+/// for it and clamps its velocity to the normal top speed — the ship a
+/// neighbour is flying at 300 m/s is shown, and collided with, at 120 — and
+/// the old session's `input_ack` runs on for inputs nobody applied).
+#[test]
+fn a_ghost_takes_no_input_that_was_filed_for_the_ship_it_replaces() {
+    let o = WorldPos::ZERO;
+    let mut here = SimWorld::new(ShardId(1));
+    let mut state = ShipState::at_rest(at(o, [0.0, 50.0, 0.0]));
+    state.vel = [300.0, 0.0, 0.0];
+    let entity = here.spawn_ship(guid(7), 5, state);
+    here.world_mut()
+        .get_mut::<space_sim::ShipControls>(entity)
+        .expect("a ship has controls")
+        .fast = true;
+    // The player's inputs for the next three ticks: fast travel off.
+    let now = here.tick();
+    let inputs: Vec<PlayerInput> = (1..=3)
+        .map(|i| PlayerInput {
+            entity: guid(7),
+            thrust: [0.0, 0.0, 1.0],
+            torque: [0.0; 3],
+            tick: now + i,
+            fast: false,
+        })
+        .collect();
+    here.apply_inputs(now, &inputs);
+    assert_eq!(here.buffered_input_count(), 3);
+    // The ship is handed away: it leaves, and its ghost takes its place.
+    let components = here.export_entity(guid(7)).expect("exports");
+    here.despawn(guid(7));
+    here.insert_ghost(guid(7), &components).expect("a ghost");
+    let before = here.export_entity(guid(7)).expect("the ghost exports");
+    for _ in 0..3 {
+        here.step();
+    }
+    assert_eq!(here.buffered_input_count(), 0);
+    assert_eq!(
+        here.state_of(guid(7)).expect("the ghost").vel,
+        [300.0, 0.0, 0.0],
+        "the ghost's velocity is its owner's word"
+    );
+    assert_eq!(
+        here.export_entity(guid(7)).expect("the ghost exports"),
+        before,
+        "no component of the ghost was touched"
+    );
+    assert_eq!(
+        here.input_ack(5),
+        0,
+        "nothing was applied for the old session"
+    );
+    assert_eq!(here.input_ack(0), 0, "nor for nobody's");
+}
+
 /// A ghost driven from outside pushes a dynamic body of this world and is
 /// never integrated here; a spring owned by a ghost pulls on this world's end.
 #[test]
@@ -1458,4 +1522,113 @@ fn a_dynamic_concave_body_uses_its_cached_convex_decomposition() {
         "at rest: {:?}",
         st.vel
     );
+}
+
+// ---------------------------------------------------------------------------
+// bubbles and resting bodies
+// ---------------------------------------------------------------------------
+
+/// A stack of five 0.8 m crates asleep on a floor, with a bob on a spring
+/// beside it that never comes to rest (so their bubble is stepped every
+/// tick), and `passers` weightless balls flying past in a row, 5 m beside the
+/// stack, at 20 m/s: they come into the stack's bubble and leave it again.
+/// The passers have the lowest guids of all.
+///
+/// Returns how far any crate was from where it rested, at worst, and whether
+/// every crate stayed asleep throughout.
+fn a_stack_is_passed_by(passers: u64) -> (f64, bool) {
+    let o = WorldPos::ZERO;
+    let mut sim = SimWorld::new(ShardId(1));
+    sim.set_statics(vec![floor(o, 0.0, 10.0)]).unwrap();
+    sim.set_gravity(GravityField {
+        zones: vec![zone(o, 50.0)],
+        bodies: vec![],
+        clock: Default::default(),
+    });
+    let crates = 100..105u64;
+    for (i, n) in crates.clone().enumerate() {
+        spawn(
+            &mut sim,
+            n,
+            at(o, [0.0, 0.4 + 0.8 * i as f64, 0.0]),
+            crate_body(0.8),
+        );
+    }
+    let mut bob = ball(0.2);
+    bob.linear_damping = 0.0;
+    bob.mass = space_sim::MassSpec::Mass(4.0);
+    sim.spawn_body(
+        guid(110),
+        BodySpawn::new(ShipState::at_rest(at(o, [2.2, 2.6, 0.0])), bob)
+            .with_springs(vertical_spring(at(o, [2.2, 5.0, 0.0]), 200.0, 0.0)),
+    )
+    .unwrap();
+    sim.step_n(300);
+    assert!(
+        crates
+            .clone()
+            .all(|n| sim.is_sleeping(guid(n)) == Some(true)),
+        "the stack sleeps"
+    );
+    assert_eq!(sim.bubbles().len(), 1, "stack and bob share a bubble");
+    assert!(sim.bubbles()[0].stepped, "which the bob keeps stepped");
+    let height = |sim: &SimWorld, n: u64| rel(o, sim.state_of(guid(n)).unwrap().pos)[1];
+    let rest: Vec<f64> = crates.clone().map(|n| height(&sim, n)).collect();
+    let mut passer = ball(0.3);
+    passer.gravity_scale = 0.0;
+    passer.linear_damping = 0.0;
+    for k in 0..passers {
+        let mut s = ShipState::at_rest(at(o, [-40.0 - 1.2 * k as f64, 3.0, 5.0]));
+        s.vel = [20.0, 0.0, 0.0];
+        sim.spawn_body(guid(k + 1), BodySpawn::new(s, passer.clone()))
+            .unwrap();
+    }
+    let (mut worst, mut slept, mut most_bubbles, mut fewest_bubbles) = (0.0f64, true, 0, 9);
+    for _ in 0..400 {
+        sim.step();
+        most_bubbles = most_bubbles.max(sim.bubbles().len());
+        fewest_bubbles = fewest_bubbles.min(sim.bubbles().len());
+        for (i, n) in crates.clone().enumerate() {
+            worst = worst.max((height(&sim, n) - rest[i]).abs());
+            slept &= sim.is_sleeping(guid(n)) == Some(true);
+        }
+    }
+    assert_eq!(
+        fewest_bubbles, 1,
+        "the passers came into the stack's bubble"
+    );
+    assert_eq!(sim.bubbles().len(), 2, "and left it again");
+    (worst, slept)
+}
+
+/// A body that comes into a resting stack's bubble and leaves it again does
+/// not touch the stack: the crates stay asleep and do not move at all.
+///
+/// Mutation this catches: on a split the group holding the bubble's
+/// *smallest guid* keeps the bubble (as it once did). The passer has it, so
+/// the stack and the bob were moved into a new solver world — and there the
+/// stack woke and fell into the floor before its contacts were found: the
+/// bottom crate by 6.5 cm, the top one by 30 cm. Seen in the demo area: every
+/// player who walked away from the gravity room made its crate stack hop (a
+/// player's ship has a lower guid than any scene body).
+#[test]
+fn a_resting_stack_is_not_disturbed_when_a_passer_by_leaves_its_bubble() {
+    let (worst, slept) = a_stack_is_passed_by(1);
+    assert_eq!(worst, 0.0, "the stack moved");
+    assert!(slept, "the stack was woken");
+}
+
+/// When it is the stack that has to move — the group that passes is the
+/// larger one, so the stack is taken into its bubble and out of it again —
+/// the stack keeps standing: it is put into the other solver world awake,
+/// finds its contacts in the first step and settles again within
+/// millimetres.
+///
+/// Mutation this catches: inserting a sleeping body into a solver world
+/// asleep (`RigidBodyBuilder::sleeping(e.sleeping)`): the top crate then
+/// drops 30 cm into the stack before it is pushed out again.
+#[test]
+fn a_resting_stack_moved_into_another_bubble_keeps_standing() {
+    let (worst, _) = a_stack_is_passed_by(8);
+    assert!(worst < 0.01, "the stack moved by {worst} m");
 }

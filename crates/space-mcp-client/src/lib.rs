@@ -159,11 +159,14 @@ fn draw_replica(scene: &mut Scene, kind: SceneKind, replica: &Replica) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = bodies.draw(
         replica,
-        replica.tick as f64,
+        space_client::bodies::When {
+            t: replica.tick as f64,
+            own: None,
+            carry: &|_, _| [0.0; 3],
+        },
         spawn,
         Instant::now(),
         scene,
-        &|_| [0.0; 3],
     );
     // The demo area's sky (the Sun, the planets, the Moon) at the newest tick
     // heard, by the shard's scene clock.

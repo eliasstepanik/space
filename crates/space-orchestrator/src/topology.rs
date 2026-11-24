@@ -1,9 +1,9 @@
-//! The authoritative split/merge geometry over `space_world::octree` (H11).
+//! The authoritative carve/merge geometry over `space_world::octree` (H11).
 //!
-//! Pure and synchronous: given a [`ShardMap`] and a shard, a plan function
-//! returns the new map, the epoch it belongs to and the [`EpochChange`]s the
-//! orchestrator publishes. Every H-worth of geometry reasoning is testable
-//! without a single socket.
+//! Pure and synchronous: given a [`ShardMap`] and a node or a shard, a plan
+//! function returns the new map, the epoch it belongs to and the
+//! [`EpochChange`]s the orchestrator publishes. Every H-worth of geometry
+//! reasoning is testable without a single socket.
 //!
 //! # The geometry
 //!
@@ -11,21 +11,40 @@
 //! `size_m(64) = 1024 m` (one cell), `size_m(54) = 1 048 576 m = 1024 km`, and
 //! a child is exactly half its parent's edge (plan §3.2).
 //!
-//! * A **split** is *additive* (plan F5): one child octant is appended with the
-//!   new owner and the parent keeps the old one, so `ShardMap::lookup` (deepest
-//!   match) changes ownership only inside the child. Splits are **one octant at
-//!   a time**, not 8-wide: carving all eight children of a hot region creates
-//!   seven empty shards and leaves the eighth still hot (plan R5).
-//! * A **merge** is the exact inverse: the child region is removed, so `lookup`
-//!   falls back to the parent's owner.
-//! * A region may only split when its edge is at least [`SPLIT_MIN_NODE_SIZE_M`]
-//!   (1024 km, i.e. **depth ≤ 54**): below that a region is still ~100× the 10 km
-//!   interest radius, so splitting it changes routing without relieving load.
-//! * Splitting is capped at [`SPLIT_MAX_DEPTH`] (60) — four levels below the
-//!   addressing limit where `i64` indices saturate (plan §3.2 "ceiling").
-//! * The root must be declared with split headroom (see
+//! * A **carve** ([`carve_plan`]) is *additive* (plan F5): one node lying
+//!   inside an existing region is appended with a new owner and every other
+//!   region keeps its owner, so `ShardMap::lookup` (deepest match) changes
+//!   ownership only inside that node — and only where no deeper region already
+//!   says otherwise. The node may be **any** descendant of the region it is
+//!   carved out of, down to a single cell ([`MAX_REGION_DEPTH`], depth 64):
+//!   that is how the four cells that meet at a scene become four shard areas
+//!   under a depth-40 root (`docs/plan-sharding.md` §1).
+//! * A **split** ([`split_plan`]) is the special case the autoscaler and the
+//!   operator use: carve one **direct child octant** of a shard's region.
+//!   Splits are **one octant at a time**, not 8-wide: carving all eight
+//!   children of a hot region creates seven empty shards and leaves the eighth
+//!   still hot (plan R5).
+//! * A **merge** ([`merge_plan`]) is the exact inverse of the carve that made
+//!   the region: the region is removed, so `lookup` falls back to the
+//!   **enclosing region** ([`enclosing_region`]: the nearest ancestor node that
+//!   is a region of the map, however many levels up) and its owner.
+//! * A region may only be *split* when its edge is at least
+//!   [`SPLIT_MIN_NODE_SIZE_M`] (1024 km, i.e. **depth ≤ 54**): below that a
+//!   region is still ~100× the 10 km interest radius, so halving it on load
+//!   alone changes routing without relieving anything. The floor is a rule of
+//!   the octant split only: a carve names its node and has no size floor.
+//! * No region is smaller than one cell: depth 64 is where the octree ends
+//!   (`octree::children` is `None` there), so a crowd inside one cell cannot
+//!   be split further.
+//! * The root must be declared with headroom (see
 //!   [`OrchestratorConfig::root_depth`](crate::config::OrchestratorConfig::root_depth)):
-//!   a depth-64 root can never split.
+//!   nothing can be carved out of a depth-64 root.
+//!
+//! Every plan is a pure function of the map it is given (H14: the same history
+//! yields the same maps), and every produced map is checked by [`validate`]
+//! before it is handed back (H11's structural half): a plan returns either a
+//! map in which every position has exactly the one owner `lookup` names, or
+//! an error and nothing.
 
 use space_protocol::shard::{validate_node, EpochChange, ShardId, ShardMap, ShardRegion};
 use space_world::octree;
@@ -34,8 +53,30 @@ use space_world::NodeRef;
 /// Only a region whose edge is at least this (1024 km, depth ≤ 54) may split.
 pub const SPLIT_MIN_NODE_SIZE_M: f64 = 1_048_576.0;
 
-/// Deepest a region may be split to. See the module docs' "ceiling" note.
-pub const SPLIT_MAX_DEPTH: u8 = 60;
+/// The deepest a region may be: one cell (1024 m), where the octree ends.
+///
+/// It used to be 60 (`SPLIT_MAX_DEPTH`), a defensive bound four levels above
+/// the addressing limit. The node rules ([`validate_node`]) are exact at every
+/// depth and `octree::children` refuses to go below a cell, so there is
+/// nothing to defend against, and a shard area of one cell is what the demo
+/// area's four quadrants are made of.
+pub const MAX_REGION_DEPTH: u8 = space_world::MAX_DEPTH;
+
+/// A carve plan: the node carved, its new owner, and the map that results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Carve {
+    /// The node carved out of the region that encloses it.
+    pub node: NodeRef,
+    /// The id that owns the node from now on.
+    pub new_shard: ShardId,
+    /// The owner of the enclosing region: whose territory the node is carved
+    /// out of, and who gets it back when the carve is merged away.
+    pub from: ShardId,
+    /// The map with the node's region appended (nobody else changes).
+    pub map: ShardMap,
+    /// The change to publish through the epoch protocol.
+    pub change: EpochChange,
+}
 
 /// A split plan: the carved child, its new owner, and the map that results.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,16 +91,19 @@ pub struct Split {
     pub change: EpochChange,
 }
 
-/// A merge plan: the child region removed, and the map that results.
+/// A merge plan: the carved region removed, and the map that results.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Merge {
-    /// The child region being removed (its owner folds back into the parent).
+    /// The region being removed (its owner's area folds back into the
+    /// enclosing region).
     pub child: NodeRef,
-    /// The shard that owns the parent and therefore the merged region now.
+    /// The shard that owns the enclosing region and therefore the merged
+    /// region now.
     pub into: ShardId,
-    /// The map with the child region removed.
+    /// The map with the region removed.
     pub map: ShardMap,
-    /// The change to publish: the child node reverts to the parent's owner.
+    /// The change to publish: the node reverts to the enclosing region's
+    /// owner.
     pub change: EpochChange,
 }
 
@@ -69,19 +113,30 @@ pub enum TopologyError {
     /// No region in the map is owned by the shard.
     UnknownShard(ShardId),
     /// The shard's region is too small to split (edge < [`SPLIT_MIN_NODE_SIZE_M`],
-    /// i.e. depth > 54) or deeper than [`SPLIT_MAX_DEPTH`].
+    /// i.e. depth > 54).
     TooSmallToSplit(NodeRef),
-    /// The shard's region has no parent in the map to merge into.
+    /// The shard's region has no enclosing region owned by another shard to
+    /// merge into.
     NoMergeTarget(NodeRef),
     /// Every octant of the shard's region is already carved out for another
     /// shard: there is nothing left of it to split off.
     NoFreeOctant(NodeRef),
+    /// The node to carve is already a region of the map.
+    AlreadyARegion(NodeRef),
+    /// The node to carve lies inside no region of the map: there is nobody to
+    /// carve it out of.
+    NotInsideARegion(NodeRef),
+    /// The node to carve is not a node of the octree: deeper than a cell, or
+    /// an index its depth does not have ([`validate_node`]'s reason).
+    NotANode(String),
     /// A produced map violated an invariant (never expected; a bug guard).
     Invalid(String),
 }
 
 impl core::fmt::Display for TopologyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let path =
+            |n: &NodeRef| format!("{}:{}:{}:{}", n.depth, n.index[0], n.index[1], n.index[2]);
         match self {
             TopologyError::UnknownShard(s) => write!(f, "no region owned by {s}"),
             TopologyError::TooSmallToSplit(n) => write!(
@@ -90,14 +145,23 @@ impl core::fmt::Display for TopologyError {
                 n.depth,
                 NodeRef::size_m(n.depth)
             ),
-            TopologyError::NoMergeTarget(n) => {
-                write!(f, "region at depth {} has no parent to merge into", n.depth)
-            }
+            TopologyError::NoMergeTarget(n) => write!(
+                f,
+                "region at depth {} has no enclosing region to merge into",
+                n.depth
+            ),
             TopologyError::NoFreeOctant(n) => write!(
                 f,
                 "every octant of the region at depth {} is already carved out",
                 n.depth
             ),
+            TopologyError::AlreadyARegion(n) => {
+                write!(f, "the node {} is already a region of the map", path(n))
+            }
+            TopologyError::NotInsideARegion(n) => {
+                write!(f, "the node {} lies inside no region of the map", path(n))
+            }
+            TopologyError::NotANode(reason) => write!(f, "not a node of the octree: {reason}"),
             TopologyError::Invalid(reason) => write!(f, "produced map is invalid: {reason}"),
         }
     }
@@ -111,13 +175,14 @@ pub fn size_m(depth: u8) -> f64 {
     NodeRef::size_m(depth)
 }
 
-/// Whether a node may be split: at least [`SPLIT_MIN_NODE_SIZE_M`] on a side and
-/// no deeper than [`SPLIT_MAX_DEPTH`].
+/// Whether a node may be split into octants: at least
+/// [`SPLIT_MIN_NODE_SIZE_M`] on a side (depth ≤ 54).
+///
+/// This is the gate of the octant split ([`split_plan`]), which the
+/// autoscaler and the operator use. [`carve_plan`] does not ask it.
 #[must_use]
 pub fn can_split(node: NodeRef) -> bool {
-    // The size gate is the binding one (depth <= 54); the depth cap is enforced
-    // on every produced map by `validate`, so it never binds here in practice.
-    size_m(node.depth) >= SPLIT_MIN_NODE_SIZE_M && node.depth < SPLIT_MAX_DEPTH
+    size_m(node.depth) >= SPLIT_MIN_NODE_SIZE_M
 }
 
 /// The region of `map` owned by `shard`, preferring the deepest (most specific).
@@ -129,11 +194,38 @@ pub fn region_of(map: &ShardMap, shard: ShardId) -> Option<&ShardRegion> {
         .max_by_key(|r| r.node.depth)
 }
 
+/// Whether `inner` lies strictly inside `outer`: `outer` is an ancestor of
+/// `inner` in the octree (never the same node).
+#[must_use]
+pub fn is_inside(inner: NodeRef, outer: NodeRef) -> bool {
+    // A node of depth >= 1 is addressed by its lowest cell; the ancestor at
+    // `outer.depth` is the node of that depth containing the cell.
+    outer.depth < inner.depth && NodeRef::containing_cell(outer.depth, inner.lower_cell()) == outer
+}
+
+/// The region of `map` that encloses `node`: the **nearest ancestor** of
+/// `node` that is a region, however many levels up. `None` when no region
+/// lies around it (a top-level region, or a node outside the map).
+///
+/// This is whose territory a carve of `node` comes out of, and who a merge of
+/// the region at `node` gives it back to. A lookup, not a plan: nothing is
+/// cloned or validated, so the operator view may ask it for every region of
+/// every snapshot.
+#[must_use]
+pub fn enclosing_region(map: &ShardMap, node: NodeRef) -> Option<&ShardRegion> {
+    map.regions
+        .iter()
+        .filter(|r| is_inside(node, r.node))
+        .max_by_key(|r| r.node.depth)
+}
+
 /// The octant of `node` whose child contains the node's centre.
 ///
-/// The centre is where a shard spawns a joining ship, so in a region nobody has
-/// flown far in, this is the octant that holds the players. `0` for a node with
-/// no children (it cannot be split anyway).
+/// The centre of a root is the corner the scene's spawn point lies a few
+/// metres inside of, on the +x+y+z side (`space_scene::ANCHOR_OFFSET`), and
+/// the centre of any other region is where its shard puts a joining ship; so
+/// in a region nobody has flown far in, this is the octant that holds the
+/// players. `0` for a node with no children (it cannot be split anyway).
 #[must_use]
 pub fn centre_octant(node: NodeRef) -> usize {
     let centre = node.center();
@@ -176,22 +268,20 @@ pub fn free_octants(map: &ShardMap, shard: ShardId) -> Result<Vec<u8>, TopologyE
 }
 
 /// The shard `shard`'s region would be merged into — the owner of the region
-/// around it — **without planning the merge**.
+/// around it ([`enclosing_region`]) — **without planning the merge**.
 ///
 /// The same rule as [`merge_plan`] (which uses this), minus building and
 /// validating the resulting map.
 ///
 /// # Errors
 ///
-/// [`TopologyError::UnknownShard`], or [`TopologyError::NoMergeTarget`] if the
-/// parent node is not a region of the map or is owned by the shard itself.
+/// [`TopologyError::UnknownShard`], or [`TopologyError::NoMergeTarget`] if no
+/// region of the map encloses the shard's region (it is a top-level region)
+/// or the enclosing region is owned by the shard itself.
 pub fn merge_target(map: &ShardMap, shard: ShardId) -> Result<ShardId, TopologyError> {
     let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
-    let parent = octree::parent(region.node).ok_or(TopologyError::NoMergeTarget(region.node))?;
-    map.regions
-        .iter()
-        .find(|r| r.node == parent)
-        .map(|r| r.shard)
+    enclosing_region(map, region.node)
+        .map(|around| around.shard)
         .filter(|owner| *owner != shard)
         .ok_or(TopologyError::NoMergeTarget(region.node))
 }
@@ -230,66 +320,169 @@ pub fn pick_split_octant(
         .ok_or(TopologyError::NoFreeOctant(region.node))
 }
 
-/// Plan a one-octant split of `shard`'s region.
+/// Plan the carve of `node` for `new_owner`: the primitive every new shard
+/// area is made with.
+///
+/// `node` may be any octree node that lies **inside an existing region** of
+/// the map ([`enclosing_region`]) — a direct child octant or a single cell
+/// twenty-four levels down alike — and is not a region already. Its region is
+/// appended with `new_owner`; nothing else in the map changes, so `lookup`
+/// answers `new_owner` inside `node` (except inside a still deeper region,
+/// which keeps its owner) and exactly what it answered before everywhere else.
+/// There is no size floor: the node is named by the caller, not picked by
+/// load. [`Carve::from`] is the owner of the enclosing region.
+///
+/// The new region's endpoint is the un-dialable
+/// [`ShardRegion::UNRESOLVED_ENDPOINT`] sentinel (never the enclosing
+/// region's address): the orchestrator patches in the real address when the
+/// new shard registers (plan §3.4). The returned map is validated before it
+/// is handed back.
+///
+/// # Errors
+///
+/// [`TopologyError::NotANode`] if `node` is not a node of the octree
+/// ([`validate_node`]), [`TopologyError::AlreadyARegion`] if the map already
+/// has a region at `node`, [`TopologyError::NotInsideARegion`] if no region
+/// encloses it, [`TopologyError::Invalid`] if the produced map fails
+/// [`validate`].
+pub fn carve_plan(
+    map: &ShardMap,
+    node: NodeRef,
+    new_owner: ShardId,
+) -> Result<Carve, TopologyError> {
+    validate_node(node.depth, node.index).map_err(TopologyError::NotANode)?;
+    if map.regions.iter().any(|r| r.node == node) {
+        return Err(TopologyError::AlreadyARegion(node));
+    }
+    let from = enclosing_region(map, node)
+        .ok_or(TopologyError::NotInsideARegion(node))?
+        .shard;
+    let mut new_map = map.clone();
+    new_map.epoch += 1;
+    new_map.regions.push(ShardRegion::new(
+        node,
+        new_owner,
+        ShardRegion::UNRESOLVED_ENDPOINT,
+    ));
+    validate(&new_map).map_err(TopologyError::Invalid)?;
+    Ok(Carve {
+        node,
+        new_shard: new_owner,
+        from,
+        change: (node, new_owner),
+        map: new_map,
+    })
+}
+
+/// The **layout cells** of a root: the cells handed, in this order, to the
+/// shards that register after the root's own (`docs/plan-sharding.md` §2).
+///
+/// With `k` the cell index of the root's centre corner, the scene's spawn
+/// point lies in the cell `[k, k, k]`, which stays with the root's shard. The
+/// three other cells of that layer that meet at the corner come first —
+/// `[k, k, k-1]`, `[k-1, k, k]`, `[k-1, k, k-1]`: with the root's shard these
+/// are the four quadrants of the scene, meeting at scene x = -6 / z = -4
+/// (`space_scene::ANCHOR_OFFSET`) — then the four cells of the layer below
+/// (`y = k-1`). Seven cells: with the root that is the default `--max-shards`.
+///
+/// A pure function of the root; whether a cell can still be given away is
+/// [`next_layout_cell`]'s question.
+#[must_use]
+pub fn layout_cells(root: NodeRef) -> [NodeRef; 7] {
+    let k = root.center().cell;
+    let cell = |dx: i64, dy: i64, dz: i64| {
+        NodeRef::new(space_world::MAX_DEPTH, [k[0] + dx, k[1] + dy, k[2] + dz])
+    };
+    [
+        cell(0, 0, -1),
+        cell(-1, 0, 0),
+        cell(-1, 0, -1),
+        cell(0, -1, 0),
+        cell(0, -1, -1),
+        cell(-1, -1, 0),
+        cell(-1, -1, -1),
+    ]
+}
+
+/// The next layout cell of `root` that can be carved out of `map` for a new
+/// shard: the first of [`layout_cells`] that is not a region already and lies
+/// inside one ([`carve_plan`] accepts it). `None` when every one is taken —
+/// or when the root is a single cell, which has no cells to give.
+#[must_use]
+pub fn next_layout_cell(map: &ShardMap, root: NodeRef) -> Option<NodeRef> {
+    layout_cells(root)
+        .into_iter()
+        .find(|cell| carve_plan(map, *cell, ShardId::NONE).is_ok())
+}
+
+/// Plan a one-octant split of `shard`'s region: the [`carve_plan`] of one of
+/// its eight child octants, behind the split's own gate ([`can_split`]).
 ///
 /// `octant` selects which of the eight children to carve (bit 0 = +x, bit 1 = +y,
 /// bit 2 = +z, matching `octree::children` order); the caller picks it with
 /// [`pick_split_octant`]. `new_shard` is the id the caller allocated for the
 /// child.
 ///
-/// The child's endpoint is the un-dialable [`ShardRegion::UNRESOLVED_ENDPOINT`]
-/// sentinel (never the parent's address): the orchestrator patches in the real
-/// address when the new shard registers (plan §3.4). The returned map is
-/// validated before it is handed back.
-///
 /// # Errors
 ///
 /// [`TopologyError::UnknownShard`] if no region is owned by `shard`,
-/// [`TopologyError::TooSmallToSplit`] if the region fails [`can_split`],
-/// [`TopologyError::Invalid`] if the produced map fails [`validate`].
+/// [`TopologyError::TooSmallToSplit`] if the region fails [`can_split`], and
+/// what [`carve_plan`] refuses: [`TopologyError::AlreadyARegion`] for an
+/// octant that is already carved out, [`TopologyError::Invalid`] if the
+/// produced map fails [`validate`].
 pub fn split_plan(
     map: &ShardMap,
     shard: ShardId,
     octant: usize,
     new_shard: ShardId,
 ) -> Result<Split, TopologyError> {
-    let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
-    if !can_split(region.node) {
-        return Err(TopologyError::TooSmallToSplit(region.node));
-    }
-    let children = octree::children(region.node).expect("can_split implies children exist");
-    let child = children[octant % 8];
-    let mut new_map = map.clone();
-    new_map.epoch += 1;
-    new_map.regions.push(ShardRegion::new(
-        child,
-        new_shard,
-        ShardRegion::UNRESOLVED_ENDPOINT,
-    ));
-    validate(&new_map).map_err(TopologyError::Invalid)?;
+    let carve = carve_plan(map, octant_node(map, shard, octant)?, new_shard)?;
     Ok(Split {
-        child,
+        child: carve.node,
         new_shard,
-        change: (child, new_shard),
-        map: new_map,
+        change: carve.change,
+        map: carve.map,
     })
 }
 
-/// Plan the merge of `shard`'s region back into its parent's owner.
-///
-/// The merge target is the **parent** node's owner (the common case after a
-/// split, plan §3.2). The child region is removed and the change reverts the
-/// child node to the parent's owner, so `lookup` falls back exactly as it did
-/// before the split — the inverse.
+/// The node a split of `shard`'s region carves for `octant` (0..=7, taken
+/// modulo 8): that child octant of the region — whether or not it is still
+/// free.
 ///
 /// # Errors
 ///
-/// [`TopologyError::UnknownShard`], [`TopologyError::NoMergeTarget`] if the
-/// parent is not in the map or is owned by the shard itself, or
-/// [`TopologyError::Invalid`].
+/// [`TopologyError::UnknownShard`], or [`TopologyError::TooSmallToSplit`] if
+/// the region fails [`can_split`].
+pub fn octant_node(
+    map: &ShardMap,
+    shard: ShardId,
+    octant: usize,
+) -> Result<NodeRef, TopologyError> {
+    let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
+    octree::children(region.node)
+        .filter(|_| can_split(region.node))
+        .map(|children| children[octant % 8])
+        .ok_or(TopologyError::TooSmallToSplit(region.node))
+}
+
+/// Plan the merge of `shard`'s region back into the region around it.
+///
+/// The merge target is the owner of the **enclosing region**
+/// ([`enclosing_region`]: the nearest ancestor node that is a region — the
+/// direct parent after an octant split, the root twenty-four levels up for a
+/// cell carved out of it). The shard's region is removed and the change
+/// reverts its node to that owner, so `lookup` falls back exactly as it did
+/// before the carve — the inverse. Regions carved out of the removed one stay
+/// where they are, with their owners.
+///
+/// # Errors
+///
+/// [`TopologyError::UnknownShard`], [`TopologyError::NoMergeTarget`] if no
+/// region encloses the shard's region or the one that does is owned by the
+/// shard itself, or [`TopologyError::Invalid`].
 pub fn merge_plan(map: &ShardMap, shard: ShardId) -> Result<Merge, TopologyError> {
     let region = region_of(map, shard).ok_or(TopologyError::UnknownShard(shard))?;
-    let parent_owner = merge_target(map, shard)?;
+    let into = merge_target(map, shard)?;
     let mut new_map = map.clone();
     new_map.epoch += 1;
     new_map
@@ -298,8 +491,8 @@ pub fn merge_plan(map: &ShardMap, shard: ShardId) -> Result<Merge, TopologyError
     validate(&new_map).map_err(TopologyError::Invalid)?;
     Ok(Merge {
         child: region.node,
-        into: parent_owner,
-        change: (region.node, parent_owner),
+        into,
+        change: (region.node, into),
         map: new_map,
     })
 }
@@ -307,26 +500,24 @@ pub fn merge_plan(map: &ShardMap, shard: ShardId) -> Result<Merge, TopologyError
 /// Validate a produced map (H11's structural half).
 ///
 /// Checks, in order:
-/// * every node passes [`validate_node`] (the same rules decode enforces);
-/// * no two regions of **equal depth** overlap (ownership would be ambiguous);
-/// * no region is deeper than [`SPLIT_MAX_DEPTH`] (the split ceiling).
+/// * every node passes [`validate_node`] (the same rules decode enforces),
+///   which is also the depth limit: no region is deeper than
+///   [`MAX_REGION_DEPTH`], one cell;
+/// * no two regions of **equal depth** overlap (ownership would be ambiguous).
+///
+/// Regions of different depths may nest freely — that is what a carve is —
+/// and `lookup`'s deepest match gives every position one owner.
 ///
 /// `Ok(())` otherwise `Err(reason)`.
 ///
 /// The pairwise check makes this quadratic in the number of regions, which is
-/// fine for the one or two calls a split or merge makes and is why nothing
+/// fine for the one or two calls a carve or merge makes and is why nothing
 /// that runs per region per snapshot may call it (see [`free_octants`]).
 pub fn validate(map: &ShardMap) -> Result<(), String> {
     #[cfg(test)]
     VALIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
     for region in &map.regions {
         validate_node(region.node.depth, region.node.index)?;
-        if region.node.depth > SPLIT_MAX_DEPTH {
-            return Err(format!(
-                "region at depth {} is deeper than SPLIT_MAX_DEPTH {SPLIT_MAX_DEPTH}",
-                region.node.depth
-            ));
-        }
     }
     // Equal-depth regions must not overlap: two regions of the same depth
     // overlap iff their nodes are equal (distinct same-depth octrees are
@@ -370,8 +561,21 @@ mod tests {
         let kids = octree::children(root).expect("splits");
         let grandkids = octree::children(kids[3]).expect("splits");
         let floor = NodeRef::new(55, [0, 0, 0]); // below the split floor
+        let k = root.center().cell[0];
         let maps = [
             root_map(),
+            // Cells carved straight out of the root, twenty-four levels down,
+            // and one carved out of a carved octant.
+            ShardMap::new(
+                6,
+                vec![
+                    ShardRegion::new(root, shard(1), addr(1)),
+                    ShardRegion::new(NodeRef::new(64, [k, k, k - 1]), shard(2), addr(2)),
+                    ShardRegion::new(NodeRef::new(64, [k - 1, k, k]), shard(3), addr(3)),
+                    ShardRegion::new(kids[0], shard(4), addr(4)),
+                    ShardRegion::new(NodeRef::new(64, [0, 0, 0]), shard(5), addr(5)),
+                ],
+            ),
             ShardMap::new(
                 4,
                 vec![
@@ -409,11 +613,13 @@ mod tests {
                     "{owner} in a map of {} region(s)",
                     map.regions.len()
                 );
+                // (An octant that is merely taken is not a refusal of the
+                // region: `free_octants` leaves it out of its list.)
                 assert_eq!(
                     free_octants(map, owner).err(),
                     split_plan(map, owner, 0, ShardId::NONE)
                         .err()
-                        .filter(|err| !matches!(err, TopologyError::Invalid(_))),
+                        .filter(|err| !matches!(err, TopologyError::AlreadyARegion(_))),
                     "{owner}: the same refusal"
                 );
                 assert_eq!(
@@ -431,6 +637,83 @@ mod tests {
 
     fn shard(n: u32) -> ShardId {
         ShardId::new(n)
+    }
+
+    /// The order in which new shards are given their cells is fixed: the three
+    /// cells that share the spawn cell's layer and meet it at the root's centre
+    /// corner, then the four below. Each is carved in turn; the spawn point's
+    /// own cell is never given away, and when all seven are taken there is
+    /// nothing left.
+    ///
+    /// Mutation this catches: handing out the spawn cell (the root's shard
+    /// would own no ground at the scene), a different order (which shard owns
+    /// which quadrant would depend on something else), or an eighth cell.
+    #[test]
+    fn layout_cells_are_handed_out_in_a_fixed_order_around_the_spawn_cell() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = root.center().cell;
+        let cells = layout_cells(root);
+        let offsets: Vec<[i64; 3]> = cells
+            .iter()
+            .map(|c| [c.index[0] - k[0], c.index[1] - k[1], c.index[2] - k[2]])
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                [0, 0, -1],
+                [-1, 0, 0],
+                [-1, 0, -1],
+                [0, -1, 0],
+                [0, -1, -1],
+                [-1, -1, 0],
+                [-1, -1, -1],
+            ]
+        );
+        assert!(cells.iter().all(|c| c.depth == 64), "single cells");
+        let spawn_cell = NodeRef::new(64, k);
+        assert!(!cells.contains(&spawn_cell), "the spawn cell stays put");
+        // The scene's spawn point is in the spawn cell, a few metres from the
+        // corner the first three cells meet it at.
+        let map = root_map();
+        let anchor = space_scene::scene_anchor(&map).expect("a map has an anchor");
+        assert!(octree::contains(spawn_cell, anchor));
+
+        // Carved in turn, each for the next shard, until none is left.
+        let mut map = map;
+        for (i, expected) in cells.iter().enumerate() {
+            let next = next_layout_cell(&map, root).expect("a cell is left");
+            assert_eq!(next, *expected, "cell {i}");
+            map = carve_plan(&map, next, shard(10 + i as u32))
+                .expect("a layout cell lies inside the root")
+                .map;
+            assert_eq!(map.lookup(&next.center()), Some(shard(10 + i as u32)));
+            assert_eq!(
+                map.lookup(&anchor),
+                Some(shard(1)),
+                "the root keeps the spawn"
+            );
+        }
+        assert_eq!(next_layout_cell(&map, root), None, "all seven are taken");
+        validate(&map).expect("eight regions, one owner everywhere");
+
+        // After the first three, the four quadrants of the scene have four
+        // owners: a point a few metres either side of scene x = -6 / z = -4.
+        let at =
+            |x: f64, z: f64| map.lookup(&WorldPos::from_f64_metres_around(anchor, [x, 0.0, z]));
+        assert_eq!(at(0.0, 0.0), Some(shard(1)));
+        assert_eq!(at(0.0, -10.0), Some(shard(10)));
+        assert_eq!(at(-12.0, 0.0), Some(shard(11)));
+        assert_eq!(at(-12.0, -10.0), Some(shard(12)));
+
+        // A cell that was merged away is the next one handed out again.
+        let mut freed = map.clone();
+        freed.regions.retain(|r| r.node != cells[1]);
+        assert_eq!(next_layout_cell(&freed, root), Some(cells[1]));
+
+        // A root of one cell has nothing to give.
+        let one_cell = NodeRef::new(64, [3, 3, 3]);
+        let tiny = ShardMap::new(1, vec![ShardRegion::new(one_cell, shard(1), addr(1))]);
+        assert_eq!(next_layout_cell(&tiny, one_cell), None);
     }
 
     fn region(depth: u8, index: [i64; 3], owner: u32) -> ShardRegion {
@@ -461,23 +744,320 @@ mod tests {
         }
     }
 
+    /// The octant split keeps its size floor; the deepest region a map may
+    /// hold is one cell, and only a carve gets there.
     #[test]
-    fn the_split_gate_is_depth_54_and_the_cap_is_60() {
+    fn the_split_gate_is_depth_54_and_a_region_may_be_one_cell() {
         assert!(can_split(NodeRef::new(54, [0, 0, 0])), "1024 km splits");
         assert!(!can_split(NodeRef::new(55, [0, 0, 0])), "512 km does not");
         assert!(!can_split(NodeRef::new(64, [0, 0, 0])), "one cell does not");
-        // The cap: a node at SPLIT_MAX_DEPTH cannot be split further.
-        assert!(!can_split(NodeRef::new(SPLIT_MAX_DEPTH, [0, 0, 0])));
-        // The size gate binds first: 54 < SPLIT_MAX_DEPTH, so no node can ever
-        // reach the cap through can_split alone. The cap is a belt-and-braces
-        // ceiling on the *produced map*, not the usual gate.
-        const { assert!(54 < SPLIT_MAX_DEPTH) };
         for d in 55..=64u8 {
             assert!(
                 !can_split(NodeRef::new(d, [0, 0, 0])),
                 "depth {d} is below the floor"
             );
         }
+        // The deepest region is one cell: where the octree ends.
+        assert_eq!(MAX_REGION_DEPTH, 64);
+        assert_eq!(size_m(MAX_REGION_DEPTH), 1_024.0);
+        assert!(octree::children(NodeRef::new(MAX_REGION_DEPTH, [0, 0, 0])).is_none());
+        // A map with regions at every depth from the root down to a cell is
+        // valid (it used to be refused below depth 60)...
+        let mut regions = vec![region(40, [0, 0, 0], 1)];
+        for depth in 41..=MAX_REGION_DEPTH {
+            regions.push(region(depth, [0, 0, 0], u32::from(depth)));
+        }
+        validate(&ShardMap::new(1, regions)).expect("nested down to one cell");
+        // ...and one with a node below a cell, or outside the index range of
+        // its depth, is not.
+        let below = ShardMap::new(1, vec![region(65, [0, 0, 0], 1)]);
+        assert!(validate(&below).is_err(), "depth 65 does not exist");
+        let outside = ShardMap::new(1, vec![region(40, [1 << 39, 0, 0], 1)]);
+        assert!(validate(&outside).is_err(), "no such node at depth 40");
+    }
+
+    /// The cell index of the root's centre corner: the eight cells that meet
+    /// there are `k - 1` and `k` on each axis.
+    fn centre_cell(root: NodeRef) -> i64 {
+        let centre = root.center();
+        assert_eq!(centre.local, [-512.0; 3], "a corner, not a cell centre");
+        assert_eq!(centre.cell, [centre.cell[0]; 3]);
+        centre.cell[0]
+    }
+
+    /// A point `d` metres from the root's centre corner.
+    fn from_corner(root: NodeRef, d: [f64; 3]) -> WorldPos {
+        WorldPos::from_f64_metres_around(root.center(), d)
+    }
+
+    /// `docs/plan-sharding.md` §1: three cells carved out of a depth-40 root
+    /// — `[k,k,k-1]`, `[k-1,k,k]`, `[k-1,k,k-1]`, with `k` the cell index of
+    /// the root's centre corner — leave four shard areas that meet along the
+    /// vertical line through that corner. `lookup` is exact on both sides of
+    /// every border and at the corner, and merging one cell away gives it back
+    /// to the root's owner, twenty-four levels up.
+    ///
+    /// Mutations this catches: a carve that only takes a direct child octant;
+    /// a `validate` that refuses a region below depth 60; a merge that needs
+    /// the direct parent to be a region; a merge that removes more than the
+    /// one region.
+    #[test]
+    fn three_cells_carved_out_of_a_depth_40_root_and_one_merged_back() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = centre_cell(root);
+        assert_eq!(k, 1 << 23, "the depth-40 root is 2^24 cells wide");
+        let cells = [
+            (NodeRef::new(64, [k, k, k - 1]), shard(2)),
+            (NodeRef::new(64, [k - 1, k, k]), shard(3)),
+            (NodeRef::new(64, [k - 1, k, k - 1]), shard(4)),
+        ];
+        let mut map = root_map();
+        for (cell, owner) in cells {
+            let before = map.clone();
+            let plan = carve_plan(&map, cell, owner).expect("a cell inside the root");
+            assert_eq!(plan.node, cell);
+            assert_eq!(plan.new_shard, owner);
+            assert_eq!(plan.from, shard(1), "carved out of the root's territory");
+            assert_eq!(plan.change, (cell, owner));
+            assert_eq!(plan.map.epoch, before.epoch + 1, "one epoch per carve");
+            assert_eq!(plan.map.regions.len(), before.regions.len() + 1);
+            assert_eq!(
+                &plan.map.regions[..before.regions.len()],
+                &before.regions[..],
+                "nobody else's region changes"
+            );
+            let added = plan.map.regions.last().expect("the new region");
+            assert_eq!(
+                (added.node, added.shard, added.endpoint),
+                (cell, owner, ShardRegion::UNRESOLVED_ENDPOINT),
+                "named before its shard has an address"
+            );
+            validate(&plan.map).expect("a depth-64 region validates");
+            map = plan.map;
+        }
+        assert_eq!(map.epoch, 4);
+
+        // The four areas, seen from the vertical line where they meet, at the
+        // height of the middle of the cell layer (512 m above the corner):
+        // +x+z stays the root's, the other three quadrants are the cells'.
+        let owner_of = |map: &ShardMap, x: f64, y: f64, z: f64| {
+            map.lookup(&from_corner(root, [x, y, z]))
+                .expect("the root covers everything near its centre")
+        };
+        let quadrants = |map: &ShardMap, y: f64, d: f64| {
+            [
+                owner_of(map, d, y, d),
+                owner_of(map, d, y, -d),
+                owner_of(map, -d, y, d),
+                owner_of(map, -d, y, -d),
+            ]
+        };
+        let four = [shard(1), shard(2), shard(3), shard(4)];
+        for y in [0.001, 512.0, 1023.999] {
+            for d in [0.001, 4.0, 6.0, 300.0, 1023.999] {
+                assert_eq!(quadrants(&map, y, d), four, "y {y}, {d} m from the line");
+            }
+        }
+        // A border belongs to the cell above it on its axis (a cell spans
+        // [lower, upper)): exactly on x = 0 is the +x side, exactly on z = 0
+        // the +z side, and the line itself is the root's quadrant.
+        assert_eq!(owner_of(&map, 0.0, 512.0, 5.0), shard(1));
+        assert_eq!(owner_of(&map, -0.001, 512.0, 5.0), shard(3));
+        assert_eq!(owner_of(&map, 5.0, 512.0, 0.0), shard(1));
+        assert_eq!(owner_of(&map, 5.0, 512.0, -0.001), shard(2));
+        assert_eq!(owner_of(&map, 0.0, 512.0, -5.0), shard(2));
+        assert_eq!(owner_of(&map, -0.001, 512.0, -5.0), shard(4));
+        assert_eq!(owner_of(&map, -5.0, 512.0, 0.0), shard(3));
+        assert_eq!(owner_of(&map, -5.0, 512.0, -0.001), shard(4));
+        assert_eq!(owner_of(&map, 0.0, 512.0, 0.0), shard(1));
+        // The corner itself — where eight cells meet — is the lowest point of
+        // cell [k,k,k], which nobody carved: the root's.
+        assert_eq!(map.lookup(&root.center()), Some(shard(1)));
+        assert_eq!(owner_of(&map, 0.0, 0.0, 0.0), shard(1));
+        // The horizontal borders: the cells are one layer, 1024 m high. Just
+        // under it and just over it everything is the root's again, in all
+        // four quadrants.
+        for y in [-0.001, -300.0, 1024.0, 1300.0] {
+            assert_eq!(quadrants(&map, y, 5.0), [shard(1); 4], "y {y}");
+        }
+        // And the cells end where the next cell begins.
+        for (x, z) in [(5.0, -1024.001), (-1024.001, 5.0), (-1024.001, -5.0)] {
+            assert_eq!(owner_of(&map, x, 512.0, z), shard(1), "({x}, {z})");
+        }
+        assert_eq!(owner_of(&map, -5.0, 512.0, -1023.999), shard(4));
+
+        // Merge one cell away: it goes back to the root's owner although the
+        // root is not its parent node, and nothing else moves.
+        assert_eq!(merge_target(&map, shard(3)), Ok(shard(1)));
+        let merge = merge_plan(&map, shard(3)).expect("a carved cell merges");
+        assert_eq!(merge.child, NodeRef::new(64, [k - 1, k, k]));
+        assert_eq!(merge.into, shard(1), "the nearest enclosing region's owner");
+        assert_eq!(merge.change, (merge.child, shard(1)));
+        assert_eq!(merge.map.epoch, map.epoch + 1);
+        assert_eq!(merge.map.regions.len(), 3);
+        assert!(region_of(&merge.map, shard(3)).is_none());
+        validate(&merge.map).expect("the merged map validates");
+        for y in [0.001, 512.0, 1023.999] {
+            for d in [0.001, 6.0, 300.0, 1023.999] {
+                assert_eq!(
+                    quadrants(&merge.map, y, d),
+                    [shard(1), shard(2), shard(1), shard(4)],
+                    "y {y}, {d} m from the line: -x+z fell back to the root's owner"
+                );
+            }
+        }
+        // The merge is the exact inverse of the carve that made the region.
+        let mut without = map.clone();
+        without.regions.retain(|r| r.shard != shard(3));
+        assert_eq!(merge.map.regions, without.regions);
+    }
+
+    /// What a carve refuses, and that a refusal is an error and nothing else.
+    #[test]
+    fn a_carve_needs_a_node_inside_a_region_that_is_not_one_already() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = centre_cell(root);
+        let cell = NodeRef::new(64, [k, k, k - 1]);
+        let map = carve_plan(&root_map(), cell, shard(2)).expect("carve").map;
+        // Already a region: the same cell again, and the root itself.
+        assert_eq!(
+            carve_plan(&map, cell, shard(3)).unwrap_err(),
+            TopologyError::AlreadyARegion(cell)
+        );
+        assert_eq!(
+            carve_plan(&map, root, shard(3)).unwrap_err(),
+            TopologyError::AlreadyARegion(root)
+        );
+        // Inside no region: a neighbour of the root, the root's own parent
+        // (which contains the root, and is contained by nothing), a cell far
+        // outside it.
+        for outside in [
+            NodeRef::new(40, [1, 0, 0]),
+            NodeRef::new(39, [0, 0, 0]),
+            NodeRef::new(64, [-5, k, k]),
+        ] {
+            assert_eq!(
+                carve_plan(&map, outside, shard(3)).unwrap_err(),
+                TopologyError::NotInsideARegion(outside),
+                "{outside:?}"
+            );
+        }
+        // Not a node of the octree at all: below a cell, or an index its
+        // depth does not have.
+        for bogus in [
+            NodeRef::new(65, [k, k, k]),
+            NodeRef::new(41, [1 << 40, 0, 0]),
+        ] {
+            assert!(
+                matches!(
+                    carve_plan(&map, bogus, shard(3)).unwrap_err(),
+                    TopologyError::NotANode(_)
+                ),
+                "{bogus:?}"
+            );
+        }
+        // Every refusal left the map alone (a plan borrows it).
+        assert_eq!(map.regions.len(), 2);
+        assert_eq!(map.epoch, 2);
+        // A carve is a pure function of the map: the same call, the same plan.
+        let other = NodeRef::new(64, [k - 1, k, k]);
+        assert_eq!(
+            carve_plan(&map, other, shard(3)),
+            carve_plan(&map, other, shard(3))
+        );
+    }
+
+    /// A node may be carved out of a carved region, and a region may be carved
+    /// *around* deeper ones: the deeper regions keep their owners, a merge
+    /// gives a region back to whatever encloses it now, and the enclosing
+    /// region is always the nearest one.
+    #[test]
+    fn carves_nest_and_a_merge_falls_back_to_the_nearest_enclosing_region() {
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = centre_cell(root);
+        let cell = NodeRef::new(64, [k, k, k]);
+        let octant = octree::children(root).expect("children")[7];
+        assert!(is_inside(cell, octant) && is_inside(octant, root));
+        assert!(is_inside(cell, root), "any number of levels up");
+        assert!(!is_inside(root, root) && !is_inside(root, cell));
+        assert!(!is_inside(NodeRef::new(64, [k - 1, k, k]), octant));
+
+        // The cell first, then the octant around it.
+        let map = carve_plan(&root_map(), cell, shard(2)).expect("cell").map;
+        assert_eq!(
+            enclosing_region(&map, cell).map(|r| r.shard),
+            Some(shard(1))
+        );
+        let around = carve_plan(&map, octant, shard(3)).expect("the octant around the cell");
+        assert_eq!(around.from, shard(1));
+        let map = around.map;
+        let inside_cell = WorldPos::new([k, k, k], [0.0; 3]);
+        let inside_octant = WorldPos::new([k + 5, k, k], [0.0; 3]);
+        let outside = WorldPos::new([k - 1, k, k], [0.0; 3]);
+        assert_eq!(
+            map.lookup(&inside_cell),
+            Some(shard(2)),
+            "the cell kept its owner"
+        );
+        assert_eq!(map.lookup(&inside_octant), Some(shard(3)));
+        assert_eq!(map.lookup(&outside), Some(shard(1)));
+        // The cell is now enclosed by the octant, the octant by the root.
+        assert_eq!(
+            enclosing_region(&map, cell).map(|r| r.shard),
+            Some(shard(3))
+        );
+        assert_eq!(
+            enclosing_region(&map, octant).map(|r| r.shard),
+            Some(shard(1))
+        );
+        assert!(enclosing_region(&map, root).is_none(), "a top-level region");
+        assert_eq!(merge_target(&map, shard(2)), Ok(shard(3)));
+        assert_eq!(merge_target(&map, shard(3)), Ok(shard(1)));
+        // Merging the cell gives it to the octant's owner...
+        let merged = merge_plan(&map, shard(2)).expect("merge the cell");
+        assert_eq!(merged.into, shard(3));
+        assert_eq!(merged.map.lookup(&inside_cell), Some(shard(3)));
+        // ...and merging the octant instead leaves the cell where it is, now
+        // enclosed by the root.
+        let merged = merge_plan(&map, shard(3)).expect("merge the octant");
+        assert_eq!(merged.into, shard(1));
+        assert_eq!(merged.map.lookup(&inside_cell), Some(shard(2)));
+        assert_eq!(merged.map.lookup(&inside_octant), Some(shard(1)));
+        assert_eq!(merge_target(&merged.map, shard(2)), Ok(shard(1)));
+        validate(&merged.map).expect("valid");
+    }
+
+    /// The octant split is the carve of that octant, nothing more.
+    #[test]
+    fn a_split_is_the_carve_of_one_child_octant() {
+        let map = root_map();
+        let kids = octree::children(NodeRef::new(40, [0, 0, 0])).expect("children");
+        for (octant, kid) in kids.iter().enumerate() {
+            let split = split_plan(&map, shard(1), octant, shard(2)).expect("split");
+            let carve = carve_plan(&map, *kid, shard(2)).expect("carve");
+            assert_eq!(
+                (split.child, split.new_shard, split.change, &split.map),
+                (carve.node, carve.new_shard, carve.change, &carve.map),
+                "octant {octant}"
+            );
+            assert_eq!(carve.from, shard(1));
+        }
+        // A taken octant is refused as what it is.
+        let taken = split_plan(&map, shard(1), 3, shard(2)).expect("split").map;
+        assert_eq!(
+            split_plan(&taken, shard(1), 3, shard(5)).unwrap_err(),
+            TopologyError::AlreadyARegion(kids[3])
+        );
+        // The split's size floor is the split's, not the carve's: a 512 km
+        // region cannot be split, and a cell can still be carved out of it.
+        let small = ShardMap::new(1, vec![region(55, [0, 0, 0], 1)]);
+        assert!(matches!(
+            split_plan(&small, shard(1), 0, shard(2)).unwrap_err(),
+            TopologyError::TooSmallToSplit(_)
+        ));
+        let cell = NodeRef::new(64, [3, 4, 5]);
+        assert!(is_inside(cell, NodeRef::new(55, [0, 0, 0])));
+        carve_plan(&small, cell, shard(2)).expect("no size floor on a carve");
     }
 
     #[test]
@@ -644,20 +1224,40 @@ mod tests {
     }
 
     #[test]
-    fn children_composed_from_the_root_stay_valid_to_the_cap() {
+    fn children_composed_from_the_root_stay_valid_down_to_one_cell() {
         // Plan §3.2's property: children() composed repeatedly from the root
-        // always yields nodes validate_node accepts, down to the cap. Walking
-        // one octant per level (not the whole frontier) keeps the test linear:
-        // the property is about index arithmetic, not about breadth.
-        let mut node = NodeRef::new(40, [0, 0, 0]);
+        // always yields nodes validate_node accepts, all the way down to a
+        // single cell. Walking one octant per level (not the whole frontier)
+        // keeps the test linear: the property is about index arithmetic, not
+        // about breadth. Every node on the way can be carved out of the root.
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let mut node = root;
         let mut steps = 0;
-        while node.depth < SPLIT_MAX_DEPTH {
-            let kids = octree::children(node).expect("above the cap, children exist");
+        while node.depth < MAX_REGION_DEPTH {
+            let kids = octree::children(node).expect("above a cell, children exist");
             node = kids[steps % 8];
             validate_node(node.depth, node.index).expect("a child of a valid node is a valid node");
+            assert!(is_inside(node, root), "depth {}", node.depth);
+            let plan = carve_plan(&root_map(), node, shard(2)).expect("any descendant carves");
+            assert_eq!(plan.map.lookup(&node.center()), Some(shard(2)));
             steps += 1;
         }
-        assert_eq!(node.depth, SPLIT_MAX_DEPTH);
-        assert_eq!(steps, usize::from(SPLIT_MAX_DEPTH - 40));
+        assert_eq!(node.depth, MAX_REGION_DEPTH);
+        assert_eq!(steps, usize::from(MAX_REGION_DEPTH - 40));
+        assert!(
+            octree::children(node).is_none(),
+            "the octree ends at a cell"
+        );
+        // The same at the far corners of the cell space, where the indices
+        // are at the ends of the i64 range.
+        for cell in [[i64::MAX; 3], [i64::MIN; 3], [i64::MIN, 0, i64::MAX]] {
+            let leaf = NodeRef::containing_cell(MAX_REGION_DEPTH, cell);
+            let top = NodeRef::containing_cell(40, cell);
+            validate_node(leaf.depth, leaf.index).expect("a valid cell");
+            assert!(is_inside(leaf, top), "{cell:?}");
+            let map = ShardMap::new(1, vec![ShardRegion::new(top, shard(1), addr(1))]);
+            let plan = carve_plan(&map, leaf, shard(2)).expect("carves at the edge of space");
+            assert_eq!(plan.map.lookup(&leaf.center()), Some(shard(2)));
+        }
     }
 }

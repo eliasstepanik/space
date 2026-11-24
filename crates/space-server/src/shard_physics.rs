@@ -35,14 +35,25 @@ pub const SPAWN_CLEARANCE: f64 = 0.01;
 pub(super) struct GhostEntry {
     /// The shard that simulates it.
     pub(super) from: ShardId,
-    /// A ship (no hysteresis; replicated as a ship nobody here flies).
+    /// A ship (the ship's hysteresis; replicated as a ship nobody here
+    /// flies).
     ship: bool,
+    /// A ship a player flies on the shard that simulates it (it carries the
+    /// player model as its visual): in an island's key its home is that
+    /// shard (see [`crate::border`], "Players' ships").
+    player: bool,
     /// Its replicated components as last received (`Owner` set to 0: a
     /// session of another shard means nothing here, and must never be
     /// mistaken for one of ours).
     components: Components,
     /// Ticks it has been dead-reckoned since the last update.
     reckoned: u32,
+    /// The tick the ghost's state is the state **of**, on this shard's clock
+    /// (the cluster's): the tick its owner said with the update, then one
+    /// more with every tick it is moved on. `None` when the owner's ticks
+    /// are not ours (shards stepped by hand from different starts): the
+    /// ghost is then moved on a tick after every step, as it always was.
+    shown: Option<SimTick>,
     /// The island key its owner announced: `(lowest guid, home)`.
     island: Option<(EntityGuid, ShardId)>,
     /// The tick this shard handed the entity to `from` and kept this ghost
@@ -66,6 +77,11 @@ pub(super) struct BodyClock {
     /// Its hold, ticks (0: [`border::HOLD_TICKS`]): longer for a body that
     /// keeps coming back here soon after it was sent home.
     hold: SimTick,
+    /// It was spawned here on another shard's ground and has not been on
+    /// ours since: it has not crossed a border, so the distance hysteresis
+    /// (which is for a body that did) does not hold it here (see
+    /// [`crate::border`], "Scene bodies").
+    foreign: bool,
 }
 
 /// What a neighbour was last told about one of our bodies.
@@ -89,8 +105,14 @@ struct IslandInfo {
     members: Vec<EntityGuid>,
     /// The ghosts touching them, ascending.
     ghosts: Vec<EntityGuid>,
+    /// The members a client of this shard flies, ascending: they are not
+    /// moved with the island (see [`crate::border`], "Players' ships").
+    players: Vec<EntityGuid>,
     /// The one-hop key this shard announces for its members.
     announce: (EntityGuid, ShardId),
+    /// The member (or ghost) the island's home is taken from: the lowest
+    /// guid of the two-hop key.
+    key: EntityGuid,
     /// The shard the island belongs on (the two-hop key's home).
     target: ShardId,
     /// Whether going there is a body going home after an interaction (the
@@ -138,6 +160,45 @@ const OWNER: u16 = <Owner as ComponentDef>::ID;
 const PARTS: u16 = <PartStates as ComponentDef>::ID;
 const PART_STATES: u16 = <PartStates as ComponentDef>::ID;
 const RESIDUAL: u16 = <PosResidual as ComponentDef>::ID;
+const VISUAL: u16 = <space_sim::Visual as ComponentDef>::ID;
+
+/// Whether a replicated component list is a player's ship: a ship that
+/// carries the player model (`Shard::mark_player`).
+fn is_player_ship(list: &[(u16, Vec<u8>)]) -> bool {
+    component(list, CONTROLS).is_some()
+        && component(list, VISUAL)
+            .and_then(|b| space_sim::body::decode_visual(b).ok())
+            .is_some_and(|v| v.0 == space_scene::visual::PLAYER)
+}
+
+/// A component list moved on `ticks` ticks along its velocities (every
+/// part): what a body handed over late has done in the meantime, as far as
+/// its last state says (see [`crate::handoff`], guarantee 4).
+fn advanced_components(mut list: Components, ticks: SimTick) -> Components {
+    if ticks == 0 {
+        return list;
+    }
+    let dt = f64::from(space_sim::dt()) * ticks as f64;
+    let on = |s: &mut ShipState| {
+        if s.vel != [0.0; 3] {
+            s.pos = WorldPos::from_f64_metres_around(s.pos, s.vel.map(|v| f64::from(v) * dt));
+        }
+    };
+    for (id, bytes) in &mut list {
+        if *id == SHIP_STATE {
+            if let Ok(mut s) = space_sim::wire::decode_ship_state(bytes) {
+                on(&mut s);
+                *bytes = space_sim::wire::encode_ship_state(&s);
+            }
+        } else if *id == PARTS {
+            if let Ok(mut p) = space_sim::articulation::decode_part_states(bytes) {
+                p.0.iter_mut().for_each(on);
+                *bytes = space_sim::articulation::encode_part_states(&p);
+            }
+        }
+    }
+    list
+}
 
 /// The replicated components of `guid`, a local entity or a ghost (a ghost's
 /// as its owner sent them, with the motion it is driven with here).
@@ -157,6 +218,13 @@ pub(super) fn replicated_of(
                     }
                 }
             }
+            // What a client is told this copy is (the harness says it; a
+            // ghost's samples are of the frame's own tick).
+            out.push((
+                space_protocol::ORIGIN_COMPONENT,
+                space_protocol::Origin::ghost(entry.from).encode(),
+            ));
+            out.sort_by_key(|(id, _)| *id);
             Some(out)
         }
         _ => replicate::replicated_components(sim, guid),
@@ -216,7 +284,7 @@ fn zero_owner(mut list: Components) -> Components {
 }
 
 /// `old` updated by the partial list `update` (an empty payload removes).
-fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
+pub(super) fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
     let mut out: Components = old.to_vec();
     for (id, bytes) in update {
         out.retain(|(i, _)| i != id);
@@ -230,7 +298,7 @@ fn merge(old: &[(u16, Vec<u8>)], update: &[(u16, Vec<u8>)]) -> Components {
 
 /// What changed from `old` to `new`: new or different components, and an
 /// empty payload for each one that went away.
-fn diff(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> Components {
+pub(super) fn diff(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> Components {
     let mut out: Components = new
         .iter()
         .filter(|(id, bytes)| !old.iter().any(|(i, b)| i == id && b == bytes))
@@ -257,7 +325,7 @@ fn structure_differs(old: &[(u16, Vec<u8>)], new: &[(u16, Vec<u8>)]) -> bool {
     shape(old) != shape(new)
 }
 
-fn component(list: &[(u16, Vec<u8>)], id: u16) -> Option<&[u8]> {
+pub(super) fn component(list: &[(u16, Vec<u8>)], id: u16) -> Option<&[u8]> {
     list.iter()
         .find(|(i, _)| *i == id)
         .map(|(_, b)| b.as_slice())
@@ -365,7 +433,13 @@ impl Shard {
                 Ok(entity) => {
                     self.guids.insert(body.guid, entity);
                     self.interest.upsert(body.guid, entity, pos);
+                    self.far.rescan = true;
                     spawned += 1;
+                    // A body of another shard's ground goes there at once,
+                    // however close to the border it lies.
+                    if self.shard_map.lookup(&pos) != Some(self.config.shard) {
+                        self.clocks.entry(body.guid).or_default().foreign = true;
+                    }
                 }
                 Err(e) => eprintln!(
                     "space-server: {} cannot spawn the scene body {}: {e}",
@@ -388,15 +462,45 @@ impl Shard {
             return;
         }
         let mut now = self.stats();
+        // What the line is written for is a change in the counts; the tick,
+        // the clock's offset (never the same twice) and the traffic of the
+        // last five seconds ride along.
+        let offset_us = now.clock_offset_us;
+        let clients = now.clients;
+        let traffic = (now.far_bytes_out, now.far_bytes_in, now.client_bytes);
+        let before = std::mem::replace(&mut self.census_traffic, traffic);
+        let rate = |now: u64, before: u64| now.saturating_sub(before) / 5;
         now.tick = 0;
         now.clients = 0;
-        if self.census == Some(now) {
+        now.clock_offset_us = 0;
+        now.far_bytes_out = 0;
+        now.far_bytes_in = 0;
+        now.client_bytes = 0;
+        // (`SPACE_CENSUS_ALWAYS`: every five seconds whether or not anything
+        // changed — for measuring the traffic of a quiet stack.)
+        if self.census == Some(now) && std::env::var_os("SPACE_CENSUS_ALWAYS").is_none() {
             return;
         }
         self.census = Some(now);
         println!(
-            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts; handoffs {} out, {} in, {} aborted",
-            self.config.shard, now.ships, now.bodies, now.ghosts, now.handed_off, now.received, now.aborted
+            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts, {} far; handoffs \
+             {} out, {} in, {} aborted; far {} B/s out, {} B/s in, {} B/s to {} clients; {} \
+             ticks jumped, {} caught up; clock offset {:+.1} ms",
+            self.config.shard,
+            now.ships,
+            now.bodies,
+            now.ghosts,
+            now.far,
+            now.handed_off,
+            now.received,
+            now.aborted,
+            rate(traffic.0, before.0),
+            rate(traffic.1, before.1),
+            rate(traffic.2, before.2),
+            clients,
+            now.skipped,
+            now.caught_up,
+            offset_us as f64 / 1e3
         );
     }
 
@@ -408,39 +512,54 @@ impl Shard {
 
     // ---------------------------------------------------------- spawn points
 
-    /// Where a joining player's ship starts: the scene's spawn point (its
-    /// anchor) if this shard owns it, else the centre of this shard's region
-    /// — or, where a ship, body or static is in the way, the nearest free
-    /// point of a grid around it ([`SPAWN_SPACING`] apart, [`SPAWN_RINGS`]
-    /// rings out, nearest first, then by bearing: deterministic). The base
-    /// point itself if none is free.
+    /// Where a joining player's ship starts: the scene's spawn point — the
+    /// map's anchor, [`space_scene::scene_anchor`] — or, where a ship, body
+    /// or static is in the way, the nearest free point of a grid around it
+    /// ([`SPAWN_SPACING`] apart, [`SPAWN_RINGS`] rings out, nearest first,
+    /// then by bearing: deterministic). The spawn point itself if none is
+    /// free.
+    ///
+    /// **`None` when this shard does not own the spawn point.** A new player
+    /// starts there and nowhere else, so a shard that does not own it has no
+    /// place to put one: it sends the player to the owner ([`Shard::join`]).
+    /// (It used to fall back to the centre of its own region.)
+    ///
+    /// **Only points of this shard's own territory are handed out.** The
+    /// grid reaches 15 m and the borders of the cell the spawn point lies in
+    /// pass 6 m and 4 m from it ([`space_scene::ANCHOR_OFFSET`]): once the
+    /// cells beside it belong to other shards, a busy spawn would otherwise
+    /// put a new ship on a neighbour's ground — a player whose first second
+    /// is a handoff. A point across a border is skipped like an occupied one.
+    ///
+    /// The spawn point is a function of the map, not of the scene: a shard
+    /// nobody gave a scene puts its players on the same point its clients
+    /// measure from.
     #[must_use]
-    pub fn free_spawn_point(&self) -> WorldPos {
-        let base = match self.installed {
-            Some((_, anchor)) if self.shard_map.lookup(&anchor) == Some(self.config.shard) => {
-                anchor
-            }
-            _ => self.config.region.center(),
-        };
+    pub fn free_spawn_point(&self) -> Option<WorldPos> {
+        let own = |pos: &WorldPos| self.shard_map.lookup(pos) == Some(self.config.shard);
+        let spawn = space_scene::scene_anchor(&self.shard_map).filter(|anchor| own(anchor))?;
         let body = Body::ship(&self.sim.params());
         for (i, j) in spawn_grid() {
             let pos = WorldPos::from_f64_metres_around(
-                base,
+                spawn,
                 [
                     f64::from(i) * SPAWN_SPACING,
                     0.0,
                     f64::from(j) * SPAWN_SPACING,
                 ],
             );
+            if !own(&pos) {
+                continue; // across a border: a neighbour's ground
+            }
             let blocked = self
                 .sim
                 .overlaps(&body, &ShipState::at_rest(pos), SPAWN_CLEARANCE)
                 .unwrap_or(true);
             if !blocked {
-                return pos;
+                return Some(pos);
             }
         }
-        base
+        Some(spawn)
     }
 
     // ------------------------------------------------------------ the index
@@ -477,6 +596,7 @@ impl Shard {
         let guid = self.mint_guid();
         self.sim.spawn_body(guid, spawn)?;
         self.index_now(guid);
+        self.far.rescan = true;
         Ok(guid)
     }
 
@@ -552,10 +672,11 @@ impl Shard {
     // ------------------------------------------------------------- islands
 
     /// The shard a body of ours belongs on by its own position: the
-    /// region's owner once it is [`border::BODY_HYSTERESIS`] inside it, or
-    /// once it has been inside it for [`border::SETTLE_TICKS`] (a body
-    /// resting just past a border is settled there too).
-    fn home_local(&self, guid: EntityGuid) -> ShardId {
+    /// region's owner once it is [`border::BODY_HYSTERESIS`] inside it (a
+    /// ship: [`border::SHIP_HYSTERESIS`]), or once it has been inside it for
+    /// [`border::SETTLE_TICKS`] (a body resting just past a border is
+    /// settled there too).
+    pub(super) fn home_local(&self, guid: EntityGuid) -> ShardId {
         let Some(state) = self.sim.ship_state(guid) else {
             return self.config.shard;
         };
@@ -563,13 +684,20 @@ impl Shard {
             .sim
             .entity_of(guid)
             .is_some_and(|e| self.sim.world().get::<ShipControls>(e).is_some());
-        let hysteresis = if ship { 0.0 } else { border::BODY_HYSTERESIS };
+        let clock = self.clocks.get(&guid).copied().unwrap_or_default();
+        let hysteresis = if clock.foreign {
+            0.0
+        } else if ship {
+            border::SHIP_HYSTERESIS
+        } else {
+            border::BODY_HYSTERESIS
+        };
         let home = border::home(&self.shard_map, state.pos, self.config.shard, hysteresis);
         if home != self.config.shard {
             return home;
         }
         let now = self.sim.tick();
-        match self.clocks.get(&guid).and_then(|c| c.outside) {
+        match clock.outside {
             Some((owner, since))
                 if now.saturating_sub(since) >= border::SETTLE_TICKS
                     && self.shard_map.lookup(&state.pos) == Some(owner) =>
@@ -600,7 +728,12 @@ impl Shard {
                     Some((was, since)) if was == owner => Some((owner, since)),
                     _ => Some((owner, now)),
                 },
-                _ => None,
+                _ => {
+                    // On our ground (or nobody's): from here on it is a
+                    // body of ours like any other.
+                    clock.foreign = false;
+                    None
+                }
             };
             kept.insert(guid, clock);
         }
@@ -623,6 +756,23 @@ impl Shard {
                 .want
                 .is_some_and(|(to, since)| to == target && now.saturating_sub(since) >= hold);
             quiet || wanted
+        })
+    }
+
+    /// Whether an island of ours that touches other shards' bodies may be
+    /// consolidated on `target` now: once that has been where every member
+    /// of it belongs for [`border::CONFIRM_TICKS`] border passes in a row
+    /// (see [`crate::border`], "Islands and consolidation": by then both
+    /// sides have heard each other's key).
+    fn confirmed(&self, members: &[EntityGuid], target: ShardId) -> bool {
+        let now = self.sim.tick();
+        members.iter().all(|guid| {
+            self.clocks
+                .get(guid)
+                .and_then(|clock| clock.want)
+                .is_some_and(|(to, since)| {
+                    to == target && now.saturating_sub(since) >= border::CONFIRM_TICKS
+                })
         })
     }
 
@@ -673,17 +823,21 @@ impl Shard {
         }
     }
 
-    /// The shard a ghost belongs on by its own position, as its owner
-    /// computes it.
+    /// The shard a ghost belongs on in an island's key, as its owner
+    /// computes it: by its own position — or, for a player's ship, the shard
+    /// that simulates it (see [`crate::border`], "Players' ships").
     fn home_ghost(&self, guid: EntityGuid) -> ShardId {
         let Some(entry) = self.ghosts.get(&guid) else {
             return ShardId::NONE;
         };
+        if entry.player {
+            return entry.from;
+        }
         let Some(state) = self.sim.state_of(guid) else {
             return entry.from;
         };
         let hysteresis = if entry.ship {
-            0.0
+            border::SHIP_HYSTERESIS
         } else {
             border::BODY_HYSTERESIS
         };
@@ -695,6 +849,9 @@ impl Shard {
     /// [`crate::border`], "Islands and consolidation").
     pub(super) fn border_pass(&mut self) {
         self.wind_clocks();
+        // The ships our clients fly: in a key they count with this shard as
+        // their home, and no island moves them.
+        let flown: HashSet<EntityGuid> = self.clients.values().filter_map(|c| c.ship).collect();
         let islands = self.sim.islands(IslandQuery {
             margin: border::ISLAND_MARGIN,
             lead_time: border::ISLAND_LEAD,
@@ -715,7 +872,12 @@ impl Shard {
                 }
             };
             for guid in &island.bodies {
-                consider((*guid, self.home_local(*guid)));
+                let home = if flown.contains(guid) {
+                    self.config.shard
+                } else {
+                    self.home_local(*guid)
+                };
+                consider((*guid, home));
             }
             for guid in &ghosts {
                 consider((*guid, self.home_ghost(*guid)));
@@ -746,22 +908,24 @@ impl Shard {
                 }
             }
             // An island touching another shard's bodies goes where its key
-            // says, at once: that is what keeps contacts on one solver. One
-            // that is only ours is going home after an interaction, and is
-            // held until that has been its wish for a while (see `border`,
-            // "Hysteresis").
+            // says as soon as that has held for two passes (what the other
+            // side announced for this tick's key is then in): that is what
+            // keeps contacts on one solver. One that is only ours is going
+            // home after an interaction, and is held until that has been its
+            // wish for a while (see `border`, "Hysteresis").
             let wish = key2.1;
-            // An island with a ship in it follows the ship (a ship has no
-            // hysteresis: a player is on the shard the map names).
+            // An island with a ship in it is not held: its bodies go where
+            // its key says at once (to the shard of the player touching
+            // them).
             let with_ship = island.bodies.iter().any(|guid| {
                 self.sim
                     .entity_of(*guid)
                     .is_some_and(|e| self.sim.world().get::<ShipControls>(e).is_some())
             });
-            let target = if !ghosts.is_empty()
-                || wish == self.config.shard
+            let target = if wish == self.config.shard
                 || with_ship
-                || self.ready_to_go(&island.bodies, wish)
+                || (!ghosts.is_empty() && self.confirmed(&island.bodies, wish))
+                || (ghosts.is_empty() && self.ready_to_go(&island.bodies, wish))
             {
                 wish
             } else {
@@ -773,10 +937,18 @@ impl Shard {
             for guid in &island.bodies {
                 view.of.insert(*guid, index);
             }
+            let players = island
+                .bodies
+                .iter()
+                .copied()
+                .filter(|guid| flown.contains(guid))
+                .collect();
             view.islands.push(IslandInfo {
                 members: island.bodies,
                 ghosts,
+                players,
                 announce: key1,
+                key: key2.0,
                 target,
                 going_home,
             });
@@ -798,7 +970,9 @@ impl Shard {
             view.islands.push(IslandInfo {
                 members: vec![guid],
                 ghosts: Vec::new(),
+                players: Vec::new(),
                 announce: (guid, home),
+                key: guid,
                 target,
                 going_home: target != self.config.shard,
             });
@@ -806,27 +980,84 @@ impl Shard {
         self.island_view = view;
     }
 
-    /// The islands to hand off this tick, with where to: every island whose
-    /// home is another known shard and none of whose members is already in a
-    /// transfer or paused for that shard.
+    /// What to hand off this tick, with where to (see [`crate::border`]):
+    ///
+    /// * the **bodies** of every island whose home is another known shard,
+    ///   together, if none of them is already in a transfer or paused for
+    ///   that shard;
+    /// * every **player's ship** whose own position puts it on another known
+    ///   shard — wherever its island goes or stays. If it is its island's
+    ///   key, the island's bodies travel with it (one group, the ship
+    ///   first), when all of them are free to; the ship goes either way.
     pub(super) fn islands_to_hand_off(&self) -> Vec<(Vec<EntityGuid>, ShardId, bool)> {
+        let elsewhere =
+            |to: ShardId| to != self.config.shard && to != ShardId::NONE && self.knows_shard(to);
+        let free = |guid: &EntityGuid, to: ShardId| {
+            !self.ledger.is_busy(*guid)
+                && !self.pending_commits.iter().any(|p| p.guid == *guid)
+                && !self
+                    .refused
+                    .get(guid)
+                    .is_some_and(|(refused_by, _)| *refused_by == to)
+                && self.sim.ship_state(*guid).is_some()
+        };
+        // A body of the island that is on its way here (staged, or committed
+        // and not yet installed): the island's bodies wait for it and go on
+        // together, rather than being offered against it (see
+        // [`crate::border`], "Islands and consolidation"). And a player's
+        // ship that is far enough into our ground for its shard to be
+        // offering it to us on this very tick: its offer is not here yet,
+        // but it is on its way just the same ("Players' ships").
+        let arriving = |guid: &EntityGuid| {
+            self.ledger.has_incoming(*guid)
+                || self.pending_commits.iter().any(|p| p.guid == *guid)
+                || self.ghosts.get(guid).is_some_and(|ghost| {
+                    ghost.player
+                        && self.sim.state_of(*guid).is_some_and(|state| {
+                            border::home(
+                                &self.shard_map,
+                                state.pos,
+                                ghost.from,
+                                border::SHIP_HYSTERESIS,
+                            ) == self.config.shard
+                        })
+                })
+        };
         let mut out = Vec::new();
         for island in &self.island_view.islands {
             let to = island.target;
-            if to == self.config.shard || to == ShardId::NONE || !self.knows_shard(to) {
-                continue;
+            let complete = !island.ghosts.iter().any(arriving);
+            if elsewhere(to) && complete {
+                let bodies: Vec<EntityGuid> = island
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|guid| island.players.binary_search(guid).is_err())
+                    .collect();
+                if !bodies.is_empty() && bodies.iter().all(|guid| free(guid, to)) {
+                    out.push((bodies, to, island.going_home));
+                }
             }
-            let free = island.members.iter().all(|guid| {
-                !self.ledger.is_busy(*guid)
-                    && !self.pending_commits.iter().any(|p| p.guid == *guid)
-                    && !self
-                        .refused
-                        .get(guid)
-                        .is_some_and(|(refused_by, _)| *refused_by == to)
-                    && self.sim.ship_state(*guid).is_some()
-            });
-            if free {
-                out.push((island.members.clone(), to, island.going_home));
+            for ship in &island.players {
+                let to = self.home_local(*ship);
+                if !(elsewhere(to) && free(ship, to)) {
+                    continue;
+                }
+                let mut group = vec![*ship];
+                // The bodies the player touches follow the player (those
+                // that are all here: one still arriving follows later).
+                if island.key == *ship && complete {
+                    let bodies: Vec<EntityGuid> = island
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|guid| island.players.binary_search(guid).is_err())
+                        .collect();
+                    if bodies.iter().all(|guid| free(guid, to)) {
+                        group.extend(bodies);
+                    }
+                }
+                out.push((group, to, false));
             }
         }
         out
@@ -849,9 +1080,10 @@ impl Shard {
         };
         let mut state = EntitySnapshot::new(guid, list);
         state.components.push(TransferKind::Body.component(lead));
-        state
-            .components
-            .push(scene_time_component(self.sim.scene_time()));
+        state.components.push(scene_time_component(
+            self.sim.scene_time(),
+            self.scene_clock_set,
+        ));
         let offer =
             Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
         self.ledger
@@ -876,9 +1108,10 @@ impl Shard {
                 state
             }
         };
-        state
-            .components
-            .push(scene_time_component(self.sim.scene_time()));
+        state.components.push(scene_time_component(
+            self.sim.scene_time(),
+            self.scene_clock_set,
+        ));
         Some(state)
     }
 
@@ -928,10 +1161,20 @@ impl Shard {
             return;
         }
         self.drop_ghost(guid, false);
-        let components = carried_components(&self.sim, pending.components, pending.scene_time);
+        // What it has done since the state was taken, if the commit came
+        // late: on along its velocity (guarantee 4) — a few ticks at most,
+        // never the seconds of a stall (`PendingCommit::catch_up_at`).
+        let late = pending.catch_up_at(self.sim.tick());
+        self.stats.caught_up += late;
+        let components = advanced_components(pending.components, late);
+        let components = carried_components(&self.sim, components, pending.scene_time);
         match self.sim.import_entity(guid, &components) {
             Ok(_) => {
                 self.index_now(guid);
+                // Ours now: no far replica of it, and the other shards'
+                // players are told by us from here on.
+                self.far.claimed_by_the_world(guid);
+                self.far.rescan = true;
                 self.stats.received += 1;
                 self.note_sender_holds_ghost(pending.from, guid);
                 self.back_again(guid);
@@ -971,13 +1214,16 @@ impl Shard {
             Some(list) => {
                 self.index_now(guid);
                 let ship = component(&list, CONTROLS).is_some();
+                let player = is_player_ship(&list);
                 self.ghosts.insert(
                     guid,
                     GhostEntry {
                         from: to,
                         ship,
+                        player,
                         components: zero_owner(list),
                         reckoned: 0,
+                        shown: Some(self.sim.tick()),
                         island: None,
                         departed_at: Some(self.sim.tick()),
                     },
@@ -995,7 +1241,7 @@ impl Shard {
     // ---------------------------------------------------------- ghosts in
 
     /// Drop the ghost `guid` (and, with `forget`, what clients were told).
-    fn drop_ghost(&mut self, guid: EntityGuid, forget: bool) {
+    pub(super) fn drop_ghost(&mut self, guid: EntityGuid, forget: bool) {
         let held = self.ghosts.remove(&guid).is_some();
         if self.sim.is_ghost(guid) {
             self.sim.despawn(guid);
@@ -1035,6 +1281,10 @@ impl Shard {
             return; // another map: wait for the next one
         }
         self.ghost_heard.insert(from, self.sim.tick());
+        // The tick these states are the states of, if the sender counts our
+        // ticks (see `reckon_ghosts`).
+        let shown = (update.tick.abs_diff(self.sim.tick()) <= border::GHOST_TICK_TOLERANCE)
+            .then_some(update.tick);
         let revision = self.scene.revision;
         let mut listed: HashSet<EntityGuid> = HashSet::new();
         for entity in update.entities {
@@ -1067,6 +1317,9 @@ impl Shard {
                     continue;
                 }
                 self.index_now(guid);
+                // A ghost of it is the nearer copy (see `far.rs`): a far
+                // replica of it becomes this ghost in place.
+                self.far.claimed_by_the_world(guid);
             } else {
                 let state = component(&merged, SHIP_STATE)
                     .and_then(|b| space_sim::wire::decode_ship_state(b).ok());
@@ -1078,21 +1331,28 @@ impl Shard {
                 }
             }
             let ship = component(&merged, CONTROLS).is_some();
+            let player = is_player_ship(&merged);
             self.ghosts.insert(
                 guid,
                 GhostEntry {
                     from,
                     ship,
+                    player,
                     components: merged,
                     reckoned: 0,
+                    shown,
                     island,
                     departed_at: None,
                 },
             );
         }
+        // A ghost its owner withdraws has left the border margin, or that
+        // shard's hands: it is still there for whoever can see that far, so
+        // it is kept as a far replica until its shard confirms or the grace
+        // runs out (`far.rs`) — never a gap in between.
         for guid in update.removed {
             if self.ghosts.get(&guid).is_some_and(|e| e.from == from) {
-                self.remove_ghost(guid);
+                self.ghost_to_far(guid);
             }
         }
         if update.full {
@@ -1115,7 +1375,7 @@ impl Shard {
                 .map(|(g, _)| *g)
                 .collect();
             for guid in stale {
-                self.remove_ghost(guid);
+                self.ghost_to_far(guid);
             }
         }
         for key in update.islands {
@@ -1137,8 +1397,21 @@ impl Shard {
     /// starts from if no update arrives in between, the owner's state *now* —
     /// so a body crossing a border is not a tick behind on the side it enters,
     /// and does not jump by that tick when it arrives.
+    ///
+    /// **"Now" is a tick, not "one more than last time".** Two shards step at
+    /// the same instants, so whether the owner's update of tick `n` is here
+    /// before this shard's own step `n` or only after it is decided by
+    /// microseconds, and changes back and forth. A ghost that was moved on
+    /// one tick after every step, whatever its update said, therefore showed
+    /// the owner's state of this tick or of the next, a whole tick of motion
+    /// apart: a player flying past at 22 m/s was drawn to leap 0.75 m ahead
+    /// and wait there (seen on a live stack). So the ghost remembers the tick
+    /// its state is of ([`GhostEntry::shown`]) and is moved on only while
+    /// that is behind this shard's tick. Shards whose ticks do not agree
+    /// keep the old rule.
     pub(super) fn reckon_ghosts(&mut self) {
         let dt = f64::from(space_sim::dt());
+        let now = self.sim.tick();
         let step = |s: &ShipState| ShipState {
             pos: WorldPos::from_f64_metres_around(s.pos, s.vel.map(|v| f64::from(v) * dt)),
             ..*s
@@ -1148,6 +1421,11 @@ impl Shard {
             let Some(entry) = self.ghosts.get_mut(&guid) else {
                 continue;
             };
+            match entry.shown {
+                Some(at) if at >= now => continue, // already this tick's state
+                Some(at) => entry.shown = Some(at + 1),
+                None => {}
+            }
             if entry.reckoned >= border::GHOST_DEAD_RECKON_TICKS {
                 continue;
             }
@@ -1295,6 +1573,10 @@ impl Shard {
             removed.sort_unstable();
             for guid in &removed {
                 sent.remove(guid);
+            }
+            if !removed.is_empty() {
+                // What is no ghost there any more may be a far replica.
+                self.far.rescan = true;
             }
             self.ghost_sent.insert(n, sent);
             if full || !entities.is_empty() || !removed.is_empty() || !islands.is_empty() {

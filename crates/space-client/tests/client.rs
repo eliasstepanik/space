@@ -1104,7 +1104,7 @@ fn a_stream_viewer_types_the_address_and_plays() {
 
 /// Two neighbouring shards as a split leaves them (the handoff test's
 /// topology): A owns a two-cell-wide node and B the far octant carved out of
-/// it. Both know the same map.
+/// it — the cell the scene's spawn point lies in. Both know the same map.
 fn neighbours(rt: &tokio::runtime::Runtime) -> (Running, Running) {
     let _inside = rt.enter();
     let region_a = NodeRef::new(63, [0, 0, 0]);
@@ -1114,16 +1114,8 @@ fn neighbours(rt: &tokio::runtime::Runtime) -> (Running, Running) {
     let map = ShardMap::new(
         1,
         vec![
-            ShardRegion {
-                node: region_a,
-                shard: ShardId::new(1),
-                endpoint: a.addr(),
-            },
-            ShardRegion {
-                node: region_b,
-                shard: ShardId::new(2),
-                endpoint: b.addr(),
-            },
+            ShardRegion::new(region_a, ShardId::new(1), a.addr()),
+            ShardRegion::new(region_b, ShardId::new(2), b.addr()),
         ],
     );
     rt.block_on(async {
@@ -1137,15 +1129,21 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>().sqrt()
 }
 
-/// Players who join through different shards see one world: both derive the
-/// same anchor from the map their shard sent, so the scene's objects — and
-/// each other — are in the same places for both. The one who joined through
-/// the root shard arrives on the scene's spawn point; the other one where its
-/// own shard put it (the shard that owns the spawn point puts its players on
-/// the free point nearest to it). The handoff of the first one (it spawns in
-/// the carved-out octant) does not move anything.
+/// Players who dial different shards see one world — and start in one place.
+/// Both derive the same anchor from the map they were sent, so the scene's
+/// objects, and each other, are in the same places for both. The one who
+/// dials the shard that owns the scene's spawn point is welcomed there; the
+/// one who dials the **other** shard is sent on to it (a `JoinRedirect`: a
+/// new player starts on the spawn point, whatever address was typed) and
+/// arrives next to the first — not in the middle of the cell of the shard
+/// she dialed, and without a handoff.
+///
+/// (A shard that did not own the spawn point used to put the player on the
+/// centre of its own region: half a cell below the scene here, on ground of
+/// the other shard, to which she was handed at once. That is what this test
+/// used to show for Alice.)
 #[test]
-fn two_clients_on_two_shards_agree_where_the_scene_is() {
+fn two_clients_who_dial_two_shards_start_together_and_agree_where_the_scene_is() {
     let rt = runtime();
     let (a, b) = neighbours(&rt);
     // The material chart: no models of its own, so every model is a player,
@@ -1154,55 +1152,73 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
         set_scene(&rt, shard, SceneState::new(Scene::Materials.id(), 1));
     }
     let root_centre = NodeRef::new(63, [0, 0, 0]).center();
-    let far_centre = NodeRef::new(64, [1, 1, 1]).center();
+    // The scene's place in the root: 6 m, half a cell up and 4 m from the
+    // corner where its cells meet — inside B's cell.
+    let off_the_corner = [6.0, 512.0, 4.0];
+    let scene_at = WorldPos::from_f64_metres_around(root_centre, off_the_corner);
+    assert_eq!(scene_at.cell, [1, 1, 1], "in the octant B owns");
 
+    // Alice dials A, which does not own the spawn point; Bob dials B, which
+    // does. Alice first, so the spawn point itself is hers.
     let mut alice = Dry::online(&rt, a.addr());
-    // Alice is handed to B at once (A's spawn point lies in B's octant).
-    // Bob joins only after that: had he joined first, B would have put him on
-    // the free spawn point and Alice would arrive inside his ship (seen on a
-    // slow CI runner: the two ships pushed each other 10 m apart).
-    alice.until("was handed over", |app| {
-        app.replica().is_some_and(|r| r.handoffs == 1)
-    });
     let mut bob = Dry::online(&rt, b.addr());
     for client in [&mut alice, &mut bob] {
         client.until("saw the other player", |app| {
             app.replica().is_some_and(|r| r.others().count() == 1)
         });
     }
+    // Both play on B. Alice got there by being sent on — no handoff — and
+    // her client says both addresses: the one she dialed, and the shard's.
+    for (name, client) in [("Alice", &alice), ("Bob", &bob)] {
+        let replica = client.app.replica().expect("online");
+        assert_eq!(replica.shard, Some(ShardId::new(2)), "{name}");
+        assert_eq!(replica.handoffs, 0, "{name}: a join redirect is no handoff");
+    }
+    let told = alice.app.client_state(640, 360);
+    assert_eq!(told.address, a.addr().to_string(), "what she dialed");
+    assert_eq!(told.shard_address, Some(b.addr().to_string()));
+    let told = bob.app.client_state(640, 360);
+    assert_eq!(told.address, b.addr().to_string());
+    assert_eq!(told.shard_address, Some(b.addr().to_string()));
+    rt.block_on(async {
+        assert_eq!(a.shard.lock().await.stats().clients, 0, "A let nobody in");
+        assert_eq!(b.shard.lock().await.stats().clients, 2);
+    });
 
-    // The same anchor: the root region's centre, where A spawns its players.
+    // The same anchor: the scene's place in the root region.
     let anchor = |client: &Dry| client.app.replica().and_then(|r| r.anchor());
-    assert_eq!(anchor(&alice), Some(root_centre));
-    assert_eq!(
-        anchor(&bob),
-        Some(root_centre),
-        "whichever shard was joined"
-    );
-    // Alice arrived on the scene's spawn point, handoff or not; Bob is where
-    // his shard spawned him, and knows how far from the scene that is.
+    assert_eq!(anchor(&alice), Some(scene_at));
+    assert_eq!(anchor(&bob), Some(scene_at), "whichever shard was dialed");
+    // Alice arrived on the scene's spawn point, Bob on the free point next to
+    // it: a ship's width away on the same floor — not half a cell below.
     let from_scene = |client: &Dry| client.app.position_in_scene().expect("a ship");
     assert!(
         from_scene(&alice).iter().all(|c| c.abs() < 0.05),
         "{:?}",
         from_scene(&alice)
     );
-    // (B owns the scene's spawn point, so it spawns Bob on the free point
-    // of its spawn grid nearest to it, beside Alice.)
-    let _ = far_centre;
+    let beside = from_scene(&bob);
+    let apart = (beside[0] * beside[0] + beside[2] * beside[2]).sqrt();
+    assert!(
+        beside[1].abs() < 0.05 && (1.0..16.0).contains(&apart),
+        "Bob starts beside the spawn point: {beside:?}"
+    );
+    let _ = off_the_corner;
     // The harness is told both: where the ship is in the world, and where it
     // is in the scene — the same place, measured from the world's origin and
     // from the anchor.
-    let told = bob.app.client_state(640, 360);
-    assert_eq!(told.scene_position, Some(from_scene(&bob)));
-    let world = told.position.expect("a ship");
-    let origin = WorldPos::delta(WorldPos::ZERO, root_centre);
-    for i in 0..3 {
-        assert!(
-            (world[i] - origin[i] - from_scene(&bob)[i]).abs() < 0.05,
-            "{world:?} vs {:?}",
-            from_scene(&bob)
-        );
+    let origin = WorldPos::delta(WorldPos::ZERO, scene_at);
+    for client in [&bob, &alice] {
+        let told = client.app.client_state(640, 360);
+        assert_eq!(told.scene_position, Some(from_scene(client)));
+        let world = told.position.expect("a ship");
+        for i in 0..3 {
+            assert!(
+                (world[i] - origin[i] - from_scene(client)[i]).abs() < 0.05,
+                "{world:?} vs {:?}",
+                from_scene(client)
+            );
+        }
     }
 
     // One world: where a player stands relative to the chart's first sphere
@@ -1227,6 +1243,8 @@ fn two_clients_on_two_shards_agree_where_the_scene_is() {
         distance(alice_by_herself, alice_by_bob) < 0.05,
         "{alice_by_herself:?} / {alice_by_bob:?}"
     );
+    // Both stand by the chart.
+    assert!(distance(bob_by_himself, [0.0; 3]) < 30.0);
     assert!(distance(alice_by_herself, [0.0; 3]) < 30.0);
 
     drop(alice);
@@ -1254,16 +1272,8 @@ fn players_on_neighbouring_shards_see_each_other_as_characters() {
         let map = ShardMap::new(
             1,
             vec![
-                ShardRegion {
-                    node: region_a,
-                    shard: ShardId::new(1),
-                    endpoint: a.addr(),
-                },
-                ShardRegion {
-                    node: region_b,
-                    shard: ShardId::new(2),
-                    endpoint: b.addr(),
-                },
+                ShardRegion::new(region_a, ShardId::new(1), a.addr()),
+                ShardRegion::new(region_b, ShardId::new(2), b.addr()),
             ],
         );
         rt.block_on(async {
@@ -1276,21 +1286,32 @@ fn players_on_neighbouring_shards_see_each_other_as_characters() {
     for shard in [&a, &b] {
         set_scene(&rt, shard, SceneState::new(Scene::Materials.id(), 1));
     }
+    // Both start on A, which owns the spawn point — Bob although he dials B.
     let mut alice = Dry::online(&rt, a.addr());
     let mut bob = Dry::online(&rt, b.addr());
+    assert_eq!(
+        bob.app.replica().expect("online").shard,
+        Some(ShardId::new(1)),
+        "B sent Bob on to the spawn point's shard"
+    );
     // Both a few metres from the border between the two cells (x = 512 m),
-    // each on its own side.
-    let place = |shard: &Running, session: u64, x: f64| {
+    // each on its own side: Alice stays on A; Bob is put across the border,
+    // and A hands his ship to B (that is how a player gets onto B).
+    let place = |session: u64, x: f64| {
         rt.block_on(async {
-            let mut shard = shard.shard.lock().await;
+            let mut shard = a.shard.lock().await;
             let ship = shard.ship_of(session).expect("the player's ship");
             let at = WorldPos::from_f64_metres_around(WorldPos::ZERO, [x, 0.0, 0.0]);
             assert!(shard.set_state(ship, space_sim::ShipState::at_rest(at)));
         });
     };
     let session = |client: &Dry| client.app.replica().expect("online").session;
-    place(&a, session(&alice), 505.0);
-    place(&b, session(&bob), 519.0);
+    place(session(&alice), 505.0);
+    place(session(&bob), 519.0);
+    bob.until("was handed to B", |app| {
+        app.replica()
+            .is_some_and(|r| r.shard == Some(ShardId::new(2)) && r.handoffs == 1)
+    });
     for client in [&mut alice, &mut bob] {
         client.until("saw the player across the border", |app| {
             app.replica()
@@ -1298,8 +1319,13 @@ fn players_on_neighbouring_shards_see_each_other_as_characters() {
         });
     }
     let (character, ship) = (character_mesh(), ship_mesh());
-    for (name, client) in [("Alice", &mut alice), ("Bob", &mut bob)] {
-        assert_eq!(client.app.replica().unwrap().handoffs, 0, "{name} stayed");
+    for (name, client, shard, handoffs) in [("Alice", &mut alice, 1, 0), ("Bob", &mut bob, 2, 1)] {
+        let replica = client.app.replica().unwrap();
+        assert_eq!(
+            (replica.shard, replica.handoffs),
+            (Some(ShardId::new(shard)), handoffs),
+            "{name} is on its own side of the border"
+        );
         let scene = client.app.scene(640, 360);
         assert_eq!(count_mesh(scene, &character), 2, "{name}: both characters");
         assert_eq!(count_mesh(scene, &ship), 0, "{name}: no ship model");
@@ -1326,7 +1352,16 @@ fn a_split_while_connected_does_not_move_the_scene() {
     };
     let mut early = Dry::online(&rt, shard.addr());
     let anchor = early.app.replica().and_then(|r| r.anchor());
-    assert_eq!(anchor, Some(root.center()));
+    // The scene's place in a root of many cells: 6 m, half a cell up and 4 m
+    // from the corner where its cells meet, clear of every border a split
+    // can draw.
+    assert_eq!(
+        anchor,
+        Some(WorldPos::from_f64_metres_around(
+            root.center(),
+            [6.0, 512.0, 4.0]
+        ))
+    );
     // Far from the world origin in absolute terms; on the spawn point in the
     // scene's.
     let absolute = early.app.client_state(1, 1).position.expect("a ship");
@@ -1357,16 +1392,12 @@ fn a_split_while_connected_does_not_move_the_scene() {
     // The split: an octant of the root goes to a new shard. (Not the octant
     // the players stand in — nobody is handed over; the map is what changes.)
     let child = NodeRef::new(41, [6, -4, 10]);
-    let whole = ShardRegion {
-        node: root,
-        shard: ShardId::new(1),
-        endpoint: shard.addr(),
-    };
-    let carved = ShardRegion {
-        node: child,
-        shard: ShardId::new(2),
-        endpoint: SocketAddr::from(([127, 0, 0, 1], 9)),
-    };
+    let whole = ShardRegion::new(root, ShardId::new(1), shard.addr());
+    let carved = ShardRegion::new(
+        child,
+        ShardId::new(2),
+        SocketAddr::from(([127, 0, 0, 1], 9)),
+    );
     let set_map = |map: ShardMap| {
         rt.block_on(async { shard.shard.lock().await.set_shard_map(map) });
     };

@@ -49,21 +49,9 @@ pub const MIN_TOKEN_LEN: usize = 16;
 /// An empty secret matches nothing.
 #[must_use]
 pub fn constant_time_eq(given: &[u8], secret: &[u8]) -> bool {
-    if secret.is_empty() {
-        return false;
-    }
-    let mut diff = u8::from(given.len() != secret.len());
-    let mut at = 0usize;
-    for byte in given {
-        // Every byte of the guess is compared, against the secret repeated as
-        // often as needed; there is no early exit to time.
-        diff |= byte ^ secret.get(at).copied().unwrap_or(0);
-        at += 1;
-        if at == secret.len() {
-            at = 0;
-        }
-    }
-    std::hint::black_box(diff) == 0
+    // One implementation for every shared secret in the cluster: the web UI's
+    // token, the cluster secret of a shard's registration and the peer token.
+    space_net::constant_time_eq(given, secret)
 }
 
 /// Decode standard base64 (`A-Z a-z 0-9 + /`, optional `=` padding). `None`

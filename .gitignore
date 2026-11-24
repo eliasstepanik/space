@@ -14,6 +14,10 @@ artifacts/*.png
 # Local GPU/Vulkan userspace prefix (never commit; ~64 MB of .debs extracted)
 /.local/
 
+# Compose environment files: they hold the cluster secret (never commit)
+/deploy/.env
+/deploy/proxy/.env
+
 # Local run artefacts: offline client renders and the orchestrator state file
 /*.ppm
 /*.glb

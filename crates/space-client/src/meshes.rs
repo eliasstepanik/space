@@ -427,8 +427,15 @@ fn sphere_rings(radius: f32) -> u32 {
         12
     } else if radius < 2.0 {
         16
-    } else {
+    } else if radius < 8.0 {
         24
+    } else if radius < 24.0 {
+        // The far content's rocks: a ship stands on the collider, a true
+        // sphere, so the picture's facets must stay within a centimetre or
+        // two of it (r·(1 − cos(π / 2·rings))).
+        48
+    } else {
+        64
     }
 }
 

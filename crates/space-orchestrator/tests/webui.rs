@@ -114,6 +114,8 @@ impl Cluster {
                 advertise: None,
                 claim_region: None,
                 cluster: self.name.clone(),
+                client_endpoint: None,
+                secret: String::new(),
             },
             self.control_addr,
         )
@@ -308,25 +310,52 @@ async fn wait_for_state(
 #[tokio::test(flavor = "multi_thread")]
 async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     let cluster = Cluster::boot("split").await;
+    let (ui, ui_task) = cluster.web_ui(None, unhurried()).await;
+    // ---- before any shard has registered: the root is reserved for shard 1,
+    // which has said nothing — and "nothing" is `null`, never a report of
+    // zeros (a shard that has not reported is not an idle shard: nothing is
+    // merged into it or away on the strength of it).
+    let silent = get(ui, "/api/state").await.body;
+    assert!(
+        silent.contains("\"id\":1,") && silent.contains("\"load_report\":null"),
+        "the reserved root owner is listed without a report: {silent}"
+    );
+    assert!(
+        !silent.contains("\"load_report\":{"),
+        "no report is not a report of zeros: {silent}"
+    );
     let root = cluster.root_shard().await;
     assert_eq!(root.shard, ShardId::new(1));
-    let (ui, ui_task) = cluster.web_ui(None, unhurried()).await;
 
     // ---- the page shows what the orchestrator knows.
     let state = wait_for_state(
         ui,
         Duration::from_secs(5),
-        "the shard to show as connected",
-        |s| s.contains("\"connected\":true"),
+        "the shard to show as connected and to have reported",
+        |s| s.contains("\"connected\":true") && s.contains("\"load_report\":{"),
     )
     .await;
     assert_eq!(map_epoch(&state), 1);
     assert_eq!(region_count(&state), 1);
+    // (The shard's own report: it reports once a second, from its first tick.)
     assert!(
-        state.contains("\"load_report\":null"),
-        "no report is not zero: {state}"
+        state.contains("\"load_report\":{\"players\":0,"),
+        "the shard's report is shown: {state}"
     );
     assert!(!state.contains("peer-secret-never-shown"));
+    // What the shard holds is the shard's to say — the demo area's bodies,
+    // however many the scene has this week — and the page shows that number.
+    let entities = root.state.lock().await.load_report().entities;
+    assert!(entities > 0, "the demo area has bodies");
+    let state = wait_for_state(
+        ui,
+        Duration::from_secs(5),
+        "the shard's report to name what it holds",
+        |s| s.contains(&format!("\"entities\":{entities},")),
+    )
+    .await;
+    assert!(!state.contains("\"entities\":0,"), "{state}");
+    let held = format!("0 player(s), {entities} entities, tick mean");
 
     let page = get(ui, "/").await;
     assert_eq!(page.status, 200, "{page:?}");
@@ -350,7 +379,7 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
         "shard 1",
         &root.endpoint.to_string(),
         "connected",
-        "no report yet",
+        held.as_str(),
         "registered from",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");
@@ -401,14 +430,17 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     assert_eq!(accepted.status, 303, "{accepted:?}");
     assert_eq!(accepted.header("X-Space-Result"), Some("accepted"));
     assert!(
-        accepted.body.starts_with("accepted: epoch 2 proposed"),
+        accepted
+            .body
+            .starts_with("accepted: region 41:1:1:1 is wanted for a new shard"),
         "{accepted:?}"
     );
     let location = accepted.header("Location").expect("a redirect").to_owned();
     assert!(location.starts_with("../?refresh=3&notice="), "{location}");
 
-    // ---- ...and commits through the run loop: prepare, launch, hello, acks,
-    // commit. (It would abort after 3 s if the child never acked.)
+    // ---- ...and commits through the run loop: launch, the new shard's
+    // hello, the id, prepare, acks, commit. (It would abort 3 s after the
+    // prepare if somebody never acked.)
     let state = wait_for_state(ui, Duration::from_secs(10), "the split to commit", |s| {
         map_epoch(s) == 2
     })
@@ -464,7 +496,13 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     let taken = post(ui, "/action/split", &again).await;
     assert_eq!(taken.header("X-Space-Result"), Some("refused"), "{taken:?}");
     assert!(taken.body.contains("already carved out"), "{taken:?}");
-    // ---- a merge is refused honestly: no load report says the shard is empty.
+    // ---- a merge right behind the commit is refused, and for one reason:
+    // the last change is too recent. (Whether the new shard has reported yet
+    // — it does within its first second — does not decide the answer: "can a
+    // change be made at all" is asked first. This used to accept either of
+    // two answers, whichever the timing produced. What is still timing: the
+    // few requests since the commit take less than the three seconds the
+    // interval lasts.)
     let merge = post(
         ui,
         "/action/merge",
@@ -473,7 +511,7 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     .await;
     assert_eq!(merge.status, 303, "{merge:?}");
     assert_eq!(merge.header("X-Space-Result"), Some("refused"));
-    assert!(merge.body.contains("not known to be empty"), "{merge:?}");
+    assert!(merge.body.contains("too recently"), "{merge:?}");
     let state = get(ui, "/api/state").await.body;
     assert_eq!(map_epoch(&state), 2, "the refusals changed nothing");
     assert_eq!(region_count(&state), 2);
@@ -512,11 +550,24 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     );
     assert!(pushed.body.contains("epoch 2"), "{pushed:?}");
 
-    cluster
+    // The fleet as the page and the JSON show it: the child was started by
+    // the orchestrator, the root's shard by hand; nothing is starting.
+    let state = get(ui, "/api/state").await.body;
+    assert!(
+        state.contains(
+            "\"fleet\":{\"min_shards\":0,\"max_shards\":8,\"starting\":0,\"wanted\":null,\"hello_auth_required\":false}"
+        ),
+        "{state}"
+    );
+    assert_eq!(state.matches("\"launched\":true").count(), 1, "{state}");
+    assert_eq!(state.matches("\"launched\":false").count(), 1, "{state}");
+
+    let child = cluster
         .launcher
-        .kill(ShardId::new(2))
+        .launch_of(ShardId::new(2))
         .await
-        .expect("stop the child");
+        .expect("the launcher started the child");
+    cluster.launcher.kill(child).await.expect("stop the child");
     root.abort();
     ui_task.abort();
     cluster.stop();
@@ -554,6 +605,27 @@ async fn next_scene_told(player: &space_net::Conn) -> SceneState {
             .expect("recv")
             .expect("the connection is open");
         if let Message::SceneUpdate(state) = message {
+            return state;
+        }
+    }
+}
+
+/// The next scene a player connection is told that is **not a repeat of
+/// `told_before`** — the scene it was told last. A shard says its scene again
+/// every five seconds, on the cluster clock (`SCENE_REANNOUNCE_TICKS`), so
+/// exactly that repeat can lie between a change and its announcement, and
+/// exactly that is skipped.
+///
+/// It used to skip every scene below a revision the caller named. That let
+/// through what these tests are there to catch: a shard that tells its
+/// players a **stale** scene after a change — any older revision, not only
+/// the one it had just been running — went unnoticed as long as the right
+/// one followed. Now whatever is told that is not the exact repeat is
+/// returned, and the caller's `assert_eq!` fails on it.
+async fn scene_told(player: &space_net::Conn, told_before: Option<SceneState>) -> SceneState {
+    loop {
+        let state = next_scene_told(player).await;
+        if Some(state) != told_before {
             return state;
         }
     }
@@ -648,7 +720,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     )
     .await
     .expect("a player joins the root shard");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 2));
+    assert_eq!(scene_told(&player, None).await, at(Scene::Materials, 2));
 
     // ---- refused requests change nothing: an unknown name, another origin,
     // no form token, a GET.
@@ -724,7 +796,10 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
             "the page after the redirect must not show {stale:?}"
         );
     }
-    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 3));
+    assert_eq!(
+        scene_told(&player, Some(at(Scene::Materials, 2))).await,
+        at(Scene::Galaxy, 3)
+    );
 
     // ---- the same scene again, at once (the second half of a double click):
     // not a switch, and the answer says so — while the browser, which shows
@@ -815,17 +890,21 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "both shards report the same scene: {state}"
     );
     wait_for_scene(&root, at(Scene::Materials, 4), Duration::from_secs(5)).await;
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 4));
+    assert_eq!(
+        scene_told(&player, Some(at(Scene::Galaxy, 3))).await,
+        at(Scene::Materials, 4)
+    );
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("saved"),
         "4 materials\n"
     );
 
-    cluster
+    let child = cluster
         .launcher
-        .kill(ShardId::new(2))
+        .launch_of(ShardId::new(2))
         .await
-        .expect("stop the child");
+        .expect("the launcher started the child");
+    cluster.launcher.kill(child).await.expect("stop the child");
     root.abort();
     ui_task.abort();
     let _ = std::fs::remove_file(&scene_file);
@@ -904,6 +983,10 @@ async fn a_token_protected_web_ui_refuses_everything_without_the_token() {
 /// A shard that restarts and registers again is handed the scene that is
 /// current **now** — also one chosen while it was away — not the one from
 /// when the orchestrator started or from the shard's first registration.
+///
+/// (It comes back as a **new** shard: a restarted process is given the old
+/// one's region under a new id, and because a shard was replaced the scene is
+/// then re-issued one revision up, so that its bodies are built once.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
     let at = |scene: Scene, revision: u64| SceneState::new(scene.id(), revision);
@@ -922,7 +1005,7 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
     let switch_to = |scene: &str| format!("csrf={token}&scene={scene}");
 
     let first = cluster.root_shard().await;
-    let (id, endpoint) = (first.shard, first.endpoint);
+    let (id, endpoint, first_region) = (first.shard, first.endpoint, first.region);
     let accepted = post(ui, "/action/scene", &switch_to("materials")).await;
     assert_eq!(
         accepted.header("X-Space-Confirmed"),
@@ -959,21 +1042,36 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
             advertise: Some(endpoint),
             claim_region: None,
             cluster: cluster.name.clone(),
+            client_endpoint: None,
+            secret: String::new(),
         },
         cluster.control_addr,
     )
     .await
     .expect("the restarted shard is welcomed back");
-    assert_eq!(second.shard, id, "the same shard");
-    wait_for_scene(&second, at(Scene::Galaxy, 3), Duration::from_secs(5)).await;
+    assert_ne!(
+        second.shard, id,
+        "a new shard: an id is used by one process"
+    );
+    assert_eq!(second.shard, ShardId::new(2));
+    assert_eq!(second.region, first_region, "with the old one's region");
+    // Galaxy — the scene chosen while it was away — and, once it has taken
+    // over the region, galaxy one revision up.
+    wait_for_scene(&second, at(Scene::Galaxy, 4), Duration::from_secs(5)).await;
     let state = wait_for_state(ui, Duration::from_secs(5), "the shard to confirm", |s| {
-        s.contains("\"confirmed_by\":[1],\"not_confirmed_by\":[],\"pending\":false")
+        s.contains("\"confirmed_by\":[2],\"not_confirmed_by\":[],\"pending\":false")
     })
     .await;
     assert!(
         cluster_scene(&state)
-            .starts_with("\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":3,"),
+            .starts_with("\"scene\":{\"name\":\"galaxy\",\"id\":3,\"revision\":4,"),
         "{state}"
+    );
+    assert_eq!(map_epoch(&state), 2, "the replacement was an epoch change");
+    assert_eq!(region_count(&state), 1);
+    assert!(
+        !state.contains("\"id\":1,\"role\""),
+        "nothing is left of the old shard: {state}"
     );
 
     second.abort();
@@ -1009,7 +1107,7 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
     )
     .await
     .expect("a player joins");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 9));
+    assert_eq!(scene_told(&player, None).await, at(Scene::Materials, 9));
 
     // The operator switches to galaxy. For the orchestrator that is revision
     // 2 — which the shard, at 9, will not adopt.
@@ -1036,7 +1134,10 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
         "re-issued one above the shard's revision: {accepted:?}"
     );
     assert_eq!(scene_of(&root).await, at(Scene::Galaxy, 10));
-    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 10));
+    assert_eq!(
+        scene_told(&player, Some(at(Scene::Materials, 9))).await,
+        at(Scene::Galaxy, 10)
+    );
     let scene_file = space_orchestrator::scene::scene_path(&cluster.state_path);
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("saved"),
@@ -1073,7 +1174,10 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
             .contains("All 1 connected shard switched to materials (revision 11)"),
         "{accepted:?}"
     );
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 11));
+    assert_eq!(
+        scene_told(&player, Some(at(Scene::Galaxy, 10))).await,
+        at(Scene::Materials, 11)
+    );
 
     root.abort();
     ui_task.abort();
