@@ -42,9 +42,19 @@ TMPDIR=/workspace/.warren/tmp RUSTUP_HOME=/workspace/.warren/rustup RUSTUP_TOOLC
   cargo run -p xtask -- ci
 ```
 = `cargo fmt --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`;
-`cargo nextest run --workspace --locked` (falls back to `cargo test` without nextest;
+`cargo nextest run --workspace --locked --no-fail-fast` (falls back to `cargo test` without nextest;
 test target dir `<target dir>/xtask-test`, honouring `CARGO_TARGET_DIR`). GPU-using packages run
 one test at a time: `.config/nextest.toml` group `gpu`, `--test-threads=1` in the fallback.
+**Every test runs, whatever fails** (`--no-fail-fast` on both paths, and the fallback's second run
+does not wait for the first to pass): one run says everything that is wrong, and still exits
+non-zero if anything is. To see the same on Linux without pushing: the root `Dockerfile`'s image
+(`rust:1-slim-bookworm` + `build-essential`, `rustup toolchain install`) with the checkout mounted
+and `cargo run -p xtask -- ci`; `--cpus 2` is about a hosted runner.
+A test that waits for the **launcher** (a process gone, a shard started) and then reads the
+**orchestrator's** books (`launch_of`, `starting`, `/api/state`'s `fleet`) must keep the loop
+running until the orchestrator has heard it too - it asks its launcher off the loop and takes the
+answer in on a later beat (`split_merge.rs`, `run_the_loop_until_it_knows`: bounded in the
+orchestrator's ticks, not in seconds).
 The **wall-clock-sensitive** tests — space-client's `tests/seamless.rs` and `tests/handoff.rs`: a real
 client through real shard loops in real time — have a serial nextest group of their own (`timing`, four
 test slots each, decided before `gpu`; `TIMING_TESTS` in xtask); in the fallback they run with their
@@ -77,7 +87,9 @@ launcher): 1348 passed, 0 failed, 4 ignored, 551 s;
 after the demo area's far content (46 scene bodies, `scripts/harness/sharding.lua`): 1352 passed,
 0 failed, 4 ignored, 545 s;
 after the review of the far replicas and the shard manager (drains, launcher off the loop, instance
-label, loss handling, far cadence, fast travel off): 1378 passed, 0 failed, 4 ignored, 554 s
+label, loss handling, far cadence, fast travel off): 1378 passed, 0 failed, 4 ignored, 554 s;
+after the CI fixes of the shard lifecycle (stale hellos, launches being stopped; CI runs every test whatever fails): 1383 passed,
+0 failed, 4 ignored, 602 s
 (Windows, RTX 4080, `SPACE_REQUIRE_GPU=1 SPACE_RENDER_VALIDATION=1`).
 Wasm build (also a CI job):
 `cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer`.
@@ -366,8 +378,22 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
   shard's process is kept); a region is owned only once its epoch has committed; one epoch change at a
   time, and none is proposed while a shard of the map holds no control link (every shard of the map must
   ack; three deadlines missed in a row make a connected shard dead). A join whose epoch aborts is stopped.
+  **A hello nobody waits for any more is not served** (`control::hello_is_stale`,
+  `Orchestrator::answer_hello`): a shard waits 5 s (`space_net::HANDSHAKE_TIMEOUT`) for the answer to
+  its hello, then closes the connection and asks again on a new one - so a hello the run loop gets to
+  4 s or more after it arrived (`HELLO_STALE_AFTER`), or whose connection has closed, is told "not yet"
+  and decides nothing (no id, no epoch; counted in `abandoned_hellos`, a line in the event log). The
+  loop is only ever that late when it was held up (a starved host; the id counter and the scene are
+  written **and synced on the loop**, so a slow disk does it too); welcoming such a hello registered a
+  shard on a dead link, aborted its epoch and - with a launched shard - ended in a replacement that
+  took the epoch deadline and a launch pause (14 s in CI instead of 0.5 s).
   **Launches**: matched to their shard by address, never to a dead shard nor to one that registered
-  before the launch was staged; the pause after failures (1 s doubling to 30 s) starts over only when a
+  before the launch was staged; **a launch that is being stopped is still there until the launcher
+  says it is not** (`Stopping`, `stopping_launches`, `note_launch_stopped`; the launcher answers off
+  the loop, a beat or seconds later): its host port is not handed out and a hello from its address is
+  told to wait - that is the process being stopped, asking again - for at most 15 s
+  (`STOP_CONFIRM_TICKS`, then it is taken for stopped, with a line); a launch the launcher itself
+  reported gone holds nothing, so a replacement can have its port in the same tick; the pause after failures (1 s doubling to 30 s) starts over only when a
   launch's shard owns a region; a launch that is no longer needed is stopped, not given a layout cell;
   `--min-shards` <= 8, `--max-shards`, `--max-regions` or the orchestrator does not start; no merge at or
   below `--min-shards`. **A merge ends in a drain, not a kill** (`docs/plan-sharding.md` §3): a merge needs

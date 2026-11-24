@@ -318,6 +318,53 @@ impl Launch {
     }
 }
 
+/// A launch the launcher has been told to stop and has not yet said it has:
+/// what it started may **still be running** — still holding its host port,
+/// still saying hello.
+///
+/// Stopping is asked of the launcher off the run loop
+/// ([`Orchestrator::drive_launcher`]), so between "this launch is over" and
+/// "its process is gone" there are a beat or two — or, with a container
+/// daemon, seconds. Until the launcher has answered
+/// ([`Orchestrator::note_launch_stopped`]):
+///
+/// * **its host port is not handed to another launch** — the new shard could
+///   not bind it and would exit before it registered, which costs the pause
+///   a failed launch earns;
+/// * **a hello from its address is told to wait** — it is the process that is
+///   being stopped, saying hello again (a shard asks again on a new
+///   connection when its hello was not answered in time). Welcomed, it would
+///   be given a region under a new id and stopped a moment later, by the
+///   stop already on its way: a shard nobody supervises, an epoch that waits
+///   out its deadline for an ack that cannot come, and the region without an
+///   owner for those seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stopping {
+    /// The host port it was handed (0: none, the in-process launcher).
+    host_port: u16,
+    /// Where its shard listened, if the launcher had said.
+    endpoint: Option<SocketAddr>,
+    /// The tick the stop was staged at.
+    since: u64,
+}
+
+impl Stopping {
+    /// Whether what is being stopped listens at `at` ([`Launch::listens_at`]).
+    fn listens_at(&self, at: SocketAddr) -> bool {
+        match self.endpoint {
+            Some(endpoint) => endpoint == at,
+            None => self.host_port != 0 && self.host_port == at.port(),
+        }
+    }
+}
+
+/// How long the launcher is given to say that it has stopped a launch, in
+/// ticks (15 s: the longest one call to a container daemon is allowed to
+/// take). After that the launch's host port is handed out again and a hello
+/// from its address is served — a launcher that never answers must not take a
+/// port out of the range for good — and the event log says so.
+pub const STOP_CONFIRM_TICKS: u64 = 15 * crate::config::TICK_HZ;
+
 /// How long after a shard registered it may still turn out to be a launch's
 /// (its launcher has not reported yet), in ticks (5 s). While such a shard
 /// exists no launch is stopped as surplus: it might be that very shard's
@@ -377,6 +424,16 @@ pub struct Orchestrator<L: Launcher> {
     /// Launches the loop must tell the launcher to stop: the processes of the
     /// shards above that it started, and launches that never registered.
     pending_launch_kill: Vec<LaunchId>,
+    /// The launches being stopped whose process may still be running: staged
+    /// for the launcher and not yet reported stopped ([`Stopping`]).
+    stopping: BTreeMap<LaunchId, Stopping>,
+    /// The launch whose end the launcher is reporting right now
+    /// ([`Self::note_launch_exit`]): whatever stop is staged for it meanwhile
+    /// only reaps it — nothing of it is running.
+    launch_gone: Option<LaunchId>,
+    /// Hellos that were not answered because their connection had closed
+    /// before the run loop got to them ([`Self::note_abandoned_hello`]).
+    abandoned_hellos: u64,
     /// The shard the merge **in flight** removes. It is killed when that epoch
     /// commits and left alone when it aborts: until the commit it still owns its
     /// region, so killing it any earlier leaves the map naming a dead owner.
@@ -535,6 +592,8 @@ type LaunchOutcome = (LaunchId, Result<ShardHandle, String>);
 /// ([`Orchestrator::drive_launcher`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LauncherReport {
+    /// What this launch started is stopped.
+    Stopped(LaunchId),
     /// Stopping what this launch started failed, and why.
     StopFailed(LaunchId, String),
     /// The answer to the liveness question asked about this launch at this
@@ -657,6 +716,9 @@ impl<L: Launcher> Orchestrator<L> {
             pending_spawn: Vec::new(),
             pending_kill: Vec::new(),
             pending_launch_kill: Vec::new(),
+            stopping: BTreeMap::new(),
+            launch_gone: None,
+            abandoned_hellos: 0,
             pending_merge: None,
             pending_merge_into: None,
             pending_join: None,
@@ -770,8 +832,68 @@ impl<L: Launcher> Orchestrator<L> {
     /// Drain the launches the launcher has to stop: the processes behind the
     /// shards of [`Self::take_pending_kill`] that the orchestrator had
     /// started, and launches that never registered.
+    ///
+    /// **Taken this way they count as stopped**: this is for a caller that
+    /// plays the launcher and stops at once (a test driving
+    /// [`Self::tick`]). The run loop, whose launcher answers later, takes
+    /// them with [`Self::begin_launch_stops`] and reports each one with
+    /// [`Self::note_launch_stopped`].
     pub fn take_pending_launch_kill(&mut self) -> Vec<LaunchId> {
+        let stopped = self.begin_launch_stops();
+        for launch in &stopped {
+            self.note_launch_stopped(*launch);
+        }
+        stopped
+    }
+
+    /// Drain the launches the launcher has to stop, **without** taking them
+    /// for stopped: each stays in [`Self::stopping_launches`] — its host
+    /// port kept, a hello from its address told to wait — until
+    /// [`Self::note_launch_stopped`] says the launcher has done it.
+    pub fn begin_launch_stops(&mut self) -> Vec<LaunchId> {
         std::mem::take(&mut self.pending_launch_kill)
+    }
+
+    /// The launcher has stopped what `launch` started (or there was nothing
+    /// left to stop): its host port is free again, and a shard that says
+    /// hello from that address is a new one.
+    pub fn note_launch_stopped(&mut self, launch: LaunchId) {
+        self.stopping.remove(&launch);
+    }
+
+    /// The launches that are being stopped and may still be running: told to
+    /// the launcher, or about to be, and not yet reported stopped.
+    #[must_use]
+    pub fn stopping_launches(&self) -> Vec<LaunchId> {
+        self.stopping.keys().copied().collect()
+    }
+
+    /// How many hellos were dropped unanswered because their connection had
+    /// closed before the run loop got to them ([`Self::note_abandoned_hello`]).
+    #[must_use]
+    pub fn abandoned_hellos(&self) -> u64 {
+        self.abandoned_hellos
+    }
+
+    /// Take `launch` off the table and have the launcher stop what it
+    /// started. `running` says whether that may still be running — everything
+    /// but a launch the launcher itself reported gone: it is then remembered
+    /// as stopping until the launcher has answered.
+    fn stop_launch(&mut self, launch: LaunchId, running: bool) -> Option<Launch> {
+        let entry = self.launches.remove(&launch);
+        let running = running && self.launch_gone != Some(launch);
+        if let Some(entry) = entry.as_ref().filter(|_| running) {
+            self.stopping.insert(
+                launch,
+                Stopping {
+                    host_port: entry.host_port,
+                    endpoint: entry.endpoint,
+                    since: self.tick,
+                },
+            );
+        }
+        self.pending_launch_kill.push(launch);
+        entry
     }
 
     /// The node that is waiting for a shard to register and take it, if a
@@ -953,6 +1075,64 @@ impl<L: Launcher> Orchestrator<L> {
         self.handle_shard_hello_from(hello, hello.endpoint.ip())
     }
 
+    /// A `ShardHello` that **nobody waits for any more** when the run loop
+    /// gets to it ([`crate::control::hello_is_stale`]: it is `age` old — a
+    /// shard waits [`space_net::HANDSHAKE_TIMEOUT`] for its answer — or its
+    /// connection has closed): it is not served, and nothing is decided for
+    /// it — no id, no region, no epoch.
+    ///
+    /// A shard that has waited that long closes the connection and asks
+    /// again on a new one. If the run loop was held up for longer (a starved
+    /// host, a slow disk under the id counter), the hello it finally gets to
+    /// is that abandoned one. Welcoming it all the same registered a shard
+    /// whose link was already closed: found "lost" a beat later, the change
+    /// that was to give it its region aborted, its process staged for
+    /// stopping — while the same process was saying hello again. That second
+    /// hello was welcomed under yet another id and its process stopped under
+    /// it; the replacement of a dead shard then took the epoch's whole
+    /// deadline and a launch pause longer, with the region unowned for all
+    /// of it (seen in CI: 14 s instead of half a second).
+    ///
+    /// Counted ([`Self::abandoned_hellos`]) and — for a hello that carries
+    /// the cluster's credentials — said in the event log, in the ring for
+    /// entries a peer can cause: an operator should know that the loop was
+    /// that far behind.
+    ///
+    /// `closed` says which of the two it was, for the wording: the
+    /// connection was closed already, or the hello was merely `age` old.
+    pub fn note_abandoned_hello(
+        &mut self,
+        hello: &ShardHello,
+        seen_from: IpAddr,
+        age: std::time::Duration,
+        closed: bool,
+    ) {
+        self.abandoned_hellos += 1;
+        if self.control.check_credentials(hello).is_err() {
+            return;
+        }
+        let hello = as_seen_from(hello, seen_from);
+        let why = if closed {
+            "its connection was closed when the orchestrator got to it".to_owned()
+        } else {
+            format!(
+                "the orchestrator got to it {:.1} s after it arrived",
+                age.as_secs_f64()
+            )
+        };
+        self.events.push_peer_caused(
+            self.tick,
+            EventKind::Shard,
+            Severity::Warn,
+            format!(
+                "a hello from {} was not served: {why} (a shard waits {} s for its answer, then \
+                 asks again on a new connection). Nothing was decided for it",
+                hello.endpoint,
+                space_net::HANDSHAKE_TIMEOUT.as_secs()
+            ),
+        );
+    }
+
     /// [`Self::handle_shard_hello`] for a hello whose control connection
     /// comes from `seen_from`.
     ///
@@ -1070,6 +1250,21 @@ impl<L: Launcher> Orchestrator<L> {
         seen_from: IpAddr,
     ) -> Result<ShardWelcome, HelloRefusal> {
         self.control.check_credentials(hello)?;
+        // The process the orchestrator is stopping, saying hello again
+        // (`Stopping`): not welcomed. It waits, and is gone before it asks a
+        // second time; a shard that is started at that address afterwards
+        // finds the entry gone.
+        if let Some((launch, _)) = self
+            .stopping
+            .iter()
+            .find(|(_, stop)| stop.listens_at(hello.endpoint))
+        {
+            return Err(HelloRefusal::Wait(format!(
+                "the shard of {launch} at {} is being stopped; a shard that says hello from \
+                 that address is served when the launcher has said that it is gone",
+                hello.endpoint
+            )));
+        }
         if hello.shard != ShardId::NONE || hello.region.is_some() {
             // A claim on what the map already says. An id is confirmed once:
             // a shard that comes back is a new process, whose guid counter
@@ -1288,10 +1483,8 @@ impl<L: Launcher> Orchestrator<L> {
         }
         if let Some(launch) = self.launch_saying(hello) {
             let port = self
-                .launches
-                .remove(&launch)
+                .stop_launch(launch, true)
                 .map_or(0, |entry| entry.host_port);
-            self.pending_launch_kill.push(launch);
             self.log(
                 EventKind::Launcher,
                 Severity::Info,
@@ -1623,8 +1816,7 @@ impl<L: Launcher> Orchestrator<L> {
         self.connected.remove(&shard);
         self.pending_kill.push(shard);
         if let Some(launch) = self.launch_of(shard) {
-            self.launches.remove(&launch);
-            self.pending_launch_kill.push(launch);
+            self.stop_launch(launch, true);
         }
     }
 
@@ -1641,7 +1833,18 @@ impl<L: Launcher> Orchestrator<L> {
             Ok(handle) => {
                 let Some(entry) = self.launches.get_mut(&launch) else {
                     // Given up on meanwhile (it took too long, or its shard was
-                    // stopped): whatever came up must not stay up.
+                    // stopped): whatever came up must not stay up. The stop
+                    // that was sent when it was given up found nothing to
+                    // stop — the launcher had not started it yet — so it is
+                    // being stopped again, from now.
+                    self.stopping.insert(
+                        launch,
+                        Stopping {
+                            host_port: handle.endpoint.port(),
+                            endpoint: Some(handle.endpoint),
+                            since: self.tick,
+                        },
+                    );
                     self.pending_launch_kill.push(launch);
                     return;
                 };
@@ -1695,23 +1898,27 @@ impl<L: Launcher> Orchestrator<L> {
     /// it saw one ([`Launcher::exit_code`]): what tells a shard that stopped
     /// because it was told to (0) from one that died.
     pub fn note_launch_exit(&mut self, launch: LaunchId, exit: Option<i32>) {
+        // The launcher's own word that it is gone: nothing is left running,
+        // whatever stop is on its way or staged below (it only reaps). So
+        // its port is free at once — for the replacement that the lines
+        // below may stage.
+        self.stopping.remove(&launch);
         let Some(entry) = self.launches.get(&launch) else {
             return;
         };
+        self.launch_gone = Some(launch);
         match entry.shard {
             // A shard that was merged away and is gone: the end of a drain,
             // not a death.
             Some(shard) if self.draining.contains_key(&shard) => self.drain_ended(shard, exit),
             Some(shard) if self.dead.contains_key(&shard) || !self.knows(shard) => {
-                self.launches.remove(&launch);
-                self.pending_launch_kill.push(launch);
+                self.stop_launch(launch, false);
             }
             Some(shard) => self.declare_dead(shard, "its process exited"),
             None => {
                 let port = entry.host_port;
-                self.launches.remove(&launch);
                 // Reap it.
-                self.pending_launch_kill.push(launch);
+                self.stop_launch(launch, false);
                 self.log(
                     EventKind::Launcher,
                     Severity::Warn,
@@ -1723,6 +1930,7 @@ impl<L: Launcher> Orchestrator<L> {
                 self.launch_failed();
             }
         }
+        self.launch_gone = None;
     }
 
     /// The launches whose shard the launcher can be asked about: those it has
@@ -1816,8 +2024,7 @@ impl<L: Launcher> Orchestrator<L> {
             .map(|(id, launch)| (*id, launch.host_port))
             .collect();
         for (launch, port) in overdue {
-            self.launches.remove(&launch);
-            self.pending_launch_kill.push(launch);
+            self.stop_launch(launch, true);
             self.log(
                 EventKind::Launcher,
                 Severity::Warn,
@@ -1828,6 +2035,26 @@ impl<L: Launcher> Orchestrator<L> {
                 ),
             );
             self.launch_failed();
+        }
+        // A stop the launcher never confirmed: the port is not kept for ever.
+        let unconfirmed: Vec<(LaunchId, u16)> = self
+            .stopping
+            .iter()
+            .filter(|(_, stop)| now.saturating_sub(stop.since) > STOP_CONFIRM_TICKS)
+            .map(|(id, stop)| (*id, stop.host_port))
+            .collect();
+        for (launch, port) in unconfirmed {
+            self.stopping.remove(&launch);
+            self.log(
+                EventKind::Launcher,
+                Severity::Warn,
+                format!(
+                    "the launcher has not said for {} s that it stopped the shard of {launch}{}: \
+                     it is taken for stopped (its port is handed out again)",
+                    STOP_CONFIRM_TICKS / crate::config::TICK_HZ,
+                    on_port(port)
+                ),
+            );
         }
         let given_up = self
             .wanted
@@ -1953,8 +2180,7 @@ impl<L: Launcher> Orchestrator<L> {
             .map(|(id, launch)| (*id, launch.host_port))
             .collect();
         for (launch, port) in stopped {
-            self.launches.remove(&launch);
-            self.pending_launch_kill.push(launch);
+            self.stop_launch(launch, true);
             self.log(
                 EventKind::Launcher,
                 Severity::Info,
@@ -1999,6 +2225,13 @@ impl<L: Launcher> Orchestrator<L> {
             0
         } else {
             let Some(port) = self.free_host_port() else {
+                if self.stopping.values().any(|stop| stop.host_port != 0) {
+                    // A port is about to be free: the shard that held it is
+                    // being stopped. Not a failure — the next tick looks
+                    // again, and stages the launch when the launcher has
+                    // said that it is gone.
+                    return false;
+                }
                 let (lo, hi) = self.control.config.host_port_range;
                 self.log(
                     EventKind::Launcher,
@@ -2032,12 +2265,19 @@ impl<L: Launcher> Orchestrator<L> {
         true
     }
 
-    /// The next host port of the configured range that no launch holds,
-    /// counting round from where the last search ended.
+    /// The next host port of the configured range that no launch holds — and
+    /// no launch that is still being stopped — counting round from where the
+    /// last search ended.
     fn free_host_port(&mut self) -> Option<u16> {
         let (lo, hi) = self.control.config.host_port_range;
         let span = u32::from(hi.checked_sub(lo)?) + 1;
-        let used: BTreeSet<u16> = self.launches.values().map(|l| l.host_port).collect();
+        // (A launch that is being stopped may still hold its port.)
+        let used: BTreeSet<u16> = self
+            .launches
+            .values()
+            .map(|launch| launch.host_port)
+            .chain(self.stopping.values().map(|stop| stop.host_port))
+            .collect();
         (0..span)
             .map(|step| (self.next_port + step) % span)
             .find_map(|offset| {
@@ -4262,8 +4502,9 @@ impl<L: Launcher + 'static> Orchestrator<L> {
                 () = stopped(&mut stop) => break,
                 inbound = server.next_inbound() => {
                     match inbound {
-                        Some(Inbound::Hello { hello, reply, conn, verdict }) => {
-                            self.answer_hello(&server, &hello, reply, conn, verdict).await;
+                        Some(Inbound::Hello { hello, reply, conn, verdict, received }) => {
+                            let age = received.elapsed();
+                            self.answer_hello(&server, &hello, reply, conn, verdict, age).await;
                         }
                         // What a connection says after its hello is taken as
                         // said by the shard it was admitted as — never by
@@ -4330,14 +4571,37 @@ impl<L: Launcher + 'static> Orchestrator<L> {
     /// the welcome and may from then on report and acknowledge **as that
     /// shard**; refused, its task delivers the reason and closes it — nothing
     /// else it sent is ever read.
-    async fn answer_hello(
+    ///
+    /// **A hello that nobody waits for any more is not served**
+    /// ([`crate::control::hello_is_stale`]): one the loop gets to `age`
+    /// after it arrived — later than a shard waits for its answer — or whose
+    /// connection has closed. It is told "not yet" and nothing is decided
+    /// for it ([`Self::note_abandoned_hello`]).
+    ///
+    /// (Public for a test that plays the run loop: it takes the hello from
+    /// [`crate::control::ControlServer::next_inbound`] and decides when it
+    /// is answered, and how old it is by then.)
+    pub async fn answer_hello(
         &mut self,
         server: &crate::control::ControlServer,
         hello: &ShardHello,
         reply: tokio::sync::mpsc::Sender<Message>,
         conn: space_net::Conn,
         verdict: tokio::sync::oneshot::Sender<crate::control::Admission>,
+        age: std::time::Duration,
     ) {
+        // The shard has given up on this hello, or is about to: it waits
+        // `space_net::HANDSHAKE_TIMEOUT` for the answer and then asks again
+        // on a new connection. Nothing is decided for it — see
+        // `note_abandoned_hello` for what serving it used to cost. It is
+        // told "not yet": if it is still there after all, it asks again at
+        // once instead of waiting out the rest of its patience.
+        let closed = conn.is_closed();
+        if crate::control::hello_is_stale(age, closed) {
+            self.note_abandoned_hello(hello, conn.remote_address().ip(), age, closed);
+            let _ = verdict.send(Err(space_protocol::RejectReason::Draining));
+            return;
+        }
         let seen_from = conn.remote_address().ip();
         match self.handle_shard_hello_from(hello, seen_from) {
             Ok(welcome) => {
@@ -4439,8 +4703,10 @@ impl<L: Launcher + 'static> Orchestrator<L> {
     /// an operator), which is the opposite of "a failed launch, not a hung
     /// orchestrator".
     ///
-    /// * **Stops**: every staged launch is handed to a task. A failure is
-    ///   logged when it is reported.
+    /// * **Stops**: every staged launch is handed to a task, which says when
+    ///   it is done — until then the launch counts as still running: its
+    ///   host port is kept and a hello from its address waits ([`Stopping`]).
+    ///   A failure is logged when it is reported.
     /// * **Liveness**, every [`POLL_INTERVAL_TICKS`]: each launch that has a
     ///   handle is asked about — unless the last question about it is still
     ///   open ([`Self::polls_in_flight`]): questions do not pile up behind a
@@ -4454,16 +4720,20 @@ impl<L: Launcher + 'static> Orchestrator<L> {
     /// Synchronous, but it spawns: it needs a tokio runtime, which the run
     /// loop is. (A test that only drives [`Self::tick`] never calls it.)
     pub fn drive_launcher(&mut self) {
-        for launch in self.take_pending_launch_kill() {
+        for launch in self.begin_launch_stops() {
             // Whatever is still being asked about it no longer matters.
             self.polls_in_flight.remove(&launch);
             let launcher = Arc::clone(&self.launcher);
             let reports = Arc::clone(&self.launcher_reports);
             tokio::spawn(async move {
-                if let Err(err) = launcher.kill(launch).await {
-                    if let Ok(mut reports) = reports.lock() {
-                        reports.push(LauncherReport::StopFailed(launch, err.to_string()));
-                    }
+                // Said either way: until it is, the launch counts as still
+                // running (`Stopping`).
+                let report = match launcher.kill(launch).await {
+                    Ok(()) => LauncherReport::Stopped(launch),
+                    Err(err) => LauncherReport::StopFailed(launch, err.to_string()),
+                };
+                if let Ok(mut reports) = reports.lock() {
+                    reports.push(report);
                 }
             });
         }
@@ -4484,6 +4754,9 @@ impl<L: Launcher + 'static> Orchestrator<L> {
             .unwrap_or_default();
         for report in reports {
             match report {
+                LauncherReport::Stopped(launch) => self.note_launch_stopped(launch),
+                // (Not taken for stopped: what it started may still be
+                // there. `STOP_CONFIRM_TICKS` later it is, with a line.)
                 LauncherReport::StopFailed(launch, err) => {
                     eprintln!("space-orchestrator: stopping the shard of {launch} failed: {err}");
                     self.log(
@@ -8427,6 +8700,163 @@ mod tests {
         );
         assert_eq!(orch.live_shards().len(), 2);
         assert_eq!(orch.map().regions.len(), 2);
+    }
+
+    /// The process the orchestrator is stopping says hello again — and is not
+    /// welcomed; and its host port is not handed out before the launcher has
+    /// said that it is gone.
+    ///
+    /// This is the sequence that made a replacement take 14 s in CI instead
+    /// of half a second, on injected ticks. A launched shard's first hello is
+    /// welcomed, but the shard never sees the welcome (the orchestrator
+    /// answered later than the shard waits) and has closed that connection:
+    /// the orchestrator finds the link closed, aborts the change that was to
+    /// give the shard its region and stages its process for stopping. The
+    /// launcher is told off the run loop and answers a beat or more later —
+    /// and in between **the same process says hello again**, on a new
+    /// connection.
+    ///
+    /// Mutations this catches (each run):
+    ///
+    /// * welcoming that hello (no `stopping` check in `admit`): it was given
+    ///   the region under a new id and its process stopped under it by the
+    ///   stop already on its way — matched to no launch, so nobody noticed;
+    ///   the epoch waited out its deadline (90 ticks) for an ack that could
+    ///   not come, and the launch after that waited a failed launch's pause
+    ///   (30 ticks);
+    /// * handing the port out while the stop is open (`free_host_port`
+    ///   without the `stopping` ports): with a range as large as the fleet
+    ///   the replacement is started on the port its predecessor still holds,
+    ///   cannot bind it and exits.
+    #[test]
+    fn a_shard_that_is_being_stopped_is_not_welcomed_again_and_keeps_its_port() {
+        let mut orch = process_cluster(2, (7_000, 7_001));
+        let up = bring_up(&mut orch, 2);
+        let root = up[0].1;
+        let (victim_launch, victim) = (up[1].0.launch, up[1].1);
+        let cell = topology::layout_cells(orch.config().root_node())[0];
+
+        // The second shard's process is killed from outside: the launcher
+        // says it is gone, and a replacement is launched at once, on the
+        // only free port — its own (nothing of it is left running).
+        orch.note_launch_dead(victim_launch);
+        assert_eq!(orch.dead_shards(), vec![victim]);
+        assert!(
+            orch.stopping_launches().is_empty(),
+            "it is gone, not stopping"
+        );
+        let _ = (orch.begin_launch_stops(), orch.take_pending_kill());
+        let first = orch.take_pending_spawn().pop().expect("a replacement");
+        assert_eq!(first.host_port, 7_001);
+
+        // It says hello and is welcomed —
+        let welcomed = process_hello_of(&mut orch, &first).expect("welcomed");
+        assert_eq!(orch.launch_of(welcomed.shard), Some(first.launch));
+        assert!(orch.snapshot().in_flight.is_some(), "its epoch is proposed");
+        // — but has given up on that connection: the front end sees only
+        // the root's link.
+        orch.tick();
+        let lost_at = orch.current_tick();
+        orch.note_connected([root]);
+        assert!(orch.snapshot().in_flight.is_none(), "aborted at once");
+        assert_eq!(orch.take_pending_kill(), vec![welcomed.shard]);
+        assert_eq!(orch.launch_of(welcomed.shard), None);
+        assert_eq!(
+            orch.stopping_launches(),
+            vec![first.launch],
+            "its process is being stopped, and may still be running"
+        );
+        // The run loop hands the stop to its launcher, which has not
+        // answered yet.
+        assert_eq!(orch.begin_launch_stops(), vec![first.launch]);
+        assert_eq!(orch.stopping_launches(), vec![first.launch]);
+        let ids = orch.snapshot().next_shard_id;
+
+        // The same process says hello again, from the same address.
+        for _ in 0..3 {
+            let again = orch.handle_shard_hello(&fresh_hello(addr(7_001)));
+            assert!(
+                matches!(again, Err(HelloRefusal::Wait(_))),
+                "the process that is being stopped is not welcomed: {again:?}"
+            );
+            orch.tick();
+            // Its port is still its own: nothing is started on it, and that
+            // is not a failed launch.
+            assert!(orch.take_pending_spawn().is_empty(), "the port is held");
+        }
+        assert!(orch.snapshot().in_flight.is_none(), "nothing was proposed");
+        assert_eq!(orch.snapshot().next_shard_id, ids, "no id was spent on it");
+        assert_eq!(orch.dead_shards(), vec![victim], "still to be replaced");
+        assert!(
+            !orch
+                .events()
+                .newest_first()
+                .any(|e| e.text.contains("no shard can be started")),
+            "a port that is about to be free is not 'no port'"
+        );
+
+        // The launcher says it is stopped: the next tick launches the
+        // replacement on that port — no pause — and its hello is served.
+        orch.note_launch_stopped(first.launch);
+        assert!(orch.stopping_launches().is_empty());
+        orch.tick();
+        let second = orch.take_pending_spawn().pop().expect("launched now");
+        assert_eq!(second.host_port, 7_001);
+        let heir = process_hello_of(&mut orch, &second).expect("welcomed");
+        assert_eq!(u64::from(heir.shard.0), ids, "the very next id");
+        assert_eq!(heir.region.node, cell);
+        assert_eq!(orch.launch_of(heir.shard), Some(second.launch));
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().lookup(&cell.center()), Some(heir.shard));
+        assert!(orch.dead_shards().is_empty());
+        assert!(
+            orch.current_tick() - lost_at < 10,
+            "replaced {} ticks after the link was found closed, not an epoch deadline and a \
+             launch pause later",
+            orch.current_tick() - lost_at
+        );
+        assert_eq!(
+            orch.map().lookup(&orch.config().root_node().center()),
+            Some(root)
+        );
+    }
+
+    /// A launcher that never says it has stopped a launch does not take its
+    /// port out of the range for good: after [`STOP_CONFIRM_TICKS`] the
+    /// launch is taken for stopped, with a line in the event log.
+    ///
+    /// Mutation this catches: no expiry (the port of every launch whose stop
+    /// was never confirmed — a container daemon that hangs — is lost; with a
+    /// range as large as the fleet no shard can be launched again).
+    #[test]
+    fn a_stop_the_launcher_never_confirms_gives_its_port_back_after_a_while() {
+        let mut orch = process_cluster(2, (7_000, 7_001));
+        let up = bring_up(&mut orch, 2);
+        let (root, victim) = (up[0].1, up[1].1);
+        let victim_launch = up[1].0.launch;
+        // The second shard's link closes (its process hangs); the launcher
+        // is told to stop it and never answers.
+        orch.note_connected([root]);
+        assert_eq!(orch.dead_shards(), vec![victim]);
+        assert_eq!(orch.begin_launch_stops(), vec![victim_launch]);
+        let _ = orch.take_pending_kill();
+        for _ in 0..STOP_CONFIRM_TICKS {
+            orch.tick();
+            assert!(orch.take_pending_spawn().is_empty(), "the port is held");
+            assert_eq!(orch.stopping_launches(), vec![victim_launch]);
+        }
+        orch.tick();
+        orch.tick();
+        assert!(orch.stopping_launches().is_empty(), "taken for stopped");
+        let next = orch.take_pending_spawn().pop().expect("a replacement");
+        assert_eq!(next.host_port, 7_001);
+        let said: Vec<&str> = orch
+            .events()
+            .newest_first()
+            .map(|e| e.text.as_str())
+            .filter(|t| t.contains("has not said for 15 s that it stopped"))
+            .collect();
+        assert_eq!(said.len(), 1, "said once: {said:?}");
     }
 
     /// A launch whose shard is **no longer anybody** — it was stopped when

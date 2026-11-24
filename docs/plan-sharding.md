@@ -194,6 +194,30 @@ phase 6).** What it became, and where it differs from the bullets above:
   that passes by itself (a change in flight, a shard that is not connected yet) is not logged; one
   that does not - the id counter cannot be written, a hello names a live shard's address from
   another host - is, once per reason.
+- **A hello that is answered too late is not served** (`control::hello_is_stale`,
+  `Orchestrator::answer_hello`, `note_abandoned_hello`). A shard waits 5 s for the answer to its
+  hello (`space_net::HANDSHAKE_TIMEOUT`), then closes the connection and asks again on a new one.
+  The run loop normally answers within a beat; when it was held up for seconds (a starved host;
+  the id counter is written and synced on the loop, so a slow disk too) the hello it gets to is
+  one nobody waits for. Served all the same it registered a shard on a closed link: "lost" a
+  beat later, its epoch aborted, its process staged for stopping - while the same process was
+  already saying hello again, was welcomed under the next id and stopped under it. Nobody
+  supervised that shard, its epoch ran into the 3 s deadline, the launch after it waited a
+  failed launch's pause: in CI a replacement took 14 s instead of half a second (three
+  registrations, shard 3, 4 and 5, for one dead shard). So a hello that is 4 s old
+  (`HELLO_STALE_AFTER`) or whose connection has closed is told "not yet" and nothing is decided
+  for it; it is counted and written to the event log (the ring for peer-caused entries).
+  Not covered: a welcome that set out in time and was *read* too late (the shard was held up, not
+  the orchestrator) - that shard is found lost and stopped, and the next bullet's rule keeps its
+  second hello from being welcomed.
+- **A launch that is being stopped is still there** (`Stopping`). Stops are asked of the launcher
+  off the loop, so between "this launch is over" and "its process is gone" lie a beat or two, or
+  seconds with a container daemon. Until the launcher has answered (`note_launch_stopped`; at most
+  15 s, `STOP_CONFIRM_TICKS`, then it is taken for stopped and the log says so) the launch's host
+  port is not handed to another launch - the new shard could not bind it - and a hello from its
+  address is told to wait: it is the process that is being stopped. A launch the launcher itself
+  reported gone (its process exited) is not "being stopped": its port is free in the same tick,
+  which is what lets a replacement take a dead shard's own port at once.
 - **The control connection** (`control.rs`, `Inbound`): the cluster secret gates the hello and the
   hello gates everything else. The connection's task reads nothing after the hello until the run
   loop's verdict is in; refused, the reason is delivered (`Conn::reject`: written, finished, given

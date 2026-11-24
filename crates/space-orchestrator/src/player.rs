@@ -455,13 +455,17 @@ mod tests {
         server.publish(PlayerAnswer::Redirect(redirect_to(1)));
         let endpoint = space_net::client_endpoint_for(addr).expect("client endpoint");
 
-        // Never says hello.
+        // Never says hello. (The clock is read before the dial: the port's
+        // bound runs from when *it* has the connection, which on a loaded
+        // machine is well before this side hears that the handshake is done
+        // — read afterwards, the wait measured here came out under the
+        // bound, once in ten runs on one starved CPU.)
+        let started = Instant::now();
         let silent = endpoint
             .connect(addr, SERVER_NAME)
             .expect("dial")
             .await
             .expect("the transport handshake");
-        let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(3), silent.closed())
             .await
             .expect("dropped when the hello bound runs out");
@@ -483,8 +487,12 @@ mod tests {
             .await
             .expect("closed after the drain, whether the answer was read or not");
         assert_eq!(server.redirected(), 1);
-        // All the room is free again: nothing is still being served.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // All the room is free again: nothing is still being served. (The
+        // port's task lets go of its slot a moment after it closed.)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.room.available_permits() != MAX_PENDING && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(server.room.available_permits(), MAX_PENDING);
     }
 
