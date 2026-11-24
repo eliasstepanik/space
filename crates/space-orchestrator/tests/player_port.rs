@@ -551,20 +551,31 @@ async fn a_player_who_dials_the_control_port_is_told_what_it_is() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shard_that_registers_without_an_ip_is_listed_with_the_one_it_is_seen_from() {
     let orch = Running::start("observed");
-    // The port it advertises is the one it binds.
-    let port = {
-        let probe = std::net::UdpSocket::bind(loopback0()).expect("a free port");
-        probe.local_addr().expect("bound").port()
+    // The port it advertises is the one it binds. It has to be named
+    // before it is bound, so it is looked for first — and whoever else is
+    // handed ports by the system (the other tests of this file, in this
+    // process) may take it in between: then another one is looked for.
+    // ("bind: … only one usage of each socket address", seen here once, on Windows:
+    // the test then failed before it had tested anything.)
+    let mut attempt = 0;
+    let (shard, any, observed) = loop {
+        attempt += 1;
+        let port = {
+            let probe = std::net::UdpSocket::bind(loopback0()).expect("a free port");
+            probe.local_addr().expect("bound").port()
+        };
+        let any = SocketAddr::from(([0, 0, 0, 0], port));
+        let observed = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut options = orch.options();
+        options.bind = observed;
+        options.advertise = Some(any);
+        options.client_endpoint = Some(any);
+        match start_orchestrated(options, orch.control_addr).await {
+            Ok(shard) => break (shard, any, observed),
+            Err(why) if why.starts_with("bind:") && attempt < 20 => {}
+            Err(why) => panic!("the shard registers: {why}"),
+        }
     };
-    let any = SocketAddr::from(([0, 0, 0, 0], port));
-    let observed = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut options = orch.options();
-    options.bind = observed;
-    options.advertise = Some(any);
-    options.client_endpoint = Some(any);
-    let shard = start_orchestrated(options, orch.control_addr)
-        .await
-        .expect("the shard registers");
     assert_eq!(shard.endpoint, observed, "the address it is seen from");
     assert_eq!(shard.client_endpoint, any, "the host the player dialed");
 

@@ -448,6 +448,31 @@ const OUT_QUEUE: usize = 256;
 /// connection for as long as it liked.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long after a `ShardHello` arrived the run loop still answers it
+/// ([`hello_is_stale`]).
+///
+/// A shard waits [`space_net::HANDSHAKE_TIMEOUT`] (5 s) for the answer to its
+/// hello, then closes the connection and asks again on a new one. An answer
+/// that sets out later than a second before that is not going to be read:
+/// the hello is **stale**, and serving it would give an id, a region and an
+/// epoch to a connection nobody is on.
+pub const HELLO_STALE_AFTER: Duration = Duration::from_secs(4);
+
+/// Whether a `ShardHello` the run loop gets to `age` after it arrived, on a
+/// connection that is `closed` or still open, is one **nobody waits for any
+/// more**: the shard that sent it has given up on it (or is about to) and
+/// asks again on a new connection.
+///
+/// The run loop normally answers a hello within a beat. It gets to one this
+/// late only when it was held up for seconds — a starved host, a slow disk
+/// under the id counter. Such a hello is told "not yet" and changes nothing
+/// ([`crate::orchestrator::Orchestrator::note_abandoned_hello`] says what
+/// welcoming it used to cost).
+#[must_use]
+pub fn hello_is_stale(age: Duration, closed: bool) -> bool {
+    closed || age >= HELLO_STALE_AFTER
+}
+
 /// Application close code for a control connection that never sent its hello.
 const NO_HELLO_CLOSE_CODE: u32 = 0x21;
 
@@ -499,6 +524,9 @@ pub enum Inbound {
         /// Where the run loop says what became of the hello. Dropping it
         /// without an answer closes the connection.
         verdict: oneshot::Sender<Admission>,
+        /// When the hello arrived: the run loop does not serve one it gets
+        /// to too late ([`hello_is_stale`]).
+        received: std::time::Instant,
     },
     /// A shard's periodic load report.
     Report {
@@ -843,6 +871,7 @@ impl ControlServer {
                 return;
             }
         };
+        let received = std::time::Instant::now();
         // This shard's outbound channel. The run loop gets its only sender: it
         // registers it under the id it admits the connection as and writes
         // the welcome and every epoch message through it, in order.
@@ -853,6 +882,7 @@ impl ControlServer {
             reply: tx,
             conn: conn.clone(),
             verdict,
+            received,
         };
         if self.tx.send(hello).await.is_err() {
             return; // the run loop is gone
@@ -1422,6 +1452,29 @@ mod tests {
 
     /// How each refusal goes on the wire, and which one a shard may ask again
     /// after.
+    /// Mutation this catches: answering a hello however old it is, or one
+    /// whose connection has closed (see `note_abandoned_hello` in the
+    /// orchestrator for what that cost).
+    #[test]
+    fn a_hello_is_stale_once_its_shard_has_given_up_or_is_about_to() {
+        let fresh = Duration::from_millis(40);
+        assert!(!hello_is_stale(Duration::ZERO, false));
+        assert!(
+            !hello_is_stale(fresh, false),
+            "answered within a beat or two"
+        );
+        assert!(hello_is_stale(fresh, true), "its connection is closed");
+        assert!(!hello_is_stale(
+            HELLO_STALE_AFTER - Duration::from_millis(1),
+            false
+        ));
+        assert!(hello_is_stale(HELLO_STALE_AFTER, false));
+        assert!(hello_is_stale(space_net::HANDSHAKE_TIMEOUT, false));
+        // The limit leaves the answer time to arrive before the shard stops
+        // waiting for it.
+        assert!(HELLO_STALE_AFTER + Duration::from_secs(1) <= space_net::HANDSHAKE_TIMEOUT);
+    }
+
     #[test]
     fn only_a_wait_is_not_final_and_it_travels_as_draining() {
         let wait = HelloRefusal::Wait("epoch 3 is still in flight".into());

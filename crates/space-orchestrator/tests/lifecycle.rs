@@ -921,6 +921,202 @@ async fn a_connection_speaks_only_for_the_shard_it_was_admitted_as() {
     orch.stop().await;
 }
 
+/// A `ShardHello` the run loop gets to **after its shard has given up on
+/// it** is not served: no shard is registered, no id is spent, no change of
+/// the map is proposed — and the shard, which asks again on a new
+/// connection, is served as if it were asking for the first time.
+///
+/// The test is the run loop here: the front end accepts connections and
+/// queues their hellos, and the test decides when each is answered and how
+/// old it is by then. Three hellos:
+///
+/// 1. answered after the shard has **closed the connection** (what a shard
+///    does when it has waited `HANDSHAKE_TIMEOUT` for the answer);
+/// 2. answered `HELLO_STALE_AFTER` after it arrived, on a connection that is
+///    still open: told "not yet" — the shard asks again at once;
+/// 3. answered at once: welcomed, as the first shard of the cluster.
+///
+/// Mutation this catches (run): serving a hello whatever its age and
+/// whatever became of its connection (`hello_is_stale` always `false`). The
+/// first hello was then given the root and registered on a connection
+/// nobody was on; the orchestrator found that link closed a beat later, and
+/// the shard's next hello was a *replacement* under another id, through an
+/// epoch — with a launched shard, whose process was by then staged for
+/// stopping, that took the epoch's deadline and a launch pause: 14 s instead
+/// of half a second in CI.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_whose_shard_has_given_up_on_it_is_not_served() {
+    use space_orchestrator::control::{Inbound, HELLO_STALE_AFTER};
+
+    let state_path = temp_path("stale").with_extension("id");
+    let _ = std::fs::remove_file(&state_path);
+    let config = OrchestratorConfig {
+        bind: loopback0(),
+        state_path: state_path.clone(),
+        ..OrchestratorConfig::default()
+    };
+    let cluster = config.cluster.clone();
+    let control = boot(config, "peer-token-of-the-test-cluster".into()).expect("boot");
+    let mut orchestrator = Orchestrator::new(control, Arc::new(LocalLauncher::new()));
+    let server = orchestrator.bind().expect("bind control");
+    let control_addr = server.local_addr().expect("control port");
+    let accept = Arc::clone(&server).spawn_accept();
+    let ids = orchestrator.snapshot().next_shard_id;
+
+    // Say hello as a shard does, and hand back the connection and the hello
+    // as it reaches the run loop's queue.
+    let say_hello = |port: u16| {
+        let (server, cluster) = (Arc::clone(&server), cluster.clone());
+        async move {
+            let endpoint = space_net::client_endpoint_for(control_addr).expect("client endpoint");
+            let (conn, _placeholder) = space_net::connect(
+                &endpoint,
+                control_addr,
+                space_orchestrator::control::SERVER_NAME,
+                &space_net::hello("shard:0"),
+            )
+            .await
+            .expect("the transport handshake completes");
+            conn.send_control(&Message::ShardHello(plain_hello(&cluster, port, "")))
+                .await
+                .expect("the hello is sent");
+            let queued = tokio::time::timeout(Duration::from_secs(10), server.next_inbound())
+                .await
+                .expect("the hello reaches the run loop's queue")
+                .expect("the front end is there");
+            (conn, queued)
+        }
+    };
+    let answer = |conn: space_net::Conn| async move {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                m = conn.recv_control() => m,
+                m = conn.recv_stream() => m,
+            }
+        })
+        .await
+        .expect("the orchestrator answers")
+        .expect("the answer can be read")
+        .expect("the answer is a message")
+    };
+    let nothing_decided = |orchestrator: &Orchestrator<LocalLauncher>, what: &str| {
+        let snapshot = orchestrator.snapshot();
+        // (The root's reserved owner is listed from the start: expected, and
+        // not there.)
+        assert!(
+            snapshot
+                .shards
+                .iter()
+                .all(|shard| !shard.connected && shard.advertised.is_none()),
+            "{what}: nobody is registered: {:?}",
+            snapshot.shards
+        );
+        assert!(orchestrator.live_shards().is_empty(), "{what}");
+        assert!(orchestrator.dead_shards().is_empty(), "{what}");
+        assert_eq!(snapshot.next_shard_id, ids, "{what}: no id was spent");
+        assert!(snapshot.in_flight.is_none(), "{what}: nothing is proposed");
+        assert_eq!(snapshot.epoch, 1, "{what}");
+    };
+
+    // 1. The shard gives up before the loop gets to its hello.
+    let (conn, queued) = say_hello(19_101).await;
+    let Inbound::Hello {
+        hello,
+        reply,
+        conn: its_conn,
+        verdict,
+        ..
+    } = queued
+    else {
+        panic!("a hello, got {queued:?}");
+    };
+    conn.close(0, "gave up waiting");
+    tokio::time::timeout(Duration::from_secs(10), its_conn.connection().closed())
+        .await
+        .expect("the orchestrator's end sees the close");
+    orchestrator
+        .answer_hello(&server, &hello, reply, its_conn, verdict, Duration::ZERO)
+        .await;
+    assert_eq!(orchestrator.abandoned_hellos(), 1);
+    nothing_decided(&orchestrator, "a hello on a closed connection");
+
+    // 2. The loop gets to a hello later than a shard waits for its answer.
+    let (conn, queued) = say_hello(19_101).await;
+    let Inbound::Hello {
+        hello,
+        reply,
+        conn: its_conn,
+        verdict,
+        ..
+    } = queued
+    else {
+        panic!("a hello, got {queued:?}");
+    };
+    orchestrator
+        .answer_hello(&server, &hello, reply, its_conn, verdict, HELLO_STALE_AFTER)
+        .await;
+    assert_eq!(orchestrator.abandoned_hellos(), 2);
+    nothing_decided(&orchestrator, "a hello answered too late");
+    assert_eq!(
+        answer(conn).await,
+        Message::Reject(Reject {
+            reason: RejectReason::Draining
+        }),
+        "told to ask again"
+    );
+    let said: Vec<String> = orchestrator
+        .events()
+        .newest_first()
+        .filter(|e| e.text.contains("was not served"))
+        .map(|e| e.text.clone())
+        .collect();
+    assert_eq!(said.len(), 2, "each is in the event log: {said:?}");
+    assert!(said[0].contains("127.0.0.1:19101"), "{said:?}");
+    assert!(said[0].contains("4.0 s after it arrived"), "{said:?}");
+    assert!(said[1].contains("its connection was closed"), "{said:?}");
+
+    // 3. The shard asks again and is answered at once: the first shard of
+    //    the cluster, under the reserved id — not the replacement of a
+    //    shard that never was.
+    let (conn, queued) = say_hello(19_101).await;
+    let Inbound::Hello {
+        hello,
+        reply,
+        conn: its_conn,
+        verdict,
+        received,
+    } = queued
+    else {
+        panic!("a hello, got {queued:?}");
+    };
+    orchestrator
+        .answer_hello(
+            &server,
+            &hello,
+            reply,
+            its_conn,
+            verdict,
+            received.elapsed(),
+        )
+        .await;
+    let Message::ShardWelcome(welcome) = answer(conn.clone()).await else {
+        panic!("a welcome");
+    };
+    assert_eq!(welcome.shard, ShardId::new(1), "the reserved root id");
+    assert_eq!(welcome.shard_map.epoch, 1, "no epoch was needed");
+    assert_eq!(orchestrator.abandoned_hellos(), 2);
+    let snapshot = orchestrator.snapshot();
+    assert_eq!(snapshot.shards.len(), 1);
+    assert_eq!(snapshot.next_shard_id, ids, "the root's id was reserved");
+    assert!(orchestrator.dead_shards().is_empty());
+
+    conn.close(0, "done");
+    accept.abort();
+    server.close();
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(space_orchestrator::scene::scene_path(&state_path));
+}
+
 // ------------------------------------------------------- the process launcher
 
 /// The `space-server` executable the process launcher would start for the
@@ -1187,10 +1383,29 @@ async fn the_process_launcher_starts_real_shards_and_replaces_one_that_is_killed
                 .any(|t| t.starts_with(&format!("{victim} lost: its process exited"))),
             "round {round}: {texts:?}"
         );
-        assert!(
-            took < Duration::from_secs(8),
-            "round {round}: replaced {took:.2?} after the kill"
-        );
+        // And replaced in one go: no change of the map ran into its
+        // deadline on the way (three seconds for an ack that cannot come —
+        // what a replacement cost when a hello of the process that was
+        // being stopped was welcomed), no launch failed, and no launch was
+        // followed by a pause.
+        //
+        // (Not "within so many seconds": on a loaded machine that also
+        // measures how long the machine kept the orchestrator and the new
+        // process from running — an 8 s bound here failed in CI for a run
+        // loop that was held up for more than five. What it stood for is
+        // said above and below. Locally: 0.4 to 0.5 s.)
+        for defect in [
+            "aborted at its deadline",
+            "launching a shard failed",
+            "exited before it registered",
+            "did not register within",
+            "no shard can be started",
+        ] {
+            assert!(
+                !texts.iter().any(|t| t.contains(defect)),
+                "round {round} ({took:.2?}): {texts:?}"
+            );
+        }
         let heir_shard = after
             .shards
             .iter()
@@ -1234,6 +1449,17 @@ async fn the_process_launcher_starts_real_shards_and_replaces_one_that_is_killed
         .collect();
     let pid_path = launcher.pid_path();
     orch.stop().await;
+    // The loop asks its launcher off the loop: a question that was on its
+    // way when the loop was stopped still holds the launcher for a moment.
+    // It goes — and stops its processes — when the last holder lets go.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&launcher) > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "a task of the stopped orchestrator still holds its launcher"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(launcher);
     assert!(
         !pid_path.exists(),

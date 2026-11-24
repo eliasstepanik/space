@@ -553,6 +553,48 @@ async fn a_shard_registers_over_loopback_and_gets_its_id_and_map() {
     server.close();
 }
 
+/// Run the orchestrator's real loop until **its own books** say `settled` —
+/// for [`HEARD_WITHIN_TICKS`] of its ticks at most.
+///
+/// The orchestrator starts, stops and asks about its shards through its
+/// launcher **off the loop** and takes the answer in on a later beat. So
+/// what the launcher says — "started", "dead" — is not yet what the
+/// orchestrator knows: a test that has waited for the launcher and then
+/// reads the orchestrator's books at once (`launch_of`) reads them a beat
+/// too early on a slow machine (that failed in CI). The bound is in the
+/// loop's ticks, not in seconds: what is asserted is that the orchestrator
+/// hears it within its own polling rhythm, however slowly the machine lets
+/// it beat.
+async fn run_the_loop_until_it_knows(
+    orchestrator: &mut Orchestrator<LocalLauncher>,
+    server: &Arc<space_orchestrator::control::ControlServer>,
+    what: &str,
+    settled: impl Fn(&Orchestrator<LocalLauncher>) -> bool,
+) {
+    let give_up = orchestrator.current_tick() + HEARD_WITHIN_TICKS;
+    while !settled(orchestrator) {
+        assert!(
+            orchestrator.current_tick() <= give_up,
+            "{HEARD_WITHIN_TICKS} ticks later the orchestrator still does not know that {what}"
+        );
+        run_the_loop_until(
+            orchestrator,
+            server,
+            what,
+            tokio::time::sleep(std::time::Duration::from_millis(20)),
+        )
+        .await;
+    }
+}
+
+/// How many of its ticks the orchestrator may take to have heard from its
+/// launcher what the launcher already says: the grace a retired shard is
+/// given to be gone (after it the orchestrator stops waiting for the
+/// launcher's word and forgets the launch itself) and two rounds of the
+/// liveness poll.
+const HEARD_WITHIN_TICKS: u64 = space_orchestrator::config::RETIRE_GRACE_TICKS
+    + 2 * space_orchestrator::config::POLL_INTERVAL_TICKS;
+
 /// Run the orchestrator's real loop until `done` resolves (20 s at most), then
 /// a few beats more, so the loop is not stopped in the middle of delivering
 /// what the last beat produced.
@@ -718,6 +760,13 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
         .launch_of(child)
         .await
         .expect("the launcher started the cell's shard");
+    run_the_loop_until_it_knows(
+        &mut orchestrator,
+        &server,
+        "the launch became the cell's shard",
+        |orchestrator| orchestrator.launch_of(child).is_some(),
+    )
+    .await;
     assert_eq!(orchestrator.launch_of(child), Some(child_launch));
     assert_eq!(
         launcher.poll(child_launch).await.expect("poll"),
@@ -836,7 +885,30 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
     );
     assert_eq!(orchestrator.pending_merge(), None);
     assert_eq!(launcher.poll(child_launch).await.expect("poll"), Poll::Dead);
-    assert_eq!(orchestrator.launch_of(child), None);
+    // The orchestrator asks its launcher off the loop and hears the answer a
+    // beat or more later: that the launcher says "dead" (what the wait above
+    // ended on) is not yet the orchestrator having heard it. Keep the loop
+    // running until it has — it must, within its polling rhythm: the next
+    // liveness poll finds the shard gone, and a retired shard the launcher
+    // says nothing about is forgotten after its grace all the same.
+    // (Asserting at once failed in CI on a slow runner: the launch was
+    // still on the books.)
+    run_the_loop_until_it_knows(
+        &mut orchestrator,
+        &server,
+        "the cell's shard is gone",
+        |orchestrator| orchestrator.launch_of(child).is_none(),
+    )
+    .await;
+    assert_eq!(
+        orchestrator.launch_of(child),
+        None,
+        "the stopped shard's launch is forgotten"
+    );
+    assert!(
+        orchestrator.stopping_launches().is_empty(),
+        "and nothing of it is left to stop"
+    );
 
     root.abort();
     server.close();

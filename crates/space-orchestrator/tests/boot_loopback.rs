@@ -543,6 +543,21 @@ async fn a_split_commits_through_the_real_run_loop_and_the_local_launcher() {
         .launch_of(child)
         .await
         .expect("the launcher started the child");
+    // The orchestrator hears what its launcher started on a later beat (a
+    // launch runs off the loop and reports back): that the launcher knows
+    // the child is not yet the orchestrator knowing it. It must, within a
+    // second of its own ticks.
+    let give_up = orchestrator.current_tick() + space_orchestrator::config::TICK_HZ;
+    while orchestrator.launch_of(child).is_none() {
+        assert!(
+            orchestrator.current_tick() <= give_up,
+            "the orchestrator never heard which shard its launch became"
+        );
+        tokio::select! {
+            ended = orchestrator.run_with(Arc::clone(&server)) => panic!("the loop ended: {ended:?}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
     assert_eq!(orchestrator.launch_of(child), Some(child_launch));
     assert_eq!(
         launcher.poll(child_launch).await.expect("poll"),

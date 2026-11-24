@@ -552,7 +552,18 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
 
     // The fleet as the page and the JSON show it: the child was started by
     // the orchestrator, the root's shard by hand; nothing is starting.
-    let state = get(ui, "/api/state").await.body;
+    //
+    // (Which shard a launch became is something the orchestrator hears from
+    // its launcher on a later beat, and the JSON is the snapshot of the last
+    // beat: looked at until it says so, for five seconds at most.)
+    let mut state = get(ui, "/api/state").await.body;
+    for _ in 0..100 {
+        if state.matches("\"launched\":true").count() == 1 && state.contains("\"starting\":0") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state = get(ui, "/api/state").await.body;
+    }
     assert!(
         state.contains(
             "\"fleet\":{\"min_shards\":0,\"max_shards\":8,\"starting\":0,\"wanted\":null,\"hello_auth_required\":false}"

@@ -168,15 +168,28 @@ fn lint_commands() -> Vec<Vec<OsString>> {
 
 /// `cargo nextest run` for the whole workspace. The GPU packages are
 /// serialised by the `gpu` test group in `.config/nextest.toml`.
+///
+/// `--no-fail-fast`: **every test runs, whatever fails** — one run of the CI
+/// says everything that is wrong. (Stopping at the first failure left half
+/// the workspace untested per run, and a second failure was only found by
+/// the push that fixed the first.) The run still fails if any test did.
 fn nextest_command(target_dir: &Path) -> Vec<OsString> {
-    let mut args = os_args(&["nextest", "run", "--workspace", "--locked", "--target-dir"]);
+    let mut args = os_args(&[
+        "nextest",
+        "run",
+        "--workspace",
+        "--locked",
+        "--no-fail-fast",
+        "--target-dir",
+    ]);
     args.push(target_dir.into());
     args
 }
 
 /// The `cargo test` fallback, as two runs: everything except the GPU packages
 /// with cargo's normal test parallelism, then the GPU packages with one test
-/// thread.
+/// thread. Both with `--no-fail-fast` (every test target runs, whatever
+/// fails), and [`test`] runs the second also when the first failed.
 fn cargo_test_commands(target_dir: &Path) -> Vec<Vec<OsString>> {
     let mut rest = os_args(&["test", "--workspace"]);
     let mut gpu = os_args(&["test"]);
@@ -185,11 +198,17 @@ fn cargo_test_commands(target_dir: &Path) -> Vec<Vec<OsString>> {
         gpu.extend(os_args(&["-p", package]));
     }
     for args in [&mut rest, &mut gpu] {
-        args.extend(os_args(&["--locked", "--target-dir"]));
+        args.extend(os_args(&["--locked", "--no-fail-fast", "--target-dir"]));
         args.push(target_dir.into());
     }
     gpu.extend(os_args(&["--", "--test-threads=1"]));
     vec![rest, gpu]
+}
+
+/// The exit status of a task that ran several commands to the end: the
+/// status of the first one that failed, `None` when none did.
+fn first_failure(statuses: impl IntoIterator<Item = Option<i32>>) -> Option<i32> {
+    statuses.into_iter().flatten().next()
 }
 
 fn lint(runner: Runner) {
@@ -203,8 +222,14 @@ fn test(runner: Runner, target_dir: &Path) {
         runner.cargo(&nextest_command(target_dir));
     } else {
         eprintln!("xtask: cargo-nextest not found, falling back to `cargo test`");
-        for args in cargo_test_commands(target_dir) {
-            runner.cargo(&args);
+        // Both runs, whatever the first one says: one run of the CI reports
+        // every failure. The task still fails if either did.
+        let statuses: Vec<Option<i32>> = cargo_test_commands(target_dir)
+            .iter()
+            .map(|args| runner.cargo_status(args))
+            .collect();
+        if let Some(code) = first_failure(statuses) {
+            exit(code);
         }
     }
 }
@@ -245,10 +270,18 @@ impl Runner {
         Self { dry_run }
     }
 
-    /// Run `cargo <args>`; exit with its status if it fails. Arguments are
-    /// passed as OS strings, so a path with spaces or non-ASCII characters
-    /// reaches cargo unchanged.
+    /// Run `cargo <args>`; exit with its status if it fails.
     fn cargo(self, args: &[OsString]) {
+        if let Some(code) = self.cargo_status(args) {
+            exit(code);
+        }
+    }
+
+    /// Run `cargo <args>` and say how it failed: `None` when it succeeded
+    /// (or was only printed), else the exit status to end with — never 0.
+    /// Arguments are passed as OS strings, so a path with spaces or
+    /// non-ASCII characters reaches cargo unchanged.
+    fn cargo_status(self, args: &[OsString]) -> Option<i32> {
         let mut shown = String::from("cargo");
         for arg in args {
             shown.push(' ');
@@ -256,17 +289,19 @@ impl Runner {
         }
         if self.dry_run {
             println!("xtask: would run `{shown}`");
-            return;
+            return None;
         }
         println!("xtask: running `{shown}`");
         let status = Command::new("cargo")
             .args(args)
             .status()
             .unwrap_or_else(|err| panic!("xtask: failed to spawn `cargo`: {err}"));
-        if !status.success() {
-            eprintln!("xtask: `{shown}` failed: {status}");
-            exit(status.code().unwrap_or(1));
+        if status.success() {
+            return None;
         }
+        eprintln!("xtask: `{shown}` failed: {status}");
+        // (Ended by a signal there is no code; and a failure is never 0.)
+        Some(status.code().filter(|code| *code != 0).unwrap_or(1))
     }
 }
 
@@ -859,12 +894,41 @@ mod tests {
                 "run",
                 "--workspace",
                 "--locked",
+                "--no-fail-fast",
                 "--target-dir",
                 &*dir.to_string_lossy()
             ]
         );
         // The path is one argument, not re-split on its space.
         assert_eq!(command.last().map(PathBuf::from), Some(dir));
+    }
+
+    /// One run reports every failure: no test command stops at the first
+    /// failing test (`--no-fail-fast`, as cargo's own option — before any
+    /// `--`), the fallback's second run does not depend on the first, and
+    /// the task still ends with a failure's status.
+    ///
+    /// Mutation this catches: dropping the flag from either path (the CI
+    /// stopped at its first failure with 672 of 1361 tests never run), or
+    /// ending with success when only the first of two runs failed.
+    #[test]
+    fn every_test_runs_whatever_fails_and_a_failure_still_fails_the_task() {
+        let dir = Path::new("t").join("xtask-test");
+        let mut commands = cargo_test_commands(&dir);
+        commands.push(nextest_command(&dir));
+        for command in commands.iter().map(|c| args(c)) {
+            let flag = command.iter().position(|a| a == "--no-fail-fast");
+            let test_args = command.iter().position(|a| a == "--");
+            assert!(flag.is_some(), "{command:?}");
+            assert!(
+                test_args.is_none_or(|dashes| flag < Some(dashes)),
+                "{command:?}"
+            );
+        }
+        assert_eq!(first_failure([None, None]), None);
+        assert_eq!(first_failure([Some(101), None]), Some(101));
+        assert_eq!(first_failure([None, Some(101)]), Some(101));
+        assert_eq!(first_failure([Some(100), Some(101)]), Some(100));
     }
 
     /// Without nextest the GPU packages must not be run by a plain
