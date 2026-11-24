@@ -909,9 +909,12 @@ async fn a_shard_that_restarts_is_handed_the_scene_that_is_current_now() {
     let at = |scene: Scene, revision: u64| SceneState::new(scene.id(), revision);
     let cluster = Cluster::boot("restart-scene").await;
     let limits = Limits {
-        // The shard that went away may still be counted as connected for a
-        // moment; do not wait long for it.
-        scene_confirm_wait: Duration::from_millis(300),
+        // Long enough for a shard that has just spawned its scene to confirm
+        // the first switch on a loaded machine (300 ms was not, in CI's
+        // container). The shard that went away may still be counted as
+        // connected for a moment, but only until its connection is seen to
+        // close: the second switch does not wait all of this.
+        scene_confirm_wait: Duration::from_secs(5),
         ..unhurried()
     };
     let (ui, ui_task) = cluster.web_ui(None, limits).await;
