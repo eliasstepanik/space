@@ -31,7 +31,27 @@
 //! Two bodies simulated by two shards would collide only approximately (each
 //! sees the other as an immovable ghost). So bodies that may touch soon —
 //! an **island**: [`space_sim::SimWorld::islands`] with [`ISLAND_MARGIN`] and
-//! [`ISLAND_LEAD`] — are consolidated onto **one** shard before they meet:
+//! [`ISLAND_LEAD`] — are consolidated onto **one** shard before they meet.
+//!
+//! "May touch soon" is a statement about two bodies' **motion**: their
+//! bounding spheres are within twice the margin of each other now, or come
+//! that close within the lead time if each moves on in a straight line as it
+//! moves now (the closest approach of their relative motion). A body that
+//! flies *past* another, however fast, is not in its island; one that flies
+//! *at* it is, a second before they meet. (An island used to be every body
+//! within `|v| · lead` of a body in **any** direction. A ship crossing a
+//! hundred metres above the demo area at 120 m/s was then one island with
+//! everything below it, behind it and ahead of it, and since bodies follow a
+//! player — below — the whole showcase changed shard with every pass and
+//! came back afterwards: 73 body handoffs a pass in
+//! `tests/four_cells.rs`' fly-by, where there are none now; on a live stack
+//! 659 handoffs and 197 transfers called off in half an hour of play.)
+//!
+//! What it costs: the test is on bounding spheres, so a tall thin thing — a
+//! ship is a capsule 1.8 m tall and 0.6 m wide — reaches about a metre and a
+//! half sideways from its hull at rest. A player who walks past a stack that
+//! close has it brought to the player's shard and sent back three seconds
+//! after the player has gone.
 //!
 //! * Every island is given a **key**: its member with the lowest guid and that
 //!   member's [`home`]. A shard computes it over its own bodies in the island
@@ -48,6 +68,22 @@
 //!   region does not contain it — the one exception to "the shard a body is
 //!   on is the one the map names". When the island dissolves, each body's own
 //!   home applies again and it returns to its region's owner.
+//! * **Two shards never offer each other members of one island.** What each
+//!   side knows of the other's key is a tick old, so on the tick an island
+//!   forms, or its key's home changes, the two can disagree for that tick.
+//!   Two rules keep that from becoming two offers that cross: an island that
+//!   touches another shard's bodies is offered only once its home has been
+//!   the same for [`CONFIRM_TICKS`] passes (the other side's key of the first
+//!   of them is in by then); and an island one of whose bodies is **on its
+//!   way here** (staged, or committed and not yet installed) waits for it and
+//!   then goes on with it, rather than being offered against it. (The second
+//!   was seen with late commits: a crate sliding across a border towards
+//!   another that had just been sent back to its side — its home changed
+//!   while that transfer was under way, it was offered the other way, and
+//!   refused.) Should two offers cross all the same, the accepting shard
+//!   with the higher id refuses its side ("crossing island transfer") and
+//!   the refused bodies are offered again after the pause; that costs
+//!   nothing a client sees, and no test here makes it happen any more.
 //!
 //! # Hysteresis
 //!
@@ -109,6 +145,17 @@
 //!   offered in one group with the ship's lead, committed on the tick the
 //!   ship is committed, installed with it — a crate being pushed across a
 //!   border is on the ship's shard at every tick.
+//! * **Nothing follows a player back.** While a player's ship is on its way
+//!   to a shard — its transfer is staged there, or it is far enough into
+//!   that shard's ground ([`SHIP_HYSTERESIS`]) for its own shard to be
+//!   offering it now — the bodies of that shard which come within its reach
+//!   **wait where they are**: the ship will be theirs within the second.
+//!   (They used to be offered to the shard the ship was leaving, against the
+//!   ship's own transfer: refused as a crossing island transfer when the
+//!   ship's shard had the higher id, sent there and back when it had the
+//!   lower. Bodies the ship reached *before* that are already with it and
+//!   travel with it, above.) For that second, at most, the ship meets such a
+//!   body as body against ghost.
 //! * **It waits for nothing but its own gate.** The ship commits when the
 //!   accepting shard has accepted it and its player has connected there. A
 //!   body of its group that is refused, or not accepted by then, stays
@@ -165,7 +212,13 @@
 //! need not own the spawn point, or any of the scene: every body it holds
 //! outside its own territory — all of them, when the cells the scene lies in
 //! were carved out for other shards — goes to the shard that owns it by the
-//! ordinary handoff, a few ticks after the spawn. On a scene change every shard despawns the
+//! ordinary handoff, a few ticks after the spawn: **at once and all on one
+//! tick**, also a body that lies within the distance hysteresis of the
+//! spawner's own ground (the hysteresis is for a body that has crossed a
+//! border; one that was put down on a neighbour's ground has not, and held
+//! back it would meet the bodies that went ahead as body against ghost — the
+//! demo area's third bowl ball, 1.9 m from the border, did, and the three
+//! ended 18 cm from where one shard has them). On a scene change every shard despawns the
 //! bodies of the old scene it simulates (their ghosts go with the next ghost
 //! frame) and the spawner spawns the new scene's.
 //!
@@ -186,16 +239,22 @@ pub const GHOST_MARGIN: f64 = 64.0;
 /// Velocity lead of the ghost margin, seconds: a body's margin grows by
 /// `|v| · GHOST_LEAD`.
 pub const GHOST_LEAD: f64 = 3.0;
-/// Contact-proximity margin of an island, metres (each body's box grows by
-/// it; see [`space_sim::IslandQuery`]). Small: the velocity lead is what
-/// gives a moving body its reach; at rest two bodies a metre apart do not
+/// Contact-proximity margin of an island, metres (two bodies whose bounding
+/// spheres are within twice this are one island; see
+/// [`space_sim::IslandQuery`]). It has to cover what the velocity lead cannot
+/// see: what a body gains from rest in the time a body handoff takes — a
+/// third of a second: 0.3 m under a ship's thrust, 0.5 m in free fall.
+/// Small beyond that: the velocity lead is what gives a moving body its
+/// reach; at rest two bodies a metre apart do not
 /// touch, and a larger margin chained whole resting groups across a border
 /// into one island (the demo area's zero-g corner, back when a horizontal
 /// border ran through a scene at spawn height: a hinged door below an
 /// octant's floor and a spring pair just above it).
 pub const ISLAND_MARGIN: f64 = 0.5;
-/// Velocity lead of an island, seconds: long enough for a player's handoff
-/// (one second) to land before two bodies closing at moderate speed meet.
+/// Velocity lead of an island, seconds: two bodies that come within reach of
+/// each other in this time, moving on as they move now, are one island. Long
+/// enough for a player's handoff (one second) to land before two bodies
+/// closing at moderate speed meet.
 pub const ISLAND_LEAD: f64 = 1.0;
 /// How far inside another shard's territory an unowned body must be before
 /// that shard takes it over, metres.
@@ -206,6 +265,11 @@ pub const BODY_HYSTERESIS: f64 = 2.0;
 /// on it or walks along it, crossed in a fifteenth of a second at flying
 /// speed.
 pub const SHIP_HYSTERESIS: f64 = 1.0;
+/// How many border passes in a row an island that touches another shard's
+/// bodies must have belonged on the same other shard before its bodies are
+/// offered there (see the module docs, "Islands and consolidation"): one
+/// for the other side's key of this tick to arrive, one to act on it.
+pub const CONFIRM_TICKS: SimTick = 2;
 /// A body inside another shard's territory this long in a row is settled
 /// there and taken over, however close to the border (see "Hysteresis").
 pub const SETTLE_TICKS: SimTick = 3 * space_sim::TICK_HZ as SimTick;

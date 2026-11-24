@@ -72,9 +72,18 @@
 //!    [`MERGE_LEAD`] and, separately, by the **split margin**
 //!    [`SPLIT_FACTOR`] times that.
 //! 2. **Split.** The members of a bubble whose split boxes fall into more than
-//!    one connected group are separated: the group holding the bubble's
-//!    smallest guid keeps it, every other group gets a new bubble (in order of
-//!    its smallest guid).
+//!    one connected group are separated: the group with the **most members**
+//!    keeps it (ties: the one holding the smallest guid), every other group
+//!    gets a new bubble (in order of its smallest guid). The group that keeps
+//!    the bubble keeps the solver's world as it is — its contacts, what
+//!    sleeps — and every other group is put into a fresh one, awake, where it
+//!    finds its contacts again in the first step and re-settles within
+//!    millimetres. (The bubble used to stay with its smallest guid. A
+//!    player's ship has a lower guid than any body of a scene, so whenever a
+//!    player left a group of resting bodies it was *they* who were moved —
+//!    and, inserted asleep, they then fell centimetres into the floor before
+//!    the solver had their contacts: the demo area's crate stack hopped
+//!    every time somebody walked away from it.)
 //! 3. **Merge.** Bodies whose merge boxes overlap (transitively) must share a
 //!    bubble: their bubbles merge into the one with the most members (ties:
 //!    the lowest id), new bodies join it, and a group with no bubble gets a
@@ -292,9 +301,15 @@ pub struct ContactEvent {
 /// What [`crate::SimWorld::islands`] groups by.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IslandQuery {
-    /// Contact proximity margin, metres.
+    /// Contact proximity margin, metres: two bodies whose bounding spheres
+    /// are within twice this of each other are grouped.
     pub margin: f64,
-    /// Velocity look-ahead, seconds: each body's box grows by `|v| · lead_time`.
+    /// Velocity look-ahead, seconds: two bodies are grouped too if, each
+    /// moving on in a straight line as it moves now, they come that close at
+    /// some moment of the next `lead_time` seconds. (It was once "each body's
+    /// box grows by `|v| · lead_time`", in every direction: a ship passing a
+    /// hundred metres overhead at 120 m/s was then within reach of everything
+    /// below it, in front of it and behind it.)
     pub lead_time: f64,
     /// Whether a spring between two dynamic bodies couples them.
     pub springs: bool,
@@ -611,6 +626,16 @@ fn grow(b: &mut Option<Aabb>, c: [i128; 3], e: i128) {
 /// Connected components of overlapping boxes (sweep and prune on x). Each
 /// index maps to the smallest index of its component.
 fn components(boxes: &[Option<Aabb>], extra_edges: &[(usize, usize)]) -> Vec<usize> {
+    components_where(boxes, extra_edges, |_, _| true)
+}
+
+/// [`components`], where two overlapping boxes are only joined if
+/// `joined(a, b)` says so too.
+fn components_where(
+    boxes: &[Option<Aabb>],
+    extra_edges: &[(usize, usize)],
+    joined: impl Fn(usize, usize) -> bool,
+) -> Vec<usize> {
     let n = boxes.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -636,7 +661,12 @@ fn components(boxes: &[Option<Aabb>], extra_edges: &[(usize, usize)]) -> Vec<usi
             if blo[0] > ahi[0] {
                 break;
             }
-            if blo[1] <= ahi[1] && alo[1] <= bhi[1] && blo[2] <= ahi[2] && alo[2] <= bhi[2] {
+            if blo[1] <= ahi[1]
+                && alo[1] <= bhi[1]
+                && blo[2] <= ahi[2]
+                && alo[2] <= bhi[2]
+                && joined(a, b)
+            {
                 union(&mut parent, a, b);
             }
         }
@@ -645,6 +675,44 @@ fn components(boxes: &[Option<Aabb>], extra_edges: &[(usize, usize)]) -> Vec<usi
         union(&mut parent, a, b);
     }
     (0..n).map(|i| find(&mut parent, i)).collect()
+}
+
+/// One part of a body as the island query sees it: where it is, how it
+/// moves, and the radius of its bounding sphere.
+#[derive(Clone, Copy)]
+struct Reach {
+    pos: WorldPos,
+    vel: [f32; 3],
+    radius: f64,
+}
+
+/// Whether two parts, each moving on in a straight line at the speed it has
+/// now, come within `gap` metres of each other (bounding sphere to bounding
+/// sphere) at some moment of the next `lead` seconds: the closest approach
+/// of the relative motion over `[0, lead]`.
+///
+/// Plain `f64` arithmetic on exact inputs (no square root, nothing
+/// transcendental): the same answer on every shard that holds the same two
+/// states, and the same whichever of the two is `a`.
+fn may_meet(a: &Reach, b: &Reach, gap: f64, lead: f64) -> bool {
+    let d = WorldPos::delta(a.pos, b.pos);
+    let v: [f64; 3] = core::array::from_fn(|k| f64::from(b.vel[k]) - f64::from(a.vel[k]));
+    let vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    let dv = d[0] * v[0] + d[1] * v[1] + d[2] * v[2];
+    let t = if vv > 0.0 && lead > 0.0 {
+        (-dv / vv).clamp(0.0, lead)
+    } else {
+        0.0
+    };
+    let at: [f64; 3] = core::array::from_fn(|k| d[k] + v[k] * t);
+    let reach = a.radius + b.radius + gap;
+    at[0] * at[0] + at[1] * at[1] + at[2] * at[2] <= reach * reach
+}
+
+/// [`may_meet`] for two bodies: any part of one and any part of the other.
+fn bodies_may_meet(a: &[Reach], b: &[Reach], gap: f64, lead: f64) -> bool {
+    a.iter()
+        .any(|p| b.iter().any(|q| may_meet(p, q, gap, lead)))
 }
 
 fn state_bits(s: &ShipState) -> ([i64; 3], [u32; 13]) {
@@ -1642,7 +1710,20 @@ impl Physics {
                     None => groups.push((c2[i], vec![i])),
                 }
             }
-            for (_, group) in groups.into_iter().skip(1) {
+            // The largest group keeps the bubble (ties: the first, which
+            // holds the smallest guid); the others get new ones, in order of
+            // their smallest guid. Keeping it means keeping the solver's
+            // world as it is — bodies, contacts, sleep — so it is the group
+            // with the most to lose that stays (see the module docs, rule 2).
+            let keeps = groups
+                .iter()
+                .enumerate()
+                .max_by(|(i, a), (j, b)| a.1.len().cmp(&b.1.len()).then(j.cmp(i)))
+                .map_or(0, |(k, _)| k);
+            for (k, (_, group)) in groups.into_iter().enumerate() {
+                if k == keeps {
+                    continue;
+                }
                 let id = self.new_bubble_id();
                 for i in group {
                     assign[i] = Some(id);
@@ -1932,7 +2013,12 @@ impl Physics {
     /// Islands (hook for phase 2's co-location): see [`IslandQuery`].
     pub(crate) fn islands(&self, world: &World, q: IslandQuery) -> Vec<Island> {
         let guids: Vec<EntityGuid> = self.entries.keys().copied().collect();
+        // The boxes are the broad phase: each part's bounding sphere grown by
+        // the margin and by everything it can cover in the lead time. Two
+        // bodies whose boxes are apart cannot meet; whether two whose boxes
+        // overlap do is decided by the motion itself (`may_meet`).
         let mut boxes: Vec<Option<Aabb>> = vec![None; guids.len()];
+        let mut reach: Vec<Vec<Reach>> = vec![Vec::new(); guids.len()];
         let mut dynamic = vec![false; guids.len()];
         for (i, g) in guids.iter().enumerate() {
             let e = &self.entries[g];
@@ -1948,8 +2034,15 @@ impl Physics {
                     um(states[p].pos),
                     um_extent(part.radius + q.margin + speed * q.lead_time),
                 );
+                reach[i].push(Reach {
+                    pos: states[p].pos,
+                    vel: v,
+                    radius: part.radius,
+                });
             }
         }
+        let meet =
+            |a: usize, b: usize| bodies_may_meet(&reach[a], &reach[b], 2.0 * q.margin, q.lead_time);
         let mut edges = Vec::new();
         if q.springs {
             for (i, g) in guids.iter().enumerate() {
@@ -1973,7 +2066,7 @@ impl Physics {
             .zip(&dynamic)
             .map(|(b, d)| if *d { *b } else { None })
             .collect();
-        let comp = components(&coupling, &edges);
+        let comp = components_where(&coupling, &edges, meet);
         let mut out: BTreeMap<usize, Island> = BTreeMap::new();
         for (i, g) in guids.iter().enumerate() {
             if dynamic[i] && boxes[i].is_some() {
@@ -2000,7 +2093,7 @@ impl Physics {
                     continue;
                 }
                 let Some((blo, bhi)) = boxes[j] else { continue };
-                if (0..3).all(|k| blo[k] <= hi[k] && lo[k] <= bhi[k]) {
+                if (0..3).all(|k| blo[k] <= hi[k] && lo[k] <= bhi[k]) && meet(i, j) {
                     if let Some(island) = out.get_mut(&comp[j]) {
                         if !island.touching.contains(g) {
                             island.touching.push(*g);
@@ -2127,10 +2220,17 @@ fn insert_into(
         let builder = if e.ghost || !part.dynamic {
             RigidBodyBuilder::kinematic_velocity_based()
         } else {
+            // Never inserted asleep, whatever `e.sleeping` says: the solver
+            // has no contacts yet for a body it is handed asleep, and builds
+            // none for some steps after something wakes it — a resting stack
+            // moved into another bubble fell 6 cm (its top crate 30 cm) into
+            // the floor before it was pushed out again. Inserted awake and at
+            // rest it finds its contacts in the first step and is put back to
+            // sleep by the solver a second later.
             let mut b = RigidBodyBuilder::dynamic()
                 .additional_mass_properties(part.mprops)
                 .ccd_enabled(part.ccd)
-                .sleeping(e.sleeping);
+                .sleeping(false);
             if part.lock_rotation {
                 b = b.lock_rotations();
             }

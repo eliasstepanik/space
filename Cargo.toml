@@ -163,5 +163,23 @@ opt-level = 3
 [profile.dev.package.space-stream]
 opt-level = 3
 
+# The physics. The shard tests that run the demo area on four shards step it
+# for minutes of simulated time (`space-server/tests/four_cells.rs`), and at
+# opt-level 0 the solver and the collision detection are where that time goes.
+# `space-sim` is the glue around them (it reads and writes every body every
+# tick). No dependency is added or changed by this: two crates the workspace
+# already uses are built optimised once, and one small crate of ours. Measured
+# on that test file: 6.7 s -> 0.84 s per 300 ticks. Floating-point results do
+# not depend on the opt-level (no fast-math), so trajectories are the same in
+# debug and release.
+[profile.dev.package.rapier3d-f64]
+opt-level = 3
+
+[profile.dev.package.parry3d-f64]
+opt-level = 3
+
+[profile.dev.package.space-sim]
+opt-level = 2
+
 [profile.release]
 lto = "thin"

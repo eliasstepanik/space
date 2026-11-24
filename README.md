@@ -58,21 +58,29 @@ map, so all players agree on where things are.
 Needs the Rust toolchain from `rust-toolchain.toml`.
 
 ```powershell
-.\scripts\dev.ps1                          # orchestrator (player port, web UI) + the shard it starts + the window client
-.\scripts\dev.ps1 -MinShards 4             # four shards behind the same address: the demo area in four shard areas
+.\scripts\dev.ps1                          # orchestrator (player port, web UI) + the four shards it starts + the window client
+.\scripts\dev.ps1 -MinShards 1             # the same on one shard: no borders anywhere
 .\scripts\dev.ps1 -Topology two-shards     # two neighbouring shards: fly across the border
 .\scripts\dev.ps1 -Client headless -Script scripts\harness\smoke.lua   # a scripted test run
 ```
 
 ```sh
 bash scripts/dev.sh                        # the same on Linux
-bash scripts/dev.sh --min-shards 4
+bash scripts/dev.sh --min-shards 1
 ```
 
 The scripts build the release binaries, start the server side in the
 background (logs in `target/dev/`), run the client, and stop the servers when
 the client ends. `Get-Help .\scripts\dev.ps1 -Full` (or the header of
 `scripts/dev.sh`) lists the options.
+
+The scripts start **four shards** behind the one address (`-MinShards` /
+`--min-shards`, 1 to 8): the demo area lies in four shard areas that meet at
+`pos` x = -6 / z = -4, and what a player does there — walk across, push a
+crate over a border, knock a stack over it — is what it would be on one
+shard. That is the scripts' default only: `space-orchestrator` itself starts
+no shard unless told to (`--min-shards`, default 0), and the compose files
+are unchanged.
 
 By hand:
 
@@ -251,9 +259,15 @@ Standing on a border or walking along it is no handoff, and a player is
 handed over for where it is, not because another flew past.
 
 Physics bodies cross the same way, with nobody to redirect: near a border each
-shard shows its neighbour's bodies as ghosts, bodies that may touch are moved
-onto one shard before they do, and a body that leaves a region is handed to
-the next (the rules: `crates/space-server/src/border.rs`).
+shard shows its neighbour's bodies as ghosts, bodies that may touch — that are
+close, or moving *towards* each other — are moved onto one shard before they
+do, and a body that leaves a region is handed to the next (the rules:
+`crates/space-server/src/border.rs`). A body changes shard for where it is or
+for what it is about to touch, not because a player is near or flies past.
+Against the same scene on one shard (`crates/space-server/tests/four_cells.rs`):
+a body handed over in free flight goes on bit-identically; one handed over in
+contact — sliding, resting in a stack — within a millimetre, because the
+contact solver starts afresh on the shard that takes it.
 
 ## Test
 

@@ -72,7 +72,36 @@
 //! `tests/physics.rs` (unowned bodies and groups:
 //! `an_unowned_body_handoff_keeps_h1_to_h8`,
 //! `an_unanswered_body_offer_times_out_and_nothing_moved`,
-//! `a_refused_body_offer_leaves_the_body_where_it_was`, the island tests).
+//! `a_refused_body_offer_leaves_the_body_where_it_was`, the island tests)
+//! and `tests/four_cells.rs` (bodies on the demo area's four shard areas,
+//! against the same thing on one shard).
+//!
+//! # What a handed-over body keeps, and what it does not
+//!
+//! Guarantee 4 moves a body's whole state, and a body in **free flight** —
+//! weightless, in orbit, falling — goes on bit-identically on the shard that
+//! takes it (`tests/four_cells.rs`: pushed across each border and through
+//! the corner where four cells meet, dropped and handed over in mid-fall).
+//! What does **not** travel is the contact solver's own memory: the warm
+//! start of a contact and the order of its constraints. A body handed over
+//! **in contact** is solved cold on its first tick there. Measured: a crate
+//! sliding across a border on the floor stays within 0.7 mm of the same
+//! slide on one shard, and within 0.02 mm of its height — it neither sinks
+//! nor hops; a crate at rest moves by tens of micrometres; a stack re-settles
+//! by millimetres (its top crate by up to a centimetre); a collision that is
+//! under way on the very ticks of the handoff comes out 2 % different.
+//!
+//! A commit that arrives **late** is brought forward along the body's
+//! velocity, without gravity (a body resting on a floor would be sunk into
+//! it: the accepting shard has no contacts for it yet and cannot tell the
+//! floor's push from none). A body that was falling is therefore short of
+//! the missed ticks' gravity from then on — 0.33 m/s per tick: with two
+//! ticks it falls up to half a metre behind and lands a tick or two late, in
+//! the same place. Not corrected; pinned in
+//! `a_late_commit_does_not_sink_or_hop_a_falling_or_a_sliding_crate`. On one
+//! host commits are on time (the shards tick on one clock, 33 ms apart from
+//! the next tick): `ShardStats::caught_up` counts the ticks made up.
+//!
 //! # The tick of a state
 //!
 //! The shards of a cluster count the same ticks ([`crate::clock`]): tick `n`

@@ -1176,12 +1176,18 @@ fn a_crate_falls_through_the_gravity_room_across_a_border() {
 /// split so that most of the gravity room is shard 2's ([`split_demo`]), and
 /// a player who starts on shard 1, three metres behind the border between
 /// the zero-g corner and the spawn point, and runs through the room. The
-/// ship is handed to shard 2 on the way and pulls the islands it passes over
-/// with it — bodies of the zero-g corner and the bowl, which lie on shard 1's
-/// side; once it has gone, the bodies settle and must not be sent back and
-/// forth (the island hysteresis). Bounded: each body goes back at most a
-/// couple of times, and after a while nothing moves between the shards at
-/// all.
+/// ship is handed to shard 2 on the way — and takes **nothing** of shard 1's
+/// side with it, and nothing moves between the shards once it has gone.
+///
+/// (The premise of this test changed with the island rule, phase 4 of
+/// `docs/plan-sharding.md`. The run used to pull the islands it passed over
+/// along — bodies of the zero-g corner and of the bowl, which lie on shard
+/// 1's side, more than three of them — and the test pinned that they came
+/// back afterwards without being sent to and fro: at most a couple of
+/// handoffs each. An island now reaches only what a body is moving
+/// *towards*, so the same run pulls none of them, and what is pinned is
+/// that: 0 bodies taken along, 0 handoffs afterwards. Bodies a player does
+/// reach, and what becomes of them, are `tests/four_cells.rs`'.)
 ///
 /// (The run was first seen with a *horizontal* border at eye height, the
 /// floor of the room's +z half on shard 2: the ship crossed it by landing,
@@ -1242,20 +1248,24 @@ fn a_player_running_through_a_split_showcase_leaves_it_settled() {
         ship_x > 19.0,
         "it ran through the room and out: x = {ship_x:.1}"
     );
-    // (More than the bowl's three balls, which roll into reach of the
-    // pyramid across the border by themselves: the spring pair and the door
-    // of the zero-g corner, which the ship started beside.)
-    assert!(
-        most_pulled_over > 3,
-        "the ship's island took bodies of shard 1's side along: {most_pulled_over}"
+    // It took nothing of shard 1's side along: the nearest bodies there —
+    // the door and the spring pair of the zero-g corner behind its start,
+    // the balls in the bowl beside its path — were never within reach of
+    // where it was going. (An island used to reach as far as a body's speed
+    // in every direction, behind it and beside it too: at this ship's 15 m/s
+    // that was the whole corner and the bowl, more than three bodies taken
+    // to shard 2 and sent back afterwards. See `space_sim::IslandQuery`.)
+    assert_eq!(
+        most_pulled_over, 0,
+        "the ship's island took bodies of shard 1's side along"
     );
     let after_run = handoffs(&c);
     c.tick_n(600);
     let settling = handoffs(&c) - after_run;
     let total = space_scene::body_defs(Scene::DemoArea).len();
-    assert!(
-        settling <= 2 * total,
-        "{settling} handoffs in the twenty seconds after the run: bodies are ping-ponging"
+    assert_eq!(
+        settling, 0,
+        "handoffs in the twenty seconds after the run: bodies are ping-ponging"
     );
     let settled = handoffs(&c);
     c.tick_n(300);

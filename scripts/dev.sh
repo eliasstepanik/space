@@ -13,7 +13,7 @@
 #                     the one address a client connects to - its control port
 #                     on 127.0.0.1:7900 (shards only) and its web UI on
 #                     http://127.0.0.1:7980/. It starts the shards itself
-#                     (--min-shards, default 1; below) and sends every client
+#                     (--min-shards, default 4; below) and sends every client
 #                     to the one that owns the spawn point. Change the scene
 #                     for every shard and client in the web UI. Needs curl.
 #       single        one standalone shard on 127.0.0.1:7777
@@ -44,15 +44,17 @@
 #                        (default target/dev/harness-out)
 #   --stream ADDR        where the stream client serves viewers
 #   --size WxH  --quality high|medium|low|ci  --glb FILE  --no-vsync
-#   --min-shards N       orchestrated only (default 1): the orchestrator starts
-#                        and keeps N shards running by itself
-#                        (space-orchestrator --launcher process --min-shards N),
-#                        each a space-server process on a port from 7870 up,
-#                        logging to target/dev/shard-<port>.log. With 4 the
+#   --min-shards N       orchestrated only (default 4, at most 8): the
+#                        orchestrator starts and keeps N shards running by
+#                        itself (space-orchestrator --launcher process
+#                        --min-shards N), each a space-server process on a
+#                        port from 7870 up, logging to
+#                        target/dev/shard-<port>.log. With the default 4 the
 #                        demo area lies in four shard areas that meet at pos
 #                        x = -6 / z = -4. A shard that dies is replaced, and a
 #                        client that was on it comes back by itself through
-#                        the player port.
+#                        the player port. --min-shards 1 is the whole world
+#                        on one shard.
 #   --port-offset N      add N to every port (a second stack beside the first)
 #   --no-build           use the release binaries that are already built
 #   --servers-only       start the server side and return (stop with --stop)
@@ -61,7 +63,7 @@
 # Examples:
 #   scripts/dev.sh
 #   scripts/dev.sh --topology two-shards
-#   scripts/dev.sh --min-shards 4
+#   scripts/dev.sh --min-shards 1
 #   scripts/dev.sh --client headless --script scripts/harness/smoke.lua
 #   scripts/dev.sh --client headless        # then: curl http://127.0.0.1:8098/state
 #   scripts/dev.sh -- --frames 600 --no-vsync
@@ -98,7 +100,7 @@ size=""
 quality="high"
 glb=""
 port_offset=0
-min_shards=1
+min_shards=4
 min_shards_given=0
 connect_screen=0
 no_vsync=0

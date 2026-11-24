@@ -39,9 +39,11 @@ That builds the release binaries and starts, in the background:
 | logs | `target/dev/*.log`, the shards' in `target/dev/shard-<port>.log` |
 
 - The orchestrator always starts its shards itself (`space-orchestrator
-  --player-bind … --launcher process --min-shards N`), one by default.
-  `--min-shards 4` / `-MinShards 4` gives four: the demo area in four shard
-  areas that meet at HUD `pos` x = -6 / z = -4. The script waits until every
+  --player-bind … --launcher process --min-shards N`), **four by default**:
+  the demo area in four shard areas that meet at HUD `pos` x = -6 / z = -4
+  (`--min-shards 1` / `-MinShards 1` is one shard that owns everything — the
+  thing to compare with when something looks wrong at a border; up to 8).
+  The script waits until every
   shard owns its region and the player port has a shard to send a client to
   (about a second), and says which shard that is. `--stop` stops those shards
   too: it reads their pids from `target/dev/launched-shards.pid` — the
@@ -280,7 +282,7 @@ Check what your change touches, and one step either side of it.
   `client_endpoint` per region and shard; the page shows the same on its
   Cluster card and in the shard table's "players dial" column
   (`0.0.0.0:<port>` = "the host they dialed").
-- **Four shard areas:** `--min-shards 4`. `GET /api/state` (and the page)
+- **Four shard areas** (the scripts' default). `GET /api/state` (and the page)
   show four regions, each with a connected owner; `fleet` says what the
   orchestrator keeps running and what is starting. From the spawn point
   (`pos 0 0 0`, the root's shard) cross x = -6 and z = -4: the HUD's shard
@@ -296,10 +298,28 @@ Check what your change touches, and one step either side of it.
   keeps its `shard`, `session` and `handoffs` while the first crosses, also
   when the first flies right past it: a player's ship is handed over for
   where it is, not for who is near (`space-server/src/border.rs`, "Players'
-  ships"). The bodies a player's second of motion reaches do change shard
-  with it and back (the shards' handoff counters run; their `aborted`
-  counters may rise for **bodies** — two shards offering each other members
-  of one island — never for a player).
+  ships"). The bodies a player is about to touch — within a metre or so of
+  its hull, or on the line it is moving along within a second — do change
+  shard with it and go back three seconds after it has gone (the shards'
+  handoff counters run). **Flying past changes nothing**: a pass over the
+  showcase, however fast, is the ship's own handoff and no other, and a
+  shard's `aborted` counter stays where it is — a log line `the handoff of
+  ... was called off` is something to look into, for a body as for a player.
+- **Physics on four shards** (`docs/plan-sharding.md` §7; the repeatable
+  version is `crates/space-server/tests/four_cells.rs`, against the same
+  scene on one shard). Leave the stack alone for two minutes: no shard's
+  `handoffs`/`aborted` moves (the census line in `shard-<port>.log` is only
+  written when something changed), and in `/state`'s `bodies` only the
+  moons, pendulums, chain and spring pair move. Then use it: walk into the
+  crate stack and on over z = -4, push the crate that floats on the border
+  at `pos` -13.2 0.6 -4.0 (it goes up and forward: it floats at head height
+  and a ship's top is round — on one shard too), push the spring pair over
+  x = -6, walk away from a stack. Nothing may sink into what it rests on,
+  hop, jitter, vanish or be there twice; a second client on the neighbour's
+  shard lists the same bodies at the same places (`bodies` is drawn state:
+  two clients sampled a few milliseconds apart differ by that much motion,
+  and not at all at rest). A body knocked more than 64 m from every border
+  is missing for clients of the other shards — known, section 6.
 - **Seamless crossing** (`docs/plan-sharding.md` §5): a change of shard
   shows in the HUD's shard number and in nothing else. Sample `/state` as
   fast as it answers while crossing and look at what is **drawn**:

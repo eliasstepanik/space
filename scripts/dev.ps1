@@ -14,7 +14,7 @@
                     127.0.0.1:7777 - the one address a client connects to -
                     its control port on 127.0.0.1:7900 (shards only) and its
                     web UI on http://127.0.0.1:7980/. It starts the shards
-                    itself (-MinShards, default 1; see below) and sends every
+                    itself (-MinShards, default 4; see below) and sends every
                     client to the one that owns the spawn point. Change the
                     scene for every shard and client in the web UI.
       single        one standalone shard on 127.0.0.1:7777
@@ -51,13 +51,14 @@
     runs a Lua script and makes its outcome this script's exit code, -OutDir
     DIR is where scripts write screenshots (default target\dev\harness-out).
 
-    -MinShards N (orchestrated only; default 1): the orchestrator starts and
-    keeps N shards running by itself (space-orchestrator --launcher process
-    --min-shards N), each a space-server process on a port from 7870 up,
-    logging to target\dev\shard-<port>.log. With 4 the demo area lies in four
-    shard areas that meet at pos x = -6 / z = -4: walk across and the HUD's
-    shard number changes. A shard that dies is replaced, and a client that was
-    on it comes back by itself through the player port.
+    -MinShards N (orchestrated only; default 4, at most 8): the orchestrator
+    starts and keeps N shards running by itself (space-orchestrator --launcher
+    process --min-shards N), each a space-server process on a port from 7870
+    up, logging to target\dev\shard-<port>.log. With the default 4 the demo
+    area lies in four shard areas that meet at pos x = -6 / z = -4: walk
+    across and the HUD's shard number changes, and nothing else does. A shard
+    that dies is replaced, and a client that was on it comes back by itself
+    through the player port. -MinShards 1 is the whole world on one shard.
 
     -PortOffset N adds N to every port (a second stack beside the first).
 
@@ -65,17 +66,17 @@
 
 .EXAMPLE
     .\scripts\dev.ps1
-    The orchestrator, the one shard it starts and the windowed client in the
-    demo area. Open http://127.0.0.1:7980/ to switch the scene while playing.
+    The orchestrator, the four shards it starts and the windowed client in the
+    demo area. Open http://127.0.0.1:7980/ to switch the scene while playing,
+    and to see the four regions and their shards.
 
 .EXAMPLE
     .\scripts\dev.ps1 -Topology two-shards
     Fly across the shard border: hold D until the HUD says "shard 2".
 
 .EXAMPLE
-    .\scripts\dev.ps1 -MinShards 4
-    The demo area on four shards the orchestrator starts itself. The web UI
-    (http://127.0.0.1:7980/) shows the four regions and their shards.
+    .\scripts\dev.ps1 -MinShards 1
+    The same with one shard that owns everything: no borders anywhere.
 
 .EXAMPLE
     .\scripts\dev.ps1 -Topology single -Scene galaxy -ConnectScreen
@@ -124,7 +125,7 @@ param(
     # running. (8 is the orchestrator's own limit: the root's shard and one
     # per layout cell; it refuses to start with more.)
     [ValidateRange(1, 8)]
-    [int]$MinShards = 1,
+    [int]$MinShards = 4,
     # Start the client on the connect screen instead of connecting at once.
     [switch]$ConnectScreen,
     # Present as fast as frames render instead of waiting for vsync.

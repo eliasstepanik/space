@@ -57,8 +57,8 @@ You are expected to *use* the game while you build it.
 
 | I want to… | Use |
 |---|---|
-| start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): the orchestrator (player port, web UI), the shard it starts, and a client pointed at the player port |
-| run the demo area on four shards | the same with `-MinShards 4` / `--min-shards 4`: the orchestrator starts the shards itself (one `space-server` process each, logs in `target/dev/shard-<port>.log`), replaces one that dies, and `-Stop` stops them too. The client's address stays the player port |
+| start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): the orchestrator (player port, web UI), the **four shards** it starts — the demo area in four shard areas that meet at HUD `pos` x = -6 / z = -4 — and a client pointed at the player port. The orchestrator starts the shards itself (one `space-server` process each, logs in `target/dev/shard-<port>.log`), replaces one that dies, and `-Stop` stops them too |
+| run it on one shard, or on more | the same with `-MinShards N` / `--min-shards N` (1 to 8; 1 = no borders anywhere). The client's address stays the player port |
 | drive a client without a human | the harness: `space-client --headless --harness 127.0.0.1:8098`, then `GET /state`, `GET /frame.png`, `POST /input`, `POST /script` |
 | script a user | Lua: `space-client --headless --script scripts/harness/smoke.lua` — the exit code is the script's result |
 | watch and play in a browser | `space-client --stream 127.0.0.1:8099` + `cargo run -p xtask -- viewer` → `http://127.0.0.1:8097/` |

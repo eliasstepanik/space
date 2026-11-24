@@ -391,8 +391,8 @@ became, and where it differs from the bullets above:
   sends_to_shard, redirected, told_starting, refused_busy }`, `map.spawn_owner` and a
   `client_endpoint` per region and shard; the page shows the same.
 - **Dev scripts**: the orchestrated topology is always `--launcher process` behind
-  `--player-bind 127.0.0.1:7777` (`-MinShards` default 1); the client is pointed at the player
-  port; the scripts wait for `player_port.answer == "redirect"`.
+  `--player-bind 127.0.0.1:7777` (`-MinShards` default 1 — 4 since phase 4, section 7); the
+  client is pointed at the player port; the scripts wait for `player_port.answer == "redirect"`.
 - **Not done here**: shards the `process` launcher starts still **bind loopback**, so a player on
   another machine is sent to `<entry host>:<port>` and reaches nothing - publishing shards is
   section 8's. The compose files are untouched: they run one hand-started shard without a player
@@ -597,15 +597,119 @@ phase 3** (the rules: `border.rs`, "Players' ships"; the tests: `space-server/te
   eight. Shards now say which transfer was called off and why (`Shard::recent_aborts`, a few
   log lines per ten seconds).
 
-**Still open for this section** (seen in phase 3's runs): bodies follow a player across a border
-and back in numbers (above, section 5's last bullet); two shards still refuse each other's body
-groups by the crossing rule now and then (harmless: retried after the pause, no client sees
-it).
+**Was still open after phase 3, closed in phase 4** (the status block below): bodies followed a
+player across a border and back in numbers (section 5's last bullet); two shards refused each
+other's body groups by the crossing rule now and then.
 
 `space-server/tests/physics.rs` gets a four-shard fixture with the borders through the showcase:
 islands whose members have three or four homes, ghost refresh between every pair, hysteresis at
 the corner where four cells meet, a player walking through the room across both borders. What
 breaks is fixed in `border.rs` / `shard_physics.rs` with the rules written down there.
+
+**Status: built (phase 4).** The fixture is `space-server/tests/four_cells.rs` (a file of its
+own, not `physics.rs`): the orchestrator's four-shard layout as four in-process shards on one
+cluster clock, every scenario run on it and on one shard that owns all four cells, compared body
+by body and tick by tick. Numbers below are from it (debug build) unless a live stack is named.
+
+- **What was measured before anything was changed** (the same fixture on `f05f5aa`). Idle: one
+  transfer called off at tick 11 of every start ("crossing island transfer"), the three balls of
+  the bowl handed to and fro in the first second and ending up to 18 cm from where one shard has
+  them, everything else bit-identical to one shard. Six passes of a ship 100 m above the showcase
+  at 120 m/s: **446 handoffs**, 6 of them the ship's — 73 bodies a pass. Flying through the
+  zero-g corner six times: 70 handoffs for 6 crossings. A player walking away from the gravity
+  room: the crate stack **sank up to 30 cm into itself and the floor for three ticks and hopped
+  back** — on four shards and on one.
+- **Cause 1, the churn: what "may touch soon" meant.** An island was every body within
+  `|v| x 1 s` of another *in any direction*: a ship at 120 m/s was one island with everything
+  within 120 m, behind and beside it too, and since bodies follow a player the whole showcase
+  changed shard with every pass and came back. Now two bodies are one island when their bounding
+  spheres are within a metre of each other, or come that close within a second **on the way they
+  are moving** — the closest approach of their relative motion (`space_sim::IslandQuery`,
+  `rigid.rs::may_meet`; no new constant). A body changes shard because it moved, or because
+  something that is about to touch it did; not because a player is near. The same six passes: 6
+  handoffs, the ship's. What is left: the test is on bounding spheres, so a player who walks past
+  a stack within about a metre and a half of its hull still takes it along (and it comes back
+  three seconds after the player has gone).
+- **Cause 2, transfers called off with nobody near.** (a) At every start: the balls rolling
+  down the ramp, *away* from the bowl, were one island with the balls rolling into it across
+  `z = -4`, the two shards computed different keys for one tick and offered each other its
+  members. Gone with cause 1. (b) In general the two sides' knowledge of each other's island key
+  is one tick old. Three rules now keep that from becoming two offers that cross
+  (`border.rs`, "Islands and consolidation" and "Players' ships"): an island that touches a
+  neighbour's bodies is offered only once its home has been the same for two passes
+  (`CONFIRM_TICKS`); an island one of whose bodies is on its way *here* waits for it and goes on
+  with it; and nothing follows a player **back** — while a player's ship is on its way to a
+  shard (staged there, or a metre into its ground), that shard's bodies ahead of it wait where
+  they are. The crossing rule itself (the lower shard id takes it) stays as the last resort; no
+  test and no minute of the live run below made it fire. (c) A scene body the spawner puts on a
+  neighbour's ground goes there at once and with the others, also when it lies within the 2 m
+  hysteresis of the border: the hysteresis is for a body that has crossed one.
+- **Cause 3, the sinking stack, was not a border at all** (`space-sim/src/rigid.rs`). When a
+  bubble split, the group holding its *smallest guid* kept the solver's world — a player's ship
+  has a lower guid than any scene body, so whenever a player left a group of resting bodies it
+  was they who were moved into a fresh world; and a body inserted there **asleep** has no
+  contacts for a few steps after something wakes it. Now the **largest** group keeps the bubble
+  (nothing happens to it at all), and a body is never inserted asleep (a stack that does have to
+  move re-settles within 6 mm instead of dropping 30 cm). Two tests in `space-sim/tests/physics.rs`.
+- **What "the same as on one shard" is, measured.** Never handed over, or handed over in **free
+  flight** (weightless, in orbit, falling; across `x = -6`, `z = -4`, through the corner, along
+  a border, at 20 m/s): **bit-identical** at every tick. Handed over **in contact**: the solver's
+  warm start stays behind, so the first tick on the new shard is solved cold — a crate sliding
+  across the border on the floor stays within 0.7 mm of one shard's and within 0.02 mm of its
+  height (no sink, no hop); crates at rest on the planetoid 0.04 mm; the three balls colliding in
+  the bowl 9 mm; a stack brought to a passing player's shard and back 8 mm at its top crate; a
+  crate a player pushes 2.7 m across the border 1.5 cm, the player 1.1 cm; a collision that is
+  under way on the very ticks of a handoff 2 %. A spring whose ends are on two shards (across the
+  corner, 20 s, a dozen swings): 0.04 mm, the swing neither grows nor dies. A pendulum and a
+  chain swinging over the border do not change shard and are bit-identical. Resting against and
+  on a ghost until consolidated (11 ticks): heights within 2 mm.
+- **Not corrected, and pinned:** a commit that arrives late is brought forward along the body's
+  velocity without gravity, so a body that was *falling* is short of 0.33 m/s per late tick —
+  with two ticks it falls up to half a metre behind and lands a tick or two late, in the same
+  place (`a_late_commit_does_not_sink_or_hop_a_falling_or_a_sliding_crate`). A body on the floor
+  is unaffected. On one host commits were never late in the live run.
+- **"A crate was knocked up and forward rather than pushed"** is the collider, not a border: the
+  demo area floats that crate at head height and a ship is a capsule, so what strikes the crate
+  is the capsule's rounded top, and a ship has no friction. The same flight on one shard sends
+  it off the same way, to the bit when the ship has changed shard before the blow
+  (`the_floating_crate_on_the_border_is_struck_the_same_on_one_shard`). Left as it is.
+- **Dev default.** `scripts/dev.ps1` / `scripts/dev.sh` start **four shards** (`-MinShards` /
+  `--min-shards` default 4; 1 = one shard). The orchestrator binary's own default (0) and the
+  compose files are unchanged.
+- **Build profile** (`Cargo.toml`, no dependency added): `rapier3d-f64` and `parry3d-f64` are
+  built at opt-level 3 and `space-sim` at 2 in the dev profile. The four-shard tests step minutes
+  of physics; 300 ticks of the fixture went from 6.7 s to 0.84 s. The new file's 14 tests take
+  6 s together on this machine (25 s one at a time).
+- **On a live stack** (`dev.ps1 -ServersOnly -PortOffset 300`, four shards by default, release
+  build, two headless clients on the harness; json, frames and outputs in
+  `target/dev/shots/phase4/`, 2026-11-24). Start: 16 bodies handed to their shards, **0 called
+  off** (2-3 before). Two minutes idle: no counter moved; only the moons, the pendulums, the
+  chain, the spring pair and the ramp's balls moved more than a millimetre. Walking into the
+  crate stack and on over `z = -4`: the lower three crates crossed still stacked, 4.1 m; a
+  second client on the far side's shard saw every crate in every sample, its view of them
+  within 15 cm of the first's while they moved (the two reads are not simultaneous) and
+  identical at rest. The floating crate on the border struck, the spring pair pushed 30 m
+  across `x = -6`, the door swung, a crate pushed past the four-cell corner (0.4 m from the
+  line) into the third shard: views within 7-10 cm in motion, medians under 1 cm, no sample
+  missing, 0 called off. Ten fast-travel passes at 245-274 m/s 150 m up: 10 handoffs, the
+  ship's ten. Five minutes of two clients flying through everything (38 legs, 24 changes of
+  shard): 103 handoffs, 79 of them bodies (16 of those the scene being rebuilt just before),
+  **0 called off** — against 659 handoffs and 197 called off in the half hour of phase 3. The
+  shard that owns the bowl end killed by pid: replaced under a new id on the next port, the
+  scene re-issued once, both clients then listing 35 bodies, 35 distinct, all of the new
+  revision. `smoke.lua`, `physics.lua` (unchanged; 97 s) and `moon.lua` pass against the
+  four-shard stack. In the whole session no shard logged a transfer called off or a tick it
+  could not keep up with, and every client ended with 0 validation messages.
+- **Not done here, and what still looks wrong.** Bodies knocked further than the ghost margin
+  from a border are drawn only by the clients of the shard that simulates them (two crates
+  325 m out were missing for a client one shard over): section 6. The reach of an island is
+  measured on bounding spheres (above). During the second of a player's handoff the ship meets
+  bodies that came within reach only then as body against ghost. The falling body's late commit
+  (above). A crossing island transfer is still possible in principle and was seen once on the
+  live stack *before* the last of the three rules was written (a ball offered towards a ship
+  that was on its way back), not since. The harness clients' prediction was 16 cm off the
+  shard's word once in the five minutes of ramming things (`correction_max_m`); where was not
+  looked at.
 
 ## 8. Docker launcher and compose
 
