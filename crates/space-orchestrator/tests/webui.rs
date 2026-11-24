@@ -353,7 +353,7 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
         "shard 1",
         &root.endpoint.to_string(),
         "connected",
-        "0 player(s), 35 entities, tick mean",
+        "0 player(s), 46 entities, tick mean",
         "registered from",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");

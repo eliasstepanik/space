@@ -846,9 +846,17 @@ impl BodyRenderer {
                     relative(camera, place_of(spawn, anchor, pos), offset)
                 }
             };
-            scene
-                .instances
-                .extend(coil(a, b, COIL_RADIUS, COIL_TURNS, COIL_WIRE));
+            // A long spring between big things is drawn as thick as it is
+            // long: the showcase's springs (1.5 m at rest) at the size they
+            // always had, the far content's 16 m one ten times that.
+            let scale = (spring.rest_length / COIL_REST).max(1.0);
+            scene.instances.extend(coil(
+                a,
+                b,
+                COIL_RADIUS * scale,
+                COIL_TURNS,
+                COIL_WIRE * scale,
+            ));
         }
     }
 }
@@ -870,6 +878,9 @@ fn extent_along(shape: &ShapeRef, axis: [f32; 3]) -> f32 {
 
 /// The radius of a drawn spring coil, metres.
 pub const COIL_RADIUS: f32 = 0.07;
+/// The rest length of the springs a coil of [`COIL_RADIUS`] is meant for,
+/// metres (the showcase's): a longer spring's coil is scaled up with it.
+pub const COIL_REST: f32 = 1.5;
 /// The turns of a drawn spring coil.
 pub const COIL_TURNS: u32 = 8;
 /// The thickness (radius) of a drawn spring's wire, metres.

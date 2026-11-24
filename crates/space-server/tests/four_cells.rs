@@ -19,6 +19,10 @@
 //!   zero-g     |   spawn point, most of the gravity room
 //! ```
 //!
+//! (Further out, one piece of the scene's far content in each of the three
+//! cells beside the root's: the giant rock on shard 4, the drifters on
+//! shard 2, the far rock on shard 3.)
+//!
 //! # What "the same as on one shard" can mean
 //!
 //! * A body that is **never handed over**, and touches nothing that was, is
@@ -42,6 +46,7 @@
 //!
 //! | test | what it pins |
 //! |---|---|
+//! | [`the_far_content_is_on_its_shards_once_and_moves_as_on_one_shard`] | the far content (171 m, 706 m and 1.2 km out): spawned once, one handoff each to the cell's shard, nobody's ghost; three minutes of orbits, swing and tumbling bit-identical to one shard |
 //! | [`the_showcase_rests_for_a_minute_on_four_shards`] | every object of the showcase at rest for 60 s: one handoff per body to its shard at the start, then none; nothing called off; nothing creeps; against one shard |
 //! | [`bodies_pushed_across_each_border_and_through_the_corner_fly_as_on_one_shard`] | free flight across `x = −6`, `z = −4`, the corner, along a border: bit-identical |
 //! | [`a_crate_slides_and_a_crate_falls_across_the_border_in_gravity`] | handed over in contact and while falling: no sink, no hop |
@@ -90,6 +95,12 @@ const FLOOR: f64 = space_scene::demo::FLOOR;
 /// A lane of the gravity room's floor that is clear across `z = −4`: between
 /// the west curb and the crate stack.
 const LANE_X: f64 = 10.9;
+
+/// The scene bodies the root's shard — which spawns the scene — hands to the
+/// shards whose ground they lie on, at the start of every four-shard run:
+/// 16 of the showcase's 35 and the far content's 11 (`space_scene::demo`,
+/// "Far content").
+const SCENE_HANDOFFS: usize = 16 + 11;
 
 const ROOT: ShardId = ShardId::new(1);
 /// `x > −6`, `z < −4`: the bowl end of the gravity room.
@@ -609,7 +620,11 @@ fn the_showcase_rests_for_a_minute_on_four_shards() {
         .map(|(_, g)| *g)
         .filter(|g| c.simulators(*g) != vec![ROOT])
         .collect();
-    assert_eq!(foreign.len(), 16, "the bodies off the root's ground");
+    assert_eq!(
+        foreign.len(),
+        SCENE_HANDOFFS,
+        "the bodies off the root's ground"
+    );
     assert_eq!(
         c.handed_off(),
         foreign.len(),
@@ -637,8 +652,15 @@ fn the_showcase_rests_for_a_minute_on_four_shards() {
         // What rests does not creep (the last 50 of the 60 seconds).
         let rests = !matches!(
             *name,
-            "moon" | "swinging pendulum" | "bobbing pendulum" | "chain" | "ramp ball"
-        ) && !name.starts_with("spring pair");
+            "moon"
+                | "swinging pendulum"
+                | "bobbing pendulum"
+                | "chain"
+                | "ramp ball"
+                | "far moon"
+                | "giant moon"
+        ) && !name.starts_with("spring pair")
+            && !name.starts_with("drift pair");
         if rests {
             let crept = strayed(&four, i, 300);
             assert!(crept < 1.0e-3, "{name} crept {crept:.5} m");
@@ -652,6 +674,171 @@ fn the_showcase_rests_for_a_minute_on_four_shards() {
         .expect("the demo area floats a crate on z = -4");
     let i = c.names.iter().position(|(_, g)| *g == on_border).unwrap();
     assert_eq!(strayed(&four, i, 0), 0.0, "the crate on the border moved");
+}
+
+/// The far content — the drifters 171 m out, the far rock's moons 706 m
+/// out, the giant rock's 1.2 km out (`space_scene::demo`, "Far content") —
+/// over three minutes on four shards and on one.
+///
+/// * **Spawned once per cluster.** The four shards together simulate
+///   exactly the bodies one shard does, each on one shard; the far content
+///   is on the shard of its cell — the drifters on the north shard, the far
+///   moons on the west one, the giant moons on the diagonal one — after one
+///   handoff each from the root's shard, which spawned them, and never
+///   changes shard again. Nothing is called off.
+/// * **Nobody's ghost.** No shard ever holds a ghost of any of it: it lies
+///   beyond the 64 m (plus three seconds of motion) of every border, which
+///   is what makes it a far replica for a player on another shard
+///   (`tests/far.rs`).
+/// * **The same as on one shard, to the bit, at every tick**: orbits, swing
+///   and tumbling are free flight, and a handoff in free flight is exact.
+///   The moons stay within 1 % of their orbits' radii for the three minutes
+///   (four to sixteen times round), on four shards as on one.
+///
+/// Mutations this catches (each was run): every shard spawning the scene's
+/// bodies instead of the one spawner (`replace_scene_bodies` without the
+/// spawner check: two shards simulate one guid at once — the fixture's own
+/// assertion after every tick); the far rock 60 m from `x = −6` (its moons
+/// are the west shard's ghosts on the root's shard); the giant rock at
+/// +840, 320, +840, in the root's own cell (24 handoffs, and its moons on
+/// the root's shard); a body brought forward at its install by a tick it
+/// did not miss (`install_body`: 27 ticks caught up where there are none,
+/// and every moon off the one-shard orbit).
+#[test]
+fn the_far_content_is_on_its_shards_once_and_moves_as_on_one_shard() {
+    const TICKS: usize = 3 * 60 * 30;
+    let far: [(&str, ShardId); 5] = [
+        ("drift pair a", NORTH),
+        ("drift pair b", NORTH),
+        ("drift crate", NORTH),
+        ("far moon", WEST),
+        ("giant moon", DIAGONAL),
+    ];
+    let (four, one, c) = on_four_and_on_one(|c| {
+        let content: Vec<EntityGuid> = far.iter().flat_map(|(name, _)| c.named(name)).collect();
+        assert_eq!(content.len(), 11);
+        let mut out = Tracks::new();
+        for tick in 0..TICKS {
+            c.tick();
+            out.push(c.track());
+            // (For the dozen ticks the handoff from the spawner takes, the
+            // shard a body is going to holds it as the root's ghost — it
+            // lies on that shard's own ground. Measured: gone by tick 12.)
+            if tick < 30 {
+                continue;
+            }
+            for shard in &c.shards {
+                for guid in &content {
+                    assert_eq!(
+                        shard.ghost_owner(*guid),
+                        None,
+                        "{} holds a ghost of the far content's {guid} at tick {tick}",
+                        shard.shard()
+                    );
+                }
+            }
+        }
+        out
+    });
+    // Once per cluster: the four shards' own bodies are the one shard's.
+    let own = |c: &Cluster| -> Vec<EntityGuid> {
+        let mut all: Vec<EntityGuid> = c
+            .shards
+            .iter()
+            .flat_map(|s| s.body_list())
+            .filter(|b| !b.ghost)
+            .map(|b| b.guid)
+            .collect();
+        all.sort();
+        all
+    };
+    let scene: Vec<EntityGuid> = c.names.iter().map(|(_, g)| *g).collect();
+    assert_eq!(
+        scene.len(),
+        46,
+        "the showcase's 35 and the far content's 11"
+    );
+    assert_eq!(own(&c), scene, "every scene body once, and nothing else");
+    assert_eq!(own(&c), own(&Cluster::one()));
+    assert_eq!(
+        c.handed_off(),
+        SCENE_HANDOFFS,
+        "one handoff each, at the start"
+    );
+    c.assert_nothing_called_off();
+    assert_eq!(c.caught_up(), 0);
+    let len = |v: [f64; 3]| dist(v, [0.0; 3]);
+    for (name, shard) in far {
+        for guid in c.named(name) {
+            assert_eq!(c.simulators(guid), vec![shard], "{name}");
+            assert_eq!(c.owner(c.rel(guid)), shard, "{name} lies in its cell");
+            let i = c.names.iter().position(|(_, g)| *g == guid).unwrap();
+            let (apart, at) = worst_apart(&four, &one, i);
+            assert_eq!(apart, 0.0, "{name}: off the one-shard run at tick {at}");
+            // It was handed over once, within the first ticks, and is
+            // there in every sample but that one.
+            let in_flight = four.iter().filter(|row| row[i][0].is_nan()).count();
+            assert!(in_flight <= 1, "{name} was in flight {in_flight} times");
+        }
+    }
+    use space_scene::demo;
+    for (name, centre, orbits) in [
+        ("far moon", demo::FAR_ROCK_CENTER, demo::FAR_ROCK_ORBITS),
+        (
+            "giant moon",
+            demo::GIANT_ROCK_CENTER,
+            demo::GIANT_ROCK_ORBITS,
+        ),
+    ] {
+        for (guid, radius) in c.named(name).into_iter().zip(orbits) {
+            let i = c.names.iter().position(|(_, g)| *g == guid).unwrap();
+            let mut swept = 0.0;
+            let mut last: Option<[f64; 3]> = None;
+            for row in &four {
+                if row[i][0].is_nan() {
+                    continue;
+                }
+                let d = [0, 1, 2].map(|k| row[i][k] - centre[k]);
+                assert!(
+                    (len(d) - radius).abs() < radius * 0.01,
+                    "{name} is {} m from its rock, not {radius}",
+                    len(d)
+                );
+                if let Some(l) = last {
+                    let cos = (0..3).map(|k| d[k] * l[k]).sum::<f64>() / (len(d) * len(l));
+                    swept += cos.clamp(-1.0, 1.0).acos();
+                }
+                last = Some(d);
+            }
+            assert!(
+                swept > 2.0 * std::f64::consts::TAU,
+                "{name} went {swept} rad round in three minutes"
+            );
+        }
+    }
+    // The pair swings (4 m either way between its ends) and the tumbling
+    // crates stay where they are.
+    let (a, b) = (c.named("drift pair a")[0], c.named("drift pair b")[0]);
+    let index = |g: EntityGuid| c.names.iter().position(|(_, n)| *n == g).unwrap();
+    let apart: Vec<f64> = four
+        .iter()
+        .filter(|row| row[index(a)][0].is_finite() && row[index(b)][0].is_finite())
+        .map(|row| dist(row[index(a)], row[index(b)]))
+        .collect();
+    let (lo, hi) = apart
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), d| (l.min(*d), h.max(*d)));
+    assert!(
+        (lo - 12.0).abs() < 0.05 && (hi - 20.0).abs() < 0.05,
+        "the pair swings between {lo} and {hi} m apart"
+    );
+    for guid in c.named("drift crate") {
+        assert_eq!(
+            strayed(&four, index(guid), 30),
+            0.0,
+            "a tumbling crate moved"
+        );
+    }
 }
 
 // ------------------------------------------------------------- free flight
@@ -702,7 +889,7 @@ fn bodies_pushed_across_each_border_and_through_the_corner_fly_as_on_one_shard()
     // One handoff per body (the scene's sixteen at the start aside): also
     // for the one that went through the corner, which never was a body of
     // the two cells beside its path.
-    assert_eq!(c.handed_off(), 16 + c.extra.len());
+    assert_eq!(c.handed_off(), SCENE_HANDOFFS + c.extra.len());
     c.assert_nothing_called_off();
 }
 
@@ -885,7 +1072,14 @@ fn a_stack_on_the_border_stands_and_is_pushed_over_across_it() {
             c.tick();
             out.push(c.track());
         }
-        assert_eq!(c.handed_off(), if c.shards.len() == 4 { 16 } else { 0 });
+        assert_eq!(
+            c.handed_off(),
+            if c.shards.len() == 4 {
+                SCENE_HANDOFFS
+            } else {
+                0
+            }
+        );
         // The player lands in the lane two and a half metres before the
         // stack, walks into it and stops.
         let mut pilot = Pilot::join(c, "pusher");
@@ -1053,7 +1247,7 @@ fn bodies_resting_against_and_on_a_ghost_do_not_move() {
             "body {i}"
         );
     }
-    assert_eq!(c.handed_off(), 16 + 2, "one handoff per pair");
+    assert_eq!(c.handed_off(), SCENE_HANDOFFS + 2, "one handoff per pair");
     c.assert_nothing_called_off();
 }
 
@@ -1120,7 +1314,7 @@ fn a_ship_set_down_on_a_slab_of_the_neighbour_stands_still() {
         vec![ROOT],
         "the slab followed the player"
     );
-    assert_eq!(c.handed_off(), 16 + 1);
+    assert_eq!(c.handed_off(), SCENE_HANDOFFS + 1);
     c.assert_nothing_called_off();
 }
 
@@ -1168,7 +1362,7 @@ fn an_island_waits_for_a_member_that_is_on_its_way_before_it_moves_on() {
     }
     println!(
         "crossing: {} handoffs beyond the scene's sixteen",
-        c.handed_off() - 16
+        c.handed_off() - SCENE_HANDOFFS
     );
 }
 
@@ -1240,7 +1434,7 @@ fn a_spring_across_the_corner_swings_as_on_one_shard() {
     let (four, one, c) = on_four_and_on_one(scenario);
     assert_eq!(c.simulators(c.extra[0]), vec![DIAGONAL]);
     assert_eq!(c.simulators(c.extra[1]), vec![ROOT]);
-    assert_eq!(c.handed_off(), 16, "neither end changed shard");
+    assert_eq!(c.handed_off(), SCENE_HANDOFFS, "neither end changed shard");
     c.assert_nothing_called_off();
     for i in 0..2 {
         let (apart, at) = worst_apart(&four, &one, i);
@@ -1312,7 +1506,7 @@ fn a_pendulum_and_a_chain_swinging_over_the_border_stay_on_their_shard() {
         assert_eq!(worst_apart(&four, &one, i).0, 0.0, "the {name}");
         assert_eq!(c.simulators(c.extra[i]), vec![ROOT], "the {name}");
     }
-    assert_eq!(c.handed_off(), 16);
+    assert_eq!(c.handed_off(), SCENE_HANDOFFS);
     c.assert_nothing_called_off();
 }
 
@@ -1345,7 +1539,7 @@ fn a_player_passing_the_showcase_moves_no_body_it_does_not_reach() {
     let mut pilot = Pilot::join(&mut c, "passer-by");
     pilot.steps(&mut c, [0.0; 3], 60);
     let settled = c.handed_off();
-    assert_eq!(settled, 16);
+    assert_eq!(settled, SCENE_HANDOFFS);
     let mut nearest = f64::INFINITY;
     let mut fly = |c: &mut Cluster, pilot: &mut Pilot, thrust: [f32; 3], ticks: usize| {
         for _ in 0..ticks {
@@ -1456,7 +1650,7 @@ fn a_body_ahead_of_a_player_who_is_changing_shard_waits_where_it_is() {
     );
     assert_eq!(
         c.handed_off(),
-        16 + 1,
+        SCENE_HANDOFFS + 1,
         "the ship's own handoff and no other"
     );
     c.assert_nothing_called_off();
@@ -1485,7 +1679,7 @@ fn a_body_ahead_of_a_player_who_is_changing_shard_waits_where_it_is() {
         pilot.steps(&mut c, [0.0; 3], 75);
         assert_eq!(
             c.handed_off(),
-            16 + pilot.switches,
+            SCENE_HANDOFFS + pilot.switches,
             "a crate {behind:.1} m behind the border changed shard"
         );
         c.assert_nothing_called_off();

@@ -208,7 +208,19 @@ room and lifts off, sets a spring pendulum swinging, pushes a floating crate
 and the door, lands on the planetoid and lifts off, watches a moon circle
 it); it flies around for a couple of minutes, so give it
 `--script-timeout 300`. `scripts/harness/moon.lua` fast-travels to the Moon
-and lands on it (about three minutes; `--script-timeout 330`). The API:
+and lands on it (about three minutes; `--script-timeout 330`).
+`scripts/harness/sharding.lua` is the tour of the four shard areas and of
+the far content: on the spawn point it counts the 46 bodies and checks the
+far content's 11 at their steps (as far replicas when there are several
+shards), watches the moons and the spring pair move between three looks,
+flies a loop round the corner where the four areas meet (x = -6, z = -4 and
+back: four changes of shard, `handoffs` counting, and in **every frame** the
+drawn ship within 10 cm of where the frame before and its velocity put it),
+then out to the drifters, each of which must go from `far` to `local` in
+place — never missing, twice or back. It pushes nothing. About 50 s on a
+GPU; give it `--script-timeout 180`. On a `--min-shards 1` stack it finds no
+far replica at the spawn point, takes that as "one shard" and asserts the
+same tour without a change of shard. The API:
 
 ```lua
 client.type("127.0.0.1:7777")  client.press("enter")
@@ -335,6 +347,40 @@ Check what your change touches, and one step either side of it.
   Everything moves smoothly at any frame rate (no 30 Hz steps), sits on what
   it rests on (no gap, no sinking), and a player walking into the gravity room
   lands (HUD `gravity 9.81 m/s2  landed`) and lifts off again with Space.
+- **Far content** (demo area; `space_scene::demo`, "Far content"): three
+  things far outside the area, one in each of the three shard areas beside
+  the spawn point's, more than 64 m from every border — what a player on the
+  spawn point is sent as **far replicas**, at the three coarser rates. The
+  HUD says `bodies 46`: the showcase's 35 and these 11.
+  - The **drifters**, `pos` 90 40 -140 (171 m; in the first view, top right,
+    just right of Earth): two 4 m teal crates swinging on a thick steel coil
+    between 12 m and 20 m apart, once in 6 s, and three 3 m crates tumbling
+    in place; a `DRIFTERS` sign under them. `step` 1, ten samples a second.
+  - The **far rock**, `pos` -560 90 420 (706 m; turn 127° left, 7° up, over
+    the zero-g corner): a cratered rock 32 m across with three 5 m moons
+    26, 34 and 42 m out (round in 26, 39 and 53 s) and a `FAR ROCK 4 M/S2`
+    sign. `step` 2, five a second.
+  - The **giant rock**, `pos` -840 320 -840 (1.23 km; 45° left, 15° up,
+    above the glass corner and left of the planetoid): 80 m across, three
+    12 m moons 55, 70 and 85 m out (37, 53 and 71 s), a `GIANT ROCK 3 M/S2`
+    sign. `step` 3, one a second.
+
+  At 640x480 the crates are about 13 pixels, the far rock 25 and its moons
+  4, the giant rock 36 and its moons 5 (half as much again at 1280x720). The
+  rocks are lit by the Sun and the faint ambient light only (the area's
+  lamps do not reach): a rock whose day side faces away is a dim grey ball,
+  never black. Fly there (the giant rock in fast travel: hold W at it and
+  let go 150 m out): each piece goes `far` -> `local` at your own change of
+  shard, in every frame and once; you land on a rock as on the planetoid
+  (HUD `gravity 3.3 m/s2` on the far rock, `2.8` on the giant one; `landed`
+  shows at touchdown and mostly drops out again at rest, as on the
+  planetoid) and lift off with Space. On a `-MinShards 1` stack the same 46
+  bodies are all `local`, at the same steps. **Known defect** (`docs/plan-sharding.md`
+  §6, "Far content"): the giant rock's moons, far replicas at one sample a
+  second, stand still and leap up to 7 m every second for most of the time
+  — their samples reach the client up to 29 ticks late; the drifters and
+  the far rock's moons are smooth (millimetres off their speed times the
+  frame time), and so are the giant rock's moons on one shard.
 - **Other scenes:** switch to each one and back.
 - **Players:** a second client must see the first one's character.
 - **One address:** a client given the player port comes online on the shard
@@ -393,15 +439,17 @@ Check what your change touches, and one step either side of it.
 - **Seeing across shards** (`docs/plan-sharding.md` §6; the repeatable
   version is `crates/space-server/tests/far.rs`). A border makes no
   difference to what is in `bodies` and `others`: every client lists the
-  same 35 bodies of the showcase, each once, whichever shard it is on, and
+  same 46 bodies of the scene, each once, whichever shard it is on, and
   the count equals the one of a `-MinShards 1` stack. From the spawn point
-  none of them is `far`: the showcase lies within 64 m of the borders, so
+  none of the showcase's 35 is `far`: it lies within 64 m of the borders, so
   the other shards' part of it arrives as ghosts (and a thing within 64 m
   of *any* face of its cell counts as near the root's ground too —
-  `border::territory_distance` is a lower bound). To see far replicas put
-  something more than 64 m (plus three seconds of its motion) from both
-  border planes: a second client at `pos` -110 0 80 is `far` for one on the
-  spawn point (`others[1].source`, `far_drawn` 1); a zero-g crate knocked
+  `border::territory_distance` is a lower bound) — 19 `local` and 16
+  `ghost`; the 11 of the far content (above) are `far`, `far_drawn` 11:
+  five at `step` 1, three at 2, three at 3. Anything else more than 64 m
+  (plus three seconds of its motion) from both border planes is one too: a
+  second client at `pos` -110 0 80 is `far` for one on the
+  spawn point (`others[1].source`); a zero-g crate knocked
   south-west — rise half a metre, ram the one at -17.0 1.1 -1.5 along
   (-0.8, 0, 0.6) — turns from `ghost` into `far` about 140 m out and stays
   in every frame. Sample `others` / `bodies` as fast as `/state` answers

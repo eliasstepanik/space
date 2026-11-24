@@ -39,6 +39,32 @@
 //! a ship's lift engines (`ShipParams::lift`) let it climb out of the gravity
 //! as easily as it flies anywhere else. The whole showcase is within 20 m of the spawn point, clear of
 //! the stations, and nearly 500 m from the shard border 512 m away in +X.
+//!
+//! # Far content
+//!
+//! Under a root region of more than one cell the scene is cut into four
+//! shard areas by the planes `x = −6` and `z = −4` ([`crate::ANCHOR_OFFSET`]),
+//! and everything above lies within 64 m of one of them: near enough to be a
+//! border *ghost* on the neighbouring shards. Three things lie further out —
+//! one in each of the three cells beside the spawn point's, more than 64 m
+//! (plus three seconds of their motion) from every face of their cell, at
+//! distances that fall into the three coarser update steps of a view from
+//! the spawn point (`space_protocol::far::STEPS`). They are what a client on
+//! the spawn point's shard is sent as **far replicas**:
+//!
+//! | what | where (m) | from the spawn | cell | update step there |
+//! |---|---|---|---|---|
+//! | the **drifters** ([`DRIFT_CENTER`]): two 4 m crates on a spring that swing to and fro for good (6 s a swing, undamped), three 3 m crates tumbling | 90, 40, −140 | 171 m, ahead to the right, beside Earth | `x > −6, z < −4` | every 3rd tick (10 Hz) |
+//! | the **far rock** ([`FAR_ROCK_CENTER`]): a static ball 16 m in radius with large-body gravity (4 m/s² on its surface, a reach of 64 m), three 2.5 m balls in circular orbits 26, 34 and 42 m out | −560, 90, 420 | 706 m, behind to the left | `x < −6, z > −4` | every 6th (5 Hz) |
+//! | the **giant rock** ([`GIANT_ROCK_CENTER`]): a static ball 40 m in radius (3 m/s² on its surface, a reach of 140 m), three 6 m balls in orbits 55, 70 and 85 m out | −840, 320, −840 | 1230 m, ahead to the left, 15° up (over the stations and clear of the planetoid) | `x < −6, z < −4` | every 30th (1 Hz) |
+//!
+//! Nothing here touches anything (free flight and a spring only), so a
+//! handoff of it is exact, and nothing ever leaves its cell: the orbits and
+//! the swing are closed, the tumbling crates only turn. A cell is 1024 m, so
+//! from the spawn point the furthest place that still belongs to one of the
+//! three neighbouring cells is some 1.4 km away: there is no far replica at
+//! "3 to 5 km" in this layout — out there everything is the root's own again.
+//! On one shard all of it is simply local, sent at the same steps.
 
 use space_sim::articulation::{Articulation, JointDef, JointKind, JointTarget, PartDef};
 use space_sim::body::{Body, CollisionGroups, MassSpec, Visual};
@@ -91,6 +117,57 @@ pub const PLANETOID_REACH: f64 = 16.0;
 /// The radii of the orbits of the three balls circling the planetoid, metres
 /// from its centre (inside the unfaded part of the reach, 12 m).
 pub const PLANETOID_ORBITS: [f64; 3] = [7.0, 8.5, 10.0];
+
+/// The middle of the **drifters** (scene space; see the module docs, "Far
+/// content"): 171 m from the spawn point, ahead to the right and 13° up —
+/// just right of Earth in a newcomer's view.
+pub const DRIFT_CENTER: [f64; 3] = [90.0, 40.0, -140.0];
+/// The side of the two crates of the drifters' spring pair, metres.
+pub const DRIFT_PAIR_SIZE: f32 = 4.0;
+/// The rest length of their spring, centre to centre, metres.
+pub const DRIFT_PAIR_REST: f32 = 16.0;
+/// How far apart the pair starts, centre to centre: each crate swings
+/// `(DRIFT_PAIR_START − DRIFT_PAIR_REST) / 2` = 2 m either side of its rest
+/// place.
+pub const DRIFT_PAIR_START: f64 = 20.0;
+/// The spring's stiffness, N/m: two crates of 32 t each swing with a period
+/// of `2π·√(16 000 kg / k)` = 6.0 s.
+pub const DRIFT_PAIR_STIFFNESS: f32 = 17_500.0;
+/// The side of the drifters' three tumbling crates, metres.
+pub const DRIFT_CRATE_SIZE: f32 = 3.0;
+
+/// The **far rock**'s centre (scene space): 706 m from the spawn point,
+/// behind it to the left.
+pub const FAR_ROCK_CENTER: [f64; 3] = [-560.0, 90.0, 420.0];
+/// The far rock's radius, metres.
+pub const FAR_ROCK_RADIUS: f64 = 16.0;
+/// The pull on the far rock's surface, m/s².
+pub const FAR_ROCK_SURFACE_GRAVITY: f64 = 4.0;
+/// The far rock's `GM`.
+pub const FAR_ROCK_GM: f64 = FAR_ROCK_SURFACE_GRAVITY * FAR_ROCK_RADIUS * FAR_ROCK_RADIUS;
+/// The far rock's reach (the pull is unfaded out to three quarters of it).
+pub const FAR_ROCK_REACH: f64 = 64.0;
+/// The radii of the orbits of the far rock's three moons, metres.
+pub const FAR_ROCK_ORBITS: [f64; 3] = [26.0, 34.0, 42.0];
+/// The radius of each of the far rock's moons, metres.
+pub const FAR_MOON_RADIUS: f32 = 2.5;
+
+/// The **giant rock**'s centre (scene space): 1230 m from the spawn point,
+/// ahead to the left and 15° up — over the glass corner's panels, which
+/// would hide it any lower.
+pub const GIANT_ROCK_CENTER: [f64; 3] = [-840.0, 320.0, -840.0];
+/// The giant rock's radius, metres.
+pub const GIANT_ROCK_RADIUS: f64 = 40.0;
+/// The pull on the giant rock's surface, m/s².
+pub const GIANT_ROCK_SURFACE_GRAVITY: f64 = 3.0;
+/// The giant rock's `GM`.
+pub const GIANT_ROCK_GM: f64 = GIANT_ROCK_SURFACE_GRAVITY * GIANT_ROCK_RADIUS * GIANT_ROCK_RADIUS;
+/// The giant rock's reach.
+pub const GIANT_ROCK_REACH: f64 = 140.0;
+/// The radii of the orbits of the giant rock's three moons, metres.
+pub const GIANT_ROCK_ORBITS: [f64; 3] = [55.0, 70.0, 85.0];
+/// The radius of each of the giant rock's moons, metres.
+pub const GIANT_MOON_RADIUS: f32 = 6.0;
 
 /// The bowl's sphere radius and depth (its rim is 1.2 m above its bottom).
 pub const BOWL_RADIUS: f64 = 3.0;
@@ -501,6 +578,17 @@ pub fn statics() -> Vec<StaticDef> {
             visual::PLANETOID,
         )
     });
+    // ---- far content: the two rocks (module docs, "Far content") ----
+    for (name, radius, at) in [
+        ("far rock", FAR_ROCK_RADIUS, FAR_ROCK_CENTER),
+        ("giant rock", GIANT_ROCK_RADIUS, GIANT_ROCK_CENTER),
+    ] {
+        s.push(StaticDef {
+            friction: 0.8,
+            restitution: 0.05,
+            ..new_static(name, ball(radius as f32), at, id, visual::PLANETOID)
+        });
+    }
     s
 }
 
@@ -874,6 +962,132 @@ pub fn bodies() -> Vec<BodyDef> {
     });
     // ---- the planetoid ----
     out.extend(planetoid_bodies());
+    // ---- far content (appended: a scene body's guid is its index) ----
+    out.extend(far_bodies());
+    out
+}
+
+/// The three planes the moons of a rock circle in — each spanned by two
+/// orthonormal vectors, with the phase the moon starts at — the planetoid's.
+fn orbit_planes() -> [([f64; 3], [f64; 3], f64); 3] {
+    [
+        ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.0),
+        (
+            [1.0, 0.0, 0.0],
+            [0.0, 50.0f64.to_radians().sin(), 50.0f64.to_radians().cos()],
+            2.1,
+        ),
+        ([0.0, 0.0, 1.0], unit([1.0, 1.6, 0.0]), 4.2),
+    ]
+}
+
+/// Three balls of `radius` called `name` in circular orbits of `radii` round
+/// the point mass `gm` at `centre`: the speed `√(GM/r)` across the radius,
+/// in the three [`orbit_planes`]. Undamped, so the orbits stay closed.
+fn moons_of(
+    name: &'static str,
+    centre: [f64; 3],
+    gm: f64,
+    radii: [f64; 3],
+    radius: f32,
+) -> Vec<BodyDef> {
+    radii
+        .iter()
+        .zip(orbit_planes())
+        .map(|(r, (u, w, phase))| {
+            let v = (gm / r).sqrt();
+            let (s, c) = phase.sin_cos();
+            let dir = [0, 1, 2].map(|k| c * u[k] + s * w[k]);
+            let tangent = [0, 1, 2].map(|k| -s * u[k] + c * w[k]);
+            let mut b = ball_body(radius);
+            b.linear_damping = 0.0;
+            b.angular_damping = 0.0;
+            b.restitution = 0.3;
+            BodyDef {
+                vel: tangent.map(|t| (t * v) as f32),
+                ..at_rest(
+                    name,
+                    [0, 1, 2].map(|k| centre[k] + dir[k] * r),
+                    b,
+                    visual::BALL,
+                )
+            }
+        })
+        .collect()
+}
+
+/// The far content's bodies (module docs, "Far content"): the drifters — a
+/// spring pair and three tumbling crates — and the moons of the two rocks.
+fn far_bodies() -> Vec<BodyDef> {
+    let [cx, cy, cz] = DRIFT_CENTER;
+    let mut out = Vec::new();
+    // Two crates on a spring between their centres (no lever arm: the swing
+    // stays on its line whatever turns them), released stretched and never
+    // damped: they swing for good.
+    let mut pair = crate_body(DRIFT_PAIR_SIZE);
+    pair.linear_damping = 0.0;
+    let half = DRIFT_PAIR_START * 0.5;
+    out.push(BodyDef {
+        springs: vec![(
+            Spring {
+                part: 0,
+                anchor: [0.0; 3],
+                target: SpringTarget::World(WorldPos::ZERO),
+                rest_length: DRIFT_PAIR_REST,
+                stiffness: DRIFT_PAIR_STIFFNESS,
+                damping: 0.0,
+                max_force: 0.0,
+                mode: SpringMode::Spring,
+            },
+            Anchor::Body("drift pair b", [0.0; 3]),
+        )],
+        ..at_rest(
+            "drift pair a",
+            [cx - half, cy, cz],
+            pair.clone(),
+            visual::CRATE,
+        )
+    });
+    out.push(at_rest(
+        "drift pair b",
+        [cx + half, cy, cz],
+        pair,
+        visual::CRATE,
+    ));
+    // Three crates that only turn, each about an axis of its own: nothing
+    // slows them (no angular damping) and nothing moves them.
+    for (offset, spin) in [
+        ([0.0, 12.0, -6.0], [0.25, 0.4, 0.1]),
+        ([12.0, -9.0, 12.0], [-0.15, 0.2, 0.45]),
+        ([-13.0, -10.0, 10.0], [0.35, -0.3, 0.2]),
+    ] {
+        let mut b = crate_body(DRIFT_CRATE_SIZE);
+        b.linear_damping = 0.02;
+        b.angular_damping = 0.0;
+        out.push(BodyDef {
+            ang_vel: spin,
+            ..at_rest(
+                "drift crate",
+                [cx + offset[0], cy + offset[1], cz + offset[2]],
+                b,
+                visual::CRATE,
+            )
+        });
+    }
+    out.extend(moons_of(
+        "far moon",
+        FAR_ROCK_CENTER,
+        FAR_ROCK_GM,
+        FAR_ROCK_ORBITS,
+        FAR_MOON_RADIUS,
+    ));
+    out.extend(moons_of(
+        "giant moon",
+        GIANT_ROCK_CENTER,
+        GIANT_ROCK_GM,
+        GIANT_ROCK_ORBITS,
+        GIANT_MOON_RADIUS,
+    ));
     out
 }
 
@@ -936,7 +1150,8 @@ fn chain(top: [f64; 3], links: usize) -> BodyDef {
     }
 }
 
-/// The demo area's gravity: the gravity room and the planetoid.
+/// The demo area's gravity: the gravity room, the planetoid and the two
+/// rocks of the far content.
 #[must_use]
 pub fn gravity() -> Vec<GravityDef> {
     vec![
@@ -952,6 +1167,20 @@ pub fn gravity() -> Vec<GravityDef> {
             gm: PLANETOID_GM,
             radius: PLANETOID_RADIUS,
             center: PLANETOID_CENTER,
+        },
+        GravityDef::Body {
+            reach: FAR_ROCK_REACH,
+            name: "far rock",
+            gm: FAR_ROCK_GM,
+            radius: FAR_ROCK_RADIUS,
+            center: FAR_ROCK_CENTER,
+        },
+        GravityDef::Body {
+            reach: GIANT_ROCK_REACH,
+            name: "giant rock",
+            gm: GIANT_ROCK_GM,
+            radius: GIANT_ROCK_RADIUS,
+            center: GIANT_ROCK_CENTER,
         },
     ]
 }

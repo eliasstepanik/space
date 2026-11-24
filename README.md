@@ -198,7 +198,7 @@ every shard**. Connected clients follow within a second.
 
 | scene | |
 |---|---|
-| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit. The area rides along with **Earth** (eight Earth radii ahead and above the spawn point): the Moon, the Sun and the planets move around it on their real orbits, sped up 8766× (a year per real hour, the Moon round in 4.5 min), at real size, each a solid ball you can land on, pulling with its real `GM` within a finite reach that ends far from the demo area |
+| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit — and, further out, one thing in each of the three neighbouring shard areas, to be seen across shards at the three coarser update rates: the *drifters* 171 m out (crates swinging on a spring and tumbling), the *far rock* 706 m out and the *giant rock* 1.2 km out, each with gravity and three moons (you can fly there and land). The area rides along with **Earth** (eight Earth radii ahead and above the spawn point): the Moon, the Sun and the planets move around it on their real orbits, sped up 8766× (a year per real hour, the Moon round in 4.5 min), at real size, each a solid ball you can land on, pulling with its real `GM` within a finite reach that ends far from the demo area |
 | `materials` | PBR chart: gold, plastic and steel from mirror-smooth to rough |
 | `galaxy` | the deterministic galaxy through the LOD selector |
 
@@ -260,6 +260,7 @@ curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'
 
 space-client --headless --server 127.0.0.1:7777 --script scripts/harness/smoke.lua   # exit code = result
 space-client --headless --server 127.0.0.1:7777 --script scripts/harness/physics.lua --script-timeout 300
+space-client --headless --server 127.0.0.1:7777 --script scripts/harness/sharding.lua --script-timeout 180   # the four shard areas and the far content
 ```
 
 The harness is loopback-only without credentials; any other address needs a
@@ -319,6 +320,9 @@ past and joins their sparse samples along their velocities
 (`crates/space-protocol/src/far.rs`, `crates/space-server/src/far.rs`). The
 harness says which copy of a thing a client holds: `source` (`local`, `ghost`,
 `far`), `step` and `sample_age_s` per body and per other player in `/state`.
+The demo area has something to see at each rate: from the spawn point its
+drifters, far rock and giant rock (11 of its 46 bodies) are far replicas of
+the three other shards, at 10, 5 and 1 samples a second.
 
 ## Test
 

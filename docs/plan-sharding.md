@@ -1019,11 +1019,10 @@ harness, `/state` sampled 100 to 200 times a second, 2026-11-24; tracks and fram
 
 **Not done here, and what still looks wrong.**
 
-- **The demo area has nothing between 64 m and 10 km** (the hold): every far replica looked at
-  was a player or a crate knocked out of the showcase, at most 300 m off. Far replicas at
-  kilometres — their rates, their bounds, their truthful ticks — rest on `tests/far.rs` (3 km, and
-  11.5 km for the cut); the rates measured live at 0.5 to 7 km are of ghosts and local bodies,
-  which go through the same per-client steps. Phase 7's far rock is what will show it.
+- **The demo area had nothing between 64 m and 10 km** (the hold): every far replica looked at
+  in phase 5 was a player or a crate knocked out of the showcase, at most 300 m off. Phase 7 put
+  the far content there — the block below — and it showed what this bullet warned of: far
+  replicas at the 1 Hz step do **not** arrive as the tests have them.
 - A player in fast travel outruns the interest (above). A thing in the eased band between 12 and
   50 m that comes nearer or goes away is drawn with its time running up to a tenth faster or
   slower at 40 m/s (the delay changes with the distance); it does not step.
@@ -1034,6 +1033,78 @@ harness, `/state` sampled 100 to 200 times a second, 2026-11-24; tracks and fram
 - Not looked at on the live stack: a shard that stalls while it holds far replicas (the 3 s
   silence rule is a test), more than two far replicas at once (tests: 460), a scene switch with
   far replicas in view (test).
+
+**Far content (phase 7).** The demo area now has something a player on the spawn point sees
+across shards at each of the three coarser steps (`space-scene/src/demo.rs`, "Far content";
+drawn by `space-client/src/demo_area.rs`; `scripts/harness/sharding.lua` is its tour):
+
+| what | scene `pos` | from the spawn | cell and owner (four shards) | step there |
+|---|---|---|---|---|
+| the **drifters**: two 4 m crates on a spring (12 to 20 m apart, 6 s a swing, undamped) and three 3 m crates tumbling | 90 40 -140 | 171 m | `x > -6, z < -4`: the north shard | 1 (10 Hz) |
+| the **far rock**: a static ball of 16 m, 4 m/s², reach 64 m; three 2.5 m moons 26, 34, 42 m out | -560 90 420 | 706 m | `x < -6, z > -4`: the west shard | 2 (5 Hz) |
+| the **giant rock**: a static ball of 40 m, 3 m/s², reach 140 m; three 6 m moons 55, 70, 85 m out | -840 320 -840 | 1230 m | `x < -6, z < -4`: the diagonal shard | 3 (1 Hz) |
+
+- **Where, and why not "3 to 5 km".** Under the dev layout only the three cells beside the spawn
+  point's belong to other shards; everything beyond them is the root's again. So the furthest a
+  far replica can be from the spawn point is some 1.4 km, and the 1 Hz step — from 1.1 km — has
+  to be shown from inside the diagonal cell. Each piece lies more than 64 m plus three seconds of
+  its motion from every face of its cell (so it is nobody's ghost and never changes shard) and
+  inside the band of distances in which its step is certain for a player within 25 m of the
+  spawn point (`space-scene/tests/scene.rs`, `the_far_content_keeps_to_its_cells_and_steps`: five
+  minutes, each mutation run). The giant rock is 15 degrees up: at eye height the glass corner's
+  panels hid it. 11 bodies, appended: the showcase's 35 keep their indices and guids; **46** in
+  all. Nothing of it touches anything, so its handoff from the spawner is exact: on four shards
+  it is bit-identical to one shard for three minutes (`four_cells.rs`,
+  `the_far_content_is_on_its_shards_once_and_moves_as_on_one_shard`), and a client of the root's
+  shard is sent the 11 as far replicas of the three other shards every 3rd, 6th and 30th tick
+  (`far.rs`, `a_player_on_the_spawn_point_is_sent_the_demo_areas_far_content_at_its_steps`).
+- **Looked at** (`dev.ps1 -ServersOnly -PortOffset 300`, four shards, release build, one headless
+  client at 60 frames a second, 2026-11-24; tracks and frames in `target/dev/shots/phase7/`).
+  From the spawn point: 46 bodies, 46 distinct — 19 `local`, 16 `ghost`, 11 `far` (5 at step 1,
+  3 at step 2, 3 at step 3) — and the same 46, all `local`, at the same steps, on `-MinShards 1`.
+  In 150 s idle (8527 frames): the spring pair (10 Hz, up to 2.09 m/s) moved at most 3.7 cm a
+  frame, never more than 7 mm off its speed times the frame time; a far moon (5 Hz, 6.3 m/s)
+  11.6 cm a frame, 0.1 mm off. Flying to the drifters, onto the far rock, in fast travel
+  (468 m/s) to the giant rock and onto it, and back: 46 bodies, each once, in every one of
+  21 368 frames over seven changes of shard; each piece `far` -> `local` and back in place — at
+  most 1.5 cm off its motion on the frame it changes (steps 1 and 2); the own ship 3.2 mm off at
+  a change of shard. Standing on the rocks: `gravity` 3.28 and 2.76 m/s² at the eye, lift-off
+  with Space. Two and a half minutes idle: no shard's handoff or abort counter moved, no tick
+  jumped, clock offsets 0.0 ms. `sharding.lua` passes on four shards (50 s) and on one (55 s);
+  `smoke.lua`, `physics.lua` (95 s) and `moon.lua` (195 s) pass on four; every client ended with
+  0 validation messages.
+- **Traffic.** To the one idle client on the spawn point: **30.8 kB/s** (29.8 to 31.7; phase 5
+  had 21.7 without the far content): the 68 samples a second of the 11 bodies, some 130 B each.
+  Into the root's shard from the three others: 7.8 kB/s (5.8 from the drifters' shard, 1.9 and
+  0.5 from the rocks').
+- **Defect found: a far replica at the 1 Hz step stutters on the live stack.** The giant rock's
+  moons (7.5 to 9.4 m/s, 17 cm a frame) stand still for part of every second and then leap — up
+  to **7.1 m** between two frames — for most of the time. Measured on the client: the samples
+  are of ticks exactly 30 apart, but the frame that brings one comes 30 ticks after the last
+  **or 32**, and a slip is never made good: the delay from a sample's tick to its arrival climbs
+  1, 3, 5 ... 29 ticks (two ticks more every 1 to 24 s), then a sample overtakes and it starts
+  over at 1. The client draws step 3 33.5 ticks behind (`far::draw_delay`: the spacing plus 3.5
+  ticks), so from a delay of 4 ticks on — in 97 of the 150 seconds watched — it runs out of samples
+  before the next one comes. The same sawtooth is there at 5 Hz (delay up to 4 ticks beyond the
+  spacing: just inside the margin, nothing seen) and at 10 Hz (up to 2). It is **not** there
+  for the same moons on one shard, where they are `local` at step 3 (delay constant, 0.8 mm off
+  in 90 s), and not in `tests/far.rs`, where the shards step in a fixed order (delivering the
+  far updates up to two ticks late at random, or stepping the shards in a random order, gives a
+  constant delay of at most the lateness). Not root-caused; what fits: the relay to a client is
+  gated by "its step's spacing since it was last **sent**" (`replicate.rs`, `sent.at`), so
+  whenever a far replica is sent a little off its cadence the stored sample it carries is that
+  much older from then on — for a body the shard simulates the same slip costs nothing, because
+  what is sent is its state of that tick. Not fixed here (it is phase 5's code).
+- **Also seen.** At the start of every four-shard cluster the five drifters' transfers to the
+  north shard are called off once by the epoch changes of the shards still joining
+  (`EpochChanged`, before any client; section 5 had three) and go through right after; no
+  transfer was called off in the hour after. `landed` in the harness state is true at touchdown
+  on a rock and mostly false again at rest (26 of 74 frames on the far rock, 9 of 70 on the
+  giant one — and 0 of 236 on the planetoid, so not new). A ship flown into the side of a rock
+  stands there (`landed`, the pull at its feet): Space lifts it along the world's up, not away
+  from the rock — one flies off sideways. The rocks' texture is the planetoid's 128 x 64 map on
+  a ball of 32 and 80 m: smeared into streaks at the poles, a metre and more per texel. A rock's
+  night side is a dim grey ball against the black (the area's lamps do not reach it).
 
 ## 7. Physics across four borders
 
@@ -1358,8 +1429,10 @@ made untrue brought up to date.
    interpolation on the client.
 6. **Docker and autoscaling.** Engine API client, launcher, compose and Dockerfiles, the hot-cell
    and drain policy, the workflow order.
-7. **Demo-area content** (after the hold): a far rock with bodies in orbit some 350 m out in
-   another quadrant, and the showcase tour on four shards.
+7. **Demo-area content** (after the hold; built — section 6, "Far content"): the drifters 171 m
+   out, a far rock 706 m out and a giant rock 1.2 km out, one in each of the three other shard
+   areas, with bodies swinging, tumbling and in orbit; and the tour of the four shard areas,
+   `scripts/harness/sharding.lua`.
 
 ## Not solved here
 

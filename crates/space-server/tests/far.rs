@@ -6,6 +6,10 @@
 //! client's view is rebuilt from the frames its shard sends, the way a client
 //! does it: merged by guid, each sample at the tick it is the state **of**.
 //!
+//! One test runs on the **demo area** instead, cut into the four shard areas
+//! of a `--min-shards 4` cluster: its far content (`space_scene::demo`, "Far
+//! content") is what a player on the spawn point is sent as far replicas.
+//!
 //! Every test names the mutation it fails under.
 
 use std::collections::{BTreeMap, HashMap};
@@ -13,9 +17,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_protocol::far::{self, FarInterest, FarPlayer, FarUpdate};
 use space_protocol::{
-    EntityGuid, EntitySnapshot, Hello, Message, Origin, OriginKind, ShardId, ShardMap, ShardRegion,
-    ORIGIN_COMPONENT, PROTOCOL_VERSION,
+    EntityGuid, EntitySnapshot, Hello, Message, Origin, OriginKind, Scene, SceneState, ShardId,
+    ShardMap, ShardRegion, ORIGIN_COMPONENT, PROTOCOL_VERSION,
 };
+use space_server::border;
 use space_server::shard::{
     Destination, Shard, FAR_COMPONENTS, FAR_RECEIVE_BYTES, FAR_REFRESH_TICKS, FAR_SILENCE_TICKS,
 };
@@ -143,6 +148,25 @@ impl Cluster {
             client_bytes: 0,
             largest_frame: 0,
         }
+    }
+
+    /// Shards with these regions, all running the demo area (revision 1):
+    /// its bodies are spawned by the first one, which owns the root.
+    fn demo_area(regions: &[(u32, NodeRef)]) -> Self {
+        let map = map_of(regions, 1);
+        let mut c = Self::new();
+        c.shards = regions
+            .iter()
+            .map(|(id, node)| {
+                let mut s = Shard::new(ShardConfig::new(ShardId::new(*id), listening(*id), *node));
+                s.set_shard_map(map.clone());
+                s
+            })
+            .collect();
+        for s in &mut c.shards {
+            assert!(s.set_scene(SceneState::new(Scene::DemoArea.id(), 1)));
+        }
+        c
     }
 
     fn shard(&self, id: u32) -> &Shard {
@@ -792,6 +816,131 @@ fn a_ghost_shows_its_owners_state_of_the_tick_whoever_stepped_first() {
 fn from_local_to_ghost_to_far_replica_without_a_gap() {
     local_to_ghost_to_far(0);
     local_to_ghost_to_far(3);
+}
+
+/// The demo area on four shards, seen from its spawn point: the **far
+/// content** (`space_scene::demo`, "Far content") reaches the player as far
+/// replicas — the five drifters from the north shard every 3rd tick, the far
+/// rock's three moons from the west shard every 6th, the giant rock's three
+/// from the diagonal shard every 30th — and nothing else of the scene does:
+/// the showcase's 35 bodies are the root's own or border ghosts. The client
+/// holds all 46 bodies once, the same 46 a client of one shard that owns
+/// everything holds; there the far content is the shard's own and is sent at
+/// the same steps (the steps are by distance, for every kind of copy).
+///
+/// Mutations this catches (each was run): the far rock 60 m from the border
+/// `x = −6` (`space_scene::demo::FAR_ROCK_CENTER`: its moons arrive as
+/// ghosts); a step table that sends everything within a kilometre at the
+/// 10 Hz step (`space_protocol::far::STEPS`: the far moons come every 3rd
+/// tick); the giant rock at +840, 320, +840, in the root's own cell (its
+/// moons are the root shard's own, not far replicas).
+#[test]
+fn a_player_on_the_spawn_point_is_sent_the_demo_areas_far_content_at_its_steps() {
+    let regions = [
+        (1, NodeRef::new(63, [0, 0, 0])),
+        (2, NodeRef::new(64, [1, 1, 0])),
+        (3, NodeRef::new(64, [0, 1, 1])),
+        (4, NodeRef::new(64, [0, 1, 0])),
+    ];
+    // (name, the shard of its cell, its step from the spawn point)
+    let content: [(&str, u32, u8); 5] = [
+        ("drift pair a", 2, 1),
+        ("drift pair b", 2, 1),
+        ("drift crate", 2, 1),
+        ("far moon", 3, 2),
+        ("giant moon", 4, 3),
+    ];
+    let defs = space_scene::body_defs(Scene::DemoArea);
+    let guid = |index: usize| border::scene_guid(ShardId::new(1), 1, index);
+    let expected = |name: &str| content.iter().find(|(n, ..)| *n == name).copied();
+    let mut views = Vec::new();
+    for shards in [4, 1] {
+        let mut c = Cluster::demo_area(&regions[..shards]);
+        // The scene's bodies go to their shards before anybody looks.
+        c.tick_n(30);
+        let (session, ship) = join(c.shard_mut(1), "at the spawn point");
+        let mut view = View::default();
+        for _ in 0..420 {
+            c.tick();
+            view.take(&mut c, 1, session);
+        }
+        assert!(view.held.contains_key(&ship));
+        assert_eq!(
+            view.held.len(),
+            defs.len() + 1,
+            "{shards} shard(s): the scene's bodies and the own ship"
+        );
+        assert!(
+            view.removed.is_empty(),
+            "nothing was taken away again: {:?}",
+            view.removed
+        );
+        let mut far = 0;
+        for (index, def) in defs.iter().enumerate() {
+            let g = guid(index);
+            let held = view.held.get(&g).unwrap_or_else(|| {
+                panic!("{shards} shard(s): {} is missing from the view", def.name)
+            });
+            let Some((_, from, step)) = expected(def.name) else {
+                assert_ne!(
+                    view.origin(g),
+                    Some(OriginKind::Far),
+                    "{}: the showcase is within reach of the border ghosts",
+                    def.name
+                );
+                continue;
+            };
+            far += 1;
+            if shards == 4 {
+                assert_eq!(view.origin(g), Some(OriginKind::Far), "{}", def.name);
+                assert_eq!(c.shard(1).ghost_owner(g), None, "{}", def.name);
+                assert!(c.shard(1).sim().entity_of(g).is_none(), "{}", def.name);
+                assert!(
+                    c.shard(1)
+                        .far_list()
+                        .iter()
+                        .any(|f| f.guid == g && f.from == ShardId::new(from)),
+                    "{} is a far replica of shard {from} on the root's shard",
+                    def.name
+                );
+                assert!(c.shard(from).sim().ship_state(g).is_some(), "{}", def.name);
+            } else {
+                assert_eq!(view.origin(g), None, "{}: the shard's own", def.name);
+            }
+            // The numbers, not `far::interval`.
+            let every: u64 = [1, 3, 6, 30][usize::from(step)];
+            let last = held.samples.last().expect("seen").tick;
+            let counted: Vec<&Seen> = held
+                .samples
+                .iter()
+                .filter(|s| s.tick + 300 > last)
+                .collect();
+            assert!(
+                (counted.len() as u64).abs_diff(300 / every) <= 1,
+                "{shards} shard(s): {} came {} times in 300 ticks, step {step} is every {every}",
+                def.name,
+                counted.len()
+            );
+            for w in counted.windows(2) {
+                assert_eq!(
+                    w[1].tick - w[0].tick,
+                    every,
+                    "{shards} shard(s): {} evenly spaced",
+                    def.name
+                );
+            }
+        }
+        assert_eq!(far, 11, "the far content");
+        if shards == 4 {
+            assert_eq!(c.shard(1).far_list().len(), 11, "and nothing else is far");
+            assert_eq!(c.shard(1).stats().far, 11);
+        } else {
+            assert!(c.shard(1).far_list().is_empty());
+        }
+        views.push(view.held.keys().copied().collect::<Vec<EntityGuid>>());
+    }
+    // (The ship's guid is the root shard's first in both runs.)
+    assert_eq!(views[0], views[1], "four shards show what one shows");
 }
 
 /// A far update that was lost is made good: what the next refresh names and

@@ -41,7 +41,7 @@
 //!
 //! | scene | statics | bodies | gravity |
 //! |---|---|---|---|
-//! | `demo-area` | the stations (ported with the client's numbers), the Kestrel and its apron, the showcase's curbs, bowl, ramp, fulcrum, gantry, door post, the planetoid; Earth, the Moon, the Sun and the planets as balls moving on their orbits ([`solar`]) | the showcase ([`demo`]), crates resting on the planetoid and balls orbiting it | the gravity room; the planetoid (4 m/s² on its surface, a reach of 16 m); the solar system's ten bodies (real `GM`, each with a finite reach that ends far from the demo area) |
+//! | `demo-area` | the stations (ported with the client's numbers), the Kestrel and its apron, the showcase's curbs, bowl, ramp, fulcrum, gantry, door post, the planetoid; the far content's two rocks, 706 m and 1.2 km out; Earth, the Moon, the Sun and the planets as balls moving on their orbits ([`solar`]) | the showcase ([`demo`]), crates resting on the planetoid and balls orbiting it; the far content ([`demo`], "Far content": a spring pair and tumbling crates 171 m out, three moons round each far rock) — 46 in all | the gravity room; the planetoid (4 m/s² on its surface, a reach of 16 m); the far rock (4 m/s², 64 m) and the giant rock (3 m/s², 140 m); the solar system's ten bodies (real `GM`, each with a finite reach that ends far from the demo area) |
 //! | `materials` | the chart's 21 spheres, the glass and lamp spheres, the floor slab | none | none (a chart to fly around) |
 //! | `galaxy` | the spawn cube | none | none (stars are light-years apart) |
 //!
