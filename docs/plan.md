@@ -48,4 +48,4 @@
 - Phase 7 — MCP
   - Status: **complete** — `space-mcp` (hand-rolled JSON-RPC, stdio + Streamable HTTP), `space-mcp-server` (drive a shard) and `space-mcp-client` (play and capture frames).
 - Phase 8 — packaging + skill
-  - Status: **complete** — `Dockerfile.client` + compose `stream` profile, top-level CI build `Dockerfile`, wasm and Docker-build CI jobs, the `space-dev` agent skill (`skills/space-dev/SKILL.md`), workspace version 0.1.0. The Dockerfiles are correct-by-inspection only (`deploy/README.md`).
+  - Status: **complete** — `Dockerfile.client` + compose `stream` profile, top-level CI build `Dockerfile`, wasm and Docker-build CI jobs, the `space-dev` agent skill (`.warren/skills/space-dev/SKILL.md`), workspace version 0.1.0. The Dockerfiles are correct-by-inspection only (`deploy/README.md`).

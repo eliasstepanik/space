@@ -1,12 +1,12 @@
 # AGENT.md
 
 Rules and workflow for anyone — AI agent or human — changing this repository.
-They are binding. The how-to lives in the skills folder; read both skills
-before you change code:
+They are binding. The how-to lives in `.warren/skills/` (Warren loads them
+as this project's skills); read both skills before you change code:
 
-- [`skills/space-dev/SKILL.md`](skills/space-dev/SKILL.md) — layout, build, CI,
+- [`.warren/skills/space-dev/SKILL.md`](.warren/skills/space-dev/SKILL.md) — layout, build, CI,
   GPU tests, the invariants that must not break, the release pipeline.
-- [`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md) —
+- [`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md) —
   the visual test loop: start the stack, drive a client, look at the frames.
 
 `AGENTS.md` and `CLAUDE.md` only point here.
@@ -34,7 +34,7 @@ Every change goes through these steps, in this order.
 1. **Understand.** Read the skill, the crate's module docs and the tests of the
    area you touch. State what you are about to change and why.
 2. **Change.** Small, in the crate that owns the behaviour. Keep the invariants
-   listed in `skills/space-dev/SKILL.md` (wire gate, handoff freeze, pure Rust,
+   listed in `.warren/skills/space-dev/SKILL.md` (wire gate, handoff freeze, pure Rust,
    `forbid(unsafe_code)`, no TLS in-tree).
 3. **Check.** `cargo fmt`, `cargo clippy -D warnings` and the tests of every
    crate you touched; then the whole thing: `cargo run -p xtask -- ci`. On a
@@ -44,7 +44,7 @@ Every change goes through these steps, in this order.
    client — by looking at real frames. Passing tests are not a substitute.
    This is not optional and it is not only for renderer work: a new flag, a
    changed message, a web UI field, a camera tweak all end with you looking at
-   the result. How: `skills/space-visual-test/SKILL.md`.
+   the result. How: `.warren/skills/space-visual-test/SKILL.md`.
 5. **Report.** Say what you ran and what you saw, with the commands and the
    pictures. Say plainly what you did not verify and what still looks wrong.
    Never report a check you did not run.
