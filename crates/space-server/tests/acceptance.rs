@@ -2234,6 +2234,50 @@ fn a_full_shard_refuses_an_incoming_handoff_with_target_full() {
     assert_eq!(pair.b.stats().received, 0, "B took ownership of nothing");
 }
 
+/// A shard's load report counts what is **on its way into** its world: a
+/// transfer it has accepted and staged is in no world yet — the offering
+/// shard lets go of it with the commit — and a shard that reported "nothing
+/// here" in that moment could be retired by the orchestrator
+/// (`ShardRetire` after a drain) with the entity in its hands.
+///
+/// Mutation this catches: counting the simulated entities alone
+/// (`Shard::load_report` without `arriving()`): B reports 0 entities with the
+/// accepted transfer staged.
+#[test]
+fn a_load_report_counts_a_transfer_that_is_staged() {
+    let mut pair = Pair::new();
+    let id_a = pair.a.shard();
+    let id_b = pair.b.shard();
+    let (_session_a, guid) = join(&mut pair.a, "player");
+    let empty = pair.b.load_report();
+    assert_eq!((empty.players, empty.entities), (0, 0), "B holds nothing");
+
+    let offer = space_protocol::HandoffOffer {
+        entity: guid,
+        from: id_a,
+        to: id_b,
+        epoch: pair.b.epoch(),
+        state: Box::new(offer_state(guid, "player")),
+        activation_tick: pair.a.sim().tick() + space_server::handoff::HANDOFF_LEAD,
+    };
+    pair.b.peer_message(id_a, Message::HandoffOffer(offer));
+    let accepted = pair
+        .b
+        .take_outbox()
+        .iter()
+        .any(|o| matches!(o.message, Message::HandoffAccept(_)));
+    assert!(accepted, "B accepted the transfer");
+    assert!(
+        pair.b.sim().ship_state(guid).is_none(),
+        "staged: not in B's world yet"
+    );
+    let report = pair.b.load_report();
+    assert_eq!(
+        report.entities, 1,
+        "the staged transfer is counted: {report:?}"
+    );
+}
+
 /// B6: a peer that is not in this shard's map is not a neighbour, and a commit
 /// must come from the shard that staged the transfer.
 ///

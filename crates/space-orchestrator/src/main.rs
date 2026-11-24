@@ -123,19 +123,26 @@
 //! |---|---|---|
 //! | `--docker-socket <path>` | `SPACE_ORCHESTRATOR_DOCKER_SOCKET` | the Engine's socket (default `/var/run/docker.sock`) |
 //! | `--shard-image <ref>` | `SPACE_ORCHESTRATOR_SHARD_IMAGE` | the image a shard container is created from. **No default in the binary**: the orchestrator image has the variable baked in at build time, naming the shard image of its own commit (`…/space-shard:sha-<commit>`), so shard and orchestrator are always the same build. Pulled if it is not on the host; a private image has to be pulled by the operator first (no registry credentials are handled here) |
+//! | `--docker-self <name>` | `SPACE_ORCHESTRATOR_DOCKER_SELF` | the orchestrator's **own container's name** (compose: `container_name`, or `<project>-orchestrator-1`), which it inspects to find the next two; default: `$HOSTNAME`, which is the container's short id only as long as nobody gave it a host name and it was not recreated from an older container's configuration (Watchtower does that). A name the daemon does not know is skipped |
 //! | `--docker-network <name>` | `SPACE_ORCHESTRATOR_DOCKER_NETWORK` | the network the shards join; default: the orchestrator container's own, found by inspecting itself |
 //! | `--docker-control-addr <host:port>` | `SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR` | what the shards dial to reach the control port; default: the orchestrator container's own address on that network and the control port's port. A name (the compose service) works too: `space-server --orchestrator` resolves it |
 //! | `--docker-publish-ip <ip>` | `SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP` | the host address each shard's UDP port is published on (default `0.0.0.0`: every interface — the shards' ports are public, like the player port) |
 //! | `--docker-name-prefix <text>` | `SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX` | container names are this and the host port (default `space-shard-`: `space-shard-7870`) |
+//! | `--docker-instance <id>` | `SPACE_ORCHESTRATOR_DOCKER_INSTANCE` | what tells **this** orchestrator's shard containers from another stack's on the same host (the label `space.instance`). Default: an id made once and kept in `<state file>.instance`, so it is the same at every start as long as the state is kept (a volume) and different for every other stack. Give it (the compose files pass the compose project's name) where the state is not kept. Not a secret |
+//! | `--shard-memory <MiB>` | `SPACE_ORCHESTRATOR_SHARD_MEMORY` | the memory limit of each shard container (default 2048; 0 = none; no swap on top) |
 //!
 //! A shard container gets the cluster secret in its environment (never on
-//! its command line), the labels `space.cluster`, `space.role=shard`,
-//! `space.launch` and `space.port`, no restart policy (the orchestrator
-//! replaces a shard that dies), no mount, no capability, and never the
-//! socket. At start the orchestrator **removes** every container carrying
-//! its cluster's shard label that an earlier run left (a shard cannot join a
-//! new orchestrator: it stops when it loses its own), and on SIGTERM or
-//! Ctrl-C it removes the ones it started before it exits.
+//! its command line), the labels `space.cluster`, `space.role=shard` and
+//! `space.instance` (and, for the operator's eyes, `space.launch` and
+//! `space.port`), no restart policy (the orchestrator replaces a shard that
+//! dies), no mount, no capability, a read-only root filesystem, a process
+//! limit, the memory limit, the user `10001:10001`, and never the socket. At
+//! start the orchestrator **removes** every container carrying its own three
+//! labels that an earlier run left (a shard cannot join a new orchestrator:
+//! it stops when it loses its own) — never another stack's, also not one
+//! that uses the same cluster name — and on SIGTERM or Ctrl-C it removes the
+//! ones it started before it exits. An image that disappears from the host
+//! while the orchestrator runs is pulled again by the launch that misses it.
 //!
 //! **Whoever can use the Docker socket is root on the host.** Mounting it
 //! makes the orchestrator's container that; see `docs/security-notes.md`.
@@ -147,11 +154,15 @@
 //! players) for a new one, and merges an idle shard away — its region goes
 //! back, it hands over what it holds, and is stopped when it is empty
 //! ([`space_orchestrator::autoscale`]). Never below `--min-shards`, never
-//! above `--max-shards`, never the shard that owns the spawn point.
+//! above `--max-shards`; only shards the orchestrator launched itself are
+//! merged away by the autoscaler, never into a shard that has not reported
+//! or has no room for the players of both; a crowd on the spawn point does
+//! not grow the cluster (a region is never smaller than a cell); and while a
+//! merged shard drains the map does not change again.
 //!
 //! | flag | environment fallback | |
 //! |---|---|---|
-//! | `--shard-capacity <players>` | `SPACE_ORCHESTRATOR_SHARD_CAPACITY` | players at which a shard counts as full (default 100, which is also the most a shard takes). Load = max(players / capacity, tick p95 / 33.3 ms) |
+//! | `--shard-capacity <players>` | `SPACE_ORCHESTRATOR_SHARD_CAPACITY` | players at which a shard counts as full (default 100, which is also the most a shard takes: more is refused at startup). Load = max(players / capacity, tick p95 / 33.3 ms) |
 //! | `--scale-out-load <x>` | `SPACE_ORCHESTRATOR_SCALE_OUT_LOAD` | load at or above which a shard is relieved (default 0.8) |
 //! | `--scale-out-after <s>` | `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER` | … once it has stayed there this long (default 10) |
 //! | `--scale-in-load <x>` | `SPACE_ORCHESTRATOR_SCALE_IN_LOAD` | load of a shard **and** the one it would merge into together, at or below which it is merged away (default 0.35) |
@@ -238,7 +249,7 @@ struct Options {
 }
 
 /// The flags that are a name and a value and nothing more: each with its
-/// environment fallback. (`--launcher docker`'s six, and the seven of the
+/// environment fallback. (`--launcher docker`'s nine, and the seven of the
 /// autoscaler.)
 const TEXT_FLAGS: &[(&str, &str)] = &[
     ("--docker-socket", "SPACE_ORCHESTRATOR_DOCKER_SOCKET"),
@@ -256,6 +267,9 @@ const TEXT_FLAGS: &[(&str, &str)] = &[
         "--docker-name-prefix",
         "SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX",
     ),
+    ("--docker-self", "SPACE_ORCHESTRATOR_DOCKER_SELF"),
+    ("--docker-instance", "SPACE_ORCHESTRATOR_DOCKER_INSTANCE"),
+    ("--shard-memory", "SPACE_ORCHESTRATOR_SHARD_MEMORY"),
     ("--shard-capacity", "SPACE_ORCHESTRATOR_SHARD_CAPACITY"),
     ("--scale-out-load", "SPACE_ORCHESTRATOR_SCALE_OUT_LOAD"),
     ("--scale-out-after", "SPACE_ORCHESTRATOR_SCALE_OUT_AFTER"),
@@ -327,7 +341,8 @@ const USAGE: &str =
                      [--shard-log-dir <dir>] [--host-port-range <a>-<b>] \
                      [--docker-socket <path>] [--shard-image <ref>] [--docker-network <name>] \
                      [--docker-control-addr <host:port>] [--docker-publish-ip <ip>] \
-                     [--docker-name-prefix <text>] \
+                     [--docker-name-prefix <text>] [--docker-self <name>] \
+                     [--docker-instance <id>] [--shard-memory <MiB>] \
                      [--shard-capacity <players>] [--scale-out-load <x>] [--scale-out-after <s>] \
                      [--scale-in-load <x>] [--scale-in-after <s>] [--scale-cooldown <s>] \
                      [--drain-timeout <s>] \
@@ -343,8 +358,10 @@ const USAGE: &str =
      SPACE_ORCHESTRATOR_SHARD_EXE, SPACE_ORCHESTRATOR_SHARD_LOG_DIR and \
      SPACE_ORCHESTRATOR_HOST_PORTS for the shard flags; SPACE_ORCHESTRATOR_DOCKER_SOCKET, \
      SPACE_ORCHESTRATOR_SHARD_IMAGE, SPACE_ORCHESTRATOR_DOCKER_NETWORK, \
-     SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR, SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP and \
-     SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX for the docker launcher; \
+     SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR, SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP, \
+     SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX, SPACE_ORCHESTRATOR_DOCKER_SELF, \
+     SPACE_ORCHESTRATOR_DOCKER_INSTANCE and SPACE_ORCHESTRATOR_SHARD_MEMORY for the docker \
+     launcher; \
      SPACE_ORCHESTRATOR_SHARD_CAPACITY, SPACE_ORCHESTRATOR_SCALE_OUT_LOAD, \
      SPACE_ORCHESTRATOR_SCALE_OUT_AFTER, SPACE_ORCHESTRATOR_SCALE_IN_LOAD, \
      SPACE_ORCHESTRATOR_SCALE_IN_AFTER, SPACE_ORCHESTRATOR_SCALE_COOLDOWN and \
@@ -714,8 +731,31 @@ impl Options {
             name_prefix: text("--docker-name-prefix")
                 .map_or(defaults.name_prefix, |p| p.trim().to_owned()),
             cluster: config.cluster.clone(),
-            // A container's host name is its id unless somebody chose another.
-            self_container: env("HOSTNAME").filter(|name| !name.trim().is_empty()),
+            // Empty: `run` reads it from (or makes it in) the file next to
+            // the state file.
+            instance: text("--docker-instance").map_or_else(String::new, |i| i.trim().to_owned()),
+            self_container: text("--docker-self").map(|name| name.trim().to_owned()),
+            // A container's host name is the start of its id unless somebody
+            // chose another, or it was recreated from an older container.
+            self_hostname: env("HOSTNAME")
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            memory_mib: match text("--shard-memory") {
+                None => defaults.memory_mib,
+                Some(value) => value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|mib| {
+                        *mib == 0 || (MIN_SHARD_MEMORY_MIB..=MAX_SHARD_MEMORY_MIB).contains(mib)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "--shard-memory needs a whole number of MiB from \
+                             {MIN_SHARD_MEMORY_MIB} up, or 0 for no limit (got {value})"
+                        )
+                    })?,
+            },
         };
         if config.launcher == LauncherKind::Docker {
             if docker.image.is_empty() {
@@ -750,6 +790,23 @@ impl Options {
             if !plain(&docker.name_prefix) || docker.name_prefix.contains(':') {
                 return Err(
                     "--docker-name-prefix may hold letters, digits, '.', '_' and '-'".to_owned(),
+                );
+            }
+            if docker
+                .self_container
+                .as_deref()
+                .is_some_and(|name| !valid_label_word(name))
+            {
+                return Err(
+                    "--docker-self needs the orchestrator container's name (letters, digits, \
+                     '.', '_' and '-')"
+                        .to_owned(),
+                );
+            }
+            if !docker.instance.is_empty() && !valid_label_word(&docker.instance) {
+                return Err(
+                    "--docker-instance may hold up to 64 letters, digits, '.', '_' and '-'"
+                        .to_owned(),
                 );
             }
         }
@@ -878,16 +935,98 @@ async fn run(options: Options, started: Instant) -> Result<(), String> {
             serve(config, peer_token, webui, launcher).await
         }
         LauncherKind::Docker => {
+            let mut docker = docker;
+            // Fail now rather than at the first launch: no socket (before
+            // anything is written), no network to put the shards on, no
+            // image. What an earlier run left behind is removed here, before
+            // anything is started.
+            DockerLauncher::new(docker.clone())
+                .ensure_available()
+                .map_err(|e| e.to_string())?;
+            if docker.instance.is_empty() {
+                // Not told which orchestrator this is: the id kept next to
+                // the state file, made now if this is the first start.
+                docker.instance = docker_instance(&config.state_path)?;
+            }
             config.launcher_note = format!("containers of {}", docker.image);
             let launcher = DockerLauncher::new(docker);
-            // Fail now rather than at the first launch: no socket, no
-            // network to put the shards on, no image. What an earlier run
-            // left behind is removed here, before anything is started.
-            launcher.ensure_available().map_err(|e| e.to_string())?;
             let found = launcher.prepare().await.map_err(|e| e.to_string())?;
             println!("space-orchestrator: {found}");
             serve(config, peer_token, webui, launcher).await
         }
+    }
+}
+
+/// The smallest memory limit `--shard-memory` takes, in MiB (0 = no limit is
+/// taken too). Below this a shard does not start at all.
+const MIN_SHARD_MEMORY_MIB: u64 = 64;
+/// The largest, in MiB (a terabyte: beyond it the number is a typing error).
+const MAX_SHARD_MEMORY_MIB: u64 = 1024 * 1024;
+
+/// Whether `text` can be a container name or an instance id: 1 to 64 letters,
+/// digits, `.`, `_` and `-`.
+fn valid_label_word(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// Where the docker launcher's instance id is kept: the state path with
+/// `.instance` appended (next to `.scene`).
+fn instance_path(state: &Path) -> PathBuf {
+    let mut name = state.as_os_str().to_owned();
+    name.push(".instance");
+    PathBuf::from(name)
+}
+
+/// The id that tells this orchestrator's shard containers from every other
+/// stack's on the host (`space.instance`): read from the file next to the
+/// state file, or made — once — and written there. So it is the same at
+/// every start for as long as the state is kept, and two stacks, each with a
+/// state of its own, never share one.
+///
+/// It is **not a secret** and is derived from none: sixteen hexadecimal
+/// digits out of the generator the web UI's form tokens come from, used here
+/// only because they do not repeat.
+fn docker_instance(state: &Path) -> Result<String, String> {
+    let path = instance_path(state);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let id = text.trim();
+            if valid_label_word(id) {
+                Ok(id.to_owned())
+            } else {
+                Err(format!(
+                    "{} does not hold an instance id (up to 64 letters, digits, '.', '_', '-'). \
+                     Delete it to have a new one made - shard containers an earlier run left \
+                     behind are then not recognised and have to be removed by hand - or pass \
+                     --docker-instance",
+                    path.display()
+                ))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let id: String = space_orchestrator::webui::auth::random_token()
+                .chars()
+                .take(16)
+                .collect();
+            // Through a sibling and a rename: never a half-written id.
+            let mut tmp = path.clone().into_os_string();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, format!("{id}\n"))
+                .and_then(|()| std::fs::rename(&tmp, &path))
+                .map_err(|e| {
+                    format!(
+                        "{}: cannot keep the docker launcher's instance id ({e}); make the state \
+                         directory writable or pass --docker-instance",
+                        path.display()
+                    )
+                })?;
+            Ok(id)
+        }
+        Err(err) => Err(format!("{}: {err}", path.display())),
     }
 }
 
@@ -1204,7 +1343,12 @@ mod tests {
         assert_eq!(docker.publish_ip, "0.0.0.0");
         assert_eq!(docker.name_prefix, "space-shard-");
         assert_eq!(docker.cluster, options.config.cluster);
-        assert_eq!(docker.self_container.as_deref(), Some("0123456789ab"));
+        // The host name is the fallback, never "the name it was told".
+        assert_eq!(docker.self_container, None);
+        assert_eq!(docker.self_hostname.as_deref(), Some("0123456789ab"));
+        // Not told which instance it is: decided at start, from the state.
+        assert_eq!(docker.instance, "");
+        assert_eq!(docker.memory_mib, 2_048);
         // Flags win over variables.
         let options = parse_with(
             &[
@@ -1245,6 +1389,110 @@ mod tests {
         assert!(with("--docker-name-prefix", "bad/name").is_err());
         // Not asked for, not checked: another launcher needs no image.
         assert!(parse(&["--launcher", "process"]).is_ok());
+    }
+
+    /// The orchestrator's own container's name, the instance and the shards'
+    /// memory limit: flags or variables, the name before the host name, and
+    /// nonsense refused.
+    ///
+    /// Mutation this catches: taking `HOSTNAME` for the container's name when
+    /// one is given (the launcher asks the daemon for the name first); a
+    /// memory limit the daemon would refuse (under its minimum) passed on.
+    #[test]
+    fn the_docker_launcher_is_told_its_own_name_its_instance_and_the_memory_limit() {
+        let options = parse_with(
+            &["--launcher", "docker", "--shard-image", "i:t"],
+            &[
+                ("SPACE_ORCHESTRATOR_DOCKER_SELF", "space-orchestrator"),
+                ("SPACE_ORCHESTRATOR_DOCKER_INSTANCE", "space-prod"),
+                ("SPACE_ORCHESTRATOR_SHARD_MEMORY", "512"),
+                ("HOSTNAME", "0123456789ab"),
+            ],
+        )
+        .expect("parses");
+        let docker = &options.docker;
+        assert_eq!(docker.self_container.as_deref(), Some("space-orchestrator"));
+        assert_eq!(docker.self_hostname.as_deref(), Some("0123456789ab"));
+        assert_eq!(docker.instance, "space-prod");
+        assert_eq!(docker.memory_mib, 512);
+        let with = |flag: &str, value: &str| {
+            parse(&["--launcher", "docker", "--shard-image", "i:t", flag, value])
+        };
+        assert_eq!(
+            with("--docker-self", "a_b.c-1")
+                .unwrap()
+                .docker
+                .self_container
+                .as_deref(),
+            Some("a_b.c-1")
+        );
+        assert_eq!(with("--shard-memory", "0").unwrap().docker.memory_mib, 0);
+        assert!(with("--docker-self", "a/b").is_err());
+        assert!(with("--docker-self", "a b").is_err());
+        assert!(with("--docker-instance", "a=b").is_err());
+        assert!(with("--docker-instance", &"x".repeat(65)).is_err());
+        for bad in ["5", "-1", "1.5", "lots", "9999999999"] {
+            let err = with("--shard-memory", bad).expect_err(bad);
+            assert!(err.contains("--shard-memory"), "{err}");
+        }
+    }
+
+    /// The instance id that tells this orchestrator's shard containers from
+    /// another stack's: made once, kept next to the state file, the same at
+    /// every later start - and another one for another state. It is not the
+    /// cluster's name, and a file that holds something else is an error, not
+    /// a new id.
+    ///
+    /// Mutation this catches: making a fresh id at every start (the shards a
+    /// killed orchestrator left would never be recognised, and would hold
+    /// their names and ports for good); deriving it from the cluster name
+    /// (two stacks left at the default name remove each other's shards).
+    #[test]
+    fn the_docker_instance_is_made_once_and_kept_with_the_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "space-orch-instance-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let one = dir.join("one.id");
+        let two = dir.join("two.id");
+        let first = docker_instance(&one).expect("made");
+        assert_eq!(first.len(), 16);
+        assert!(valid_label_word(&first), "{first}");
+        assert_eq!(instance_path(&one), dir.join("one.id.instance"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("one.id.instance")).unwrap(),
+            format!("{first}\n")
+        );
+        assert!(!dir.join("one.id.instance.tmp").exists());
+        assert_eq!(
+            docker_instance(&one).expect("read"),
+            first,
+            "the same again"
+        );
+        assert_eq!(docker_instance(&one).expect("read"), first);
+        let other = docker_instance(&two).expect("made");
+        assert_ne!(other, first, "another stack, another instance");
+        // What an operator wrote there is taken as it is ...
+        std::fs::write(dir.join("two.id.instance"), "  staging-2 \n").unwrap();
+        assert_eq!(docker_instance(&two).expect("read"), "staging-2");
+        // ... unless it is no id: said, and not replaced.
+        std::fs::write(dir.join("two.id.instance"), "not an id\n").unwrap();
+        let err = docker_instance(&two).expect_err("no id");
+        assert!(
+            err.contains("two.id.instance") && err.contains("--docker-instance"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("two.id.instance")).unwrap(),
+            "not an id\n"
+        );
+        // Nowhere to keep it: an error that says what to do.
+        let err = docker_instance(&dir.join("no-such-dir").join("x.id")).expect_err("no dir");
+        assert!(err.contains("--docker-instance"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On a platform without the Docker socket the launcher says so at

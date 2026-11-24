@@ -449,6 +449,8 @@ impl Cluster {
                     m.shard.lock().await.orchestrator_message(message);
                 }
             }
+            // A drained shard is told to stop; `merge` plays its exit.
+            Message::ShardRetire(_) => {}
             other => panic!("unexpected orchestrator->shard message: {other:?}"),
         }
     }
@@ -600,8 +602,13 @@ impl Cluster {
     /// what a shard's `LoadReport` carries.
     async fn merge(&mut self, child: ShardId) {
         let before = self.epoch();
-        let players = self.member(child).shard.lock().await.stats().clients;
-        self.report_load(child, u32::try_from(players).expect("a small client count"));
+        // (And so does every other shard of the map: the one that takes the
+        // region back has to be known to have room for what comes with it.)
+        let owners: Vec<ShardId> = self.map().regions.iter().map(|r| r.shard).collect();
+        for owner in owners {
+            let players = self.member(owner).shard.lock().await.stats().clients;
+            self.report_load(owner, u32::try_from(players).expect("a small client count"));
+        }
         let reply = self
             .orch
             .handle_admin(&space_protocol::AdminCommand::ForceMerge(child));
@@ -620,6 +627,24 @@ impl Cluster {
         }
         assert!(self.epoch() > before, "the merge committed");
         self.deliver_outbox().await;
+        // The merged shard drains — and until it is gone the map does not
+        // change again. It says what it really holds (nothing, in these
+        // tests), is told to stop, and its process exits.
+        self.step().await;
+        let holds = self.member(child).shard.lock().await.load_report();
+        assert_eq!(
+            (holds.players, holds.entities),
+            (0, 0),
+            "the merged shard is empty"
+        );
+        self.orch.handle_load_report(&holds);
+        self.step().await;
+        match self.orch.launch_of(child) {
+            Some(launch) => self.orch.note_launch_exit(launch, Some(0)),
+            None => self.orch.declare_dead(child, "its process exited"),
+        }
+        assert!(self.orch.draining_shards().is_empty(), "the drain is over");
+        self.run_pending_launches().await;
     }
 
     /// Kill `shard` through the admin verb and run a beat so the staged kill is

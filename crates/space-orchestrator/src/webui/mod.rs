@@ -2212,14 +2212,17 @@ mod tests {
         for _ in 0..crate::config::MIN_EPOCH_INTERVAL_TICKS {
             orch.tick();
         }
-        // The cell's shard says it is empty.
-        orch.handle_load_report(&LoadReport {
-            shard: new.shard,
-            players: 0,
-            tick_p95_ms: 1.0,
-            load: 0.0,
-            ..Default::default()
-        });
+        // The cell's shard says it is empty, and the root's shard — which
+        // would take the cell back — has reported too (a merge needs both).
+        for shard in [new.shard, ShardId::new(1)] {
+            orch.handle_load_report(&LoadReport {
+                shard,
+                players: 0,
+                tick_p95_ms: 1.0,
+                load: 0.0,
+                ..Default::default()
+            });
+        }
         let path = crate::snapshot::node_path(cell);
         let (handle, port) = crate::ops::channel(orch.snapshot());
         run_loop(orch, port, ShardAnswers::Promptly);

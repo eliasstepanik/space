@@ -24,7 +24,11 @@
 //! * **Out.** A shard whose load has stayed at or above
 //!   [`ScaleConfig::out_load`] for [`ScaleConfig::out_dwell_ticks`] is
 //!   relieved: [`ScaleAction::Split`]. What the orchestrator then carves for
-//!   a new shard is the shard's **hot cell** ([`scale_out_target`]).
+//!   a new shard is the shard's **hot cell** ([`scale_out_target`]) — with
+//!   one exception, the scene's spawn cell: a shard of its own for a cell
+//!   that holds every player of the loaded shard relieves nobody (a region
+//!   cannot be smaller than a cell), so that is not done, and the log says
+//!   "the spawn cell is at capacity".
 //! * **In.** A shard that could be merged away, and whose load **together
 //!   with that of the shard it would merge into** ([`ScaleConfig::merged_load`]) has
 //!   stayed at or below [`ScaleConfig::in_load`] for
@@ -39,12 +43,17 @@
 //! * **Order.** Hot before cold (a hot shard is the emergency). Of several
 //!   hot shards the lowest id; of several cold ones the **highest** id — the
 //!   newest shard is the first to go, so a cluster that grew and shrinks
-//!   again ends with the shards it began with.
+//!   again ends with the shards it began with. That holds for a shard that
+//!   was given the spawn cell too: it is merged back like any other carved
+//!   cell once the pair is cold (it used to be exempt for owning the spawn
+//!   point, and so stayed for ever).
 //!
 //! Who may be merged at all is the caller's to say ([`ShardLoad::merged`] is
-//! `None` for a shard that may not): the orchestrator never offers the shard
-//! that owns the spawn point, nor anybody while the cluster is at
-//! `--min-shards`.
+//! `None` for a shard that may not): the orchestrator never offers a shard
+//! it did not launch itself, one of the layout cells `--min-shards` stands
+//! for, anybody while the cluster is at `--min-shards`, nor a shard whose
+//! merge target has no fresh report or no room for its players
+//! (`Orchestrator::shard_loads`).
 
 use std::collections::BTreeMap;
 
@@ -133,6 +142,15 @@ impl ScaleConfig {
         if self.capacity == 0 {
             return Err("--shard-capacity must be at least 1 player".into());
         }
+        let limit = space_server::shard::MAX_PLAYERS_PER_SHARD;
+        if usize::try_from(self.capacity).unwrap_or(usize::MAX) > limit {
+            return Err(format!(
+                "--shard-capacity ({}) must not be above {limit}: a shard refuses a player \
+                 beyond that many, so a higher capacity would call a shard \"not loaded\" that \
+                 is already turning players away",
+                self.capacity
+            ));
+        }
         let band = self.in_load > 0.0 && self.in_load < self.out_load && self.out_load.is_finite();
         if !band {
             return Err(format!(
@@ -163,14 +181,14 @@ impl ScaleConfig {
 
     /// The load the shard that takes a region back would have afterwards:
     /// both shards' players against one capacity, both tick times against
-    /// one budget. `into` is the merge target's report — `None` counts as an
-    /// idle shard (one that reports nothing could not acknowledge the merge
-    /// anyway, and the orchestrator does not start it).
+    /// one budget. `into` is the merge target's report, and there is no
+    /// form of this without one: a target that has not reported is **not**
+    /// an idle shard, and the orchestrator offers no merge into it
+    /// (`Orchestrator::shard_loads`).
     #[must_use]
-    pub fn merged_load(&self, shard: &LoadReport, into: Option<&LoadReport>) -> f64 {
-        let (players, tick) = into.map_or((0, 0.0), |r| (r.players, r.tick_p95_ms));
-        (f64::from(shard.players.saturating_add(players)) / f64::from(self.capacity.max(1)))
-            .max(f64::from(shard.tick_p95_ms + tick) / TICK_BUDGET_MS)
+    pub fn merged_load(&self, shard: &LoadReport, into: &LoadReport) -> f64 {
+        (f64::from(shard.players.saturating_add(into.players)) / f64::from(self.capacity.max(1)))
+            .max(f64::from(shard.tick_p95_ms + into.tick_p95_ms) / TICK_BUDGET_MS)
     }
 }
 
@@ -220,8 +238,9 @@ pub struct ShardLoad {
     pub load: f64,
     /// The load it and its merge target would have together
     /// ([`ScaleConfig::merged_load`]) — or `None` when this shard may not be
-    /// merged away now (it owns the root or the spawn point, or the cluster
-    /// has no shard to spare).
+    /// merged away now (it owns the root, the orchestrator did not launch it,
+    /// its merge target has not reported or has no room, or the cluster has
+    /// no shard to spare).
     pub merged: Option<f64>,
 }
 
@@ -244,18 +263,46 @@ pub enum ScaleOut {
 /// out of its region. A pure function.
 ///
 /// The one thing it cannot do is make a region smaller than a cell: a shard
-/// whose hot cell **is** its region (the spawn point's cell, once it has a
-/// shard of its own, is the usual one — every new player starts there) stays
-/// as loaded as it is, and the answer says so.
+/// whose hot cell **is** its region stays as loaded as it is, and the answer
+/// says so.
+///
+/// # The spawn point's cell
+///
+/// `spawn_cell` is the cell the scene's spawn point lies in — where every
+/// new player starts — if the map has one. It is the one hot cell a new shard
+/// does not help with by itself: carved with **all** of the loaded shard's
+/// players in it, the new shard is exactly as loaded as the old one was, can
+/// never be relieved (a cell is the smallest region), and the old one sits
+/// idle beside it. So:
+///
+/// * the spawn cell is its own region already, or every player of the shard
+///   is in it: **nothing**, and the answer says "the spawn cell is at
+///   capacity";
+/// * the shard has players outside it too: the spawn cell is carved, once —
+///   that takes the crowd off the tick of everybody else in the region. The
+///   new shard owns the spawn point from then on, and is merged back like any
+///   carved cell when it and the shard around it are cold together.
 #[must_use]
-pub fn scale_out_target(map: &ShardMap, report: &LoadReport) -> ScaleOut {
+pub fn scale_out_target(
+    map: &ShardMap,
+    report: &LoadReport,
+    spawn_cell: Option<NodeRef>,
+) -> ScaleOut {
     if report.hot_cell_players == 0 {
         return ScaleOut::Octant;
     }
     let cell = NodeRef::new(crate::topology::MAX_REGION_DEPTH, report.hot_cell);
     let shard = report.shard;
+    let is_spawn = spawn_cell == Some(cell);
     if let Some(region) = map.regions.iter().find(|region| region.node == cell) {
-        return ScaleOut::Nothing(if region.shard == shard {
+        return ScaleOut::Nothing(if region.shard == shard && is_spawn {
+            format!(
+                "the spawn cell is at capacity: a region cannot be smaller than a cell (1024 m). \
+                 {} of {shard}'s {} player(s) are in it, it is {shard}'s whole region, and every \
+                 new player starts there — no new shard can take part of this load",
+                report.hot_cell_players, report.players
+            )
+        } else if region.shard == shard {
             format!(
                 "{} of {shard}'s {} player(s) are in one cell, and that cell is its whole region: \
                  a region cannot be smaller than a cell (1024 m), so no new shard can take part of \
@@ -270,6 +317,16 @@ pub fn scale_out_target(map: &ShardMap, report: &LoadReport) -> ScaleOut {
         });
     }
     match crate::topology::enclosing_region(map, cell) {
+        Some(region)
+            if region.shard == shard && is_spawn && report.hot_cell_players >= report.players =>
+        {
+            ScaleOut::Nothing(format!(
+                "the spawn cell is at capacity: a region cannot be smaller than a cell (1024 m). \
+                 All {} of {shard}'s player(s) are in it and every new player starts there — a \
+                 shard of its own would be exactly as loaded and could never be relieved",
+                report.players
+            ))
+        }
         Some(region) if region.shard == shard => ScaleOut::Cell(cell),
         Some(region) => ScaleOut::Nothing(format!(
             "{shard}'s players are on {}'s ground (they are being handed over)",
@@ -332,7 +389,7 @@ impl Autoscaler {
             .map(|report| ShardLoad {
                 shard: report.shard,
                 load: self.config.load_of(report),
-                merged: Some(self.config.merged_load(report, None)),
+                merged: Some(self.config.merged_load(report, &LoadReport::default())),
             })
             .collect();
         self.on_loads(&loads, tick)
@@ -565,12 +622,9 @@ mod tests {
             (3, 1.0, 2, 1.0, 1.25),
         ];
         for (ap, at, bp, bt, load) in pairs {
-            let got = config.merged_load(&report(2, ap, at), Some(&report(1, bp, bt)));
+            let got = config.merged_load(&report(2, ap, at), &report(1, bp, bt));
             assert!((got - load).abs() < 1e-6, "{ap}+{bp} players: {got}");
         }
-        // Nobody to merge into known: an idle shard.
-        let alone = config.merged_load(&report(2, 1, 5.0), None);
-        assert!((alone - 0.25).abs() < 1e-6, "{alone}");
     }
 
     /// The decision, as a table: loads held for a number of ticks, and what
@@ -785,30 +839,90 @@ mod tests {
             hot_cell_players: players,
             ..Default::default()
         };
-        // The root's shard, crowded on the spawn point: that cell is carved.
-        assert_eq!(
-            scale_out_target(&map, &hot(1, k, 9)),
-            ScaleOut::Cell(spawn_cell)
-        );
-        // Any other cell of its ground too.
+        let spawn = Some(spawn_cell);
+        // Any cell of its ground that is not the spawn point's: carved.
         let far = [k[0] + 5, k[1], k[2] - 2];
         assert_eq!(
-            scale_out_target(&map, &hot(1, far, 9)),
+            scale_out_target(&map, &hot(1, far, 9), spawn),
             ScaleOut::Cell(NodeRef::new(64, far))
         );
         // A one-cell shard cannot be relieved.
-        let ScaleOut::Nothing(why) = scale_out_target(&map, &hot(2, west.index, 9)) else {
+        let ScaleOut::Nothing(why) = scale_out_target(&map, &hot(2, west.index, 9), spawn) else {
             panic!("a cell cannot be cut");
         };
         assert!(why.contains("cannot be smaller than a cell"), "{why}");
+        assert!(!why.contains("spawn cell"), "not the spawn cell: {why}");
         // Players it still holds on a neighbour's ground are that
         // neighbour's in a moment.
-        let ScaleOut::Nothing(why) = scale_out_target(&map, &hot(1, west.index, 9)) else {
+        let ScaleOut::Nothing(why) = scale_out_target(&map, &hot(1, west.index, 9), spawn) else {
             panic!("not its ground");
         };
         assert!(why.contains("being handed over"), "{why}");
         // Slow without players: the old halving.
-        assert_eq!(scale_out_target(&map, &hot(1, k, 0)), ScaleOut::Octant);
+        assert_eq!(
+            scale_out_target(&map, &hot(1, k, 0), spawn),
+            ScaleOut::Octant
+        );
+    }
+
+    /// The spawn point's cell is the one hot cell a shard of its own does
+    /// not help with: every new player starts there.
+    ///
+    /// Mutation this catches: carving the spawn cell like any other hot cell
+    /// (the state before: with all of the root's players on the spawn point
+    /// the cell went to a new shard that was exactly as loaded, could never
+    /// be relieved — a region is never smaller than a cell — and was never
+    /// merged back; the cluster had grown by a shard and nobody was relieved).
+    #[test]
+    fn the_spawn_cell_is_carved_only_while_that_relieves_somebody() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let root = NodeRef::new(40, [0, 0, 0]);
+        let k = root.center().cell;
+        let spawn_cell = NodeRef::new(64, k);
+        let map = ShardMap::new(1, vec![ShardRegion::new(root, ShardId::new(1), addr)]);
+        let crowd = |shard: u32, players: u32, in_spawn_cell: u32| LoadReport {
+            shard: ShardId::new(shard),
+            players,
+            hot_cell: k,
+            hot_cell_players: in_spawn_cell,
+            ..Default::default()
+        };
+        // Everybody is in the spawn cell: a shard of its own changes nothing.
+        let ScaleOut::Nothing(why) = scale_out_target(&map, &crowd(1, 9, 9), Some(spawn_cell))
+        else {
+            panic!("the spawn cell must not be carved with every player in it");
+        };
+        assert!(
+            why.contains("the spawn cell is at capacity")
+                && why.contains("cannot be smaller than a cell"),
+            "{why}"
+        );
+        // Three more out in the region: carving the cell takes the crowd off
+        // their tick.
+        assert_eq!(
+            scale_out_target(&map, &crowd(1, 12, 9), Some(spawn_cell)),
+            ScaleOut::Cell(spawn_cell)
+        );
+        // Once it is a region of its own it cannot be cut again, and the
+        // answer names it.
+        let carved = ShardMap::new(
+            2,
+            vec![
+                ShardRegion::new(root, ShardId::new(1), addr),
+                ShardRegion::new(spawn_cell, ShardId::new(2), addr),
+            ],
+        );
+        let ScaleOut::Nothing(why) = scale_out_target(&carved, &crowd(2, 9, 9), Some(spawn_cell))
+        else {
+            panic!("a cell cannot be cut");
+        };
+        assert!(why.contains("the spawn cell is at capacity"), "{why}");
+        // A map without a spawn point (no scene anchor): a hot cell like any
+        // other.
+        assert_eq!(
+            scale_out_target(&map, &crowd(1, 9, 9), None),
+            ScaleOut::Cell(spawn_cell)
+        );
     }
 
     /// Settings that would make the cluster flap, or never act, are refused.
@@ -824,6 +938,13 @@ mod tests {
             config.check()
         };
         assert!(with(|c| c.capacity = 0).is_err());
+        // (Mutation: no upper bound — a shard refuses the 101st player while
+        // a capacity of 200 calls it half empty.)
+        let limit = u32::try_from(space_server::shard::MAX_PLAYERS_PER_SHARD).unwrap();
+        assert_eq!(with(|c| c.capacity = 100), Ok(()));
+        assert_eq!(limit, 100, "the default capacity is the shard's limit");
+        let too_many = with(|c| c.capacity = 101).expect_err("above what a shard takes");
+        assert!(too_many.contains("--shard-capacity"), "{too_many}");
         assert!(with(|c| c.in_load = 0.8).is_err());
         assert!(with(|c| c.in_load = 0.9).is_err());
         assert!(with(|c| c.in_load = 0.0).is_err());

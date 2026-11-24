@@ -44,7 +44,7 @@ mod far;
 pub use far::{
     FarInfo, FAR_COMPONENTS, FAR_INTERESTS, FAR_INTEREST_STALE_TICKS, FAR_INTEREST_TICKS,
     FAR_MAX_LAG, FAR_ORPHAN_TICKS, FAR_RECEIVE_BYTES, FAR_REFRESH_TICKS, FAR_SILENCE_TICKS,
-    MAX_FAR_ENTITY_BYTES, MAX_FAR_PER_PEER,
+    FAR_UPDATES, MAX_FAR_ENTITY_BYTES, MAX_FAR_PER_PEER,
 };
 
 /// Hard cap on concurrent client sessions per shard (docs/plan.md U9).
@@ -444,12 +444,18 @@ impl Shard {
             .filter_map(|ship| self.sim.ship_state(ship))
             .map(|state| state.pos.cell)
             .collect();
+        // What is simulated here — and what is **about to be**: a transfer
+        // this shard has accepted (staged) or whose commit is in and waits
+        // for its tick is in no world for a moment, on either shard's count.
+        // A report of "nothing" in that moment would let the orchestrator
+        // retire a draining shard with the entity in its hands.
         let entities = self
             .sim
             .bodies()
             .iter()
             .filter(|(guid, _, ghost)| !ghost && self.sim.ship_state(*guid).is_some())
-            .count();
+            .count()
+            + self.arriving();
         crate::load::report(
             self.config.shard,
             u32::try_from(self.clients.len()).unwrap_or(u32::MAX),
@@ -458,6 +464,18 @@ impl Shard {
             self.stats.skipped,
             self.load.take(),
         )
+    }
+
+    /// The transfers on their way into this shard's world: accepted and
+    /// staged, or committed and waiting for the tick they install on.
+    fn arriving(&self) -> usize {
+        let staged = self.ledger.incoming();
+        staged.len()
+            + self
+                .pending_commits
+                .iter()
+                .filter(|pending| !staged.contains_key(&pending.guid))
+                .count()
     }
 
     /// Remember the shards `new` no longer names, so that they are still
@@ -1271,6 +1289,16 @@ impl Shard {
                     .former
                     .get(&shard)
                     .is_some_and(|(_, until)| self.sim.tick() <= *until))
+    }
+
+    /// The shards the map named until a moment ago and that are still heard
+    /// (see [`Shard::knows_shard`]).
+    pub(crate) fn former_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
+        let now = self.sim.tick();
+        self.former
+            .iter()
+            .filter(move |(_, (_, until))| now <= *until)
+            .map(|(shard, _)| *shard)
     }
 
     fn on_neighbour_status(&mut self, from: ShardId, status: NeighbourStatus) {

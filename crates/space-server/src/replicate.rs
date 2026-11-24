@@ -54,10 +54,24 @@
 //! the acknowledged tick that was never acknowledged itself is **presumed lost**
 //! and its entities and removals are owed again (minus whatever the frame that
 //! did arrive carried as well); a newer frame is still in flight. Presuming loss
-//! can be wrong (two frames arrived between two input batches) and then costs
-//! one redundant re-send — of current state, so it is harmless. A client that
-//! never acknowledges anything (it sends no input) simply keeps the old
-//! send-and-forget behaviour.
+//! can be wrong (two frames arrived between two input batches — on a live
+//! stack that happens often) and then costs one redundant re-send, of
+//! current state. A client that never acknowledges anything (it sends no
+//! input) has its frames taken as arrived after [`MAX_IN_FLIGHT_FRAMES`]
+//! ticks: the old send-and-forget behaviour.
+//!
+//! Two things make that sound. **An entry lists what changed since the last
+//! frame known to have arrived** ([`Sent::base`]: acknowledged, or aged out),
+//! not since the last frame *sent* — so the frame after a lost one says
+//! everything the lost one said, removals included, and "the frame that did
+//! arrive carried it as well" really means the client has it all. (Listing
+//! what changed since the last send lost a component that changed once, or
+//! went away, in the lost frame: fast travel that stayed on in a client's
+//! prediction, an `Origin` that stayed on a ship.) An entity no frame is
+//! known to have brought goes out in full, with what it is remembered to
+//! have lost ([`ComponentLog::full_with_removals`]): the client merges a
+//! delta's entry into whatever copy it may still hold. **And a re-send does
+//! not move an entity's cadence** — see "How often" below.
 //!
 //! That leaves the one frame no acknowledgement can vouch for: the first. A
 //! client learns which ship is its own from it, and says nothing — no input, so
@@ -84,14 +98,15 @@
 //!
 //! The [`ComponentLog`] remembers, per entity and component, the bytes last
 //! seen and the tick they changed. A snapshot, and a delta entry for an entity
-//! the client does not hold yet (or one a lost frame owes), carries the full
-//! set; any other delta entry carries the `ShipState` and the `Owner` (always:
-//! they name the entity's motion and its player) plus only the components
-//! whose bytes changed since the entity was last sent to this client — so a
-//! crate's shape, a chain's joints and a pendulum's spring go out once, and a
-//! moving body costs its state, its residual and its part states. A component
-//! that went away is listed with an empty payload (protocol 5,
-//! [`Delta::entities`]).
+//! no frame is known to have brought the client, carries the full set; any
+//! other delta entry carries the `ShipState` and the `Owner` (always: they
+//! name the entity's motion and its player) plus only the components whose
+//! bytes changed since the last frame with the entity that is known to have
+//! arrived — a few ticks back, the round trip of an acknowledgement — so a
+//! crate's shape, a chain's joints and a pendulum's spring go out once (a few
+//! times while the first frame is unacknowledged), and a moving body costs
+//! its state, its residual and its part states. A component that went away is
+//! listed with an empty payload (protocol 5, [`Delta::entities`]).
 //!
 //! # How often: distance steps
 //!
@@ -105,6 +120,18 @@
 //! since *its* last word. An entity that has been at rest for longer than its
 //! step's spacing and moves again is due at once, so its first sample is the
 //! start of the motion, not a point somewhere along it.
+//!
+//! The spacing is counted **between the samples** — the ticks the states are
+//! the states of ([`Sent::sample`], [`ComponentLog::sample_of`]) — and only
+//! for an entity that changed and then stopped from the last send
+//! (`step_is_due`). For what this shard simulates the two are the same. A
+//! far replica's samples are taken by another shard, exactly the spacing
+//! apart, and are here a tick later, give or take one: each is relayed in
+//! the frame of the tick it arrives, so a far sample reaches a client a
+//! constant tick or two after the tick it is of. (Counted from the last
+//! send, every re-send of a frame presumed lost moved the gate later for
+//! good and the stored sample aged in the shard — up to a whole spacing: far
+//! moons that stood and leapt, on a live stack.)
 //!
 //! The bound that follows: a client is sent at most
 //! `sum over the moving entities in its view of (bytes of one sample x the
@@ -174,6 +201,11 @@ struct LogEntry {
     /// then (its row did, or a far replica's sample arrived), whether or not
     /// any byte differs.
     touched: u64,
+    /// The tick the recorded state is the state **of**: `touched` for an
+    /// entity of this shard's world, the simulating shard's tick for a far
+    /// replica (a tick or two earlier). What an entity's distance step is
+    /// counted in ([`build_frame`]).
+    sample: u64,
     /// The entity left this shard's view ([`ComponentLog::forget`]): nothing
     /// is logged for it, but what it had is remembered as removed for a
     /// while, in case it is back under another kind of copy before a client
@@ -204,8 +236,22 @@ impl ComponentLog {
     /// differ from the last record (or is new) is stamped `tick`; one that is
     /// gone is remembered as removed at `tick`.
     pub fn record(&mut self, guid: EntityGuid, components: Components, tick: u64) {
+        self.record_sampled(guid, components, tick, tick);
+    }
+
+    /// [`ComponentLog::record`] for a state that is the state of tick
+    /// `sample`, recorded at `tick`: a far replica's, which another shard
+    /// sampled a tick or two before it got here.
+    pub fn record_sampled(
+        &mut self,
+        guid: EntityGuid,
+        components: Components,
+        tick: u64,
+        sample: u64,
+    ) {
         let entry = self.entries.entry(guid).or_default();
         entry.touched = tick;
+        entry.sample = sample;
         entry.gone = false;
         let mut next: Vec<(ComponentId, Vec<u8>, u64)> = Vec::with_capacity(components.len());
         for (id, bytes) in components {
@@ -278,6 +324,35 @@ impl ComponentLog {
         self.entries
             .get(&guid)
             .is_some_and(|e| !e.gone && e.touched > base)
+    }
+
+    /// The tick `guid`'s recorded state is the state of (see
+    /// [`ComponentLog::record_sampled`]); 0 for an entity that is not logged.
+    #[must_use]
+    pub fn sample_of(&self, guid: EntityGuid) -> u64 {
+        self.entries
+            .get(&guid)
+            .filter(|e| !e.gone)
+            .map_or(0, |e| e.sample)
+    }
+
+    /// The full component set of `guid` **and** an empty payload for every
+    /// component it is remembered to have lost ([`TOMBSTONE_TICKS`]): what a
+    /// delta carries for an entity the client is not known to hold as it is.
+    /// The client may hold an older copy all the same — the frame that
+    /// removed it was lost, or it was another kind of copy — and merges a
+    /// delta's entry into what it holds: without the removals a component the
+    /// new copy lacks (a ghost's `Origin` on a ship that is now this shard's
+    /// own) would stay for good.
+    #[must_use]
+    pub fn full_with_removals(&self, guid: EntityGuid) -> Option<EntitySnapshot> {
+        let mut entity = self.full(guid)?;
+        let entry = self.entries.get(&guid)?;
+        entity
+            .components
+            .extend(entry.removed.iter().map(|(id, _)| (*id, Vec::new())));
+        entity.components.sort_by_key(|(id, _)| *id);
+        Some(entity)
     }
 
     /// The full component set of `guid`, as a snapshot entity.
@@ -414,11 +489,23 @@ pub struct SentFrame {
 /// What a client was last sent of one entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sent {
-    /// The tick of the frame that last carried it: what changed after it is
-    /// what the next entry for it lists.
+    /// The tick of the frame that last carried it: an entity is due again
+    /// only if something about it changed after that.
     pub at: u64,
     /// Its distance step for this client ([`space_protocol::far`]).
     pub step: u8,
+    /// The tick the state it was last sent is the state **of**
+    /// ([`ComponentLog::sample_of`]): what its step's spacing is counted
+    /// from. Not `at` — a far replica's sample is a tick or two older than
+    /// the frame, and a frame may carry the same sample twice (the re-send
+    /// of a frame presumed lost).
+    pub sample: u64,
+    /// The tick of the newest frame that carried it and is **known to have
+    /// arrived** (acknowledged, or aged out of the in-flight list); `None`
+    /// until one has. The next entry for it lists what changed after this
+    /// tick — not after `at`: a frame that is lost then takes nothing with
+    /// it, because the next one says the same again and more.
+    pub base: Option<u64>,
 }
 
 /// One client's replication state.
@@ -505,6 +592,7 @@ impl ClientReplica {
                 break;
             };
             if frame.tick == ack {
+                self.arrived(&frame);
                 delivered = Some(frame);
             } else {
                 lost_entities.extend(frame.entities);
@@ -518,6 +606,13 @@ impl ClientReplica {
             // A ship that moves every tick is in every frame: without this, each
             // acknowledgement that skips a frame would owe the whole moving
             // fleet again although the newer frame already delivered it.
+            // (Delivered it **all**: an entry lists what changed since the
+            // last frame known to have arrived — `Sent::base` — so the
+            // delivered frame's entry says everything the lost one said.
+            // While entries listed what changed since the last frame *sent*,
+            // this dropped the lost frame's own changes for good: a
+            // component that changed once — `ShipControls::fast` — or went
+            // away — an `Origin`.)
             let entities: HashSet<EntityGuid> = delivered.entities.into_iter().collect();
             let removals: HashSet<EntityGuid> = delivered.removed.into_iter().collect();
             lost_entities.retain(|guid| !entities.contains(guid));
@@ -552,7 +647,37 @@ impl ClientReplica {
             removed,
         });
         while self.in_flight.len() > MAX_IN_FLIGHT_FRAMES {
-            self.in_flight.pop_front();
+            if let Some(frame) = self.in_flight.pop_front() {
+                self.arrived(&frame);
+            }
+        }
+    }
+
+    /// `frame` arrived (it was acknowledged, or is taken to have): what it
+    /// carried is what the next entries are differences to.
+    fn arrived(&mut self, frame: &SentFrame) {
+        for guid in &frame.entities {
+            if let Some(sent) = self.sent.get_mut(guid) {
+                sent.base = sent.base.max(Some(frame.tick));
+            }
+        }
+    }
+
+    /// Take the frames no acknowledgement has settled within
+    /// [`MAX_IN_FLIGHT_FRAMES`] **ticks** as arrived (a client that
+    /// acknowledges nothing: see the constant). By age as well as by count:
+    /// far things are in a frame once a second, and a base that lagged
+    /// thirty-two such frames would be older than the log remembers what a
+    /// component was removed ([`TOMBSTONE_TICKS`]).
+    fn settle_aged(&mut self, tick: u64) {
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|f| tick.saturating_sub(f.tick) > MAX_IN_FLIGHT_FRAMES as u64)
+        {
+            if let Some(frame) = self.in_flight.pop_front() {
+                self.arrived(&frame);
+            }
         }
     }
 }
@@ -748,9 +873,21 @@ pub fn changed_since(sim: &mut SimWorld, guids: &GuidIndex, base_tick: u64) -> V
 /// built on first use and reused.
 #[derive(Debug, Default)]
 pub struct PassCache {
-    /// `(guid, change base)` → its encoded entry this tick: the full set for
-    /// `None`, what changed after the base otherwise (`None`: not logged).
-    snapshots: HashMap<(EntityGuid, Option<u64>), Option<EntitySnapshot>>,
+    /// `(guid, what of it)` → its encoded entry this tick (`None`: not
+    /// logged).
+    snapshots: HashMap<(EntityGuid, Base), Option<EntitySnapshot>>,
+}
+
+/// What of an entity an entry carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Base {
+    /// Its full set: an entity of a snapshot.
+    Whole,
+    /// Its full set and what it is remembered to have lost: a delta's entry
+    /// for an entity no frame is known to have brought the client.
+    Entry,
+    /// What changed after this tick.
+    Since(u64),
 }
 
 impl PassCache {
@@ -760,19 +897,19 @@ impl PassCache {
         Self::default()
     }
 
-    /// `guid`'s entry as of this tick — its full set (`base` `None`) or what
-    /// changed after `base` — built on first request.
+    /// `guid`'s entry as of this tick, built on first request.
     fn snapshot(
         &mut self,
         log: &ComponentLog,
         guid: EntityGuid,
-        base: Option<u64>,
+        base: Base,
     ) -> Option<&EntitySnapshot> {
         self.snapshots
             .entry((guid, base))
             .or_insert_with(|| match base {
-                None => log.full(guid),
-                Some(base) => log.since(guid, base),
+                Base::Whole => log.full(guid),
+                Base::Entry => log.full_with_removals(guid),
+                Base::Since(base) => log.since(guid, base),
             })
             .as_ref()
     }
@@ -865,7 +1002,7 @@ pub fn build_frame(
         let mut builder = SnapshotBuilder::with_budget(cx.budget, tick, cx.shard, cx.epoch);
         let mut sent = Vec::new();
         while let Some(&guid) = replica.pending_snapshot.front() {
-            let Some(snap) = cache.snapshot(cx.log, guid, None) else {
+            let Some(snap) = cache.snapshot(cx.log, guid, Base::Whole) else {
                 // Despawned between planning and sending.
                 replica.pending_snapshot.pop_front();
                 continue;
@@ -887,7 +1024,15 @@ pub fn build_frame(
             // out in: what it does afterwards, while the other chunks go
             // out, is after that.
             for guid in &sent {
-                replica.sent.insert(*guid, Sent { at: tick, step: 0 });
+                replica.sent.insert(
+                    *guid,
+                    Sent {
+                        at: tick,
+                        step: 0,
+                        sample: cx.log.sample_of(*guid),
+                        base: None,
+                    },
+                );
             }
             replica.ack_tick = tick;
             replica.remember(tick, sent, Vec::new());
@@ -917,7 +1062,13 @@ pub fn build_frame(
     removed.dedup();
     for guid in &removed {
         replica.sent.remove(guid);
+        // What a frame still in flight carried of it is no word on the copy
+        // the client may be sent later.
+        for frame in &mut replica.in_flight {
+            frame.entities.retain(|carried| carried != guid);
+        }
     }
+    replica.settle_aged(tick);
 
     // The client's own ship first, for as long as it may not have been told
     // which ship that is (see [`UNACKNOWLEDGED_SHIP_TICKS`]). Then debt (it is
@@ -928,16 +1079,15 @@ pub fn build_frame(
     // be a reason to send it in its own right. Deduplicated, and restricted
     // to what is visible now.
     //
-    // What goes out in full: the unconfirmed own ship, debt (a lost frame may
-    // have carried the only copy of a component) and anything the client does
-    // not hold. An entity it holds goes out as what changed since it was last
-    // sent.
+    // What goes out in full, with what it is remembered to have lost
+    // ([`ComponentLog::full_with_removals`]): the unconfirmed own ship and
+    // anything no frame is known to have brought the client. Everything else
+    // — debt too — goes out as what changed since the last frame that is
+    // known to have arrived ([`Sent::base`]), removals included.
     let mut candidates: Vec<EntityGuid> = Vec::new();
-    let mut full: HashSet<EntityGuid> = HashSet::new();
     let mut seen: HashSet<EntityGuid> = HashSet::new();
     let own_ship = replica.ship_is_unconfirmed(tick).then_some(replica.ship);
     let owed = std::mem::take(&mut replica.owed);
-    full.extend(own_ship.iter().chain(owed.iter()).copied());
     let mut due: Vec<EntityGuid> = Vec::new();
     let mut entered: Vec<EntityGuid> = Vec::new();
     for (i, guid) in visible.ordered.iter().enumerate() {
@@ -947,8 +1097,7 @@ pub fn build_frame(
         };
         let distance = visible.distances.get(i).copied().unwrap_or(0.0);
         sent.step = far::step_after(distance, sent.step);
-        if tick.saturating_sub(sent.at) >= far::interval(sent.step)
-            && cx.log.touched_after(*guid, sent.at)
+        if cx.log.touched_after(*guid, sent.at) && step_is_due(sent, cx.log.sample_of(*guid), tick)
         {
             due.push(*guid);
         }
@@ -971,7 +1120,10 @@ pub fn build_frame(
     let mut taken = 0usize;
     for guid in &candidates {
         let held = replica.sent.get(guid).copied();
-        let base = held.filter(|_| !full.contains(guid)).map(|held| held.at);
+        let base = held
+            .filter(|_| own_ship != Some(*guid))
+            .and_then(|held| held.base)
+            .map_or(Base::Entry, Base::Since);
         let Some(snap) = cache.snapshot(cx.log, *guid, base) else {
             taken += 1; // gone: not owed, not sent
             continue;
@@ -985,6 +1137,8 @@ pub fn build_frame(
             Sent {
                 at: tick,
                 step: held.map_or(0, |held| held.step),
+                sample: cx.log.sample_of(*guid),
+                base: held.and_then(|held| held.base),
             },
         );
         sent.push(*guid);
@@ -995,6 +1149,28 @@ pub fn build_frame(
     replica.ack_tick = tick;
     replica.remember(tick, sent, removed.clone());
     Frame::Delta(builder.finish_delta(base_tick, removed, input_ack))
+}
+
+/// Whether an entity that changed since `sent` is due again at `tick`, its
+/// state now being the state of tick `sample`: its step's spacing has passed
+/// **between the two samples** — or since it was last sent, for one that
+/// changed in between and then stopped (its last state is still owed, and
+/// nothing newer is coming).
+///
+/// The first half is what keeps a far replica's delay constant. Its samples
+/// are taken by another shard, exactly the spacing apart, and arrive here a
+/// tick later give or take one; counted from the last *send*, a sample that
+/// arrives a tick early would wait, and every re-send of a frame presumed
+/// lost would move the gate later for good — the stored sample ages in the
+/// shard, the next one more, until the client has nothing to draw between
+/// (`tests/far.rs`, `a_far_sample_is_relayed_on_the_tick_it_arrives_...`).
+/// Counted from the sample, each is relayed in the frame of the tick it
+/// arrives. (A sample from before the last one: its owner changed. Due.)
+fn step_is_due(sent: &Sent, sample: u64, tick: u64) -> bool {
+    let spacing = far::interval(sent.step);
+    sample < sent.sample
+        || sample - sent.sample >= spacing
+        || tick.saturating_sub(sent.at) >= spacing
 }
 
 /// The session driving `ship`, whose `input_ack` a frame carries.
@@ -1281,6 +1457,168 @@ mod tests {
         }
         log.refresh(&mut sim, &guids, replicated_components);
         assert!(!log.entries.contains_key(&it));
+    }
+
+    /// What a frame says about `guid`, if anything.
+    fn entry_of(frame: &Frame, guid: EntityGuid) -> Option<Components> {
+        let entities = match frame {
+            Frame::Snapshot(s) => &s.entities,
+            Frame::Delta(d) => &d.entities,
+        };
+        entities
+            .iter()
+            .find(|e| e.guid == guid)
+            .map(|e| e.components.clone())
+    }
+
+    /// A frame that is lost takes nothing with it: what it carried of an
+    /// entity — a component that changed once, one that went away — is in
+    /// the next frame that names the entity, whether that is the entity's
+    /// next change or the re-send of what the lost frame owed.
+    ///
+    /// The client merges a delta's entry into what it holds
+    /// (`space-client`, `link.rs`), so a change it is not sent it never has,
+    /// and a component it is not told has gone it keeps: fast travel that
+    /// stays on in its prediction, a ship of its own shard drawn as a ghost.
+    ///
+    /// Mutations this catches (each run): listing what changed since the
+    /// entity was last **sent** (`Base::Since(held.at)` in `build_frame`) —
+    /// the first half fails: the frame after the lost one says the motion
+    /// and nothing of the lost frame's change, and the acknowledgement then
+    /// takes the entity off the debt because "the newer frame carried it";
+    /// sending debt as the full set without removals (`Base::Whole` for an
+    /// owed entity) — the second half fails: the component that went away
+    /// in the lost frame stays on the client for good.
+    #[test]
+    fn a_change_carried_by_a_lost_frame_is_sent_again() {
+        let (mut sim, guids, all) = parked_fleet(1);
+        let mut replica = ClientReplica::new(all[0]);
+        let mut log = ComponentLog::new();
+        // An entity of another shard, as the log holds one: its state, its
+        // controls and where it is from.
+        let it = guid(77);
+        let (state, controls, origin) = (0, 1, space_protocol::ORIGIN_COMPONENT);
+        let visible = [all[0], it];
+        let budget = 64 * 1024;
+
+        // Tick 1: the snapshot, and it arrives.
+        sim.step();
+        log.record(
+            it,
+            vec![(state, vec![1]), (controls, vec![0]), (origin, vec![9])],
+            sim.tick(),
+        );
+        let first = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert!(matches!(first, Frame::Snapshot(_)));
+        replica.acknowledge(sim.tick());
+
+        // Tick 2: fast travel goes on and the origin goes away — once. The
+        // frame that says so is lost.
+        sim.step();
+        log.record(it, vec![(state, vec![2]), (controls, vec![1])], sim.tick());
+        let lost = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(
+            entry_of(&lost, it),
+            Some(vec![
+                (state, vec![2]),
+                (controls, vec![1]),
+                (origin, Vec::new())
+            ])
+        );
+        // Tick 3: it only moves. This frame arrives.
+        sim.step();
+        log.record(it, vec![(state, vec![3]), (controls, vec![1])], sim.tick());
+        let next = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(
+            entry_of(&next, it),
+            Some(vec![
+                (state, vec![3]),
+                (controls, vec![1]),
+                (origin, Vec::new())
+            ]),
+            "the frame after a lost one says what the lost one said"
+        );
+        replica.acknowledge(sim.tick());
+        assert!(replica.owed.is_empty(), "frame 3 carried all of it");
+
+        // Tick 4: the controls go away, in a frame that is lost, and then
+        // nothing changes any more.
+        sim.step();
+        log.record(it, vec![(state, vec![4])], sim.tick());
+        let lost = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(
+            entry_of(&lost, it),
+            Some(vec![(state, vec![4]), (controls, Vec::new())])
+        );
+        sim.step();
+        let quiet = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(entry_of(&quiet, it), None, "nothing changed");
+        // The client acknowledges tick 5: frame 4 never came.
+        replica.acknowledge(sim.tick());
+        assert_eq!(replica.owed, vec![it]);
+        sim.step();
+        let again = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(
+            entry_of(&again, it),
+            Some(vec![(state, vec![4]), (controls, Vec::new())]),
+            "the debt is paid with the removal the lost frame carried"
+        );
+    }
+
+    /// An entity no frame is **known** to have brought the client goes out
+    /// whole — and with an empty payload for every component it is
+    /// remembered to have lost. The client may hold a copy all the same (the
+    /// frame that brought it arrived and its acknowledgement is still on its
+    /// way; or it was another kind of copy a tick ago), and it merges a
+    /// delta's entry into what it holds.
+    ///
+    /// Mutation this catches (run): the full set alone for such an entity
+    /// (`Base::Entry => log.full(guid)` in `PassCache::snapshot`): the
+    /// `Origin` that went away while the first frame was unacknowledged is
+    /// never taken off the client's copy — a ship of its own shard drawn as
+    /// a ghost of another's for good.
+    #[test]
+    fn an_entity_no_frame_is_known_to_have_brought_is_sent_whole_with_what_it_lost() {
+        let (mut sim, guids, all) = parked_fleet(1);
+        let mut replica = ClientReplica::new(all[0]);
+        let mut log = ComponentLog::new();
+        let it = guid(77);
+        let (state, shape, origin) = (0, 5, space_protocol::ORIGIN_COMPONENT);
+        let visible = [all[0], it];
+        let budget = 64 * 1024;
+
+        // Tick 1: the snapshot. It arrives, but the shard does not know yet.
+        sim.step();
+        log.record(
+            it,
+            vec![(state, vec![1]), (shape, vec![7, 7]), (origin, vec![9])],
+            sim.tick(),
+        );
+        let first = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert!(matches!(first, Frame::Snapshot(_)));
+        assert_eq!(replica.sent[&it].base, None, "not known to have arrived");
+
+        // Tick 2: the entity is this shard's own now — no origin any more.
+        sim.step();
+        log.record(it, vec![(state, vec![2]), (shape, vec![7, 7])], sim.tick());
+        let next = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(
+            entry_of(&next, it),
+            Some(vec![
+                (state, vec![2]),
+                (shape, vec![7, 7]),
+                (origin, Vec::new())
+            ]),
+            "whole, and with what it lost"
+        );
+
+        // Once a frame with it is known to have arrived, an entry is what
+        // changed since that frame and no more.
+        replica.acknowledge(sim.tick());
+        sim.step();
+        log.record(it, vec![(state, vec![3]), (shape, vec![7, 7])], sim.tick());
+        let later = frame_for(&mut sim, &guids, &mut log, &mut replica, &visible, budget);
+        assert_eq!(entry_of(&later, it), Some(vec![(state, vec![3])]));
     }
 
     /// One frame with each visible guid at `distance` metres from the ship.

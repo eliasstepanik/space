@@ -64,7 +64,9 @@
 //!   shard owns a region again; a join that runs into its deadline is such a
 //!   failure.
 //! * **Supervision.** The run loop asks the launcher twice a second whether
-//!   what it started is alive, treats a registered shard whose control link
+//!   what it started is alive — asks and is told, in tasks, and never waits
+//!   for the answer ([`Orchestrator::drive_launcher`]) — treats a registered
+//!   shard whose control link
 //!   closed as dead too, and one that holds its link but lets
 //!   [`ACK_STRIKES`] map changes in a row run into their deadline
 //!   ([`Orchestrator::declare_dead`]). A dead shard's
@@ -83,7 +85,11 @@
 //! players and bodies to the shards that own the ground now by the ordinary
 //! handoff, keeps reporting, and is told to stop (`ShardRetire`; it exits 0)
 //! when it reports that it holds nothing, or is stopped as it is after the
-//! drain timeout ([`Orchestrator::draining_shards`]). Stopping a shard for
+//! drain timeout ([`Orchestrator::draining_shards`]) — and then, if it still
+//! held bodies, the scene is re-issued so that they are built again
+//! ([`Orchestrator::end_drain`]). **While a shard drains no map change is
+//! made** ([`Orchestrator::begin_drain`]): it is told of no further epoch and
+//! could hand nothing over under another one. Stopping a shard for
 //! any other reason is closing its control link (a shard does not run without
 //! its orchestrator) and, for one the orchestrator started, telling the
 //! launcher to stop its process or remove its container.
@@ -95,9 +101,12 @@
 //! merge away — the load of the pair; it answers with at most one action:
 //! relieve a loaded shard, by carving its **hot cell** for a new shard
 //! ([`Orchestrator::begin_carve`]), or merge an idle one away, which then
-//! drains. It never merges the shard that owns the spawn point, nor one of
-//! the layout cells `--min-shards` stands for, nor anybody while the cluster
-//! is at `--min-shards`; and nothing is launched beyond `--max-shards`.
+//! drains. It merges away only shards the orchestrator launched, never one
+//! of the layout cells `--min-shards` stands for, nobody while the cluster
+//! is at `--min-shards`, and nobody whose merge target has not reported or
+//! has no room ([`Orchestrator::shard_loads`]); the spawn cell is carved only
+//! while that relieves somebody ([`Orchestrator::scale_out`]); and nothing is
+//! launched beyond `--max-shards`.
 //!
 //! # Who is heard
 //!
@@ -333,6 +342,10 @@ struct Join {
 struct Drain {
     /// The tick its merge committed at.
     since: u64,
+    /// The shard that took its region back: the one it hands everything to.
+    /// If that shard dies the drain cannot end well, and is ended at once
+    /// ([`Orchestrator::declare_dead`]).
+    into: ShardId,
     /// The tick it was told to stop at ([`space_protocol::ShardRetire`]),
     /// once it was.
     retired_at: Option<u64>,
@@ -368,6 +381,9 @@ pub struct Orchestrator<L: Launcher> {
     /// commits and left alone when it aborts: until the commit it still owns its
     /// region, so killing it any earlier leaves the map naming a dead owner.
     pending_merge: Option<ShardId>,
+    /// The shard the merge in flight gives the region back to (set and
+    /// cleared with `pending_merge`).
+    pending_merge_into: Option<ShardId>,
     /// The shard the carve or replacement **in flight** gives its region(s).
     /// It is registered and connected, and owns nothing until that epoch
     /// commits; if it aborts, the shard is stopped instead of running on
@@ -456,6 +472,26 @@ pub struct Orchestrator<L: Launcher> {
     /// and taken in on the next beat (a launch runs outside the loop, so it
     /// cannot touch the orchestrator).
     launch_results: Arc<std::sync::Mutex<Vec<LaunchOutcome>>>,
+    /// What became of the stops and liveness questions the loop handed to
+    /// tasks ([`Self::drive_launcher`]), taken in on the next beat.
+    launcher_reports: Arc<std::sync::Mutex<Vec<LauncherReport>>>,
+    /// The launches a liveness question is open for, with the tick it was
+    /// asked at: none is asked about twice at once.
+    polls_in_flight: BTreeMap<LaunchId, u64>,
+    /// Liveness questions that failed or stayed open too long, in all.
+    launcher_failures: u64,
+    /// The tick the last line about such trouble was written to the log.
+    launcher_trouble_logged: Option<u64>,
+    /// How much trouble has not been written since.
+    launcher_trouble_unlogged: u64,
+    /// The spawn point changed owner and the new owner has not yet answered
+    /// the scene that was queued for it **behind the commit**: until it has,
+    /// the player port does not name it ([`Self::player_target`]). With it,
+    /// the scene revision its answer has to carry at least.
+    spawn_owner_settling: Option<(ShardId, u64)>,
+    /// An epoch commit is in the outbox and has not been handed to the
+    /// shards' links yet ([`Self::drain_outbox`] clears it).
+    commit_unsent: bool,
     /// The operator port, once a front end is attached.
     ops: Option<OpsPort>,
     /// The event log's revision when the last snapshot was published.
@@ -495,17 +531,73 @@ pub struct Orchestrator<L: Launcher> {
 /// why it could not start the shard.
 type LaunchOutcome = (LaunchId, Result<ShardHandle, String>);
 
+/// What a task that asked the launcher something reports back
+/// ([`Orchestrator::drive_launcher`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LauncherReport {
+    /// Stopping what this launch started failed, and why.
+    StopFailed(LaunchId, String),
+    /// The answer to the liveness question asked about this launch at this
+    /// tick.
+    Polled(LaunchId, u64, PollAnswer),
+}
+
+/// The answer to one liveness question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollAnswer {
+    /// It runs.
+    Alive,
+    /// It is gone, with the exit status the launcher saw, if it saw one.
+    Exited(Option<i32>),
+    /// The launcher could not say, and why.
+    Failed(String),
+}
+
+/// How long a liveness question may stay open before the log says so, in
+/// ticks (5 s).
+pub const POLL_SLOW_TICKS: u64 = 5 * crate::config::TICK_HZ;
+
+/// The window over which trouble with the launcher is written to the event
+/// log once, in ticks (10 s).
+pub const LAUNCHER_TROUBLE_WINDOW_TICKS: u64 = 10 * crate::config::TICK_HZ;
+
 /// A scene re-issue that is still owed after a replacement
 /// ([`Orchestrator::respawn_scene`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Respawn {
-    /// The shard that was replaced.
-    dead: ShardId,
-    /// Its replacement.
-    new: ShardId,
+    /// Why the scene's bodies have to be built again.
+    cause: RespawnCause,
     /// The revision the scene had when the raise failed: once it is above
     /// that, by whatever cause, the scene's bodies have been rebuilt.
     at_revision: u64,
+}
+
+/// Why the scene is re-issued under a new revision
+/// ([`Orchestrator::respawn_scene`]): bodies of it are gone for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RespawnCause {
+    /// `new` took over the regions of the dead `dead`.
+    Replaced {
+        /// The shard that died.
+        dead: ShardId,
+        /// Its replacement.
+        new: ShardId,
+    },
+    /// This shard's region was merged away and it was stopped — or died —
+    /// before it had handed everything over.
+    Drained(ShardId),
+}
+
+impl core::fmt::Display for RespawnCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RespawnCause::Replaced { dead, new } => write!(f, "{new} replaced {dead}"),
+            RespawnCause::Drained(shard) => write!(
+                f,
+                "{shard} was stopped before it had handed over everything it simulated"
+            ),
+        }
+    }
 }
 
 /// Why an epoch in flight was aborted.
@@ -566,6 +658,7 @@ impl<L: Launcher> Orchestrator<L> {
             pending_kill: Vec::new(),
             pending_launch_kill: Vec::new(),
             pending_merge: None,
+            pending_merge_into: None,
             pending_join: None,
             wanted: None,
             draining: BTreeMap::new(),
@@ -593,6 +686,13 @@ impl<L: Launcher> Orchestrator<L> {
             last_decision: None,
             in_flight: None,
             launch_results: Arc::new(std::sync::Mutex::new(Vec::new())),
+            launcher_reports: Arc::new(std::sync::Mutex::new(Vec::new())),
+            polls_in_flight: BTreeMap::new(),
+            launcher_failures: 0,
+            launcher_trouble_logged: None,
+            launcher_trouble_unlogged: 0,
+            spawn_owner_settling: None,
+            commit_unsent: false,
             ops: None,
             published_revision: 0,
             printed_event: 0,
@@ -644,6 +744,9 @@ impl<L: Launcher> Orchestrator<L> {
                 self.outbox.push((to, scene.clone()));
             }
         }
+        // Whatever commit was waiting is handed to the shards' links by the
+        // caller now.
+        self.commit_unsent = false;
         std::mem::take(&mut self.outbox)
     }
 
@@ -772,7 +875,8 @@ impl<L: Launcher> Orchestrator<L> {
     #[must_use]
     pub fn player_target(&self) -> Option<ShardId> {
         self.spawn_owner().filter(|owner| {
-            self.control.unclaimed_root_owner() != Some(*owner)
+            self.spawn_owner_settling.map(|(shard, _)| shard) != Some(*owner)
+                && self.control.unclaimed_root_owner() != Some(*owner)
                 && self.connected.contains(owner)
                 && !self.dead.contains_key(owner)
                 && self.control.map().client_endpoint_of(*owner).is_some()
@@ -1007,6 +1111,13 @@ impl<L: Launcher> Orchestrator<L> {
             return Err(HelloRefusal::Wait(format!(
                 "epoch {epoch} is still in flight; one change at a time"
             )));
+        }
+        // No map change while a shard is draining (`drain_refusal`): whatever
+        // this hello would be given — a dead shard's regions, a wanted node,
+        // a layout cell — is a new epoch. It passes by itself, within the
+        // drain timeout; the shard asks again.
+        if let Some(draining) = self.drain_refusal() {
+            return Err(HelloRefusal::Wait(draining));
         }
         // A shard at the very address a registered, live shard advertises.
         let at_its_address = self
@@ -1412,6 +1523,25 @@ impl<L: Launcher> Orchestrator<L> {
     /// Staging a launch for it there would start a shard for regions that
     /// have an owner again a few lines later; the next tick looks instead.
     fn mark_dead(&mut self, shard: ShardId, why: &str, managed: bool, reconcile: bool) {
+        if self.draining.contains_key(&shard) {
+            // A shard that was merged away owns nothing: there is nothing to
+            // replace. Its drain is over — and it must not stay listed as
+            // draining, holding up every map change until the timeout.
+            self.connected.remove(&shard);
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!(
+                    "{shard} lost while it was draining: {why}. It owned no region; what it \
+                     still held is gone"
+                ),
+            );
+            self.end_drain(shard);
+            if reconcile {
+                self.reconcile_launches();
+            }
+            return;
+        }
         if self.dead.contains_key(&shard) || !self.knows(shard) {
             return;
         }
@@ -1449,6 +1579,28 @@ impl<L: Launcher> Orchestrator<L> {
             if let Some(abort) = self.control.publisher.abort() {
                 self.settle_abort(&abort, AbortCause::Gone(shard), &missing);
             }
+        }
+        // A shard that is draining **into** this one has nobody left to hand
+        // anything to: waiting for its timeout would only keep this shard's
+        // replacement — which no drain may overlap — waiting as well. It is
+        // stopped now, with what it holds. (The scene's bodies it held are
+        // built again when the replacement commits.)
+        let stranded: Vec<ShardId> = self
+            .draining
+            .iter()
+            .filter(|(_, drain)| drain.into == shard)
+            .map(|(draining, _)| *draining)
+            .collect();
+        for draining in stranded {
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!(
+                    "{draining} was draining into {shard}, which is gone: it has nobody to hand \
+                     its players and bodies to and is stopped as it is; what it held is gone"
+                ),
+            );
+            self.end_drain(draining);
         }
         if reconcile {
             self.reconcile_launches();
@@ -1753,6 +1905,14 @@ impl<L: Launcher> Orchestrator<L> {
         if self.tick < self.launch_backoff_until {
             return;
         }
+        if !self.draining.is_empty() {
+            // Whatever a launch is for — a dead shard's regions, a layout
+            // cell — is a map change, and none is made while a shard drains
+            // (`drain_refusal`). The launch is staged when the drain is over,
+            // instead of a shard that waits for its region longer than a
+            // launch is given to register.
+            return;
+        }
         let root_unclaimed = self.control.unclaimed_root_owner().is_some();
         loop {
             let starting = self.starting();
@@ -1999,6 +2159,12 @@ impl<L: Launcher> Orchestrator<L> {
         self.ack_strikes.remove(&shard);
         self.last_heard.remove(&shard);
         self.scene_confirmed.remove(&shard);
+        if self
+            .spawn_owner_settling
+            .is_some_and(|(settling, _)| settling == shard)
+        {
+            self.spawn_owner_settling = None;
+        }
     }
 
     /// Drop every report that has not been refreshed for
@@ -2031,6 +2197,7 @@ impl<L: Launcher> Orchestrator<L> {
         }
         // It answers: whatever deadlines it let pass before are forgotten.
         self.ack_strikes.remove(&shard);
+        let spawn_owner_before = self.spawn_owner();
         if let Some(commit) = self.control.publisher.ack(shard, epoch, self.tick) {
             let what = self.in_flight.take().unwrap_or_else(|| "map change".into());
             self.log(
@@ -2042,7 +2209,10 @@ impl<L: Launcher> Orchestrator<L> {
             // region is now an owner like any other, and a merge's shard owns
             // nothing.
             let joined = self.pending_join.take();
-            let merged = self.pending_merge.take();
+            let merged = self
+                .pending_merge
+                .take()
+                .zip(self.pending_merge_into.take());
             if joined.is_some_and(|join| self.launch_of(join.shard).is_some()) {
                 // A shard the orchestrator launched owns a region now:
                 // launching works.
@@ -2066,7 +2236,7 @@ impl<L: Launcher> Orchestrator<L> {
                 }),
             };
             self.queue_outbound(&push);
-            if let Some(gone) = merged {
+            if let Some((gone, into)) = merged {
                 // The merged shard is not in the new map, so the fan-out above
                 // skipped it. Queue the commit for it too (it had the prepare
                 // staged; with this it learns it owns nothing), and only
@@ -2077,7 +2247,7 @@ impl<L: Launcher> Orchestrator<L> {
                 // shard whose link closes stops either way.
                 self.outbox.push((gone, commit.message.clone()));
                 self.outbox.push((gone, push.message.clone()));
-                self.begin_drain(gone);
+                self.begin_drain(gone, into);
             }
             if let Some(Join {
                 shard: new,
@@ -2088,12 +2258,42 @@ impl<L: Launcher> Orchestrator<L> {
                 // more, and nothing is remembered about it.
                 self.dead.remove(&dead);
                 self.forget_shard(dead);
-                self.respawn_scene(dead, new);
+                self.respawn_scene(RespawnCause::Replaced { dead, new });
             }
             // The epoch settled: the publisher returns to Idle so the next
             // change can be proposed after the minimum interval.
             self.control.publisher.reset();
+            self.commit_unsent = true;
+            self.settle_spawn_owner(spawn_owner_before);
         }
+    }
+
+    /// A commit may have given the scene's spawn point a new owner
+    /// (`before` is who owned it until now): a replacement of the shard that
+    /// owned it, a carve of the spawn cell, a merge of its owner. **The
+    /// player port must not name the new owner before that shard knows it is
+    /// one** — a player sent there a moment too early is sent on, or told
+    /// "starting", by a shard that still runs the old map.
+    ///
+    /// The commit is only in the outbox here, and delivered is not applied.
+    /// What says "applied" is an answer to something that was queued for the
+    /// shard *behind* the commit: the current scene is queued for it again
+    /// (a shard reads its orchestrator's messages in order and answers every
+    /// `SceneSet` with a `SceneAck`), and until that answer is in — with a
+    /// revision no older than the scene's now, which after a replacement is
+    /// a revision nothing before the commit can have named —
+    /// [`Self::player_target`] names nobody and the player port says
+    /// "starting". A shard that does not answer is asked again once a second
+    /// like any shard that has not confirmed the scene
+    /// ([`Self::remind_scene_laggards`]).
+    fn settle_spawn_owner(&mut self, before: Option<ShardId>) {
+        let now = self.spawn_owner();
+        let Some(owner) = now.filter(|_| now != before) else {
+            return;
+        };
+        self.scene_confirmed.remove(&owner);
+        self.outbox.push((owner, self.scene_message()));
+        self.spawn_owner_settling = Some((owner, self.scene().revision));
     }
 
     /// Raise the scene's revision — the scene itself stays — after `new` took
@@ -2115,7 +2315,12 @@ impl<L: Launcher> Orchestrator<L> {
     /// second ([`Self::retry_scene_respawn`]) until it succeeds — or until
     /// the revision rises for another reason, which rebuilds the bodies just
     /// as well.
-    fn respawn_scene(&mut self, dead: ShardId, new: ShardId) {
+    ///
+    /// The same is done for a shard whose region was merged away and that
+    /// was stopped, or died, **before it had handed everything over**
+    /// ([`RespawnCause::Drained`], [`Self::end_drain`]): the bodies it still
+    /// simulated are gone, and nothing else would ever build them again.
+    fn respawn_scene(&mut self, cause: RespawnCause) {
         let before = self.scene();
         match self.control.scene.raise_above(before.revision) {
             Ok(now) => {
@@ -2126,7 +2331,7 @@ impl<L: Launcher> Orchestrator<L> {
                     EventKind::Scene,
                     Severity::Info,
                     format!(
-                        "{new} replaced {dead}: the scene {} is re-issued as revision {} \
+                        "{cause}: the scene {} is re-issued as revision {} \
                          (it was {}) so that its bodies are built once, afresh",
                         now.scene, now.revision, before.revision
                     ),
@@ -2134,8 +2339,7 @@ impl<L: Launcher> Orchestrator<L> {
             }
             Err(err) => {
                 let owed = Respawn {
-                    dead,
-                    new,
+                    cause,
                     at_revision: before.revision,
                 };
                 // Said once, not once a second.
@@ -2144,7 +2348,7 @@ impl<L: Launcher> Orchestrator<L> {
                         EventKind::Scene,
                         Severity::Warn,
                         format!(
-                            "{new} replaced {dead}, but the scene's revision could not be \
+                            "{cause}, but the scene's revision could not be \
                              raised ({err}): the scene's bodies are not rebuilt until it can \
                              (tried again every second) or the scene is switched"
                         ),
@@ -2167,7 +2371,7 @@ impl<L: Launcher> Orchestrator<L> {
             return;
         }
         if self.tick.is_multiple_of(SCENE_RESEND_INTERVAL_TICKS) {
-            self.respawn_scene(owed.dead, owed.new);
+            self.respawn_scene(owed.cause);
         }
     }
 
@@ -2227,6 +2431,16 @@ impl<L: Launcher> Orchestrator<L> {
             return;
         }
         self.heard(shard, HeardKind::SceneAck);
+        if let Some((settling, revision)) = self.spawn_owner_settling {
+            // The answer to the scene that was queued behind the commit which
+            // made this shard the spawn point's owner: it has read the commit
+            // (a shard reads its orchestrator's messages in order). An answer
+            // that arrives while the commit is still in the outbox is to
+            // something older.
+            if settling == shard && !self.commit_unsent && ack.applied.revision >= revision {
+                self.spawn_owner_settling = None;
+            }
+        }
         let before = self.scene_confirmed.get(&shard).copied();
         if before.is_some_and(|held| ack.applied.revision <= held.revision) {
             return; // a repeat, or an older answer arriving late
@@ -2354,6 +2568,11 @@ impl<L: Launcher> Orchestrator<L> {
                 self.scene_confirmed
                     .get(shard)
                     .is_none_or(|held| held.revision < current.revision)
+                    // (The spawn point's new owner, whose answer is what the
+                    // player port waits for: `settle_spawn_owner`.)
+                    || self
+                        .spawn_owner_settling
+                        .is_some_and(|(settling, _)| settling == *shard)
             })
             .collect();
         for shard in behind {
@@ -2543,6 +2762,7 @@ impl<L: Launcher> Orchestrator<L> {
         // was to replace is still dead and still waiting: the next shard that
         // registers is given its regions.)
         self.pending_merge = None;
+        self.pending_merge_into = None;
         let joiner = self.pending_join.take().map(|join| join.shard);
         if let Some(joiner) = joiner {
             if cause == AbortCause::Deadline && self.launch_of(joiner).is_some() {
@@ -2589,6 +2809,14 @@ impl<L: Launcher> Orchestrator<L> {
             // shown, but none is fed, so no dwell accrues and nothing fires.
             return;
         }
+        if !self.draining.is_empty() {
+            // No map change while a shard drains (`drain_refusal`), so there
+            // is nothing the autoscaler could do: it is not asked. (Asked, it
+            // would decide, be refused, and count that as its one action per
+            // dwell.) A dwell that stood before the drain still stands after
+            // it only if the load is still on that side of its threshold.
+            return;
+        }
         let loads = self.shard_loads();
         if loads.is_empty() {
             return;
@@ -2630,21 +2858,36 @@ impl<L: Launcher> Orchestrator<L> {
     /// away — the load it and the shard that would take its region back have
     /// together.
     ///
-    /// **Who may be merged away by the autoscaler:** a shard whose region has
-    /// a region around it owned by somebody else ([`topology::merge_target`]:
-    /// never the root's), that does **not own the scene's spawn point** (every
-    /// new player starts there: that shard is never removed), whose region is
-    /// **not one of the layout cells `--min-shards` stands for** (with 4: the
-    /// three cells beside the spawn point's — the demo area stays in its
-    /// four areas, and what comes and goes are the shards the autoscaler
-    /// added), and only while the cluster has more shards than
-    /// `--min-shards`. An operator's merge is held to the last rule only.
+    /// **Who may be merged away by the autoscaler:** a shard
+    ///
+    /// * whose region has a region around it owned by somebody else
+    ///   ([`topology::merge_target`]: never the root's);
+    /// * that **the orchestrator launched** — a shard somebody started by
+    ///   hand is that somebody's to take away: with `--min-shards 0` the
+    ///   autoscaler would otherwise merge every hand-started shard a minute
+    ///   after it went idle;
+    /// * whose region is **not one of the layout cells `--min-shards` stands
+    ///   for** (with 4: the three cells beside the spawn point's — the demo
+    ///   area stays in its four areas, and what comes and goes are the shards
+    ///   the autoscaler added);
+    /// * only while the cluster has more shards than `--min-shards`;
+    /// * and only when **the shard that would take its region back has a
+    ///   fresh report and room**: no report is not "idle", and a shard takes
+    ///   no more than [`space_server::shard::MAX_PLAYERS_PER_SHARD`] players
+    ///   ([`Self::merge_room_refusal`]).
+    ///
+    /// The shard that owns the **spawn point** is no exception either way:
+    /// the root's shard has no region around it and is never merged, and a
+    /// shard the autoscaler gave the spawn cell (see [`Self::scale_out`]) is
+    /// merged back like any other carved cell once the pair is cold — the
+    /// spawn point is then the surrounding shard's again, and the player
+    /// port follows. An operator's merge is held to the `--min-shards` rule
+    /// and to the last one.
     fn shard_loads(&self) -> Vec<ShardLoad> {
         let scale = *self.control.autoscaler.config();
         let map = self.control.map();
         let min = self.control.config.min_shards;
         let spare = self.owner_count() > min;
-        let spawn = self.spawn_owner();
         let layout = topology::layout_cells(self.control.config.root_node());
         let kept = &layout[..min.saturating_sub(1).min(layout.len())];
         let keeps = |shard: ShardId| {
@@ -2654,10 +2897,14 @@ impl<L: Launcher> Orchestrator<L> {
             .iter()
             .filter(|(shard, _)| self.owns_a_region(**shard))
             .map(|(shard, report)| {
-                let merged = (spare && spawn != Some(*shard) && !keeps(*shard))
-                    .then(|| topology::merge_target(map, *shard).ok())
-                    .flatten()
-                    .map(|into| scale.merged_load(report, self.latest.get(&into)));
+                let merged = (spare
+                    && !keeps(*shard)
+                    && self.launch_of(*shard).is_some()
+                    && self.merge_room_refusal(*shard).is_none())
+                .then(|| topology::merge_target(map, *shard).ok())
+                .flatten()
+                .and_then(|into| self.latest.get(&into))
+                .map(|into| scale.merged_load(report, into));
                 ShardLoad {
                     shard: *shard,
                     load: scale.load_of(report),
@@ -2674,10 +2921,16 @@ impl<L: Launcher> Orchestrator<L> {
     ///
     /// A shard whose hot cell is its whole region cannot be relieved — a
     /// region is never smaller than a cell — and the answer says so
-    /// ([`crate::autoscale::scale_out_target`]): the spawn point's cell, once
-    /// it has a shard of its own, is where that happens, because every new
-    /// player starts there. A shard that is slow without players is halved
-    /// the old way ([`Self::begin_split`]), where its region is large enough.
+    /// ([`crate::autoscale::scale_out_target`]). **The spawn point's cell**
+    /// is where that matters, because every new player starts there: carved
+    /// for a new shard with all of the loaded shard's players in it, that
+    /// shard would be exactly as loaded, could never be relieved, and the
+    /// cluster would only have grown. So the spawn cell is carved only while
+    /// that relieves somebody — the loaded shard has players **outside** it,
+    /// who then no longer share a tick with the crowd — and otherwise
+    /// nothing is done and the log says "the spawn cell is at capacity",
+    /// once per cooldown. A shard that is slow without players is halved the
+    /// old way ([`Self::begin_split`]), where its region is large enough.
     ///
     /// # Errors
     ///
@@ -2686,7 +2939,10 @@ impl<L: Launcher> Orchestrator<L> {
         let Some(report) = self.latest.get(&shard).copied() else {
             return Err(format!("no fresh load report from {shard}"));
         };
-        match crate::autoscale::scale_out_target(self.control.map(), &report) {
+        let map = self.control.map();
+        let spawn_cell = space_scene::scene_anchor(map)
+            .map(|spawn| NodeRef::new(topology::MAX_REGION_DEPTH, spawn.cell));
+        match crate::autoscale::scale_out_target(map, &report, spawn_cell) {
             ScaleOut::Octant => self.begin_split(shard, Octant::FromCentre),
             ScaleOut::Cell(cell) => {
                 let outcome = self.begin_carve(cell).map(|wanted| {
@@ -2717,7 +2973,23 @@ impl<L: Launcher> Orchestrator<L> {
     /// (`space_server::shard::FORMER_SHARD_GRACE_TICKS`). It keeps its
     /// control link and keeps reporting; [`Self::drain_pass`] stops it when
     /// it is empty.
-    fn begin_drain(&mut self, shard: ShardId) {
+    ///
+    /// # No map change during a drain
+    ///
+    /// A draining shard is not a shard of the map, so it is told of no
+    /// further change of it ([`crate::epoch::EpochPublisher::recipients`]) —
+    /// and a shard refuses a handoff offered under another epoch than its own
+    /// (`StaleEpoch`). One more epoch while it drains would therefore make
+    /// every offer it still has to make stale: it could hand nothing over and
+    /// would be stopped at the timeout with its players and bodies. So **no
+    /// epoch is proposed while a shard is draining** ([`Self::drain_refusal`]):
+    /// not by the autoscaler, not for an operator, not for a shard that
+    /// registers (it is told to wait), and no shard is launched. That is
+    /// bounded by the drain timeout plus [`RETIRE_GRACE_TICKS`]. A shard that
+    /// dies meanwhile is replaced when the drain is over — unless it is the
+    /// one being drained **into**: then the drain cannot end well and is
+    /// ended at once ([`Self::declare_dead`]).
+    fn begin_drain(&mut self, shard: ShardId, into: ShardId) {
         // Its load is no longer the autoscaler's business; what it reports
         // from here on says when it is empty.
         self.forget_reports(shard);
@@ -2725,6 +2997,7 @@ impl<L: Launcher> Orchestrator<L> {
             shard,
             Drain {
                 since: self.tick,
+                into,
                 retired_at: None,
             },
         );
@@ -2768,15 +3041,7 @@ impl<L: Launcher> Orchestrator<L> {
             }
             // Only what it said after the commit counts: before it, a
             // neighbour could still hand it something.
-            let said = self
-                .latest
-                .get(&shard)
-                .filter(|_| {
-                    self.shard_ticks
-                        .get(&shard)
-                        .is_some_and(|at| *at > drain.since)
-                })
-                .map(|report| (report.players, report.entities));
+            let said = self.said_while_draining(shard, drain);
             if said == Some((0, 0)) {
                 self.outbox.push((
                     shard,
@@ -2858,13 +3123,76 @@ impl<L: Launcher> Orchestrator<L> {
         self.launch_of(shard).is_some()
     }
 
+    /// What the draining `shard` last said it holds — `(players, entities)` —
+    /// since its merge committed; `None` if it has not reported since.
+    fn said_while_draining(&self, shard: ShardId, drain: Drain) -> Option<(u32, u32)> {
+        self.latest
+            .get(&shard)
+            .filter(|_| {
+                self.shard_ticks
+                    .get(&shard)
+                    .is_some_and(|at| *at > drain.since)
+            })
+            .map(|report| (report.players, report.entities))
+    }
+
     /// Take a draining shard out of the cluster for good: its link is closed,
     /// its process or container stopped and removed, and nothing is
     /// remembered about it.
+    ///
+    /// **What it still held is not lost silently.** A shard that was never
+    /// told to stop — it ran into the drain timeout, or died — and whose last
+    /// report since the commit did not say "no entities" (or that never
+    /// reported) took bodies of the scene with it. No shard would ever build
+    /// them again, so the scene is re-issued under a new revision, as after
+    /// the replacement of a dead shard ([`Self::respawn_scene`]): every shard
+    /// drops the scene's bodies and the spawner builds them afresh. While a
+    /// dead shard waits for its replacement that is left to the replacement's
+    /// commit, which does the same — the spawner may be the dead one.
+    /// (A player it held is back on the connect screen and joins again.)
     fn end_drain(&mut self, shard: ShardId) {
-        self.draining.remove(&shard);
+        let Some(drain) = self.draining.remove(&shard) else {
+            return;
+        };
+        let lost = drain.retired_at.is_none()
+            && self
+                .said_while_draining(shard, drain)
+                .is_none_or(|(_, entities)| entities > 0);
         self.stage_kill(shard);
         self.forget_shard(shard);
+        if !lost {
+            return;
+        }
+        if let Some(dead) = self.dead.keys().next().copied() {
+            self.log(
+                EventKind::Scene,
+                Severity::Info,
+                format!(
+                    "{shard} was stopped before it had handed over everything it simulated: \
+                     the scene's bodies are built afresh when {dead} has been replaced"
+                ),
+            );
+        } else {
+            self.respawn_scene(RespawnCause::Drained(shard));
+        }
+    }
+
+    /// Why no map change can be made right now because a shard is draining,
+    /// if one is (see [`Self::begin_drain`], "No map change during a drain").
+    fn drain_refusal(&self) -> Option<String> {
+        let (shard, drain) = self.draining.iter().next()?;
+        let timeout = self.control.autoscaler.config().drain_timeout_ticks;
+        let ends_by = match drain.retired_at {
+            Some(told) => told + RETIRE_GRACE_TICKS,
+            None => drain.since + timeout + RETIRE_GRACE_TICKS,
+        };
+        Some(format!(
+            "{shard} is draining (it hands its players and bodies to {}); a change of the map \
+             now would make every offer it still has to make stale, so none is made until it has \
+             stopped — at most {:.0} s from now",
+            drain.into,
+            (ends_by.saturating_sub(self.tick) as f64 / crate::config::TICK_HZ as f64).ceil()
+        ))
     }
 
     /// The shards that still owe an ack for the prepare in flight (empty when
@@ -2915,6 +3243,9 @@ impl<L: Launcher> Orchestrator<L> {
         }
         if let Some(waiting) = self.wanted_refusal() {
             return Err(waiting);
+        }
+        if let Some(draining) = self.drain_refusal() {
+            return Err(draining);
         }
         let outcome = self.split_octant(shard, which);
         // Started or not, the shard is on cooldown from here: a split that was
@@ -3066,6 +3397,9 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(waiting) = self.wanted_refusal() {
             return Err(waiting);
         }
+        if let Some(draining) = self.drain_refusal() {
+            return Err(draining);
+        }
         // A merge takes a shard away; `--min-shards` says how many stay.
         if let Some(needed) = self.min_shards_refusal(shard) {
             self.control.autoscaler.note_action(shard, self.tick);
@@ -3078,6 +3412,12 @@ impl<L: Launcher> Orchestrator<L> {
         if !self.latest.contains_key(&shard) {
             self.control.autoscaler.note_action(shard, self.tick);
             return Err(no_report(shard));
+        }
+        // And the shard that takes the region back must be known to have
+        // room for the players that come with it.
+        if let Some(no_room) = self.merge_room_refusal(shard) {
+            self.control.autoscaler.note_action(shard, self.tick);
+            return Err(no_room);
         }
         let plan = match topology::merge_plan(self.control.map(), shard) {
             Ok(plan) => plan,
@@ -3104,6 +3444,7 @@ impl<L: Launcher> Orchestrator<L> {
         // is staged for killing by the commit (`handle_epoch_ack`), and left
         // alone if the epoch aborts (`tick`).
         self.pending_merge = Some(shard);
+        self.pending_merge_into = Some(plan.into);
         // The shard that takes the region back gets what comes with it: it
         // is left alone for a while too.
         self.control.autoscaler.note_action(plan.into, self.tick);
@@ -3253,11 +3594,55 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(needed) = self.min_shards_refusal(shard) {
             return Some(needed);
         }
+        // Whether a change can be made at all comes before what is known
+        // about the two shards, as in `begin_merge`: right behind a commit
+        // the answer is "too recently" whether or not the new shard's first
+        // report has arrived yet — one answer, not one of two by timing.
+        if let Some(busy) = self.proposal_refusal() {
+            return Some(busy);
+        }
         if !self.latest.contains_key(&shard) {
             return Some(no_report(shard));
         }
-        self.proposal_refusal()
-            .or_else(|| self.absent_recipient(&BTreeSet::new()).map(not_connected))
+        if let Some(no_room) = self.merge_room_refusal(shard) {
+            return Some(no_room);
+        }
+        self.absent_recipient(&BTreeSet::new()).map(not_connected)
+    }
+
+    /// Why `shard`'s region cannot go back to the shard around it for what
+    /// that shard is known to hold, or `None`: whoever asks for the merge —
+    /// the autoscaler or an operator.
+    ///
+    /// * **The target has no fresh report.** It used to count as idle: a
+    ///   shard that is stuck, or has only just registered, was handed
+    ///   another shard's players on the strength of saying nothing.
+    /// * **Together they have more players than a shard takes**
+    ///   ([`space_server::shard::MAX_PLAYERS_PER_SHARD`]): the target would
+    ///   answer the handoffs beyond that `TargetFull`, and the merged shard
+    ///   would be stopped at the drain timeout with the players it could not
+    ///   hand over.
+    ///
+    /// (`None` too when `shard` itself has no report or no merge target:
+    /// those are other refusals, and the callers make them first.)
+    fn merge_room_refusal(&self, shard: ShardId) -> Option<String> {
+        let into = topology::merge_target(self.control.map(), shard).ok()?;
+        let own = self.latest.get(&shard)?;
+        let Some(target) = self.latest.get(&into) else {
+            return Some(format!(
+                "no fresh load report from {into}, which would take the region back: it is not \
+                 known to have room for what {shard} holds, and no report is not \"idle\""
+            ));
+        };
+        let limit = space_server::shard::MAX_PLAYERS_PER_SHARD;
+        let together = own.players.saturating_add(target.players);
+        (usize::try_from(together).unwrap_or(usize::MAX) > limit).then(|| {
+            format!(
+                "{shard} has {} player(s) and {into} has {}: {together} together, and a shard \
+                 takes no more than {limit} — {into} would refuse the players beyond that",
+                own.players, target.players
+            )
+        })
     }
 
     /// Why the cluster cannot take one more shard, if it cannot: it already
@@ -3323,6 +3708,9 @@ impl<L: Launcher> Orchestrator<L> {
         }
         if let Some(waiting) = self.wanted_refusal() {
             return Some(waiting);
+        }
+        if let Some(draining) = self.drain_refusal() {
+            return Some(draining);
         }
         if self
             .control
@@ -4027,39 +4415,163 @@ impl<L: Launcher + 'static> Orchestrator<L> {
             self.connected.remove(&shard);
             self.scene_confirmed.remove(&shard);
         }
-        for launch in self.take_pending_launch_kill() {
-            if let Err(err) = self.launcher.kill(launch).await {
-                eprintln!("space-orchestrator: stopping the shard of {launch} failed: {err}");
-                self.log(
-                    EventKind::Launcher,
-                    Severity::Warn,
-                    format!("stopping the shard of {launch} failed: {err}"),
-                );
-            }
-        }
-        // What the launches did, and whether what was launched is still alive.
-        let reported = self
-            .launch_results
-            .lock()
-            .map(|mut results| std::mem::take(&mut *results))
-            .unwrap_or_default();
-        for (launch, result) in reported {
-            self.note_launch_result(launch, result);
-        }
-        if self.tick.is_multiple_of(POLL_INTERVAL_TICKS) {
-            for launch in self.launches_to_poll() {
-                if let Ok(Poll::Dead) = self.launcher.poll(launch).await {
-                    let exit = self.launcher.exit_code(launch).await;
-                    self.note_launch_exit(launch, exit);
-                }
-            }
-        }
+        // The launcher's part: stops, what the launches did, and whether what
+        // was launched is still alive — asked and told, never waited for.
+        self.drive_launcher();
         // Whose control link is open: a registered shard whose link closed is
         // dead.
         self.note_connected(server.connected().await);
         // What follows is for the operator view only.
         self.print_new_events();
         self.publish(false);
+    }
+
+    /// The launcher's part of a beat. **Nothing here waits for the
+    /// launcher**: a stop and a liveness question each run in a task of their
+    /// own, like a launch, and report back through
+    /// [`Self::launcher_reports`], which the next beat takes in.
+    ///
+    /// They used to be awaited here, one after the other. The process
+    /// launcher answers at once; the Docker launcher asks a daemon, with a
+    /// bound of 10 to 15 s per call — so a daemon that hung stopped the
+    /// orchestrator's clock for that long per shard (eight shards: over a
+    /// minute without a tick, an epoch deadline, an answer to a hello or to
+    /// an operator), which is the opposite of "a failed launch, not a hung
+    /// orchestrator".
+    ///
+    /// * **Stops**: every staged launch is handed to a task. A failure is
+    ///   logged when it is reported.
+    /// * **Liveness**, every [`POLL_INTERVAL_TICKS`]: each launch that has a
+    ///   handle is asked about — unless the last question about it is still
+    ///   open ([`Self::polls_in_flight`]): questions do not pile up behind a
+    ///   launcher that does not answer. A launch reported dead is taken in
+    ///   ([`Self::note_launch_exit`]) with the exit status the task read.
+    /// * **Trouble is said, at a bounded rate** ([`Self::launcher_trouble`]):
+    ///   a question that failed (it used to be dropped without a word, so a
+    ///   shard whose container had vanished was "alive" for ever), and one
+    ///   that has been open for [`POLL_SLOW_TICKS`].
+    ///
+    /// Synchronous, but it spawns: it needs a tokio runtime, which the run
+    /// loop is. (A test that only drives [`Self::tick`] never calls it.)
+    pub fn drive_launcher(&mut self) {
+        for launch in self.take_pending_launch_kill() {
+            // Whatever is still being asked about it no longer matters.
+            self.polls_in_flight.remove(&launch);
+            let launcher = Arc::clone(&self.launcher);
+            let reports = Arc::clone(&self.launcher_reports);
+            tokio::spawn(async move {
+                if let Err(err) = launcher.kill(launch).await {
+                    if let Ok(mut reports) = reports.lock() {
+                        reports.push(LauncherReport::StopFailed(launch, err.to_string()));
+                    }
+                }
+            });
+        }
+        // What the launches did.
+        let launched = self
+            .launch_results
+            .lock()
+            .map(|mut results| std::mem::take(&mut *results))
+            .unwrap_or_default();
+        for (launch, result) in launched {
+            self.note_launch_result(launch, result);
+        }
+        // What the stops and the questions came to.
+        let reports = self
+            .launcher_reports
+            .lock()
+            .map(|mut reports| std::mem::take(&mut *reports))
+            .unwrap_or_default();
+        for report in reports {
+            match report {
+                LauncherReport::StopFailed(launch, err) => {
+                    eprintln!("space-orchestrator: stopping the shard of {launch} failed: {err}");
+                    self.log(
+                        EventKind::Launcher,
+                        Severity::Warn,
+                        format!("stopping the shard of {launch} failed: {err}"),
+                    );
+                }
+                LauncherReport::Polled(launch, asked_at, answer) => {
+                    // (An answer to a question that was given up on — the
+                    // launch was stopped since — says nothing about a
+                    // question that is open now.)
+                    if self.polls_in_flight.get(&launch) == Some(&asked_at) {
+                        self.polls_in_flight.remove(&launch);
+                    }
+                    match answer {
+                        PollAnswer::Alive => {}
+                        PollAnswer::Exited(exit) => self.note_launch_exit(launch, exit),
+                        PollAnswer::Failed(err) => self.launcher_trouble(format!(
+                            "asking the launcher whether the shard of {launch} is alive \
+                             failed: {err}"
+                        )),
+                    }
+                }
+            }
+        }
+        if !self.tick.is_multiple_of(POLL_INTERVAL_TICKS) {
+            return;
+        }
+        for launch in self.launches_to_poll() {
+            if let Some(asked_at) = self.polls_in_flight.get(&launch).copied() {
+                let open_for = self.tick.saturating_sub(asked_at);
+                if open_for >= POLL_SLOW_TICKS {
+                    self.launcher_trouble(format!(
+                        "the launcher has not said for {} s whether the shard of {launch} is \
+                         alive (it is not asked again until it has)",
+                        open_for / crate::config::TICK_HZ
+                    ));
+                }
+                continue;
+            }
+            let asked_at = self.tick;
+            self.polls_in_flight.insert(launch, asked_at);
+            let launcher = Arc::clone(&self.launcher);
+            let reports = Arc::clone(&self.launcher_reports);
+            tokio::spawn(async move {
+                let answer = match launcher.poll(launch).await {
+                    Ok(Poll::Dead) => PollAnswer::Exited(launcher.exit_code(launch).await),
+                    Ok(Poll::Alive) => PollAnswer::Alive,
+                    Err(err) => PollAnswer::Failed(err.to_string()),
+                };
+                if let Ok(mut reports) = reports.lock() {
+                    reports.push(LauncherReport::Polled(launch, asked_at, answer));
+                }
+            });
+        }
+    }
+
+    /// Say that the launcher did not do what it was asked — in the event
+    /// log, **at most once per [`LAUNCHER_TROUBLE_WINDOW_TICKS`]**: a daemon
+    /// that is down fails every question about every shard, twice a second.
+    /// What is not written is counted, and the next line says how much that
+    /// was ([`Self::launcher_failures`] is the total).
+    fn launcher_trouble(&mut self, what: String) {
+        self.launcher_failures += 1;
+        let due = self
+            .launcher_trouble_logged
+            .is_none_or(|at| self.tick.saturating_sub(at) >= LAUNCHER_TROUBLE_WINDOW_TICKS);
+        if !due {
+            self.launcher_trouble_unlogged += 1;
+            return;
+        }
+        let more = std::mem::take(&mut self.launcher_trouble_unlogged);
+        let also = if more > 0 {
+            format!(" ({more} more such failure(s) since the last line about it)")
+        } else {
+            String::new()
+        };
+        self.log(EventKind::Launcher, Severity::Warn, format!("{what}{also}"));
+        self.launcher_trouble_logged = Some(self.tick);
+    }
+
+    /// How often the launcher failed to answer a liveness question, or took
+    /// longer than [`POLL_SLOW_TICKS`] over one, since the orchestrator
+    /// started (each open question counts once per poll interval).
+    #[must_use]
+    pub fn launcher_failures(&self) -> u64 {
+        self.launcher_failures
     }
 
     /// Write the event-log entries not yet written to standard output, oldest
@@ -4715,6 +5227,7 @@ mod tests {
         let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         orch.handle_load_report(&report(2, 0));
+        orch.handle_load_report(&report(1, 0));
         let reply = orch.handle_admin(&AdminCommand::ForceMerge(child));
         assert!(accepted(&reply), "{reply:?}");
         assert_eq!(orch.pending_merge(), Some(child));
@@ -4835,6 +5348,7 @@ mod tests {
         let merged = || {
             let mut orch = live(orchestrator_with_a_child());
             orch.handle_load_report(&report(2, 3));
+            orch.handle_load_report(&report(1, 0));
             assert!(accepted(
                 &orch.handle_admin(&AdminCommand::ForceMerge(ShardId::new(2)))
             ));
@@ -4859,11 +5373,14 @@ mod tests {
         }
         orch.tick();
         assert_eq!(orch.take_pending_kill(), vec![child]);
-        let said = &event_texts(&orch)[0];
+        // (The newest entry is the scene's: four bodies went with the shard,
+        // see `a_drain_that_ends_with_bodies_builds_the_scene_afresh`.)
+        let said = event_texts(&orch);
         assert!(
-            said.contains("did not drain within 30 s")
-                && said.contains("3 player(s) and 4 entities"),
-            "{said}"
+            said.iter()
+                .any(|line| line.contains("did not drain within 30 s")
+                    && line.contains("3 player(s) and 4 entities")),
+            "{said:?}"
         );
         assert!(orch.draining_shards().is_empty());
 
@@ -4893,9 +5410,11 @@ mod tests {
         assert_eq!(orch.take_pending_kill(), vec![child]);
         assert!(orch.dead_shards().is_empty());
         assert!(
-            event_texts(&orch)[0].contains("ended while it was draining"),
+            event_texts(&orch)
+                .iter()
+                .any(|line| line.contains("ended while it was draining")),
             "{:?}",
-            event_texts(&orch)[0]
+            event_texts(&orch)
         );
     }
 
@@ -4907,6 +5426,7 @@ mod tests {
         let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         orch.handle_load_report(&report(2, 0));
+        orch.handle_load_report(&report(1, 0));
         assert!(accepted(
             &orch.handle_admin(&AdminCommand::ForceMerge(child))
         ));
@@ -4951,6 +5471,8 @@ mod tests {
         let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         assert_ne!(orch.spawn_owner(), Some(child), "the fixture's premise");
+        // (A shard the orchestrator launched: the autoscaler merges no other.)
+        launched(&mut orch, child);
         // No report at all: not known to be there.
         let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
         assert!(why.contains("not known to be empty"), "{why}");
@@ -4986,39 +5508,18 @@ mod tests {
         );
     }
 
-    /// The autoscaler never merges the shard that owns the spawn point away,
-    /// and nobody while the cluster is at `--min-shards`.
+    /// The autoscaler merges nobody away while the cluster is at
+    /// `--min-shards`. (The shard that owns the spawn point used to be exempt
+    /// as well; it is merged back like any carved shard now — see
+    /// `a_crowd_on_the_spawn_point_grows_the_cluster_only_when_that_relieves_somebody`.)
     ///
-    /// Mutation this catches: offering every cold shard to the autoscaler
-    /// (the spawn point's shard — where every player joins — would be the
-    /// first to go on a quiet evening).
+    /// Mutation this catches: offering a cold shard to the autoscaler
+    /// whatever `--min-shards` says (it would be merged, stopped, and a new
+    /// one launched in its place at once).
     #[test]
-    fn the_autoscaler_never_removes_the_spawn_points_shard_nor_goes_below_the_minimum() {
-        // The first split from the centre carves the octant with the spawn point.
-        let mut orch = live(orchestrator_with_first_id(100));
-        assert!(
-            orch.handle_operator(&OperatorCommand::Split {
-                shard: ShardId::new(1),
-                octant: None,
-                expected_epoch: None,
-            })
-            .accepted
-        );
-        let child = join(&mut orch).shard;
-        assert!(ack_the_prepare(&mut orch) > 0);
-        assert_eq!(orch.spawn_owner(), Some(child));
-        let _ = orch.drain_outbox();
-        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
-            orch.handle_load_report(&report(child.0, 0));
-            orch.handle_load_report(&report(1, 0));
-            orch.tick();
-        }
-        assert_eq!(orch.pending_merge(), None, "the spawn point's shard stays");
-        assert_eq!(orch.map().regions.len(), 2);
-        assert!(orch.snapshot().autoscaler.last_decision.is_none());
-
-        // A child that does not own the spawn point, in a cluster that is to
-        // keep two shards: not merged either, and nothing is even tried.
+    fn the_autoscaler_never_goes_below_the_minimum() {
+        // A launched child in a cluster that is to keep two shards: not
+        // merged, and nothing is even tried.
         let config = OrchestratorConfig {
             min_shards: 2,
             ..OrchestratorConfig::default()
@@ -5050,6 +5551,7 @@ mod tests {
             .ok();
         }
         orch.note_connected([ShardId::new(1), ShardId::new(2)]);
+        launched(&mut orch, ShardId::new(2));
         for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
             orch.handle_load_report(&report(2, 0));
             orch.handle_load_report(&report(1, 0));
@@ -5061,11 +5563,16 @@ mod tests {
 
     /// The layout cells `--min-shards` stands for are never merged away by
     /// the autoscaler, whatever else was added: of an idle layout cell and an
-    /// idle cell the autoscaler carved, the carved one goes, and then nobody.
+    /// idle cell the autoscaler carved, the carved one goes — and the layout
+    /// cell stays **while the cluster still has a shard to spare**.
     ///
     /// Mutation this catches: counting shards only (the state before: with
     /// five shards the newest idle one went — a quadrant of the demo area,
     /// while the players were out at the cell that had been carved for them).
+    /// The second half is what catches it: three shards, one more than the
+    /// minimum, and the only idle one that could be merged by the count is
+    /// the layout cell's. (It used to run with two shards left, at the
+    /// minimum, where the count alone already said no.)
     #[test]
     fn the_autoscaler_keeps_the_layout_cells_of_min_shards() {
         let config = OrchestratorConfig {
@@ -5076,24 +5583,37 @@ mod tests {
         let layout = topology::layout_cells(root)[0];
         let k = root.center().cell;
         let carved = space_world::NodeRef::new(64, [k[0] + 4, k[1], k[2]]);
+        let busy = space_world::NodeRef::new(64, [k[0] + 6, k[1], k[2]]);
         let ids =
             PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
-        // (The layout cell's shard has the highest id: by "newest first"
-        // alone it would be the one to go.)
+        // (The layout cell's shard has a higher id than the idle carved
+        // cell's: by "newest idle first" alone it would be the one to go.)
         let mut orch = live(orchestrator_over(
             config,
             vec![
                 ShardRegion::new(root, ShardId::new(1), addr(7_001)),
                 ShardRegion::new(carved, ShardId::new(2), addr(7_002)),
                 ShardRegion::new(layout, ShardId::new(3), addr(7_003)),
+                ShardRegion::new(busy, ShardId::new(4), addr(7_004)),
             ],
             ids,
         ));
-        let links = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
-        let idle = [report(1, 0), report(2, 0), report(3, 0)];
+        // All of them launched by the orchestrator: the layout rule alone is
+        // what keeps shard 3.
+        for shard in [2, 3, 4] {
+            launched(&mut orch, ShardId::new(shard));
+        }
+        let mut links = vec![
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+            ShardId::new(4),
+        ];
+        // Shard 4 holds 40 players: with the root's shard it is not cold.
+        let reports = [report(1, 0), report(2, 0), report(3, 0), report(4, 40)];
         let mut merged = None;
         for _ in 0..(2 * crate::autoscale::MERGE_DWELL_TICKS) {
-            beat(&mut orch, &links, &idle);
+            beat(&mut orch, &links, &reports);
             if let Some(shard) = orch.pending_merge() {
                 merged = Some(shard);
                 break;
@@ -5106,13 +5626,27 @@ mod tests {
         );
         assert!(ack_the_prepare(&mut orch) > 0);
         let _ = orch.drain_outbox();
-        // Two shards are left, which is the minimum; and even with a third
-        // the layout cell would stay.
+        // It drains and goes.
+        beat(&mut orch, &links, &reports);
+        beat(&mut orch, &links, &reports);
+        links.retain(|shard| *shard != ShardId::new(2));
+        match orch.launch_of(ShardId::new(2)) {
+            Some(launch) => orch.note_launch_exit(launch, Some(0)),
+            None => orch.note_connected(links.iter().copied()),
+        }
+        assert!(orch.draining_shards().is_empty());
+        let _ = (orch.drain_outbox(), orch.take_pending_kill());
+        // Three shards are left, one more than the minimum, and the idle
+        // layout cell could be merged into the idle root's shard by any
+        // other rule. It stays.
+        assert_eq!(orch.map().regions.len(), 3);
+        let reports = [report(1, 0), report(3, 0), report(4, 40)];
         for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
-            beat(&mut orch, &links, &idle);
-            assert_eq!(orch.pending_merge(), None);
+            beat(&mut orch, &links, &reports);
+            assert_eq!(orch.pending_merge(), None, "the layout cell stays");
         }
         assert!(orch.map().regions.iter().any(|r| r.node == layout));
+        assert!(orch.snapshot().autoscaler.last_decision.is_some());
     }
 
     /// One beat of a cluster whose shards say `reports`: the reports arrive,
@@ -5304,9 +5838,11 @@ mod tests {
             vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
             ids,
         ));
+        // (A cell out in its region — not the spawn point's, which is not
+        // carved for a crowd that is all in it, whatever the limit.)
         let k = root.center().cell;
         let crowded = LoadReport {
-            hot_cell: k,
+            hot_cell: [k[0] + 3, k[1], k[2]],
             hot_cell_players: 2,
             ..report(1, 2)
         };
@@ -5831,6 +6367,7 @@ mod tests {
 
         // Three players are no obstacle: they are handed over by the drain.
         orch.handle_load_report(&report(2, 3));
+        orch.handle_load_report(&report(1, 0));
         let reply = orch.handle_operator(&merge(2));
         assert!(reply.accepted, "{reply:?}");
         assert_eq!(orch.pending_merge(), Some(child));
@@ -5992,10 +6529,12 @@ mod tests {
             .split_refusal
             .as_deref()
             .is_some_and(|why| why.contains("below the split floor")));
+        // (Right behind the commit no change can be made at all, and that is
+        // the answer; once it can, what is missing is the shard's report.)
         assert!(view
             .merge_refusal
             .as_deref()
-            .is_some_and(|why| why.contains("not known to be empty")));
+            .is_some_and(|why| why.contains("committed too recently")));
 
         // A second cell, for a third shard: now everybody in the map hears
         // about it — the first cell's owner too, though the cells only share
@@ -6003,6 +6542,10 @@ mod tests {
         for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
             orch.tick();
         }
+        assert!(orch.snapshot().regions[1]
+            .merge_refusal
+            .as_deref()
+            .is_some_and(|why| why.contains("not known to be empty")));
         let other = cell_at_the_centre(&orch, [-1, 0, 0]);
         let wanted = orch.begin_carve(other).expect("the second cell");
         assert_eq!((wanted.node, wanted.from), (other, one));
@@ -6032,6 +6575,7 @@ mod tests {
             "{reply:?}"
         );
         orch.handle_load_report(&report(100, 0));
+        orch.handle_load_report(&report(1, 0));
         assert_eq!(orch.merge_refusal(first), None);
         let reply = orch.handle_operator(&merge(100));
         assert!(reply.accepted, "{reply:?}");
@@ -6692,6 +7236,16 @@ mod tests {
         assert!(reply.accepted, "{reply:?}");
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().regions.len(), 1);
+        // (Its drain: it is empty, is told to stop and goes. Until then the
+        // map does not change again.)
+        orch.tick();
+        orch.handle_load_report(&report(100, 0));
+        orch.tick();
+        match orch.launch_of(ShardId::new(100)) {
+            Some(launch) => orch.note_launch_exit(launch, Some(0)),
+            None => orch.note_connected([ShardId::new(1)]),
+        }
+        assert!(orch.draining_shards().is_empty());
         for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
             orch.tick();
         }
@@ -8523,6 +9077,7 @@ mod tests {
                 ids,
             ));
             orch.handle_load_report(&report(2, 0));
+            orch.handle_load_report(&report(1, 0));
             orch
         };
         // Two shards, two to keep: no merge.
@@ -8732,6 +9287,7 @@ mod tests {
         let why = refusal(orch.handle_admin(&AdminCommand::ForceSplit(ShardId::new(1))));
         assert!(why.contains("shard 2 is not connected"), "{why}");
         orch.handle_load_report(&report(2, 0));
+        orch.handle_load_report(&report(1, 0));
         let reply = orch.handle_operator(&merge(2));
         assert!(
             !reply.accepted && reply.message.contains("shard 2 is not connected"),
@@ -9622,7 +10178,10 @@ mod tests {
         orch.handle_scene_ack(&scene_ack(2, orch.scene()));
         assert!(orch.scene_confirmed_by(ShardId::new(2)).is_some());
         orch.handle_load_report(&report(2, 0));
-        assert!(orch.handle_operator(&merge(2)).accepted);
+        // (The shard that takes its region back has to have reported too.)
+        orch.handle_load_report(&report(new.0, 0));
+        let reply = orch.handle_operator(&merge(2));
+        assert!(reply.accepted, "{reply:?}");
         assert!(ack_the_prepare(&mut orch) > 0);
         // (It drains: empty, told to stop, gone.)
         orch.handle_load_report(&report(2, 0));
@@ -9864,7 +10423,51 @@ mod tests {
         assert_eq!(replacement.shard, ShardId::new(3), "a new id");
         assert_eq!(orch.player_answer(), PlayerAnswer::Starting);
         assert!(ack_the_prepare(&mut orch) > 0);
-        // Committed: the replacement is the owner, at its own address.
+        // Committed — for the orchestrator. The replacement has not been
+        // told: the commit is in the outbox. A player sent to it now would
+        // be sent on, or told "starting", by a shard that owns nothing yet.
+        let three = ShardId::new(3);
+        assert_eq!(orch.spawn_owner(), Some(three));
+        assert_eq!(
+            orch.player_answer(),
+            PlayerAnswer::Starting,
+            "committed is not delivered"
+        );
+        let current = orch.scene();
+        // (An answer that arrives before the commit has even gone out is an
+        // answer to something older.)
+        orch.handle_scene_ack(&scene_ack(3, current));
+        assert_eq!(orch.player_answer(), PlayerAnswer::Starting);
+        // What goes out to it: the commit, the map, and behind them the
+        // scene — whose answer says that it has read all three.
+        let to_it: Vec<Message> = orch
+            .drain_outbox()
+            .into_iter()
+            .filter(|(to, _)| *to == three)
+            .map(|(_, message)| message)
+            .collect();
+        let at_which = |wanted: fn(&Message) -> bool| to_it.iter().position(wanted);
+        let commit = at_which(|m| matches!(m, Message::EpochCommit(_))).expect("the commit");
+        let map = at_which(|m| matches!(m, Message::DirectoryReply(_))).expect("the map");
+        let scene = at_which(|m| matches!(m, Message::SceneSet(_))).expect("the scene");
+        assert!(commit < map && map < scene, "in that order: {to_it:?}");
+        assert_eq!(
+            orch.player_answer(),
+            PlayerAnswer::Starting,
+            "delivered is not read"
+        );
+        // An answer naming the revision from before the replacement is not
+        // an answer to it.
+        orch.handle_scene_ack(&scene_ack(
+            3,
+            SceneState {
+                revision: current.revision - 1,
+                ..current
+            },
+        ));
+        assert_eq!(orch.player_answer(), PlayerAnswer::Starting);
+        orch.handle_scene_ack(&scene_ack(3, current));
+        // Read: the replacement is the owner, at its own address.
         let PlayerAnswer::Redirect(redirect) = orch.player_answer() else {
             panic!("the replacement owns the spawn point");
         };
@@ -10002,6 +10605,723 @@ mod tests {
         assert_eq!(again.region.endpoint, observed);
         assert_eq!(again.shard, ShardId::new(3));
         assert_eq!(orch.dead_shards(), vec![ShardId::new(1)]);
+    }
+
+    // ------------------------------------- review of 79f88f8: drains, scaling
+
+    /// Make `shard` — which a fixture put into the map directly — a shard
+    /// the orchestrator launched: the autoscaler merges away no other.
+    fn launched(orch: &mut Orchestrator<MockLauncher>, shard: ShardId) {
+        orch.last_launch += 1;
+        orch.launches.insert(
+            LaunchId(orch.last_launch),
+            Launch {
+                host_port: 0,
+                since: 0,
+                endpoint: Some(addr(9_400 + u16::try_from(shard.0).expect("a small id"))),
+                shard: Some(shard),
+            },
+        );
+    }
+
+    /// The root owned by shard 1 with two octants carved out, for shards 2
+    /// and 3; all three connected.
+    fn three_shards() -> Orchestrator<MockLauncher> {
+        let config = OrchestratorConfig::default();
+        let root = config.root_node();
+        let children = space_world::octree::children(root).expect("root splits");
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        live(orchestrator_over(
+            config,
+            vec![
+                ShardRegion::new(root, ShardId::new(1), addr(7_001)),
+                ShardRegion::new(children[0], ShardId::new(2), addr(7_002)),
+                ShardRegion::new(children[1], ShardId::new(3), addr(7_003)),
+            ],
+            ids,
+        ))
+    }
+
+    /// Merge `shard` away (the admin verb) and commit it: every owner has
+    /// just reported no players, and afterwards `shard` is draining.
+    fn merge_and_commit(orch: &mut Orchestrator<MockLauncher>, shard: u32) {
+        let owners: Vec<ShardId> = orch.map().regions.iter().map(|r| r.shard).collect();
+        for owner in owners {
+            orch.handle_load_report(&report(owner.0, 0));
+        }
+        let reply = orch.handle_admin(&AdminCommand::ForceMerge(ShardId::new(shard)));
+        assert!(accepted(&reply), "{reply:?}");
+        assert!(ack_the_prepare(orch) > 0);
+        assert_eq!(orch.draining_shards(), vec![ShardId::new(shard)]);
+        let _ = orch.drain_outbox();
+    }
+
+    /// The refusal a hello got, which has to be a "wait".
+    fn told_to_wait(outcome: Result<ShardWelcome, HelloRefusal>) -> String {
+        match outcome {
+            Err(HelloRefusal::Wait(why)) => why,
+            Err(other) => panic!("refused, not told to wait: {other}"),
+            Ok(welcome) => panic!("welcomed as {}", welcome.shard),
+        }
+    }
+
+    /// While a shard drains, the map does not change — whoever asks: a
+    /// draining shard is told of no further epoch and every offer it makes
+    /// under the old one would be refused as stale. A shard that dies
+    /// meanwhile is replaced when the drain is over.
+    ///
+    /// Mutations this catches, each run: no `drain_refusal` in `assign` (the
+    /// replacement's epoch is proposed during the drain — the state before:
+    /// the draining shard could hand nothing over any more and was stopped at
+    /// the timeout with its players and bodies); none in `proposal_refusal`
+    /// (an operator's split is accepted); the autoscaler not held back (it
+    /// decides, is refused, and the log says so every dwell).
+    #[test]
+    fn no_map_change_is_made_while_a_shard_drains() {
+        let mut orch = three_shards();
+        merge_and_commit(&mut orch, 3);
+        let epoch = orch.map().epoch;
+        let (one, two, three) = (ShardId::new(1), ShardId::new(2), ShardId::new(3));
+        // It holds a player and five bodies. Well past the minimum interval
+        // between two epochs, so that the drain is the only thing in the way
+        // — and with the root's shard loaded all the while: the autoscaler
+        // would relieve it.
+        let holding = LoadReport {
+            entities: 5,
+            ..report(3, 1)
+        };
+        for _ in 0..(2 * crate::autoscale::SPLIT_DWELL_TICKS) {
+            beat(
+                &mut orch,
+                &[one, two, three],
+                &[report(1, 95), report(2, 0), holding],
+            );
+            assert_eq!(orch.wanted_node(), None, "the autoscaler is not asked");
+        }
+        assert!(
+            orch.snapshot().autoscaler.last_decision.is_none(),
+            "and decides nothing it would only be refused: {:?}",
+            orch.snapshot().autoscaler.last_decision
+        );
+        // An operator, the admin verbs, a carve: refused, with the reason.
+        let asked = orch.handle_operator(&split(1, None));
+        assert!(
+            !asked.accepted && asked.message.contains("shard 3 is draining"),
+            "{asked:?}"
+        );
+        let asked = orch.handle_operator(&merge(2));
+        assert!(
+            !asked.accepted && asked.message.contains("shard 3 is draining"),
+            "{asked:?}"
+        );
+        for verb in [AdminCommand::ForceSplit(one), AdminCommand::ForceMerge(two)] {
+            let why = refusal(orch.handle_admin(&verb));
+            assert!(why.contains("is draining"), "{verb:?}: {why}");
+        }
+        let cell = cell_at_the_centre(&orch, [3, 0, 0]);
+        let why = orch.begin_carve(cell).expect_err("no carve either");
+        assert!(why.contains("is draining"), "{why}");
+        // A shard started by hand is told to wait, and why.
+        let why = told_to_wait(orch.handle_shard_hello(&fresh_hello(addr(9_901))));
+        assert!(why.contains("shard 3 is draining"), "{why}");
+        // Another shard of the map dies. Its replacement waits too: the hello
+        // makes nobody's offers stale.
+        orch.note_connected([one, three]);
+        assert_eq!(orch.dead_shards(), vec![two]);
+        let why = told_to_wait(orch.handle_shard_hello(&fresh_hello(addr(9_901))));
+        assert!(why.contains("shard 3 is draining"), "{why}");
+        assert!(
+            prepares(&orch.drain_outbox()).is_empty(),
+            "nothing proposed"
+        );
+        assert_eq!(orch.map().epoch, epoch, "the map is as the drain found it");
+        assert_eq!(orch.draining_shards(), vec![three], "the drain goes on");
+        assert!(
+            orch.take_pending_spawn().is_empty(),
+            "and nothing is launched"
+        );
+
+        // The drain completes: empty, told to stop, gone.
+        orch.handle_load_report(&report(3, 0));
+        orch.tick();
+        assert!(orch
+            .drain_outbox()
+            .iter()
+            .any(|(to, m)| *to == three && matches!(m, Message::ShardRetire(_))));
+        orch.note_connected([one]);
+        assert!(orch.draining_shards().is_empty());
+        // Now the replacement is served.
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_901)))
+            .expect("the dead shard's region, now that the drain is over");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().epoch, epoch + 1);
+        assert!(orch.dead_shards().is_empty());
+        assert!(orch.map().regions.iter().any(|r| r.shard == welcome.shard));
+    }
+
+    /// The decision for the one case in which waiting helps nobody: the
+    /// shard a drain hands everything **to** dies. The draining shard has
+    /// nobody to give anything, so it is stopped at once — and the dead
+    /// shard's replacement, which no drain may overlap, is not held up for
+    /// the rest of the drain timeout. What the drained shard held is rebuilt
+    /// with the replacement's commit, once.
+    ///
+    /// Mutation this catches: not ending the drain when its target dies (the
+    /// replacement's hello is told to wait for a drain that cannot end, for
+    /// up to 45 s — with the spawn point's shard as the target, that long
+    /// without anybody a new player could be sent to).
+    #[test]
+    fn a_drain_whose_target_dies_is_ended_at_once_and_the_replacement_is_not_held_up() {
+        let mut orch = three_shards();
+        merge_and_commit(&mut orch, 3);
+        let (one, two, three) = (ShardId::new(1), ShardId::new(2), ShardId::new(3));
+        let revision = orch.scene().revision;
+        orch.tick();
+        orch.handle_load_report(&LoadReport {
+            entities: 4,
+            ..report(3, 1)
+        });
+        // The root's shard — which took shard 3's region back — is gone.
+        orch.note_connected([two, three]);
+        assert_eq!(orch.dead_shards(), vec![one]);
+        assert!(orch.draining_shards().is_empty(), "the drain is over");
+        assert!(orch.take_pending_kill().contains(&three), "it is stopped");
+        let said = event_texts(&orch);
+        assert!(
+            said.iter()
+                .any(|line| line.contains("shard 3 was draining into shard 1, which is gone")),
+            "{said:?}"
+        );
+        assert_eq!(
+            orch.scene().revision,
+            revision,
+            "the rebuild is the replacement's: the spawner may be the dead shard"
+        );
+        // The replacement is served at once.
+        orch.note_connected([two]);
+        let welcome = orch
+            .handle_shard_hello(&fresh_hello(addr(9_902)))
+            .expect("not held up by a drain that could never end");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert!(orch.dead_shards().is_empty());
+        assert!(orch.map().regions.iter().any(|r| r.shard == welcome.shard));
+        assert_eq!(orch.scene().revision, revision + 1, "built afresh, once");
+    }
+
+    /// A drain that ends with the shard still holding bodies — at the
+    /// timeout, or because the shard died — does not lose them for good: the
+    /// scene is re-issued under a new revision, so every shard drops the
+    /// scene's bodies and the spawner builds them again. One that ends empty
+    /// changes nothing.
+    ///
+    /// Mutation this catches: `end_drain` only killing and forgetting (the
+    /// state before: the bodies the shard still simulated were gone until
+    /// somebody switched the scene).
+    #[test]
+    fn a_drain_that_ends_with_bodies_builds_the_scene_afresh() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum End {
+            Timeout,
+            Died,
+            ToldToStop,
+        }
+        let timeout = crate::autoscale::DRAIN_TIMEOUT_TICKS;
+        let child = ShardId::new(2);
+        // (what it says it holds after the commit — players, entities — how
+        // the drain ends, whether the scene is built afresh)
+        let cases = [
+            (Some((3, 4)), End::Timeout, true),
+            (Some((1, 0)), End::Timeout, false),
+            (None, End::Timeout, true),
+            (Some((0, 2)), End::Died, true),
+            (None, End::Died, true),
+            (Some((0, 0)), End::ToldToStop, false),
+        ];
+        for (says, end, rebuilt) in cases {
+            let case = format!("{says:?}, {end:?}");
+            let mut orch = live(orchestrator_with_a_child());
+            merge_and_commit(&mut orch, 2);
+            let before = orch.scene();
+            let say = |orch: &mut Orchestrator<MockLauncher>| {
+                if let Some((players, entities)) = says {
+                    orch.handle_load_report(&LoadReport {
+                        entities,
+                        ..report(2, players)
+                    });
+                }
+            };
+            orch.tick();
+            say(&mut orch);
+            orch.tick();
+            match end {
+                End::Timeout => {
+                    for _ in 0..=timeout {
+                        say(&mut orch);
+                        orch.tick();
+                    }
+                }
+                End::Died | End::ToldToStop => orch.note_connected([ShardId::new(1)]),
+            }
+            assert!(orch.draining_shards().is_empty(), "{case}: the drain ended");
+            assert_eq!(orch.take_pending_kill(), vec![child], "{case}");
+            let now = orch.scene();
+            let texts = event_texts(&orch);
+            if rebuilt {
+                assert_eq!(now.revision, before.revision + 1, "{case}");
+                assert_eq!(now.scene, before.scene, "{case}: the scene itself stays");
+                assert!(
+                    texts.iter().any(|line| line.contains(
+                        "shard 2 was stopped before it had handed over everything it simulated"
+                    ) && line.contains("re-issued as revision")),
+                    "{case}: {texts:?}"
+                );
+                assert!(
+                    scene_sets(&orch.drain_outbox()).contains(&(ShardId::new(1), now)),
+                    "{case}: the shards are told"
+                );
+            } else {
+                assert_eq!(now, before, "{case}: nothing was lost, nothing is rebuilt");
+            }
+        }
+    }
+
+    /// A draining shard that is declared dead is out of the cluster — and
+    /// out of the list of draining shards, which is what holds up every map
+    /// change.
+    ///
+    /// Mutation this catches: `mark_dead` forgetting the shard but leaving
+    /// its `draining` entry (the state before: it was shown as draining, and
+    /// stopped a second time, when the timeout ran out).
+    #[test]
+    fn a_draining_shard_that_is_declared_dead_is_not_left_draining() {
+        let mut orch = live(orchestrator_with_a_child());
+        merge_and_commit(&mut orch, 2);
+        let child = ShardId::new(2);
+        orch.declare_dead(child, "an operator said so");
+        assert!(orch.draining_shards().is_empty());
+        assert!(orch.dead_shards().is_empty(), "it owned nothing");
+        assert_eq!(orch.take_pending_kill(), vec![child]);
+        assert!(
+            event_texts(&orch)
+                .iter()
+                .any(|line| line.contains("shard 2 lost while it was draining")),
+            "{:?}",
+            event_texts(&orch)
+        );
+        assert!(orch
+            .snapshot()
+            .shards
+            .iter()
+            .all(|shard| shard.shard != child));
+        // Nothing waits for it: once the last commit is old enough, the map
+        // can change again.
+        for _ in 0..=MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        orch.note_connected([ShardId::new(1)]);
+        let asked = orch.handle_operator(&split(1, None));
+        assert!(asked.accepted, "{asked:?}");
+    }
+
+    /// A merge hands one shard's players to another: that shard must be
+    /// known to be there and to have room — whoever asks for the merge.
+    ///
+    /// Mutations this catches: a merge target without a report counted as an
+    /// idle shard (the state before); no bound on the players of the pair (a
+    /// shard takes 100: the rest would be refused `TargetFull` and lost at
+    /// the drain timeout).
+    #[test]
+    fn a_merge_needs_the_targets_report_and_room_for_the_players() {
+        let mut orch = live(orchestrator_with_a_child());
+        let child = ShardId::new(2);
+        launched(&mut orch, child);
+        // The shard that would take the region back has said nothing.
+        orch.handle_load_report(&report(2, 0));
+        let why = orch.merge_refusal(child).expect("an operator is refused");
+        assert!(why.contains("no fresh load report from shard 1"), "{why}");
+        let links = [ShardId::new(1), child];
+        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
+            beat(&mut orch, &links, &[report(2, 0)]);
+        }
+        assert_eq!(orch.pending_merge(), None, "silence is not idleness");
+        assert!(
+            orch.snapshot().autoscaler.last_decision.is_none(),
+            "the autoscaler does not even try: {:?}",
+            orch.snapshot().autoscaler.last_decision
+        );
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
+        assert!(why.contains("no fresh load report from shard 1"), "{why}");
+        assert!(orch.drain_outbox().is_empty(), "nothing was proposed");
+
+        // Both report, and together they hold one player more than a shard
+        // takes.
+        let limit = u32::try_from(space_server::shard::MAX_PLAYERS_PER_SHARD).unwrap();
+        orch.handle_load_report(&report(2, 50));
+        orch.handle_load_report(&report(1, limit - 49));
+        let why = orch.merge_refusal(child).expect("no room");
+        assert!(
+            why.contains(&format!("{} together", limit + 1)) && why.contains("no more than 100"),
+            "{why}"
+        );
+        // (The cooldown the refused admin verb started has passed by now.)
+        let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
+        assert!(why.contains("together"), "{why}");
+        // Exactly as many as a shard takes: merged.
+        orch.handle_load_report(&report(2, 50));
+        orch.handle_load_report(&report(1, limit - 50));
+        assert_eq!(orch.merge_refusal(child), None);
+        assert!(accepted(
+            &orch.handle_admin(&AdminCommand::ForceMerge(child))
+        ));
+        assert_eq!(orch.pending_merge(), Some(child));
+    }
+
+    /// The autoscaler takes away what the orchestrator started, and nothing
+    /// else: a shard somebody started by hand stays until an operator merges
+    /// it.
+    ///
+    /// Mutation this catches: offering every idle shard (the state before:
+    /// with `--min-shards 0` — where every shard is started by hand — each
+    /// was merged away a minute after it went idle).
+    #[test]
+    fn the_autoscaler_merges_away_only_shards_the_orchestrator_launched() {
+        let mut orch = live(orchestrator_with_a_child());
+        let child = ShardId::new(2);
+        let links = [ShardId::new(1), child];
+        let idle = [report(1, 0), report(2, 0)];
+        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
+            beat(&mut orch, &links, &idle);
+            assert_eq!(orch.pending_merge(), None, "started by hand: it stays");
+        }
+        assert_eq!(orch.pending_merge(), None, "started by hand: it stays");
+        assert!(orch.snapshot().autoscaler.last_decision.is_none());
+        assert_eq!(
+            orch.merge_refusal(child),
+            None,
+            "an operator may still merge it"
+        );
+        // The same shard, launched by the orchestrator: merged after the dwell.
+        launched(&mut orch, child);
+        let mut merged = false;
+        for _ in 0..(2 * crate::autoscale::MERGE_DWELL_TICKS) {
+            beat(&mut orch, &links, &idle);
+            if orch.pending_merge() == Some(child) {
+                merged = true;
+                break;
+            }
+        }
+        assert!(merged, "a launched shard that is idle is merged away");
+    }
+
+    /// The spawn point's cell. A crowd on it does not grow the cluster — a
+    /// shard of its own for that cell would be exactly as loaded, and a
+    /// region cannot be smaller than a cell — and the log says so, once per
+    /// cooldown. When the loaded shard has players elsewhere too, the cell is
+    /// carved (that takes the crowd off their tick); the new shard then owns
+    /// the spawn point, cannot be relieved itself, and is **merged back when
+    /// the pair is cold**, like any carved cell: the cluster ends as it
+    /// began.
+    ///
+    /// Mutations this catches: carving the spawn cell like any hot cell (the
+    /// state before: phase 1 asked for a shard that relieved nobody);
+    /// exempting the spawn point's owner from being merged (the state before:
+    /// that shard stayed for ever).
+    #[test]
+    fn a_crowd_on_the_spawn_point_grows_the_cluster_only_when_that_relieves_somebody() {
+        let scale = crate::autoscale::ScaleConfig {
+            capacity: 2,
+            out_dwell_ticks: 30,
+            in_dwell_ticks: 60,
+            cooldown_ticks: 90,
+            drain_timeout_ticks: 300,
+            ..crate::autoscale::ScaleConfig::default()
+        };
+        let config = OrchestratorConfig {
+            scale,
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ids,
+        ));
+        let one = ShardId::new(1);
+        let spawn = space_scene::scene_anchor(orch.map())
+            .expect("a map has an anchor")
+            .cell;
+        let spawn_cell = space_world::NodeRef::new(64, spawn);
+        let crowd = |shard: u32, players: u32, in_the_cell: u32| LoadReport {
+            hot_cell: spawn,
+            hot_cell_players: in_the_cell,
+            ..report(shard, players)
+        };
+        let mut links = vec![one];
+        let at_capacity = |orch: &Orchestrator<MockLauncher>| -> u32 {
+            orch.events()
+                .newest_first()
+                .filter(|event| event.text.contains("the spawn cell is at capacity"))
+                .map(|event| event.repeats)
+                .sum()
+        };
+
+        // 1. Two players (a full shard here), both on the spawn point.
+        for _ in 0..400 {
+            beat(&mut orch, &links, &[crowd(1, 2, 2)]);
+            assert_eq!(orch.wanted_node(), None, "no shard is asked for");
+            assert!(orch.take_pending_spawn().is_empty());
+        }
+        assert_eq!(orch.map().regions.len(), 1, "the cluster has not grown");
+        let said = at_capacity(&orch);
+        assert!(
+            (1..=4).contains(&said),
+            "said, once a cooldown: {said} times in 400 ticks"
+        );
+        let why = orch
+            .snapshot()
+            .autoscaler
+            .last_decision
+            .expect("decided")
+            .outcome
+            .expect_err("nothing can be done");
+        assert!(
+            why.contains("the spawn cell is at capacity")
+                && why.contains("cannot be smaller than a cell"),
+            "{why}"
+        );
+
+        // 2. A third player, out in the region: now the cell is carved.
+        let mut asked = false;
+        for _ in 0..200 {
+            beat(&mut orch, &links, &[crowd(1, 3, 2)]);
+            if orch.wanted_node().is_some() {
+                asked = true;
+                break;
+            }
+        }
+        assert!(asked, "the crowd is taken off the third player's tick");
+        assert_eq!(orch.wanted_node(), Some(spawn_cell));
+        let new = join(&mut orch).shard;
+        links.push(new);
+        assert!(ack_the_prepare(&mut orch) > 0);
+        orch.note_connected(links.iter().copied());
+        assert_eq!(orch.spawn_owner(), Some(new), "it owns the spawn point");
+        let _ = orch.drain_outbox();
+
+        // 3. The new shard is as crowded as the cell is, and cannot be
+        // relieved: nothing is asked for, and the log says why.
+        let before = at_capacity(&orch);
+        for _ in 0..300 {
+            beat(&mut orch, &links, &[crowd(new.0, 2, 2), report(1, 1)]);
+            assert_eq!(orch.wanted_node(), None);
+            assert!(orch.take_pending_spawn().is_empty());
+            assert_eq!(orch.pending_merge(), None, "a loaded shard is not merged");
+        }
+        assert!(at_capacity(&orch) > before, "said for the new shard too");
+
+        // 4. Everybody leaves: the pair is cold, and the spawn cell goes
+        // back to the root's shard.
+        let mut merged = false;
+        for _ in 0..600 {
+            beat(&mut orch, &links, &[report(new.0, 0), report(1, 0)]);
+            if orch.pending_merge() == Some(new) {
+                merged = true;
+                break;
+            }
+        }
+        assert!(merged, "the spawn cell's shard is merged back when cold");
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 1);
+        assert_eq!(orch.spawn_owner(), Some(one), "the cluster is as it began");
+        assert_eq!(orch.draining_shards(), vec![new]);
+    }
+
+    /// A launcher whose answers a test chooses.
+    #[derive(Debug, Default)]
+    struct MoodyLauncher {
+        mood: std::sync::atomic::AtomicU8,
+        polls: std::sync::atomic::AtomicU32,
+        kills: std::sync::atomic::AtomicU32,
+    }
+
+    const ANSWERS: u8 = 0;
+    const FAILS: u8 = 1;
+    const SILENT: u8 = 2;
+    const SAYS_DEAD: u8 = 3;
+
+    impl MoodyLauncher {
+        fn mood(&self) -> u8 {
+            self.mood.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set(&self, mood: u8) {
+            self.mood.store(mood, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn polls(&self) -> u32 {
+            self.polls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn kills(&self) -> u32 {
+            self.kills.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Launcher for MoodyLauncher {
+        async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
+            Ok(process_handle(&spec))
+        }
+
+        async fn kill(&self, _launch: LaunchId) -> Result<(), LaunchError> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.mood() == SILENT {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn poll(&self, _launch: LaunchId) -> Result<Poll, LaunchError> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mood() {
+                ANSWERS => Ok(Poll::Alive),
+                FAILS => Err(LaunchError::Unavailable(
+                    "the daemon does not answer".into(),
+                )),
+                SILENT => std::future::pending().await,
+                _ => Ok(Poll::Dead),
+            }
+        }
+
+        async fn exit_code(&self, _launch: LaunchId) -> Option<i32> {
+            Some(7)
+        }
+    }
+
+    /// A one-shard cluster whose shard was started by a [`MoodyLauncher`].
+    fn moody_cluster() -> (
+        Orchestrator<MoodyLauncher>,
+        std::sync::Arc<MoodyLauncher>,
+        ShardId,
+    ) {
+        let config = OrchestratorConfig {
+            min_shards: 1,
+            launcher: LauncherKind::Process,
+            host_port_range: (7_870, 7_879),
+            ..OrchestratorConfig::default()
+        };
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                config.bind,
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(2, Box::new(MemoryCounterSink::default()));
+        let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
+        control.set_unclaimed_root_owner(ShardId::new(1));
+        let launcher = std::sync::Arc::new(MoodyLauncher::default());
+        let mut orch = Orchestrator::new(control, std::sync::Arc::clone(&launcher));
+        orch.tick();
+        let spec = orch.take_pending_spawn().pop().expect("the root's launch");
+        let root = orch
+            .handle_shard_hello(&fresh_hello(addr(spec.host_port)))
+            .expect("the root")
+            .shard;
+        orch.note_launch_result(spec.launch, Ok(process_handle(&spec)));
+        assert!(orch.launch_of(root).is_some());
+        (orch, launcher, root)
+    }
+
+    /// `ticks` beats of the launcher's part of the run loop, with `links`
+    /// open: tick, drive the launcher, and let its tasks run.
+    async fn launcher_beats(orch: &mut Orchestrator<MoodyLauncher>, links: &[ShardId], ticks: u64) {
+        for _ in 0..ticks {
+            orch.tick();
+            orch.note_connected(links.iter().copied());
+            orch.drive_launcher();
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn launcher_lines(orch: &Orchestrator<MoodyLauncher>, needle: &str) -> Vec<String> {
+        orch.events()
+            .newest_first()
+            .filter(|event| event.text.contains(needle))
+            .map(|event| event.text.clone())
+            .collect()
+    }
+
+    /// The run loop asks the launcher and is told — it never waits for it,
+    /// never asks twice at once, and says when the launcher fails, at a
+    /// bounded rate. On the orchestrator's own clock: every tick is a call.
+    ///
+    /// Mutations this catches, each run: a liveness question asked again
+    /// while the last one is open (questions pile up behind a daemon that
+    /// hangs: 24 in 12 s instead of 1); a failed question dropped without a
+    /// word (the state before); every failure written to the log (two lines
+    /// a second per shard for as long as the daemon is down).
+    #[test]
+    fn the_launcher_is_asked_and_told_but_never_waited_for() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let second = crate::config::TICK_HZ;
+
+        // It answers; then it fails; then it says the shard is gone.
+        let (mut orch, launcher, root) = moody_cluster();
+        runtime.block_on(async {
+            launcher_beats(&mut orch, &[root], 2 * second).await;
+            assert!(launcher.polls() >= 3, "asked twice a second");
+            assert_eq!(orch.launcher_failures(), 0);
+
+            launcher.set(FAILS);
+            let asked_before = launcher.polls();
+            launcher_beats(&mut orch, &[root], 25 * second).await;
+            let failed = u64::from(launcher.polls() - asked_before);
+            assert!(failed >= 45, "asked on, twice a second: {failed}");
+            assert!(
+                orch.launcher_failures() >= failed - 1,
+                "every failure is counted: {} of {failed}",
+                orch.launcher_failures()
+            );
+            let lines = launcher_lines(&orch, "is alive failed: launcher unavailable");
+            assert!(
+                (2..=3).contains(&lines.len()),
+                "one line per ten seconds, not one per failure: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("more such failure(s)")),
+                "what was not written is counted: {lines:?}"
+            );
+            assert!(orch.dead_shards().is_empty(), "not knowing is not dead");
+
+            launcher.set(SAYS_DEAD);
+            launcher_beats(&mut orch, &[root], second).await;
+            assert_eq!(orch.dead_shards(), vec![root], "an answer is taken in");
+        });
+
+        // It does not answer at all: one question stays open, the clock
+        // runs on, and the log says so.
+        let (mut orch, launcher, root) = moody_cluster();
+        runtime.block_on(async {
+            launcher.set(SILENT);
+            launcher_beats(&mut orch, &[root], 12 * second).await;
+            assert_eq!(launcher.polls(), 1, "not asked again while it is open");
+            let lines = launcher_lines(&orch, "has not said for");
+            assert!((1..=2).contains(&lines.len()), "{lines:?}");
+            // A stop that never returns holds nothing up either.
+            orch.declare_dead(root, "an operator said so");
+            let tick = orch.current_tick();
+            launcher_beats(&mut orch, &[], 2 * second).await;
+            assert_eq!(launcher.kills(), 1, "the stop was handed over");
+            assert_eq!(orch.current_tick(), tick + 2 * second);
+        });
     }
 
     /// A replacement's client endpoint goes into the staged map with its

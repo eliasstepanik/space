@@ -17,11 +17,26 @@
 # `com.centurylinklabs.watchtower.enable: "true"`. The ORCHESTRATOR carries it;
 # shard containers do not, and are not Watchtower's business: a new orchestrator
 # image is pulled, the old container is stopped (SIGTERM: it removes its shards
-# first, within `stop_grace_period`), and the new one starts its shards from
+# first), and the new one starts its shards from
 # the shard image of ITS OWN COMMIT (`space-shard:sha-<commit>`, baked into the
 # orchestrator image at build time and pushed before the orchestrator's
 # `latest` moves) - so client, shard and orchestrator are always one build.
 # The images are public (anonymous pull, no docker login).
+#
+# HOW LONG the old orchestrator gets for that is WATCHTOWER'S stop timeout, not
+# this file's `stop_grace_period` (which is what `docker compose stop` / `down`
+# and `docker stop` use): Watchtower waits 10 s by default, the orchestrator's
+# own bound for removing its shards is 20 s. Give Watchtower 30 s -
+# `WATCHTOWER_TIMEOUT=30s` in its environment, or `--stop-timeout 30s` on its
+# command line. Cut short, nothing is lost: the new orchestrator removes what
+# the old one left (the containers carrying its own three labels) before it
+# starts its shards. NOT EXECUTED from this repository.
+#
+# Watchtower recreates the container from the OLD container's configuration,
+# host name included - so the new container's HOSTNAME is the old one's id and
+# names nothing. The orchestrator therefore looks for itself by NAME
+# (`container_name` and SPACE_ORCHESTRATOR_DOCKER_SELF below, which must stay
+# the same); `hostname` is fixed too, so that it never is a stale id.
 #
 # The browser viewer page is NOT served here: it is a local development and
 # agent-testing tool (see AGENTS.md and crates/space-viewer/README.md), not part
@@ -41,10 +56,21 @@ services:
   orchestrator:
     image: ghcr.io/eliasstepanik/space-orchestrator:${SPACE_TAG:-latest}
     container_name: space-orchestrator
+    hostname: space-orchestrator
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     environment:
       SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
+      # This container's own name (`container_name` above): what the
+      # orchestrator inspects to find the network its shards join and the
+      # address they dial.
+      SPACE_ORCHESTRATOR_DOCKER_SELF: space-orchestrator
+      # What tells this stack's shard containers from any other stack's on
+      # this host (label space.instance). Empty = an id the orchestrator makes
+      # once and keeps in ./state (orchestrator.id.instance).
+      SPACE_ORCHESTRATOR_DOCKER_INSTANCE: ${SPACE_INSTANCE:-}
+      # Memory limit of each shard container in MiB (empty = 2048; 0 = none).
+      SPACE_ORCHESTRATOR_SHARD_MEMORY: ${SPACE_SHARD_MEMORY:-}
       # The cluster secret (.env; at least 16 characters): what a shard's hello
       # must carry; the orchestrator hands it to the shards it starts. REQUIRED,
       # no default: compose refuses to start the stack without it.
@@ -91,7 +117,8 @@ services:
       - "127.0.0.1:${WEBUI_PORT:-7980}:7980/tcp"
     networks:
       - space
-    # Time to remove its shard containers when it is stopped or replaced.
+    # Time to remove its shard containers on `docker compose stop` / `down`.
+    # (Watchtower has its own stop timeout: see the header.)
     stop_grace_period: 30s
     restart: unless-stopped
 

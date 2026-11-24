@@ -35,13 +35,51 @@ host's loopback. The orchestrator's control port, `7900/udp`, is **not
 published on the host** by either compose file: only the shards use it, and
 they reach it over the compose network. There are no fixed container IPs any
 more: the orchestrator finds its own network and address by inspecting its
-container.
+container - **by name** (`SPACE_ORCHESTRATOR_DOCKER_SELF`, which the compose
+files set: `<project>-orchestrator-1` here, `space-orchestrator` in `proxy/`),
+and only failing that by `$HOSTNAME`. The Engine finds a container by name or
+id, not by host name; `$HOSTNAME` is the id only until the container is
+recreated from an older one's configuration, which is what Watchtower does. If
+it cannot find itself it says what to set: that name, or
+`SPACE_ORCHESTRATOR_DOCKER_NETWORK` and `SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR`
+(with both given it inspects nothing).
 
 `docker compose down` (or `stop`) sends the orchestrator SIGTERM: it removes
 its shard containers (one bound of 20 s; `stop_grace_period: 30s` gives it the
 time) and exits 0. Should it be killed instead, its shards notice within about
-ten seconds and exit, and the next start first removes what is left of them
-(the containers labelled `space.cluster=<cluster>`, `space.role=shard`).
+ten seconds and exit, and the next start first removes what is left of them:
+the containers labelled `space.cluster=<cluster>`, `space.role=shard` **and
+`space.instance=<instance>`**.
+
+**Two stacks on one host.** The instance is what tells one stack's shard
+containers from another's: the compose project's name here
+(`SPACE_ORCHESTRATOR_DOCKER_INSTANCE`), and without that variable an id the
+orchestrator makes once and keeps next to its state (`orchestrator.id.instance`
+on the state volume). The cluster name alone does not: two stacks left at the
+default `SPACE_CLUSTER` would otherwise remove each other's running shards at
+every start. A second stack is another compose project with its own ports and
+container names:
+
+```sh
+SPACE_CLUSTER=space-two SPACE_PLAYER_PORT=7877 WEBUI_PORT=7981 \
+SPACE_SHARD_PORTS=7970-7999 SPACE_SHARD_NAME_PREFIX=space-two-shard- \
+  docker compose -p space-two -f deploy/docker-compose.yaml up -d
+```
+
+**What a shard container is given.** No mount, no socket, no capability,
+`no-new-privileges`, a read-only root filesystem (a shard writes no file), at
+most 1024 processes and threads, a memory limit (`SPACE_SHARD_MEMORY` in MiB,
+default 2048, `0` = none; no swap on top) and the user `10001:10001` - the one
+`Dockerfile.shard` creates, set by number so that an image without a `USER`
+line does not run a shard as root either. The labels `space.launch` and
+`space.port` are for you (`docker ps --filter label=space.port=7870`); the
+orchestrator does not read them.
+
+**The shard image.** Made sure of at start, and again by any launch the daemon
+refuses because the image is gone (somebody pruned it while the orchestrator
+ran): it is pulled once more, then the shard is created. The orchestrator
+never removes an image; `proxy/README.md` has the command that removes old
+shard images on the production host.
 
 ## Publishing pipeline
 
@@ -296,6 +334,17 @@ Desktop 28.5.1 (Linux engine in WSL2), 2026-11-24
 **Not run**
 - Anything on a Linux host: a socket group other than 0, a firewall, real
   published ports to another machine.
+- The pull of an image that was removed while the orchestrator ran (the
+  daemon's 404 on create): a unit test against a daemon in memory only
+  (`launcher/docker.rs`). The rest of the review's fixes was run on Docker
+  Desktop with the images of the two real Dockerfiles: the instance label on
+  real containers, a second compose project with the same cluster name beside
+  the first (neither removed the other's shards at a recreate or after a
+  kill), the orchestrator finding itself by name in a container recreated
+  with a stale host name, and `ReadonlyRootfs` / `PidsLimit` / the memory
+  limit / `User` on a real shard container (`docs/plan-sharding.md` section 8).
+- Watchtower's stop timeout (`WATCHTOWER_TIMEOUT`, `proxy/README.md`), and the
+  image clean-up command there.
 - Watchtower replacing the orchestrator; a pull of the `sha-` tagged shard
   image from ghcr; a private registry.
 - The `client` stream service in either compose file since it dials the player

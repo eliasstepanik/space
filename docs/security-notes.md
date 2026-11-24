@@ -275,19 +275,52 @@ What is done:
 * **A shard container is given nothing**: no socket, no mount, every
   capability dropped (`CapDrop: ALL`), `no-new-privileges`, not privileged,
   no restart policy. A shard faces players; the orchestrator does not let it
-  near the daemon.
-* **Only this cluster's containers are removed.** The removal of leftovers at
-  start, and the path that frees a container name that is taken (the daemon's
-  409), touch only containers that carry both of this cluster's labels
-  (`space.cluster=<cluster>`, `space.role=shard`). A stranger's container of
-  the same name is left alone and the launch fails.
+  near the daemon. And it is held in: a **read-only root filesystem** (a
+  shard writes no file; its log is its standard output, and nothing is
+  mounted for it to write to), at most **1024 processes and threads**
+  (`PidsLimit`), a **memory limit** (`--shard-memory`, default 2048 MiB,
+  `0` = none; `MemorySwap` is set to the same, so no swap on top), and the
+  **user `10001:10001`** set on the container by number — the uid
+  `deploy/Dockerfile.shard` runs as, so that an image that was built without
+  a `USER` line still does not run a shard as root.
+* **Only this orchestrator's containers are removed.** The removal of
+  leftovers at start, and the path that frees a container name that is taken
+  (the daemon's 409), touch only containers that carry all three of its
+  labels: `space.cluster=<cluster>`, `space.role=shard` and
+  `space.instance=<instance>`. The instance is what tells two stacks on one
+  host apart — the cluster's name does not: both may have been left at the
+  default, and each would remove the other's running shards at every start.
+  It is an id that is the same at every start of one orchestrator and
+  different between two: made once and kept next to the state file
+  (`<state>.instance`), or given (`--docker-instance`; the local compose file
+  passes the compose project's name). **It is not a secret and is derived
+  from none**: it is on every shard container for anyone who can list
+  containers to read. A stranger's container of the same name — another
+  stack's shard included — is left alone and the launch fails. (The labels
+  `space.launch` and `space.port` are for the operator; the launcher never
+  reads them.)
 * **The cluster secret travels in the container's environment**
   (`SPACE_CLUSTER_SECRET`), never in its command, and is scrubbed from every
-  error text the launcher returns. It is visible to anyone who can `docker
-  inspect` on the host — that is, to the root-equivalent only.
+  error text the launcher returns — **before** the daemon's words are cut to
+  length, so a secret that lies across the cut does not leave its front half
+  behind. It is visible to anyone who can `docker inspect` on the host — that
+  is, to the root-equivalent only.
 * **Every call is bounded** (10 s; 15 s a remove; 300 s a pull; 20 s for
-  removing everything at shutdown) and answers are read under size limits: a
-  daemon that does not answer is a failed launch, not a hung orchestrator.
+  removing everything at shutdown) and answers are read under size limits —
+  **and the run loop waits for none of them**: a launch, a stop and a liveness
+  question each run in a task of their own and report back on a later beat
+  (`Orchestrator::drive_launcher`). Until the review of phase 6 only the
+  launches did: stops and liveness questions were awaited inside the beat,
+  one after the other, so a daemon that hung stopped the orchestrator's clock
+  for 10 to 15 s per shard — no tick, no epoch deadline, no answer to a hello
+  or an operator — and "a failed launch, not a hung orchestrator", which this
+  note claimed, was true of launches only. Now a daemon that does not answer
+  costs: the launch that fails after its bound; one liveness question per
+  shard left open (it is not asked again while open); and a line in the event
+  log at most every ten seconds, with the count of what was not written
+  (`launcher_failures`). What still waits for the daemon, bounded, outside
+  the loop: `prepare` before the loop starts, and the removal of the shards at
+  shutdown.
 * **The control port stays unpublished**, and **the web UI stays off in
   production** (loopback and a token locally). The web UI is the one way to
   operate the orchestrator from outside, and it can split and merge — that is,
@@ -306,7 +339,18 @@ What is not done:
   environment (`SPACE_ORCHESTRATOR_SHARD_IMAGE`) or move the registry tag it
   names runs code as a container on the host. No digest is pinned and no
   signature checked. No registry credential is handled: a private image is
-  pulled by the operator before the orchestrator starts.
+  pulled by the operator before the orchestrator starts. An image that
+  disappears from the host while the orchestrator runs is pulled again, by
+  that same name, by the launch that misses it.
+* **Images are never removed by the orchestrator.** One `space-shard:sha-…`
+  image per release stays on the host until the operator removes it
+  (`deploy/proxy/README.md` has a command that removes only shard images no
+  container uses). Removing them from the orchestrator was looked at and left
+  out: "an image of the shard repository with another tag that no container
+  uses" is also what a second stack's image looks like while that stack is
+  down, and what a locally built image looks like, which no pull brings back.
+* **No user namespace, no seccomp profile of its own, no CPU limit.** The
+  daemon's defaults apply.
 * **Shard ports are published on every interface** by default
   (`--docker-publish-ip 0.0.0.0`), with no per-source limit on any of them
   (as on the player port).
@@ -321,7 +365,7 @@ autoscaler, re-send the map and switch the scene on every shard. Off by default.
 A split launches a shard and a merge ends in one being stopped: with
 `--launcher process` or `docker` whoever operates the page starts and stops
 processes or containers (never with parameters of their choosing: "The Docker
-socket" below).
+socket" above).
 
 * **Transport and auth.** Plain HTTP (no TLS in-tree, by project rule) with HTTP
   Basic auth: any user name, the token as the password, compared in constant
@@ -398,15 +442,23 @@ it relays that to its clients. What is new on the wire and what bounds it
 
 * **No new listener, no new credential.** Both messages ride the peer connections the handoff
   uses: taken only after the peer hello was admitted (the cluster's peer token), only from a shard
-  the receiver's map names, and only as that shard — `from` is checked against the connection.
+  the receiver's map names — or named until a minute ago: a shard whose region was merged away
+  is still a far neighbour while it hands over what it simulates (`Shard::knows_shard`, the same
+  rule its handoff offers are heard by) — and only as that shard: `from` is checked against the
+  connection.
   A client never sends or receives either message; what it gets of a far entity is an ordinary
   replicated entity with an `Origin` component.
 * **Bounded on receipt.** A `FarUpdate` over 32 KiB of entities and names, more than 512 KiB of
-  updates a second from one shard, more than nine `FarInterest`s a second, an interest naming more
+  updates a second from one shard **or more than 180 updates** (`FAR_UPDATES`: twice what a shard
+  sends at its busiest; the byte bound alone let a peer have tens of thousands of empty updates
+  a second decoded), more than nine `FarInterest`s a second, an interest naming more
   than 256 players or asking for more than 256 entities again, an entity of more than 16 KiB of
   components, a 4097th far replica of one shard: each is dropped and counted
   (`ShardStats::far_refused`). A refresh's list of names stops at 4096. The log line about a drop
-  goes through a `LogBudget` (three per ten seconds, the rest counted).
+  goes through a `LogBudget` (three per ten seconds, the rest counted). A sender keeps its own
+  messages under the bound — removals too, twelve bytes each, budgeted with the entities: 2 700
+  at once used to make one message the receiver dropped whole
+  (`removals_are_split_over_far_updates_like_everything_else`).
 * **A far message cannot write what a shard simulates or holds a ghost of**: a guid that is in the
   receiver's world is skipped (`tests/far.rs`,
   `what_a_peer_sends_is_bounded_and_cannot_overwrite_local_entities`). A far replica is in no

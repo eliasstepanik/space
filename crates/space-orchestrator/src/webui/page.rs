@@ -701,8 +701,8 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
         "scale in",
         format_args!(
             "a shard and the one it merges into together ≤ {:.2} for {}: merged, drained \
-             (within {}), stopped; never the spawn point's shard nor the layout cells, never \r
-             below {} shards",
+             (within {}), stopped; only shards the orchestrator started, never the layout \
+             cells, never below {} shards",
             scale.in_load,
             span(seconds(scale.in_dwell_ticks)),
             span(seconds(scale.drain_timeout_ticks)),

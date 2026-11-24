@@ -147,11 +147,15 @@ the Docker Engine's socket (Linux only; on Windows the orchestrator refuses to
 start with it and names `--launcher process`): created from `--shard-image`
 (the orchestrator image names the shard image of its own commit), named
 `space-shard-<port>`, its UDP port published on the host under the same
-number, the cluster secret in its environment, no mount, no capability and no
-restart policy; removed when it is no longer needed, when the orchestrator is
-told to stop (SIGTERM, Ctrl-C), and — what an orchestrator that was killed
-left behind — at the next start. Both compose files hold the orchestrator
-alone. **Whoever holds the Docker socket is root on the host**: read
+number, the cluster secret in its environment, no mount, no capability, no
+restart policy, a read-only root filesystem, a process limit and a memory
+limit (`--shard-memory`, 2048 MiB); removed when it is no longer needed, when
+the orchestrator is told to stop (SIGTERM, Ctrl-C), and — what an
+orchestrator that was killed left behind — at the next start. "Its own" is
+decided by three labels, `space.cluster`, `space.role=shard` and
+`space.instance` (an id kept next to the state file, or the compose project):
+two stacks on one host never remove each other's shards, also when both use
+the default cluster name. Both compose files hold the orchestrator alone. **Whoever holds the Docker socket is root on the host**: read
 [`docs/security-notes.md`](docs/security-notes.md), "The Docker socket",
 before mounting it anywhere.
 
@@ -164,11 +168,18 @@ merge into, stays at 0.35 or less for 60 s is merged away: its region goes
 back, it **drains** — hands its ships and bodies to the shards that own the
 ground now, by the ordinary handoff, its players included — and is told to
 stop when it reports nothing left (it exits 0), or stopped as it is after
-`--drain-timeout`. The autoscaler never removes the shard that owns the spawn
-point nor the layout cells `--min-shards` stands for, never goes below
-`--min-shards`, and leaves a shard alone for 30 s after any change that
+`--drain-timeout` — and then, if it still held bodies, the scene is re-issued
+under a new revision so that they are built again. While a shard drains the
+map does not change again (a split, a merge or a new shard waits, at most
+the drain timeout). The autoscaler removes only shards the orchestrator
+started itself — one started by hand stays until an operator merges it —
+never the layout cells `--min-shards` stands for, never goes below
+`--min-shards`, merges nothing into a shard that has not reported or has no
+room for the players of both (a shard takes 100, and `--shard-capacity` may
+not be above that), and leaves a shard alone for 30 s after any change that
 involved it. A crowd inside one cell cannot be split: a region is never
-smaller than a cell, and the event log says so. Every number is a flag
+smaller than a cell, so a crowd on the spawn point does not grow the cluster,
+and the event log says so. Every number is a flag
 (`--shard-capacity`, `--scale-out-load`, `--scale-out-after`,
 `--scale-in-load`, `--scale-in-after`, `--scale-cooldown`, `--drain-timeout`,
 each with a `SPACE_ORCHESTRATOR_...` variable), so a test can make a cluster
@@ -206,10 +217,11 @@ every shard**. Connected clients follow within a second.
 reserved and resolves to the default, so an orchestrator whose saved scene was
 `solar` comes back up showing the demo area.)
 
-The planets move by **scene time** (UTC microseconds): every shard maps its
-ticks onto the wall clock, re-anchors when it drifts more than 30 ms, and
-tells its clients the mapping (`SceneClock`, protocol 6), so all shards and
-clients agree on where the Moon is.
+The planets move by **scene time** (UTC microseconds): every shard counts its
+ticks from the cluster's tick origin (tick `n` is `origin + n/30 s`, a mapping
+that is set once and never re-anchored; the shard's tick loop is what is kept
+on the wall clock) and tells its clients the mapping (`SceneClock`, protocol
+6), so all shards and clients agree on where the Moon is.
 
 `space-orchestrator --scene NAME` sets the scene a new cluster starts with; a
 scene chosen in the web UI is remembered next to the orchestrator's state file

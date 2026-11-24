@@ -54,6 +54,15 @@ ARG SPACE_SHARD_IMAGE=space/shard:dev
 #   _DOCKER_PUBLISH_IP / _DOCKER_NAME_PREFIX   the docker launcher's settings; the
 #                                     defaults find the network and this container's
 #                                     address by inspecting this container
+#   SPACE_ORCHESTRATOR_DOCKER_SELF    this container's NAME, which is what is
+#                                     inspected (set it in compose; the fallback,
+#                                     $HOSTNAME, is the container's id only until the
+#                                     container is recreated from an older one)
+#   SPACE_ORCHESTRATOR_DOCKER_INSTANCE  what tells this orchestrator's shard containers
+#                                     from another stack's (label space.instance);
+#                                     unset: an id kept on the volume
+#                                     (orchestrator.id.instance)
+#   SPACE_ORCHESTRATOR_SHARD_MEMORY   memory limit per shard container, MiB (2048; 0 = none)
 #   SPACE_ORCHESTRATOR_SHARD_CAPACITY / _SCALE_OUT_LOAD / _SCALE_OUT_AFTER /
 #   _SCALE_IN_LOAD / _SCALE_IN_AFTER / _SCALE_COOLDOWN / _DRAIN_TIMEOUT   the autoscaler
 #   SPACE_ORCHESTRATOR_SCENE          initial scene (demo-area, materials, galaxy); a

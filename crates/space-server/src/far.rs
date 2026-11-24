@@ -69,7 +69,9 @@
 //!   and is sent in full (a message to a peer can be dropped: the queue was
 //!   full, the peer was being dialled).
 //! * A shard that has sent nothing for [`FAR_SILENCE_TICKS`], or that the map
-//!   no longer names, loses its far replicas here; a scene body of another
+//!   no longer names — once the minute is over in which a shard that was
+//!   merged away is still heard, see [`Shard::knows_shard`] — loses its far
+//!   replicas here; a scene body of another
 //!   scene revision is never kept.
 //!
 //! So a peer link costs, per second, at most
@@ -84,8 +86,9 @@
 //! A far message is taken only from a shard of the map, on its authenticated
 //! peer connection, and only as that shard (`from` is checked against the
 //! connection). It is bounded on receipt: a [`FarUpdate`] of more than
-//! [`far::MAX_FAR_UPDATE_BYTES`], more than [`FAR_RECEIVE_BYTES`] of them a
-//! second, more than [`FAR_INTERESTS`] interests a second, an interest naming
+//! [`far::MAX_FAR_UPDATE_BYTES`], more than [`FAR_RECEIVE_BYTES`] or
+//! [`FAR_UPDATES`] of them a second, more than [`FAR_INTERESTS`] interests a
+//! second, an interest naming
 //! more than [`far::MAX_FAR_PLAYERS`] players, an entity that would be the
 //! [`MAX_FAR_PER_PEER`]`+1`th of its sender — each is dropped, counted
 //! ([`ShardStats::far_refused`](super::ShardStats::far_refused)) and said in
@@ -135,11 +138,19 @@ pub const MAX_FAR_PER_PEER: usize = 4096;
 pub const FAR_RECEIVE_BYTES: usize = 512 * 1024;
 /// The most [`FarInterest`]s taken from one shard a second.
 pub const FAR_INTERESTS: u32 = 9;
+/// The most [`FarUpdate`]s taken from one shard a second, whatever their
+/// size: twice what a shard sends at its busiest (an update and the two
+/// chunks of a refresh of [`MAX_FAR_PER_PEER`] names a tick). The byte bound
+/// alone let a peer make this shard decode and walk half a megabyte of empty
+/// updates a second — tens of thousands of them.
+pub const FAR_UPDATES: u32 = 6 * space_sim::TICK_HZ;
 /// The most bytes of components one far replica may have.
 pub const MAX_FAR_ENTITY_BYTES: usize = 16 * 1024;
 /// What a sender fills one [`FarUpdate`] to, bytes (the first entity always
 /// goes; the receiver's bound is [`far::MAX_FAR_UPDATE_BYTES`]).
 const FAR_UPDATE_BUDGET: usize = far::MAX_FAR_UPDATE_BYTES * 3 / 4;
+/// What one removal costs in a [`FarUpdate`], bytes.
+const REMOVAL_BYTES: usize = 12;
 /// The names one chunk of a refresh carries.
 const FAR_REFRESH_CHUNK: usize = 2048;
 /// Log lines about refused far messages per [`FAR_REFUSAL_WINDOW`].
@@ -209,6 +220,7 @@ struct Received {
     since: SimTick,
     bytes: usize,
     interests: u32,
+    updates: u32,
 }
 
 /// The far half of a shard's state.
@@ -329,7 +341,7 @@ impl Shard {
                 Origin::far(entry.from, entry.sample_tick).encode(),
             ));
             list.sort_by_key(|(id, _)| *id);
-            self.log.record(guid, list, tick);
+            self.log.record_sampled(guid, list, tick, entry.sample_tick);
         }
     }
 
@@ -450,6 +462,10 @@ impl Shard {
             return self.far_refuse(from, "an update over the size bound");
         }
         let account = self.far_received(from);
+        account.updates += 1;
+        if account.updates > FAR_UPDATES {
+            return self.far_refuse(from, "more updates than a second takes");
+        }
         account.bytes += bytes;
         if account.bytes > FAR_RECEIVE_BYTES {
             return self.far_refuse(from, "more bytes than a second takes");
@@ -628,10 +644,27 @@ impl Shard {
         out
     }
 
+    /// The shards far replicas are exchanged with: every other shard of the
+    /// map, and every shard the map named until a moment ago
+    /// ([`Shard::knows_shard`]) — a shard whose region was merged away goes
+    /// on simulating what it has not handed over yet, with players on it,
+    /// for up to a minute. Left out, what it still simulates vanished from
+    /// every other shard's players the moment the map changed (their far
+    /// replicas of it were dropped as "a shard the map no longer names"),
+    /// and its own players lost sight of everything beyond the ghosts.
+    fn far_neighbours(&self) -> Vec<ShardId> {
+        let mut out = border::neighbours(&self.shard_map, self.config.shard);
+        let own = self.config.shard;
+        out.extend(self.former_shards().filter(|shard| *shard != own));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The far pass of a tick: forget what has gone stale, say where our
     /// players are, and send every peer what its players should see of ours.
     pub(super) fn far_pass(&mut self, tick: SimTick) {
-        let neighbours = border::neighbours(&self.shard_map, self.config.shard);
+        let neighbours = self.far_neighbours();
         self.far_expire(tick, &neighbours);
         if neighbours.is_empty() {
             return;
@@ -759,11 +792,20 @@ impl Shard {
             more: false,
         };
         // What stopped being ours (handed on, despawned) is no longer ours
-        // to show.
-        update
-            .removed
-            .extend(sent.keys().filter(|guid| !alive.contains(guid)).copied());
-        let mut bytes = 0usize;
+        // to show. Removals are budgeted like everything else in the
+        // message — twelve bytes each: what does not fit stays in `sent` and
+        // is said on the next tick. (Unbudgeted, 2 700 removals at once — a
+        // peer's player leaving the range of a crowded shard — made one
+        // message over the receiver's bound, which drops it whole.)
+        let mut gone: Vec<EntityGuid> = sent
+            .keys()
+            .filter(|guid| !alive.contains(guid))
+            .copied()
+            .collect();
+        gone.sort_unstable();
+        gone.truncate(FAR_UPDATE_BUDGET / REMOVAL_BYTES);
+        let mut bytes = gone.len() * REMOVAL_BYTES;
+        update.removed = gone;
         let ghosted = self.ghost_sent.get(&n);
         for (guid, state) in locals {
             let member = sent.get(guid).map(|held| (held.at, held.step));
@@ -786,7 +828,8 @@ impl Shard {
                 far::FAR_RANGE
             };
             if distance > range {
-                if member.is_some() {
+                if member.is_some() && bytes + REMOVAL_BYTES <= FAR_UPDATE_BUDGET {
+                    bytes += REMOVAL_BYTES;
                     sent.remove(guid);
                     update.removed.push(*guid);
                 }

@@ -113,9 +113,18 @@ pub const NEAR_DELAY_RANGE: f64 = 12.0;
 /// From here on the delay is a step's own, metres.
 const STEP_DELAY_FROM: f64 = 50.0;
 /// What a sample of another shard's entity may be late by, ticks, on top of
-/// the spacing of its step: a tick from the simulating shard to the player's,
-/// a tick to the client, and a tick and a half of slack.
-const STEP_DELAY_MARGIN: f64 = 3.5;
+/// the spacing of its step. The bound it covers: a far sample is in the
+/// frame of the tick it reaches the player's shard — one tick after the tick
+/// it is the state of, or two (the shards step at the same instants, and
+/// which is first changes) — and that delay is the same for every sample,
+/// whatever was sent in between (`space-server`, `replicate::step_is_due`).
+/// So: two ticks from the simulating shard to the frame, a tick for the frame
+/// to reach the client (what [`NEAR_DELAY`] allows a frame too), and a tick
+/// of slack. It was 3.5, written for one tick between the shards. Not
+/// covered: a frame that is lost — its sample comes again once the client's
+/// acknowledgement has shown the loss, three ticks later or more — and a
+/// shard that stalls.
+const STEP_DELAY_MARGIN: f64 = 4.0;
 /// The fraction of a step's bound from which the delay rises to the next
 /// step's (it is there at the bound: the coarser step may be in use from the
 /// bound on, see [`step_after`]).
@@ -429,7 +438,9 @@ mod tests {
             }
             last = now;
         }
-        assert_eq!(draw_delay(20_000.0), 33.5);
+        // The coarsest step's spacing and the margin: two ticks between the
+        // shards, one to the client, one of slack.
+        assert_eq!(draw_delay(20_000.0), 34.0);
     }
 
     /// An origin round-trips, and nothing else decodes as one.

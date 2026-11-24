@@ -287,25 +287,35 @@ fn a_split_stages_a_spawn_and_the_commit_publishes_the_child_region() {
 
 #[test]
 fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
-    // Root (depth 40) owned by 1, one child octant owned by 2.
-    let config = OrchestratorConfig::default();
-    let root = config.root_node();
-    let child = space_world::octree::children(root).unwrap()[0];
-    let map = ShardMap::new(
-        1,
-        vec![
-            ShardRegion::new(root, shard(1), addr(7_001)),
-            ShardRegion::new(child, shard(2), addr(7_002)),
-        ],
+    // Root (depth 40) owned by 1, and one child octant owned by the shard the
+    // autoscaler's own split launched: the autoscaler takes away what the
+    // orchestrator started, and nothing else (a shard put into the map by
+    // hand, as this test used to have it, stays until an operator merges it).
+    let mut orch = orchestrator(plane_with_root(shard(1)));
+    assert_eq!(drive_split_to_commit(&mut orch, shard(1)), 2);
+    let _ = orch.drain_outbox();
+    let child = orch
+        .map()
+        .regions
+        .iter()
+        .map(|r| r.shard)
+        .find(|owner| *owner != shard(1))
+        .expect("the split's child");
+    assert!(
+        orch.launch_of(child).is_some(),
+        "launched by the orchestrator"
     );
-    let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
-    let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
-    let mut orch = orchestrator(control);
 
-    // The merge dwell is long (1800 ticks); drive it.
+    // Both go cold. The cooldown after the split (900 ticks) and the merge
+    // dwell (1800) are long; drive them. The shard that takes the region
+    // back reports too: without its report nothing is merged into it.
     let mut staged_kill = false;
-    for _ in 0..(space_orchestrator::autoscale::MERGE_DWELL_TICKS + 5) {
-        orch.handle_load_report(&cold_report(shard(2)));
+    let patience = space_orchestrator::autoscale::SCALE_COOLDOWN_TICKS
+        + space_orchestrator::autoscale::MERGE_DWELL_TICKS
+        + 5;
+    for _ in 0..patience {
+        orch.handle_load_report(&cold_report(child));
+        orch.handle_load_report(&cold_report(shard(1)));
         orch.tick();
         assert!(
             orch.take_pending_kill().is_empty(),
@@ -323,7 +333,7 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
             continue;
         }
         // The merge was proposed: the child is still running (it has to ack).
-        assert_eq!(orch.pending_merge(), Some(shard(2)));
+        assert_eq!(orch.pending_merge(), Some(child));
         for (r, epoch) in recipients {
             orch.handle_epoch_ack(r, epoch);
         }
@@ -331,13 +341,13 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
         // stopped once it has said that it is empty (the premise before
         // phase 6: it was killed at the commit).
         assert!(orch.take_pending_kill().is_empty(), "a commit stops nobody");
-        assert_eq!(orch.draining_shards(), vec![shard(2)]);
-        drain_and_stop(&mut orch, shard(2));
+        assert_eq!(orch.draining_shards(), vec![child]);
+        drain_and_stop(&mut orch, child);
         staged_kill = true;
         break;
     }
     assert!(staged_kill, "a merge staged a kill");
-    assert_eq!(orch.map().epoch, 2, "the merge bumped the epoch");
+    assert_eq!(orch.map().epoch, 3, "the merge bumped the epoch");
     assert_eq!(orch.map().regions.len(), 1, "the child region was removed");
     assert_eq!(
         orch.map().regions[0].shard,
@@ -360,22 +370,33 @@ fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
     let k = root.center().cell;
     let cell = NodeRef::new(64, [k[0] - 1, k[1], k[2] - 1]);
     let inside = cell.center();
-    let map = ShardMap::new(
-        1,
-        vec![
-            ShardRegion::new(root, shard(1), addr(7_001)),
-            ShardRegion::new(cell, shard(2), addr(7_002)),
-        ],
-    );
-    assert_eq!(map.lookup(&inside), Some(shard(2)));
-    space_orchestrator::topology::validate(&map).expect("a cell under the root is a valid map");
-    let ids = PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
-    let control = ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into());
-    let mut orch = orchestrator(control);
+    // The cell is carved for a shard the orchestrator launches (the
+    // autoscaler merges away no other), through the epoch protocol.
+    let mut orch = orchestrator(plane_with_root(shard(1)));
+    orch.begin_carve(cell).expect("the cell can be carved");
+    let spec = orch
+        .take_pending_spawn()
+        .pop()
+        .expect("a shard is launched");
+    let carved = register(&mut orch, &spec);
+    for (to, message) in orch.drain_outbox() {
+        if let Message::EpochPrepare(prepare) = message {
+            orch.handle_epoch_ack(to, prepare.epoch);
+        }
+    }
+    let _ = orch.drain_outbox();
+    assert_eq!(orch.map().epoch, 2, "the carve committed");
+    assert_eq!(orch.map().lookup(&inside), Some(carved));
+    space_orchestrator::topology::validate(orch.map())
+        .expect("a cell under the root is a valid map");
 
     let mut merged = false;
-    for _ in 0..(space_orchestrator::autoscale::MERGE_DWELL_TICKS + 5) {
-        orch.handle_load_report(&cold_report(shard(2)));
+    let patience = space_orchestrator::autoscale::SCALE_COOLDOWN_TICKS
+        + space_orchestrator::autoscale::MERGE_DWELL_TICKS
+        + 5;
+    for _ in 0..patience {
+        orch.handle_load_report(&cold_report(carved));
+        orch.handle_load_report(&cold_report(shard(1)));
         orch.tick();
         assert!(
             orch.take_pending_kill().is_empty(),
@@ -399,19 +420,19 @@ fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
         if recipients.is_empty() {
             continue;
         }
-        assert_eq!(recipients, vec![(shard(1), 2), (shard(2), 2)]);
-        assert_eq!(orch.pending_merge(), Some(shard(2)));
-        assert_eq!(orch.map().lookup(&inside), Some(shard(2)), "not yet");
+        assert_eq!(recipients, vec![(shard(1), 3), (carved, 3)]);
+        assert_eq!(orch.pending_merge(), Some(carved));
+        assert_eq!(orch.map().lookup(&inside), Some(carved), "not yet");
         for (r, epoch) in recipients {
             orch.handle_epoch_ack(r, epoch);
         }
         assert!(orch.take_pending_kill().is_empty(), "a commit stops nobody");
-        drain_and_stop(&mut orch, shard(2));
+        drain_and_stop(&mut orch, carved);
         merged = true;
         break;
     }
     assert!(merged, "the cold cell was merged");
-    assert_eq!(orch.map().epoch, 2);
+    assert_eq!(orch.map().epoch, 3);
     assert_eq!(orch.map().regions.len(), 1, "the cell's region was removed");
     assert_eq!(
         orch.map().lookup(&inside),

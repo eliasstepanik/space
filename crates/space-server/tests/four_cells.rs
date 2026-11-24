@@ -753,11 +753,10 @@ fn the_far_content_is_on_its_shards_once_and_moves_as_on_one_shard() {
         all
     };
     let scene: Vec<EntityGuid> = c.names.iter().map(|(_, g)| *g).collect();
-    assert_eq!(
-        scene.len(),
-        46,
-        "the showcase's 35 and the far content's 11"
-    );
+    // (`names` is every body the scene defines — the showcase's and the far
+    // content's — taken from `space_scene::body_defs`, not a number written
+    // down here: a body added to the scene is one more to simulate once.)
+    assert!(scene.len() > 40, "the demo area: {} bodies", scene.len());
     assert_eq!(own(&c), scene, "every scene body once, and nothing else");
     assert_eq!(own(&c), own(&Cluster::one()));
     assert_eq!(

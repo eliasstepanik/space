@@ -23,6 +23,7 @@ use space_protocol::{
 use space_server::border;
 use space_server::shard::{
     Destination, Shard, FAR_COMPONENTS, FAR_RECEIVE_BYTES, FAR_REFRESH_TICKS, FAR_SILENCE_TICKS,
+    FAR_UPDATES,
 };
 use space_server::ShardConfig;
 use space_sim::body::{Body, MassSpec};
@@ -150,9 +151,8 @@ impl Cluster {
         }
     }
 
-    /// Shards with these regions, all running the demo area (revision 1):
-    /// its bodies are spawned by the first one, which owns the root.
-    fn demo_area(regions: &[(u32, NodeRef)]) -> Self {
+    /// Shards with these regions (and no scene).
+    fn of(regions: &[(u32, NodeRef)]) -> Self {
         let map = map_of(regions, 1);
         let mut c = Self::new();
         c.shards = regions
@@ -163,6 +163,13 @@ impl Cluster {
                 s
             })
             .collect();
+        c
+    }
+
+    /// Shards with these regions, all running the demo area (revision 1):
+    /// its bodies are spawned by the first one, which owns the root.
+    fn demo_area(regions: &[(u32, NodeRef)]) -> Self {
+        let mut c = Self::of(regions);
         for s in &mut c.shards {
             assert!(s.set_scene(SceneState::new(Scene::DemoArea.id(), 1)));
         }
@@ -537,6 +544,112 @@ fn far_bodies_are_sent_at_the_rate_of_their_distance_step() {
                 s.tick
             );
         }
+    }
+}
+
+/// The client's acknowledgement for `tick`: an input batch with no inputs.
+fn acknowledge(c: &mut Cluster, session: u64, tick: u64) {
+    c.shard_mut(1).apply_input(
+        session,
+        &space_protocol::InputTick {
+            tick,
+            seq: tick,
+            inputs: Vec::new(),
+            ack_tick: tick,
+        },
+    );
+}
+
+/// A far body's sample reaches the client **in the frame of the tick it got
+/// to the client's shard**, every time, whatever the client's
+/// acknowledgements do — so the delay from the simulating shard to the client
+/// is a constant tick or two and the client's draw delay (the step's spacing
+/// plus `STEP_DELAY_MARGIN`) always has the next sample in hand.
+///
+/// The client here does what a real one does: it acknowledges the highest
+/// tick it has applied once per input batch, and now and then two frames
+/// arrive between two batches. The shard then presumes the older one lost
+/// and sends what it carried again (`ClientReplica::acknowledge`) — a far
+/// sample among it, a couple of ticks later.
+///
+/// Mutation this catches (run; it is the defect a live stack showed as
+/// far moons that froze and leapt): counting an entity's step from the tick
+/// something was last **sent** to the client instead of from the tick its
+/// last sample is the state of (`step_is_due` in `replicate::build_frame`
+/// keeping only its last test). The redundant re-send then moves the gate two
+/// ticks later, the next sample waits those two ticks in the shard, a later
+/// one four — the delay only ever grows until it wraps at the step's
+/// spacing: here from 1 tick to 3 (10 Hz), 5 (5 Hz) and, in these 62 s, 21
+/// (1 Hz), and the client runs out of samples to draw between.
+#[test]
+fn a_far_sample_is_relayed_on_the_tick_it_arrives_whatever_the_acknowledgements_do() {
+    let mut c = Cluster::new();
+    let (session, _) = player_on_1(&mut c, at_border([-70.0, 0.0, 0.0]));
+    // Something of the player's own shard that moves every tick, as in any
+    // scene: every frame carries something and can be presumed lost.
+    spawn(
+        c.shard_mut(1),
+        moving(at_border([-90.0, 0.0, 0.0]), [0.0, 0.0, 0.3]),
+    );
+    // One body for each coarse step, drifting sideways.
+    let at = |d: f64| moving(at_border([d - 70.0, 0.0, 0.0]), [0.0, 0.0, 1.0]);
+    let bodies = [
+        (spawn(c.shard_mut(2), at(150.0)), 3u64, 150.0),
+        (spawn(c.shard_mut(2), at(600.0)), 6, 600.0),
+        (spawn(c.shard_mut(2), at(3_000.0)), 30, 3_000.0),
+    ];
+    let mut view = View::default();
+    for i in 0..1_860u64 {
+        // Which shard steps first changes, as on a live stack (thirteen
+        // ticks one way, thirteen the other): a sample is with the client's
+        // shard for the frame of its own tick, or for the next.
+        if (i / 13) % 2 == 0 {
+            c.tick();
+        } else {
+            c.tick_with_2_first();
+        }
+        view.take(&mut c, 1, session);
+        // An input batch a tick — except that every seventh comes a tick
+        // late, after two frames (7 and the steps' spacings share no factor:
+        // every phase against every step comes up).
+        if i % 7 != 0 {
+            let tick = c.shard(1).stats().tick;
+            acknowledge(&mut c, session, tick);
+        }
+    }
+    for (guid, every, distance) in bodies {
+        let samples = &view.held[&guid].samples;
+        // The first frame each sample came in (a sample may come twice: the
+        // re-send of a frame presumed lost).
+        let mut first: Vec<(u64, u64)> = Vec::new();
+        for s in samples.iter().skip_while(|s| s.tick < 60) {
+            if first.last().is_none_or(|(tick, _)| *tick != s.tick) {
+                first.push((s.tick, s.frame));
+            }
+        }
+        assert!(first.len() as u64 >= 1_700 / every, "every {every}: seen");
+        for w in first.windows(2) {
+            assert_eq!(
+                w[1].0 - w[0].0,
+                every,
+                "every {every}: a sample was skipped or sent early ({w:?})"
+            );
+            // What the client's draw delay has to cover: when the frame
+            // with the next sample is with the client — a tick after it was
+            // built, say — the body must not have been drawn past this one.
+            let needed = (w[1].1 + 1 - w[0].0) as f64;
+            assert!(
+                needed <= far::draw_delay(distance),
+                "every {every}: drawn {} ticks behind, the next sample is {needed} ticks away",
+                far::draw_delay(distance)
+            );
+        }
+        let worst = first.iter().map(|(tick, frame)| frame - tick).max();
+        assert_eq!(
+            worst,
+            Some(1),
+            "every {every}: a sample waited in the client's shard"
+        );
     }
 }
 
@@ -943,6 +1056,100 @@ fn a_player_on_the_spawn_point_is_sent_the_demo_areas_far_content_at_its_steps()
     assert_eq!(views[0], views[1], "four shards show what one shows");
 }
 
+/// What the demo area's far content costs an idle client on the spawn point
+/// of a four-shard cluster, held to the bound of `replicate`'s module docs:
+/// one sample of 130 B — the entry, its `ShipState`, its `Origin` — at the
+/// rate of each body's step: 5 drifters ten times a second, 3 moons five
+/// times, 3 moons once = 68 samples, 8 840 B a second. Exactly that for a
+/// client that acknowledges every frame; and for one whose every seventh
+/// acknowledgement skips a frame, the re-sends of what the frames presumed
+/// lost carried on top — a sample again, not the body's whole component set.
+///
+/// Mutation this catches (run): sending debt in full (`Base::Entry` for an
+/// owed entity in `build_frame`, as it was): every re-send of a far body
+/// carries its shape and model again, and the second client costs 10 946 B a
+/// second where it costs 10 133 now, over the bound of 10 297.
+///
+/// (It prints the whole traffic to the client as well — frames included,
+/// the showcase's moving bodies — for comparison with a live stack's census
+/// line; that number is not held to anything here.)
+#[test]
+fn the_far_content_costs_an_idle_client_what_its_bound_says() {
+    let regions = [
+        (1, NodeRef::new(63, [0, 0, 0])),
+        (2, NodeRef::new(64, [1, 1, 0])),
+        (3, NodeRef::new(64, [0, 1, 1])),
+        (4, NodeRef::new(64, [0, 1, 0])),
+    ];
+    const SAMPLE: usize = 12 + 8 + (2 + 8 + 76) + (2 + 8 + 14);
+    const SAMPLES_A_SECOND: usize = 5 * 10 + 3 * 5 + 3;
+    const SECONDS: usize = 20;
+    let mut measured = Vec::new();
+    for late_acks in [false, true] {
+        let mut c = Cluster::demo_area(&regions);
+        c.tick_n(30);
+        let (session, _) = join(c.shard_mut(1), "at the spawn point");
+        let mut far_bytes = 0usize;
+        let mut all_before = 0usize;
+        for i in 0..(120 + 30 * SECONDS as u64) {
+            c.tick();
+            if i == 119 {
+                all_before = c.client_bytes;
+            }
+            for message in c.frames_for(1, session) {
+                let entities = match &message {
+                    Message::Snapshot(s) => &s.entities,
+                    Message::Delta(d) => &d.entities,
+                    _ => continue,
+                };
+                if i < 120 {
+                    continue; // the shards meet, the snapshot goes out
+                }
+                far_bytes += entities
+                    .iter()
+                    .filter(|e| {
+                        e.components
+                            .iter()
+                            .find(|(id, _)| *id == ORIGIN_COMPONENT)
+                            .and_then(|(_, b)| Origin::decode(b))
+                            .is_some_and(|o| o.kind == OriginKind::Far)
+                    })
+                    .map(EntitySnapshot::encoded_len)
+                    .sum::<usize>();
+            }
+            if !late_acks || i % 7 != 0 {
+                let tick = c.shard(1).stats().tick;
+                acknowledge(&mut c, session, tick);
+            }
+        }
+        measured.push(far_bytes / SECONDS);
+        println!(
+            "everything to the idle client (late acknowledgements: {late_acks}): {} B/s",
+            (c.client_bytes - all_before) / SECONDS
+        );
+    }
+    let bound = SAMPLE * SAMPLES_A_SECOND;
+    assert_eq!(bound, 8_840);
+    assert!(
+        measured[0].abs_diff(bound) <= SAMPLE * 3 / 2,
+        "{} B a second of far replicas to a client that acknowledges every frame; the bound is \
+         {bound}",
+        measured[0]
+    );
+    // A seventh of the frames presumed lost: a seventh of the samples again.
+    assert!(
+        measured[1] <= bound * 8 / 7 + SAMPLE * 3 / 2,
+        "{} B a second with late acknowledgements; {} with none late",
+        measured[1],
+        measured[0]
+    );
+    println!(
+        "far replicas to an idle client on the spawn point: {} B/s, {} B/s with every seventh \
+         acknowledgement late (bound {bound})",
+        measured[0], measured[1]
+    );
+}
+
 /// A far update that was lost is made good: what the next refresh names and
 /// the receiver does not hold, it asks for and is sent in full — also a body
 /// at rest, which nothing else would ever say again.
@@ -1208,6 +1415,38 @@ fn what_a_peer_sends_is_bounded_and_cannot_overwrite_local_entities() {
     );
     assert!(c.shard(1).far_list().len() <= fit + 2);
 
+    // More updates than a second takes, however small: the first
+    // `FAR_UPDATES` of a second are taken, the next is not.
+    // (Mutation: no count in `on_far_update` — the last one is taken.)
+    c.tick_n(31); // a new second on shard 1's account
+    let (refused, held) = (c.shard(1).stats().far_refused, c.shard(1).far_list().len());
+    let small = |serial: u64| {
+        update(vec![EntitySnapshot::new(
+            EntityGuid::new(two, serial),
+            vec![(0, elsewhere.clone())],
+        )])
+    };
+    for i in 0..u64::from(FAR_UPDATES) {
+        c.shard_mut(1)
+            .peer_message(two, Message::FarUpdate(small(8_000 + i)));
+    }
+    assert_eq!(c.shard(1).stats().far_refused, refused, "within the rate");
+    assert_eq!(c.shard(1).far_list().len(), held + FAR_UPDATES as usize);
+    c.shard_mut(1)
+        .peer_message(two, Message::FarUpdate(small(9_999)));
+    assert_eq!(
+        c.shard(1).stats().far_refused,
+        refused + 1,
+        "over the count"
+    );
+    assert!(
+        !c.shard(1)
+            .far_list()
+            .iter()
+            .any(|f| f.guid == EntityGuid::new(two, 9_999)),
+        "and not taken"
+    );
+
     // An interest that names more players than a shard has.
     let refused = c.shard(1).stats().far_refused;
     let crowd = FarInterest {
@@ -1221,10 +1460,168 @@ fn what_a_peer_sends_is_bounded_and_cannot_overwrite_local_entities() {
     assert_eq!(c.shard(1).stats().far_refused, refused + 1);
 }
 
+/// Removals are budgeted like everything else in a far update: three thousand
+/// far replicas that are withdrawn in one tick — the player left their range,
+/// or the bodies themselves are gone — are withdrawn over several messages,
+/// none over the bound a receiver takes.
+///
+/// Mutations this catches (each run): listing every removal in one message,
+/// in either of the two places `far_send` collects them — what left the
+/// player's range (no budget on `removed` in the loop over the locals) and
+/// what stopped being this shard's (no `truncate` of `gone`): one update of
+/// 36 kB, which the receiver drops whole (`far_refused` 1) — the replicas
+/// then stay until the next refresh names what is left.
+#[test]
+fn removals_are_split_over_far_updates_like_everything_else() {
+    const N: usize = 3_000;
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Withdrawn {
+        /// The player is out of their range from one tick to the next.
+        OutOfRange,
+        /// They are despawned in one tick.
+        Gone,
+    }
+    for how in [Withdrawn::OutOfRange, Withdrawn::Gone] {
+        let mut c = Cluster::new();
+        let (session, ship) = player_on_1(&mut c, at_border([-70.0, 0.0, 0.0]));
+        let mut bodies = Vec::with_capacity(N);
+        for i in 0..N {
+            let pos = at_border([400.0 + 2.0 * (i % 50) as f64, 2.0 * (i / 50) as f64, 0.0]);
+            bodies.push(spawn(c.shard_mut(2), ShipState::at_rest(pos)));
+        }
+        let mut view = View::default();
+        // (New far replicas are looked for when a peer says where its players
+        // are, three times a second: some 160 a time.)
+        for _ in 0..300 {
+            c.tick();
+            view.take(&mut c, 1, session);
+        }
+        assert_eq!(c.shard(1).far_list().len(), N, "{how:?}");
+        assert_eq!(c.shard(2).far_sent_to(ShardId::new(1)), N, "{how:?}");
+        match how {
+            // The player is somewhere else from one tick to the next: 12 km back.
+            Withdrawn::OutOfRange => assert!(c
+                .shard_mut(1)
+                .set_state(ship, ShipState::at_rest(at_border([-12_000.0, 0.0, 0.0])))),
+            Withdrawn::Gone => {
+                for guid in &bodies {
+                    c.shard_mut(2).despawn_ship(*guid);
+                }
+            }
+        }
+        let before = c.link(2, 1);
+        c.tick_n(20);
+        let after = c.link(2, 1);
+        assert_eq!(
+            c.shard(2).far_sent_to(ShardId::new(1)),
+            0,
+            "{how:?}: all withdrawn"
+        );
+        assert!(
+            after.largest <= far::MAX_FAR_UPDATE_BYTES,
+            "{how:?}: a far update of {} B",
+            after.largest
+        );
+        assert!(
+            after.updates - before.updates >= 2,
+            "{how:?}: {N} removals do not fit one message"
+        );
+        assert_eq!(
+            c.shard(1).stats().far_refused,
+            0,
+            "{how:?}: nothing was dropped"
+        );
+        assert!(
+            c.shard(1).far_list().is_empty(),
+            "{how:?}: and all of them are gone"
+        );
+    }
+}
+
+/// A shard whose region was merged away is still a far neighbour while it
+/// hands over what it simulates (`Shard::knows_shard`, a minute): what it
+/// has not handed over yet stays in the view of the other shards' players,
+/// and it is still told what its own players should see.
+///
+/// Mutation this catches (run): the far pass over the shards of the map
+/// alone (`far_neighbours` without the former shards): the moment the map
+/// changes, shard 1 drops its far replica of the body — its client is told
+/// the body is gone, and gets it back as a new entity when the handoff
+/// arrives — and stops telling shard 2 anything (`far_sent_to` 0).
+#[test]
+fn a_shard_that_is_merged_away_stays_a_far_neighbour_while_it_drains() {
+    // Shard 1 owns the root, shard 2 a region carved out of it east of the
+    // border: a merge gives that back to shard 1.
+    let regions = [
+        (1, NodeRef::new(59, [0, 0, 0])),
+        (2, NodeRef::new(60, [1, 0, 0])),
+    ];
+    let mut c = Cluster::of(&regions);
+    let (session, _) = player_on_1(&mut c, at_border([-70.0, 0.0, 0.0]));
+    let (_, _) = player_on_2(&mut c, at_border([150.0, 0.0, 40.0]));
+    let body = spawn(
+        c.shard_mut(2),
+        moving(at_border([300.0, 5.0, 0.0]), [0.0, 0.0, 1.0]),
+    );
+    let ours = spawn(
+        c.shard_mut(1),
+        moving(at_border([-300.0, 5.0, 0.0]), [0.0, 0.0, 1.0]),
+    );
+    let mut view = View::default();
+    for _ in 0..60 {
+        c.tick();
+        view.take(&mut c, 1, session);
+    }
+    assert_eq!(view.origin(body), Some(OriginKind::Far));
+    assert!(c.shard(2).far_list().iter().any(|f| f.guid == ours));
+    assert!(c.shard(1).far_sent_to(ShardId::new(2)) > 0);
+
+    // The merge commits.
+    let merged = map_of(&regions[..1], 2);
+    for shard in &mut c.shards {
+        shard.apply_epoch(merged.clone());
+    }
+    c.tick();
+    view.take(&mut c, 1, session);
+    assert!(
+        c.shard(1).far_list().iter().any(|f| f.guid == body)
+            || c.shard(1).sim().entity_of(body).is_some(),
+        "shard 1 still shows the draining shard's body"
+    );
+    assert!(
+        c.shard(1).far_sent_to(ShardId::new(2)) > 0,
+        "and still tells the draining shard what its players see"
+    );
+    // The drain: the body is handed to shard 1, and the client never hears
+    // that it went away.
+    for _ in 0..300 {
+        c.tick();
+        view.take(&mut c, 1, session);
+        if c.shard(1).sim().entity_of(body).is_some() && c.shard(1).ghost_owner(body).is_none() {
+            break;
+        }
+    }
+    assert!(
+        c.shard(1).sim().entity_of(body).is_some() && c.shard(1).ghost_owner(body).is_none(),
+        "handed over"
+    );
+    // (370 m off: the client hears of it five times a second.)
+    for _ in 0..12 {
+        c.tick();
+        view.take(&mut c, 1, session);
+    }
+    assert!(
+        view.removed.iter().all(|(_, guid)| *guid != body),
+        "the client was told the body had gone: {:?}",
+        view.removed
+    );
+    assert_eq!(view.origin(body), None, "and it is the shard's own now");
+}
+
 /// Far replicas are soft state: a shard that falls silent loses them here
-/// within the timeout, a message that was dropped is asked for again, and a
-/// shard the map no longer names is forgotten at once — and when the entity
-/// is back it is there once.
+/// within the timeout — also one the map no longer names — a message that
+/// was dropped is asked for again, and when the entity is back it is there
+/// once.
 ///
 /// Mutation this catches: no silence rule (the replicas of a dead shard stay
 /// for ever). (After the cut the sender starts over by itself: it has not
@@ -1277,12 +1674,18 @@ fn far_replicas_of_a_silent_or_departed_shard_go_and_come_back_once() {
     assert_eq!(view.origin(drifting), Some(OriginKind::Far));
 
     // The map gives shard 2's region to a shard 3 (shard 2 died and was
-    // replaced): what shard 2 showed is forgotten on the next tick.
+    // replaced). A shard the map named until a moment ago is still a far
+    // neighbour — it may be draining, see
+    // `a_shard_that_is_merged_away_stays_a_far_neighbour_while_it_drains` —
+    // so what shard 2 showed goes by the silence rule, like any dead
+    // shard's: within three seconds.
     let replaced = vec![regions()[0], (3, regions()[1].1)];
     c.shard_mut(1).apply_epoch(map_of(&replaced, 2));
     c.cut = true; // (shard 2 is dead)
-    c.tick();
-    view.take(&mut c, 1, session);
+    for _ in 0..FAR_SILENCE_TICKS + 2 {
+        c.tick();
+        view.take(&mut c, 1, session);
+    }
     assert!(c.shard(1).far_list().is_empty());
     assert!(!view.held.contains_key(&resting));
 

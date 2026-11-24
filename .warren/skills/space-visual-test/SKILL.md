@@ -152,7 +152,9 @@ entry address never does. While playing, `scene` and `scene_revision` say what t
 shows, `position` is the absolute world position and `scene_position` the same
 in metres from the scene's spawn point (what the HUD prints). The physics:
 `gravity` (m/s² at the ship: 9.81 in the demo area's gravity room, 0 in
-weightless space), `landed` (standing on something in gravity), `bodies` (the
+weightless space), `landed` (standing on something in gravity — the client's
+prediction of its own ship says so, not the shard: it touches something, or
+has come to rest, and there is a pull), `bodies` (the
 physics bodies drawn, nearest first: `guid`, `visual` — `crate`, `ball`,
 `plank`, `door`, `chain`, `pendulum` — `position` in the frame of
 `scene_position`, `distance`, `speed`, `parts`, `in_view`, and which copy of
@@ -293,12 +295,17 @@ back to that region's owner. Every shard of the map must acknowledge a map
 change within 3 s, or it is rolled back. A merged shard is not stopped at the
 commit: its role becomes `draining`, it hands over what it holds and is told
 to stop when it is empty (section 4, "Scaling"). An operator's merge is held
-to `--min-shards` only; it may merge a layout cell or the spawn point's shard,
-which the autoscaler never does.
+to `--min-shards` and needs a fresh load report from both shards and room for
+their players together (100); it may merge a layout cell or a shard started by
+hand, which the autoscaler never does. **While a shard drains no other map
+change is made**: a split or merge asked for then is refused with "shard N is
+draining ... at most S s from now", and a shard that registers is told to
+wait.
 
 **Load and the autoscaler.** Every shard reports once a second; `/api/state`
 has it per shard as `load_report` (`players`, `entities` — the ships and
-bodies it simulates, not ghosts or far replicas — `tick_mean_ms`,
+bodies it simulates and the transfers it has accepted that are not in its
+world yet, not ghosts or far replicas — `tick_mean_ms`,
 `tick_p95_ms`, `tick_max_ms`, `ticks_jumped`, `hot_cell { cell, players }`,
 `load_metric`) and the page shows it in the shard table. An idle four-shard
 demo area reads 0 players, tick mean under a millisecond, load 0.02-0.03.
@@ -373,14 +380,19 @@ Check what your change touches, and one step either side of it.
   let go 150 m out): each piece goes `far` -> `local` at your own change of
   shard, in every frame and once; you land on a rock as on the planetoid
   (HUD `gravity 3.3 m/s2` on the far rock, `2.8` on the giant one; `landed`
-  shows at touchdown and mostly drops out again at rest, as on the
-  planetoid) and lift off with Space. On a `-MinShards 1` stack the same 46
-  bodies are all `local`, at the same steps. **Known defect** (`docs/plan-sharding.md`
-  §6, "Far content"): the giant rock's moons, far replicas at one sample a
-  second, stand still and leap up to 7 m every second for most of the time
-  — their samples reach the client up to 29 ticks late; the drifters and
-  the far rock's moons are smooth (millimetres off their speed times the
-  frame time), and so are the giant rock's moons on one shard.
+  from touchdown for as long as you stand there, as on the planetoid) and
+  lift off with Space. On a `-MinShards 1` stack the same 46
+  bodies are all `local`, at the same steps. **All of it moves smoothly**,
+  the giant rock's moons at one sample a second too: from one frame to the
+  next a moon moves its speed times the frame time (17 cm a frame at 60
+  frames a second), and its `sample_age_s` runs from a tick or two up to
+  its step's spacing (1.0 s at step 3, 0.2 s at step 2, 0.1 s at step 1 on a
+  process stack) and starts over — never beyond the spacing plus four
+  ticks. A moon that stands still and then
+  leaps is a far sample that waited in the player's shard (the defect of
+  `docs/plan-sharding.md` §6, "Far content": samples up to 29 ticks late,
+  leaps of 7 m; the repeatable version is `tests/far.rs`,
+  `a_far_sample_is_relayed_on_the_tick_it_arrives_...`).
 - **Other scenes:** switch to each one and back.
 - **Players:** a second client must see the first one's character.
 - **One address:** a client given the player port comes online on the shard
@@ -503,9 +515,29 @@ Check what your change touches, and one step either side of it.
   `player_port.sends_to_shard` names the replacement.
   On the compose stack the same test is `docker kill space-shard-<port>` —
   only a container of a stack **you** started, and look first (`docker ps`,
-  `docker inspect`: it carries `space.cluster=<your cluster>` and
-  `space.role=shard`). The replacement is a new container under a new id
-  within about a second.
+  `docker inspect`: it carries `space.cluster=<your cluster>`,
+  `space.role=shard` and `space.instance=<your compose project>`). The
+  replacement is a new container under a new id within about a second.
+  **A second stack beside another one** (yours next to somebody's, or two of
+  yours) is another compose project: its own project name (`-p`), its own
+  `SPACE_CLUSTER`, its own ports and its own shard container names —
+
+  ```sh
+  SPACE_CLUSTER=space-two SPACE_PLAYER_PORT=7877 WEBUI_PORT=7981 \
+  SPACE_SHARD_PORTS=7970-7999 SPACE_SHARD_NAME_PREFIX=space-two-shard- \
+    docker compose -p space-two -f deploy/docker-compose.yaml up -d
+  ```
+
+  The compose project's name is the **instance** (`space.instance`) the
+  orchestrator labels its shard containers with, and an orchestrator removes
+  at its start only the leftovers that carry its own cluster **and**
+  instance: neither stack may ever remove a container of the other, also
+  when both were left at the default `SPACE_CLUSTER`. Check it: start the
+  second stack, restart the first's orchestrator (`docker compose -p <first>
+  up -d --force-recreate`), and `docker ps` still shows every shard of the
+  second, with the uptime it had. Without compose (`space-orchestrator
+  --launcher docker` by hand) the instance is an id kept next to `--state`
+  (`<state>.instance`), or `--docker-instance`.
 - **Scaling** (`docs/plan-sharding.md` §3). Make the cluster scale with two
   clients: start the stack with the autoscaler's numbers lowered in the
   environment —
@@ -517,28 +549,36 @@ Check what your change touches, and one step either side of it.
   # PowerShell: $env:SPACE_ORCHESTRATOR_SHARD_CAPACITY = '2' ... ; .\scripts\dev.ps1 -ServersOnly
   ```
 
-  — and connect two headless clients. **Out:** some five seconds after the
-  second is online the root's shard reports 2 of 2 players in the spawn
-  point's cell (load 1.0) and the event log shows that cell wanted, a shard
-  launched, registered and its epoch committed, all within a few ticks;
+  — and connect two headless clients. **The spawn cell does not grow the
+  cluster:** with both on the spawn point the root's shard reports 2 of 2
+  players in the spawn point's cell (load 1.0), and the event log says, once
+  per cooldown, `split shard 1 was not carried out: the spawn cell is at
+  capacity: a region cannot be smaller than a cell (1024 m). All 2 of shard
+  1's player(s) are in it ...` — no fifth pid in `launched-shards.pid`.
+  (Only when the loaded shard also has players *outside* the spawn cell is
+  that cell carved, and merged back once the pair is cold.) **Out:** fly
+  both clients a couple of kilometres out (fast travel) and stop: five
+  seconds later the cell they stand in is wanted, a shard launched,
+  registered and its epoch committed, all within a few ticks;
   `launched-shards.pid` has a fifth pid; a second later both clients are on
   the new shard: **the HUD's shard number changes with no border crossed, and
   nothing else does** (`handoffs` counts, `shard_address` changes, the drawn
-  step is millimetres, `correction_m` 0, the same bodies listed). From then on
-  the event log says about every 45 s that a split `was not carried out: 2 of
-  shard N's 2 player(s) are in one cell, and that cell is its whole region
-  ...`: a region cannot be smaller than a cell — expected, not a defect. Fly
-  both clients a couple of kilometres out (fast travel) and stop: five
-  seconds later the cell they stand in is carved for a sixth shard. **In:**
+  step is millimetres, `correction_m` 0, the same bodies listed). **In:**
   fly both back; after 15 s and the cooldown the event log says `merge shard
   N: epoch E proposed`, the shard's role in `/api/state` is `draining` for
   about a second, then `shard N is drained after 0.8 s (0 players, 0
   entities) and is told to stop` and `shard N stopped as it was told (exit
   status 0)`; its log ends with `space-server: shard N stops: the
   orchestrator retired it (...)` and its pid leaves `launched-shards.pid`.
-  The autoscaler never merges the spawn point's shard nor the three layout
-  cells beside it, so the four areas stay and the spawn cell's shard does too.
-  **A defect:** a client on the connect screen at any point; a log line
+  The autoscaler merges away only shards the orchestrator launched, never the
+  three layout cells beside the spawn point's, and nobody whose merge target
+  has not reported or has no room: the four areas stay. **While the shard
+  drains nothing else changes the map**: kill another shard then (by pid, one
+  of your stack's) and the event log says `shard M lost: its process exited`
+  at once, nothing is proposed and nothing launched while the drain runs,
+  and the replacement registers and gets the region a few ticks after
+  `shard N stopped as it was told` (a shard started by hand meanwhile is
+  told to wait: `shard N is draining ...`). **A defect:** a client on the connect screen at any point; a log line
   `called off` for a player's ship; a drain that runs into its timeout (`...
   what it held is gone`); a shard `told to stop ... and is still there`; an
   exit status other than 0 for a retired shard; a shard merged while the
@@ -546,9 +586,11 @@ Check what your change touches, and one step either side of it.
   `the_cluster_grows_at_the_hot_cell_and_shrinks_again_by_draining`
   (`space-orchestrator`) and
   `a_shard_whose_region_is_merged_away_hands_everything_over_and_is_empty`
-  (`space-server/tests/four_cells.rs`). Known, seen there: switching fast
-  travel **off** at several hundred m/s is a prediction correction of metres
-  on that tick (23 m at 775 m/s) — the toggle, not a border.
+  (`space-server/tests/four_cells.rs`). Switching fast travel **off** at
+  several hundred m/s must be no correction and no drawn step back
+  (`correction_m` stays 0; it was 23 m at 775 m/s:
+  `space-client/src/predict.rs`,
+  `leaving_fast_travel_at_speed_is_no_correction`).
 - **A stalled shard** (a suspended host, a debugger): start the stack with
   `SPACE_DEBUG_STALL_DIR` set to a directory (the orchestrator hands its
   environment to the shards it starts). A file `stall-<shard id>` in it

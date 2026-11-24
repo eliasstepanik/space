@@ -51,7 +51,19 @@
 # its shard containers (bounded: 20 s) and exits - `stop_grace_period` below
 # gives it that time. Should it be killed instead, its shards notice within
 # about ten seconds and exit, and the next start removes what is left of them
-# (containers labelled space.cluster=<SPACE_CLUSTER>, space.role=shard) first.
+# first: the containers labelled space.cluster=<SPACE_CLUSTER>,
+# space.role=shard AND space.instance=<this compose project> - its own, never
+# another stack's.
+#
+# A SECOND STACK ON THE SAME HOST is another compose project with its own
+# ports and its own container names - nothing else: the project's name is the
+# instance that tells its shards from this one's (two stacks may even share a
+# cluster name; give each its own anyway, it is what the web UI and the logs
+# show):
+#
+#   SPACE_CLUSTER=space-two SPACE_PLAYER_PORT=7877 WEBUI_PORT=7981 \
+#   SPACE_SHARD_PORTS=7970-7999 SPACE_SHARD_NAME_PREFIX=space-two-shard- \
+#     docker compose -p space-two -f deploy/docker-compose.yaml up -d
 #
 # The streaming client is OPT-IN (`--profile stream`); it reaches the cluster
 # the way a player does, through the host's published ports.
@@ -80,6 +92,16 @@ services:
       SPACE_ORCHESTRATOR_HOST_PORTS: ${SPACE_SHARD_PORTS:-7870-7899}
       SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP: ${SPACE_SHARD_PUBLISH_IP:-0.0.0.0}
       SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX: ${SPACE_SHARD_NAME_PREFIX:-space-shard-}
+      # This container's own NAME, which the orchestrator inspects to find the
+      # network its shards join and the address they dial. (Not its host
+      # name: Docker finds a container by name or id, and the host name is the
+      # id only until the container is recreated from an older one.)
+      SPACE_ORCHESTRATOR_DOCKER_SELF: ${SPACE_ORCHESTRATOR_CONTAINER:-${COMPOSE_PROJECT_NAME}-orchestrator-1}
+      # What tells this stack's shard containers from another stack's on the
+      # same host (label space.instance): the compose project.
+      SPACE_ORCHESTRATOR_DOCKER_INSTANCE: ${SPACE_INSTANCE:-${COMPOSE_PROJECT_NAME}}
+      # Memory limit of each shard container in MiB (empty = 2048; 0 = none).
+      SPACE_ORCHESTRATOR_SHARD_MEMORY: ${SPACE_SHARD_MEMORY:-}
       # The one address players type.
       SPACE_ORCHESTRATOR_PLAYER_BIND: 0.0.0.0:7777
       # The scene every shard runs until an operator picks another one in the

@@ -47,8 +47,12 @@ DOCKER_GID` is what gives it the socket). What is done: nothing a player or a
 shard sends reaches a Docker call (image, command, ports, network and labels
 come from the orchestrator's configuration and its own launch counter); shard
 containers get no socket, no mount, no capability, `no-new-privileges` and no
-restart policy; only containers carrying both of this cluster's labels
-(`space.cluster`, `space.role=shard`) are ever removed; the cluster secret is
+restart policy, a read-only root filesystem, a process limit (1024), a memory
+limit (`SPACE_SHARD_MEMORY` MiB, default 2048) and the user `10001:10001`;
+only containers carrying all three of this orchestrator's labels
+(`space.cluster`, `space.role=shard`, `space.instance`) are ever removed -
+never another stack's on this host, also not one with the same cluster name;
+the cluster secret is
 in the shard containers' environment (visible to whoever can `docker inspect`
 here, that is to the root-equivalent only); the control port is not published;
 the web UI - the one way to operate the orchestrator from outside, and it can
@@ -103,7 +107,39 @@ compose file and `docker compose` commands do not list them; stopping the
 orchestrator (`docker compose stop` / `down`: SIGTERM, `stop_grace_period:
 30s`) removes them, and a start removes whatever an orchestrator that was
 killed left behind (containers labelled `space.cluster=<SPACE_CLUSTER>`,
-`space.role=shard`) before it starts new ones.
+`space.role=shard` and `space.instance=<this orchestrator's instance>`) before
+it starts new ones. The instance is an id the orchestrator makes at its first
+start and keeps in `./state/orchestrator.id.instance` (or `SPACE_INSTANCE` in
+`.env`): it is what keeps a second stack on this host - a staging copy, say -
+from removing this one's shards and the other way round. Keep `./state`.
+
+**The orchestrator's own container** has a fixed name and host name
+(`space-orchestrator`), and is told that name
+(`SPACE_ORCHESTRATOR_DOCKER_SELF`): it inspects itself by it to find the
+network its shards join and the address they dial. Do not rename the
+container without changing that variable. (It used to look for itself by
+`$HOSTNAME`, which is the container's id only until Watchtower recreates the
+container from the old one's configuration - the new container then carries
+the old id as its host name and the lookup found nothing.)
+
+**Old shard images.** Every push leaves one more `space-shard:sha-<commit>`
+image on this host: the orchestrator pulls the one of its commit and never
+removes any (`redeploy.sh` and Watchtower's clean-up only know the images of
+the containers they update). An image that is in use cannot be removed
+without force, so this removes exactly the shard images no container uses -
+run it by hand or from cron, **after** the shards of the running orchestrator
+are up, and never with `-f`:
+
+```sh
+docker images --format '{{.Repository}}:{{.Tag}}' ghcr.io/eliasstepanik/space-shard \
+  | xargs -r -n1 docker rmi
+```
+
+(`docker rmi` prints an error for each image a shard container is using and
+leaves it; that is the point.) Should the image of the running orchestrator's
+shards be removed all the same - by this at the wrong moment, or by a
+`docker image prune -a` - the next launch that misses it pulls it again.
+**Not executed** from this repository.
 
 ## How updates reach the host
 
@@ -123,7 +159,15 @@ killed left behind (containers labelled `space.cluster=<SPACE_CLUSTER>`,
    install or schedule per stack. **The shard containers are not Watchtower's
    business:** the old orchestrator gets SIGTERM and removes its shards, the
    new one removes leftovers and starts four shards from its own commit's
-   shard image (pulled if it is not on the host). Players of the old shards
+   shard image (pulled if it is not on the host). **How long the old
+   orchestrator gets is Watchtower's stop timeout** - 10 s unless it is told
+   otherwise - **not the compose file's `stop_grace_period`**, which only
+   `docker compose stop` / `down` and `docker stop` honour. The orchestrator
+   bounds the removal of its shards at 20 s, so give Watchtower 30:
+   `WATCHTOWER_TIMEOUT=30s` in the Watchtower container's environment (or
+   `--stop-timeout 30s` on its command line). Cut short, the new orchestrator
+   finds the old one's shards as leftovers and removes them before it starts
+   its own. (Not executed from this repository.) Players of the old shards
    reconnect through the player port, as after any shard death: about 10 s,
    and back on the spawn point.
 3. **Manual path:** `.github/workflows/deploy.yml` (`workflow_dispatch`, or

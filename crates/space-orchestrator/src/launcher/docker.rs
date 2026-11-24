@@ -20,6 +20,14 @@
 //!   on, found by inspecting itself. Its address there and `P` are the
 //!   [`ShardHandle::endpoint`]: what its hello is seen to come from, and what
 //!   the other shards dial.
+//! * **Itself.** The orchestrator's own container is asked for by **name**
+//!   (`--docker-self`; the compose files give it) and, failing that, by
+//!   `$HOSTNAME`. The Engine looks a container up by id, by name or by the
+//!   start of its id — never by host name: `$HOSTNAME` works only as long as
+//!   it is the short id Docker gives a container by default, which it no
+//!   longer is in a container that was recreated from the old one's
+//!   configuration (Watchtower). Whoever is not found is skipped; with a
+//!   network **and** a control address configured nobody is asked at all.
 //! * **Players.** UDP port `P` of the container is published as port `P` of
 //!   the host (on `--docker-publish-ip`, default all), and the shard sends its
 //!   players to `0.0.0.0:P` — "the host you dialed, this port".
@@ -32,11 +40,25 @@
 //!   environment (`SPACE_CLUSTER_SECRET`), never in its command, and is taken
 //!   out of every error text this module returns.
 //! * **Labels.** `space.cluster=<cluster>`, `space.role=shard`,
-//!   `space.launch=<n>`, `space.port=<P>`. They are how leftovers are told
-//!   from strangers: [`DockerLauncher::prepare`] removes every container that
-//!   carries the first two — shards of an orchestrator that was killed — and a
-//!   name that is taken is only ever freed when its container carries them.
-//!   **A container without them is never removed.**
+//!   `space.instance=<instance>`, `space.launch=<n>`, `space.port=<P>`. The
+//!   first three are how leftovers are told from strangers **and from the
+//!   shards of another stack on the same host**: [`DockerLauncher::prepare`]
+//!   removes every container that carries all three — shards of *this*
+//!   orchestrator's earlier run that was killed — and a name that is taken is
+//!   only ever freed when its container carries them. **A container without
+//!   them is never removed.** The cluster's name alone is not enough: two
+//!   stacks that were both left at the default name would delete each
+//!   other's running shards at every start. The *instance* is what tells
+//!   them apart: an id that is the same at every start of one orchestrator
+//!   and different between two ([`DockerOptions::instance`]; it is not a
+//!   secret and is derived from none). `space.launch` and `space.port` are
+//!   for the operator (`docker ps --filter label=space.port=7870`); the
+//!   launcher writes them and never reads them.
+//! * **Image.** [`DockerLauncher::prepare`] makes sure the image is on the
+//!   host; so does a launch whose creation the daemon refuses because the
+//!   image is gone (pruned while the orchestrator ran): it is pulled again,
+//!   under [`PULL_TIMEOUT`], and the creation tried once more. The launcher
+//!   never removes an image.
 //! * **Liveness.** [`Launcher::poll`] inspects the container; one that has
 //!   stopped is `Dead` and its exit code is kept for [`Launcher::exit_code`].
 //!   A daemon that does not answer is an error, not a dead shard.
@@ -48,7 +70,13 @@
 //! # What a shard container is given
 //!
 //! Nothing: **no mount, never the Docker socket, not privileged**, every
-//! capability dropped, `no-new-privileges`. A shard faces players.
+//! capability dropped, `no-new-privileges`, a **read-only root filesystem**
+//! (a shard writes no file: its log is its standard output), at most
+//! [`PIDS_LIMIT`] processes and threads, at most [`DockerOptions::memory_mib`]
+//! of memory (and no swap beyond it), and the user [`SHARD_USER`] whatever the
+//! image says — the uid the shard image itself runs as, given by number so
+//! that an image built without a `USER` line still does not run a shard as
+//! root. A shard faces players.
 //!
 //! # Who can make this module do what
 //!
@@ -113,6 +141,10 @@ const MAX_LINE: usize = 1024;
 const MAX_PROGRESS_LINE: usize = 64 * 1024;
 /// How much of the daemon's own words an error text carries, in characters.
 const MAX_ERROR_TEXT: usize = 300;
+/// How much of the daemon's own words is kept until a secret has been taken
+/// out of them: what is shown, and the longest secret there is on top, so
+/// that one that starts inside what is shown is there whole.
+const MAX_RAW_TEXT: usize = MAX_ERROR_TEXT + space_net::MAX_SECRET_LEN;
 
 /// The time limit of an ordinary call (ping, create, start, inspect, list).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,10 +161,25 @@ pub const LABEL_CLUSTER: &str = "space.cluster";
 pub const LABEL_ROLE: &str = "space.role";
 /// The value of [`LABEL_ROLE`] on every container this launcher creates.
 pub const ROLE_SHARD: &str = "shard";
-/// The label carrying the launch's number.
+/// The label naming the orchestrator a container is a shard of
+/// ([`DockerOptions::instance`]): what tells two stacks on one host apart.
+pub const LABEL_INSTANCE: &str = "space.instance";
+/// The label carrying the launch's number. For the operator: never read here.
 pub const LABEL_LAUNCH: &str = "space.launch";
-/// The label carrying the shard's port.
+/// The label carrying the shard's port. For the operator: never read here.
 pub const LABEL_PORT: &str = "space.port";
+
+/// The user a shard container runs as, `uid:gid`: the one
+/// `deploy/Dockerfile.shard` creates, by number (no entry in the image's
+/// user table is needed).
+pub const SHARD_USER: &str = "10001:10001";
+/// The most processes and threads a shard container may have. A shard is one
+/// process with a thread per core and a few more; this is far above that and
+/// far below what would trouble the host.
+pub const PIDS_LIMIT: i64 = 1_024;
+/// The memory a shard container may use unless told otherwise
+/// (`--shard-memory`), in MiB.
+pub const DEFAULT_MEMORY_MIB: u64 = 2_048;
 
 /// How to reach the Docker daemon: one fresh connection per request.
 pub trait Transport: Send + Sync {
@@ -213,9 +260,21 @@ pub struct DockerOptions {
     pub name_prefix: String,
     /// The cluster: the value of [`LABEL_CLUSTER`].
     pub cluster: String,
-    /// The orchestrator's own container, by id or name (`$HOSTNAME` in a
-    /// container). `None`: it does not run in one.
+    /// This orchestrator, as opposed to any other on the host: the value of
+    /// [`LABEL_INSTANCE`]. The same at every start of one orchestrator (the
+    /// binary keeps it next to its state file, or is told it:
+    /// `--docker-instance`), different between two stacks. Not a secret.
+    pub instance: String,
+    /// The orchestrator's own container by **name** or id
+    /// (`--docker-self`). `None`: not told.
     pub self_container: Option<String>,
+    /// `$HOSTNAME`: the orchestrator's own container by the start of its id,
+    /// as long as nobody gave the container another host name. Asked when
+    /// `self_container` is not given or not known to the daemon.
+    pub self_hostname: Option<String>,
+    /// The memory limit of a shard container in MiB (`--shard-memory`);
+    /// 0 = none.
+    pub memory_mib: u64,
 }
 
 impl Default for DockerOptions {
@@ -229,7 +288,10 @@ impl Default for DockerOptions {
             publish_ip: "0.0.0.0".into(),
             name_prefix: "space-shard-".into(),
             cluster: "space-local".into(),
+            instance: "default".into(),
             self_container: None,
+            self_hostname: None,
+            memory_mib: DEFAULT_MEMORY_MIB,
         }
     }
 }
@@ -286,7 +348,11 @@ enum Failure {
     Unsupported(String),
     /// No answer: not reachable, timed out, or not HTTP.
     Transport(String),
-    /// The daemon answered, and not with a 2xx.
+    /// The daemon answered, and not with a 2xx. `message` is what it said,
+    /// **not clipped yet** (at most [`MAX_RAW_TEXT`] characters): a secret is
+    /// taken out of the whole of it ([`Failure::without`]) before it is cut
+    /// to [`MAX_ERROR_TEXT`] for showing — cut first, the front half of a
+    /// secret that lies across the cut would be left standing.
     Status {
         what: String,
         status: u16,
@@ -302,12 +368,38 @@ impl core::fmt::Display for Failure {
                 what,
                 status,
                 message,
-            } => write!(f, "docker: {what}: the daemon answered {status}: {message}"),
+            } => write!(
+                f,
+                "docker: {what}: the daemon answered {status}: {}",
+                clip(message)
+            ),
         }
     }
 }
 
 impl Failure {
+    /// This failure with every occurrence of `secret` taken out of its text —
+    /// before the text is clipped.
+    fn without(self, secret: &str) -> Failure {
+        if secret.is_empty() {
+            return self;
+        }
+        let clean = |text: String| text.replace(secret, "<redacted>");
+        match self {
+            Failure::Unsupported(why) => Failure::Unsupported(clean(why)),
+            Failure::Transport(why) => Failure::Transport(clean(why)),
+            Failure::Status {
+                what,
+                status,
+                message,
+            } => Failure::Status {
+                what,
+                status,
+                message: clean(message),
+            },
+        }
+    }
+
     fn launch(self) -> LaunchError {
         match self {
             Failure::Unsupported(why) => LaunchError::Unavailable(why),
@@ -379,11 +471,12 @@ impl<T: Transport> DockerLauncher<T> {
 
     /// Make the launcher ready, once, before the run loop: ask the daemon
     /// whether it is there (`GET /_ping`), find the network and the control
-    /// address, **remove the shard containers of this cluster that an earlier
+    /// address, **remove the shard containers that an earlier run of this
     /// orchestrator left behind** (those labelled [`LABEL_CLUSTER`] = this
-    /// cluster and [`LABEL_ROLE`] = [`ROLE_SHARD`], and no other), and make
-    /// sure the image is on the host — pulling it when it is not, without
-    /// credentials.
+    /// cluster, [`LABEL_INSTANCE`] = this instance and [`LABEL_ROLE`] =
+    /// [`ROLE_SHARD`], and no other — not another stack's, whatever its
+    /// cluster is called), and make sure the image is on the host — pulling
+    /// it when it is not, without credentials.
     ///
     /// Returns a sentence saying what it found and did.
     ///
@@ -424,7 +517,7 @@ impl<T: Transport> DockerLauncher<T> {
         Ok(format!(
             "docker launcher: the daemon at {socket} answers; shards join the network {:?} and \
              dial {}; the image {image} {}; {removed} leftover shard container{} of cluster {:?} \
-             removed",
+             (instance {:?}) removed",
             resolved.network,
             resolved.control,
             if pulled {
@@ -434,6 +527,7 @@ impl<T: Transport> DockerLauncher<T> {
             },
             if removed == 1 { "" } else { "s" },
             self.options.cluster,
+            self.options.instance,
         ))
     }
 
@@ -469,26 +563,59 @@ impl<T: Transport> DockerLauncher<T> {
         let resolved = if let (Some(network), Some(control)) = (network.clone(), control.clone()) {
             Resolved { network, control }
         } else {
-            let Some(own) = configured(&self.options.self_container) else {
-                return unavailable(
-                    "the orchestrator does not seem to run in a container (it has no container \
-                     name of its own to inspect), so the shards' network and the address they \
-                     dial have to be given: pass --docker-network and --docker-control-addr"
-                        .into(),
-                );
-            };
-            let target = format!("/containers/{}/json", segment(&own));
-            let what = format!("inspecting the orchestrator's own container {own}");
-            let me = match self.json(&what, "GET", &target, None).await {
-                Ok(me) => me,
-                Err(failure) if failure.is_status(404) => {
-                    return unavailable(format!(
-                        "the daemon knows no container {own:?} (the orchestrator takes its own \
-                         container's name from HOSTNAME); pass --docker-network and \
-                         --docker-control-addr"
-                    ));
+            // The orchestrator's own container: by the name it was told,
+            // then by `$HOSTNAME`. The Engine finds a container by id, name
+            // or the start of its id - a host name is found only while it is
+            // the default one (the short id), so a name that is not known is
+            // no verdict: the next one is asked.
+            let mut asked: Vec<String> = Vec::new();
+            for candidate in [&self.options.self_container, &self.options.self_hostname] {
+                if let Some(candidate) = configured(candidate) {
+                    if !asked.contains(&candidate) {
+                        asked.push(candidate);
+                    }
                 }
-                Err(failure) => return Err(failure.launch()),
+            }
+            let mut found = None;
+            for own in &asked {
+                let target = format!("/containers/{}/json", segment(own));
+                let what = format!("inspecting the orchestrator's own container {own}");
+                match self.json(&what, "GET", &target, None).await {
+                    Ok(me) => {
+                        found = Some((own.clone(), me));
+                        break;
+                    }
+                    Err(failure) if failure.is_status(404) => {}
+                    Err(failure) => return Err(failure.launch()),
+                }
+            }
+            let Some((own, me)) = found else {
+                let missing = match (&network, &control) {
+                    (None, None) => "--docker-network and --docker-control-addr",
+                    (Some(_), None) => "--docker-control-addr",
+                    _ => "--docker-network",
+                };
+                return unavailable(if asked.is_empty() {
+                    format!(
+                        "the orchestrator does not seem to run in a container (it was given no \
+                         container name of its own, --docker-self, and has no HOSTNAME), so the \
+                         shards' network and the address they dial have to be given: pass \
+                         {missing}"
+                    )
+                } else {
+                    format!(
+                        "the daemon knows no container {} (the orchestrator looks for its own \
+                         container by --docker-self, then by HOSTNAME, and a container that was \
+                         recreated keeps the old one's host name): set \
+                         SPACE_ORCHESTRATOR_DOCKER_SELF (--docker-self) to this container's \
+                         name, or pass {missing}",
+                        asked
+                            .iter()
+                            .map(|name| format!("{name:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    )
+                });
             };
             let networks = &me["NetworkSettings"]["Networks"];
             let network = match network {
@@ -547,13 +674,16 @@ impl<T: Transport> DockerLauncher<T> {
         Ok(resolved)
     }
 
-    /// Remove every container labelled as a shard of this cluster; how many.
+    /// Remove every container labelled as a shard of this orchestrator (its
+    /// cluster **and** its instance); how many.
     async fn remove_leftovers(&self) -> Result<usize, LaunchError> {
         let cluster = &self.options.cluster;
+        let instance = &self.options.instance;
         let filters = json!({
             "label": [
                 format!("{LABEL_CLUSTER}={cluster}"),
                 format!("{LABEL_ROLE}={ROLE_SHARD}"),
+                format!("{LABEL_INSTANCE}={instance}"),
             ]
         })
         .to_string();
@@ -569,7 +699,7 @@ impl<T: Transport> DockerLauncher<T> {
         for container in listed.as_array().map_or(&[][..], Vec::as_slice) {
             // The daemon was asked for ours only. What is removed is still
             // decided here, by the labels it says the container carries.
-            if !is_shard_of(&container["Labels"], cluster) {
+            if !is_shard_of(&container["Labels"], cluster, instance) {
                 continue;
             }
             let Some(id) = container["Id"].as_str().filter(|id| !id.is_empty()) else {
@@ -728,25 +858,52 @@ impl<T: Transport> DockerLauncher<T> {
         }
     }
 
-    /// Create the container `name` from `body`; its id. A name that is taken
-    /// by a leftover shard of this cluster is freed, once; one taken by
-    /// anything else is an error and that container is left alone.
-    async fn create(&self, name: &str, body: &Value) -> Result<String, LaunchError> {
+    /// One `POST /containers/create`. The body holds the cluster secret, and
+    /// a daemon may quote a request back in its refusal: `secret` is taken
+    /// out of what it said here, before any of it is clipped.
+    async fn post_create(
+        &self,
+        what: &str,
+        target: &str,
+        body: &Value,
+        secret: &str,
+    ) -> Result<Value, Failure> {
+        self.json(what, "POST", target, Some(body))
+            .await
+            .map_err(|failure| failure.without(secret))
+    }
+
+    /// Create the container `name` from `body`; its id. An image that is not
+    /// on the host any more (the daemon's 404: somebody pruned it while the
+    /// orchestrator ran) is pulled again, once, under the pull's time limit.
+    /// A name that is taken by a leftover shard of this orchestrator is
+    /// freed, once; one taken by anything else is an error and that container
+    /// is left alone.
+    async fn create(&self, name: &str, body: &Value, secret: &str) -> Result<String, LaunchError> {
         let target = format!("/containers/create?name={}", query_value(name));
         let what = format!("creating container {name}");
-        let first = self.json(&what, "POST", &target, Some(body)).await;
+        let mut first = self.post_create(&what, &target, body, secret).await;
+        if matches!(&first, Err(failure) if failure.is_status(404)) {
+            self.ensure_image().await?;
+            first = self.post_create(&what, &target, body, secret).await;
+        }
         let created = match first {
             Err(failure) if failure.is_status(409) => {
                 let inspect = format!("/containers/{}/json", segment(name));
                 let looking = format!("inspecting the container that holds the name {name}");
                 match self.json(&looking, "GET", &inspect, None).await {
                     Ok(holder) => {
-                        if !is_shard_of(&holder["Config"]["Labels"], &self.options.cluster) {
+                        if !is_shard_of(
+                            &holder["Config"]["Labels"],
+                            &self.options.cluster,
+                            &self.options.instance,
+                        ) {
                             return Err(LaunchError::Spawn(format!(
-                                "a container named {name} exists that is not a shard of cluster \
-                                 {:?} (it does not carry this cluster's labels), and it is left \
-                                 alone: remove it, or choose another --docker-name-prefix",
-                                self.options.cluster
+                                "a container named {name} exists that is not a shard of this \
+                                 orchestrator (it does not carry the labels of cluster {:?}, \
+                                 instance {:?}), and it is left alone: remove it, or choose \
+                                 another --docker-name-prefix",
+                                self.options.cluster, self.options.instance
                             )));
                         }
                         let id = holder["Id"].as_str().unwrap_or(name);
@@ -756,7 +913,7 @@ impl<T: Transport> DockerLauncher<T> {
                     Err(failure) if failure.is_status(404) => {}
                     Err(failure) => return Err(failure.launch()),
                 }
-                self.json(&what, "POST", &target, Some(body)).await
+                self.post_create(&what, &target, body, secret).await
             }
             other => other,
         }
@@ -851,7 +1008,7 @@ impl<T: Transport> DockerLauncher<T> {
         }
 
         let body = create_body(&self.options, &resolved, spec);
-        let id = match self.create(&name, &body).await {
+        let id = match self.create(&name, &body, &spec.secret).await {
             Ok(id) => id,
             Err(err) => {
                 let mut table = self.table();
@@ -1019,9 +1176,9 @@ impl<T: Transport> Launcher for DockerLauncher<T> {
         if tokio::time::timeout(limit, all(removals)).await.is_err() {
             eprintln!(
                 "space-orchestrator: docker: removing the shard containers did not finish within \
-                 {limit:?}; what is left carries the label {LABEL_CLUSTER}={} and is removed when \
-                 the orchestrator starts again",
-                self.options.cluster
+                 {limit:?}; what is left carries the labels {LABEL_CLUSTER}={} and \
+                 {LABEL_INSTANCE}={} and is removed when the orchestrator starts again",
+                self.options.cluster, self.options.instance
             );
         }
     }
@@ -1059,9 +1216,12 @@ fn create_body(options: &DockerOptions, resolved: &Resolved, spec: &SpawnSpec) -
             "--advertise", listen,
             "--client-endpoint", listen,
         ],
+        // By number: also an image without a `USER` line runs no shard as root.
+        "User": SHARD_USER,
         "Labels": {
             LABEL_CLUSTER: options.cluster,
             LABEL_ROLE: ROLE_SHARD,
+            LABEL_INSTANCE: options.instance,
             LABEL_LAUNCH: spec.launch.0.to_string(),
             LABEL_PORT: port.to_string(),
         },
@@ -1075,10 +1235,19 @@ fn create_body(options: &DockerOptions, resolved: &Resolved, spec: &SpawnSpec) -
             "Privileged": false,
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges"],
+            // A shard writes no file (its log is its standard output).
+            "ReadonlyRootfs": true,
+            "PidsLimit": PIDS_LIMIT,
             "AutoRemove": false,
         },
         "NetworkingConfig": { "EndpointsConfig": { network: {} } },
     });
+    if options.memory_mib > 0 {
+        // The same for both: no swap on top of the memory.
+        let bytes = options.memory_mib.saturating_mul(1024 * 1024);
+        body["HostConfig"]["Memory"] = json!(bytes);
+        body["HostConfig"]["MemorySwap"] = json!(bytes);
+    }
     if !spec.secret.is_empty() {
         // In the environment, never in the command (which `docker ps` shows).
         body["Env"] = json!([format!("{ENV_CLUSTER_SECRET}={}", spec.secret)]);
@@ -1086,10 +1255,13 @@ fn create_body(options: &DockerOptions, resolved: &Resolved, spec: &SpawnSpec) -
     body
 }
 
-/// Whether `labels` (a container's) say "a shard of `cluster`".
-fn is_shard_of(labels: &Value, cluster: &str) -> bool {
+/// Whether `labels` (a container's) say "a shard of the orchestrator
+/// `instance` of `cluster`". All three labels: a shard of another stack on
+/// this host is a stranger, also when both stacks use one cluster name.
+fn is_shard_of(labels: &Value, cluster: &str, instance: &str) -> bool {
     labels[LABEL_CLUSTER].as_str() == Some(cluster)
         && labels[LABEL_ROLE].as_str() == Some(ROLE_SHARD)
+        && labels[LABEL_INSTANCE].as_str() == Some(instance)
 }
 
 /// `err` with every occurrence of `secret` taken out of its text.
@@ -1282,22 +1454,22 @@ impl Sink {
     }
 
     /// What the daemon said went wrong: the `message` of its error body, else
-    /// the body as text; clipped.
+    /// the body as text — the first [`MAX_RAW_TEXT`] characters, as they are
+    /// (see [`Failure::Status`]: clipped when shown).
     fn message(&self) -> String {
+        let raw = |text: &str| text.trim().chars().take(MAX_RAW_TEXT).collect::<String>();
         match self {
             Sink::Collect { body, .. } => match serde_json::from_slice::<Value>(body) {
                 Ok(said) if said["message"].is_string() => {
-                    clip(said["message"].as_str().unwrap_or(""))
+                    raw(said["message"].as_str().unwrap_or(""))
                 }
-                _ => clip(&String::from_utf8_lossy(body)),
+                _ => raw(&String::from_utf8_lossy(body)),
             },
-            Sink::Lines(progress) => clip(
-                progress
-                    .error
-                    .as_deref()
-                    .or(progress.status.as_deref())
-                    .unwrap_or(""),
-            ),
+            Sink::Lines(progress) => raw(progress
+                .error
+                .as_deref()
+                .or(progress.status.as_deref())
+                .unwrap_or("")),
         }
     }
 }
@@ -1691,6 +1863,7 @@ mod tests {
             control: Some("172.20.0.2:7900".into()),
             publish_ip: "0.0.0.0".into(),
             cluster: "test-cluster".into(),
+            instance: "inst-a".into(),
             ..DockerOptions::default()
         }
     }
@@ -1736,14 +1909,17 @@ mod tests {
     const START: &str = "POST /containers/0123456789abcdef0123456789abcdef/start";
 
     /// What a shard container is made of, to the letter: the image, the
-    /// command, the labels, the published UDP port, the network, no restart —
-    /// and nothing else: no mount, no socket, no privilege. The secret is in
-    /// its environment and nowhere in its command; without one there is no
-    /// environment at all.
+    /// command, the user, the labels, the published UDP port, the network, no
+    /// restart, a read-only root, the process and memory limits — and nothing
+    /// else: no mount, no socket, no privilege. The secret is in its
+    /// environment and nowhere in its command; without one there is no
+    /// environment at all, and without a memory limit no `Memory`.
     ///
     /// Mutation this catches: adding `Binds` (the Docker socket, say) or
     /// `"Privileged": true` to the body, putting the secret into `Cmd`, a
-    /// restart policy other than `no`, a TCP port binding.
+    /// restart policy other than `no`, a TCP port binding; dropping
+    /// `ReadonlyRootfs`, `PidsLimit`, `User` or the memory limit, or setting
+    /// `MemorySwap` to anything but the memory (swap on top of the limit).
     #[tokio::test]
     async fn a_shard_container_is_created_from_exactly_this() {
         let fake = Fake::new(obliging);
@@ -1772,9 +1948,11 @@ mod tests {
                     "--client-endpoint", "0.0.0.0:7871",
                 ],
                 "Env": [format!("SPACE_CLUSTER_SECRET={SECRET}")],
+                "User": "10001:10001",
                 "Labels": {
                     "space.cluster": "test-cluster",
                     "space.role": "shard",
+                    "space.instance": "inst-a",
                     "space.launch": "3",
                     "space.port": "7871",
                 },
@@ -1786,6 +1964,10 @@ mod tests {
                     "Privileged": false,
                     "CapDrop": ["ALL"],
                     "SecurityOpt": ["no-new-privileges"],
+                    "ReadonlyRootfs": true,
+                    "PidsLimit": 1024,
+                    "Memory": 2_147_483_648u64,
+                    "MemorySwap": 2_147_483_648u64,
                     "AutoRemove": false,
                 },
                 "NetworkingConfig": { "EndpointsConfig": { "space_default": {} } },
@@ -1825,6 +2007,141 @@ mod tests {
         docker.spawn(spec(4, 7_872, "")).await.expect("starts");
         let body: Value = serde_json::from_str(&fake.calls()[0].2).unwrap();
         assert!(body.get("Env").is_none(), "{body}");
+
+        // No memory limit asked for: none set (and the others stay).
+        let fake = Fake::new(obliging);
+        let unlimited = DockerOptions {
+            memory_mib: 0,
+            ..options()
+        };
+        let docker = DockerLauncher::with_transport(unlimited, fake.clone());
+        docker.spawn(spec(5, 7_873, "")).await.expect("starts");
+        let body: Value = serde_json::from_str(&fake.calls()[0].2).unwrap();
+        let host = body["HostConfig"].as_object().unwrap();
+        assert!(!host.contains_key("Memory") && !host.contains_key("MemorySwap"));
+        assert_eq!(host["ReadonlyRootfs"], json!(true));
+        assert_eq!(host["PidsLimit"], json!(1024));
+    }
+
+    /// The daemon's refusal is cleaned of the secret **before** it is cut to
+    /// length: a secret that lies across the cut is gone whole, not left
+    /// standing with its front half.
+    ///
+    /// Mutation this catches: `post_create` returning the failure as it is
+    /// (clipping first, redacting the clipped text afterwards): the text ends
+    /// with the first characters of the secret, which no longer match it.
+    #[tokio::test]
+    async fn a_secret_that_lies_across_the_cut_is_taken_out_whole() {
+        // The secret starts ten characters before the cut.
+        let fake = Fake::new(|_, _, _| {
+            Reply::Json(
+                400,
+                json!({ "message": format!("{}{SECRET} and more", "x".repeat(MAX_ERROR_TEXT - 10)) }),
+            )
+        });
+        let docker = launcher(&fake);
+        let err = docker.spawn(spec(1, 7_870, SECRET)).await.expect_err("no");
+        let printed = format!("{err:?} {err}");
+        assert!(printed.contains("400"), "{printed}");
+        assert!(!printed.contains(&SECRET[..8]), "{printed}");
+        assert!(printed.contains("<redact"), "{printed}");
+        // And one that starts at the very end of what is kept before the
+        // cut: there whole, so taken out whole.
+        let fake = Fake::new(|_, _, _| {
+            Reply::Json(
+                400,
+                json!({ "message": format!("{}{SECRET}", "y".repeat(MAX_ERROR_TEXT - 1)) }),
+            )
+        });
+        let docker = launcher(&fake);
+        let err = docker.spawn(spec(2, 7_871, SECRET)).await.expect_err("no");
+        let printed = format!("{err:?} {err}");
+        assert!(printed.contains("yy<"), "{printed}");
+        assert!(!printed.contains("yt"), "{printed}");
+    }
+
+    /// An image that was removed from the host while the orchestrator ran
+    /// (the daemon refuses the creation with 404) is pulled again and the
+    /// creation tried once more; an image that cannot be pulled fails the
+    /// launch, says so, and leaves nothing in the table.
+    ///
+    /// Mutation this catches: making sure of the image in `prepare` only
+    /// (dropping the 404 arm of `create`): after a prune on the host every
+    /// later launch - every replacement, every scale-out - fails for good.
+    #[tokio::test]
+    async fn a_launch_pulls_an_image_that_was_removed_while_the_orchestrator_ran() {
+        let there = Arc::new(AtomicUsize::new(0));
+        let images = preparing(
+            json!({}),
+            Arc::clone(&there),
+            "{\"status\":\"Downloaded\"}\n",
+        );
+        let seen = Arc::clone(&there);
+        let fake = Fake::new(move |method, target, body| match (method, target) {
+            ("POST", t) if t.starts_with("/containers/create") => {
+                if seen.load(Ordering::SeqCst) == 0 {
+                    Reply::Json(
+                        404,
+                        json!({ "message": "No such image: space-shard:sha-abc1234" }),
+                    )
+                } else {
+                    Reply::Json(201, json!({ "Id": ID }))
+                }
+            }
+            (_, t) if t.starts_with("/images/") => images(method, target, body),
+            _ => obliging(method, target, body),
+        });
+        let docker = launcher(&fake);
+        let handle = docker.spawn(spec(1, 7_870, SECRET)).await.expect("starts");
+        assert_eq!(handle.endpoint, "172.20.0.5:7870".parse().unwrap());
+        let pulling =
+            "POST /images/create?fromImage=ghcr.io%2Feliasstepanik%2Fspace-shard&tag=sha-abc1234";
+        assert_eq!(
+            fake.lines(),
+            [
+                "POST /containers/create?name=space-shard-7870",
+                IMAGE,
+                pulling,
+                IMAGE,
+                "POST /containers/create?name=space-shard-7870",
+                START,
+                INSPECT,
+            ]
+        );
+        // The image is there: the next launch asks nothing about it.
+        docker.spawn(spec(2, 7_871, "")).await.expect("starts");
+        assert_eq!(fake.calls().len(), 10);
+
+        // Not pullable: the launch fails, in words, and is forgotten.
+        let refused = "{\"error\":\"pull access denied for space-shard\"}\n";
+        let images = preparing(json!({}), Arc::new(AtomicUsize::new(0)), refused);
+        let fake = Fake::new(move |method, target, body| match (method, target) {
+            ("POST", t) if t.starts_with("/containers/create") => {
+                Reply::Json(404, json!({ "message": "No such image" }))
+            }
+            (_, t) if t.starts_with("/images/") => images(method, target, body),
+            _ => obliging(method, target, body),
+        });
+        let docker = launcher(&fake);
+        let err = docker
+            .spawn(spec(1, 7_870, ""))
+            .await
+            .expect_err("no image");
+        assert!(
+            matches!(&err, LaunchError::Unavailable(why)
+                if why.contains("could not be pulled") && why.contains("pull access denied")),
+            "{err:?}"
+        );
+        assert_eq!(
+            fake.lines(),
+            [
+                "POST /containers/create?name=space-shard-7870",
+                IMAGE,
+                pulling
+            ],
+            "one try, and no second creation"
+        );
+        assert!(docker.table().is_empty());
     }
 
     /// The launch's endpoint is the container's address on the shards'
@@ -1961,22 +2278,27 @@ mod tests {
         )
     }
 
-    /// A name that is taken by a container that is not this cluster's shard —
-    /// no labels, another cluster's, another role — fails the launch and
-    /// **removes nothing**.
+    /// A name that is taken by a container that is not this orchestrator's
+    /// shard — no labels, another cluster's, another role, **another stack's
+    /// of the same cluster name**, one without an instance — fails the launch
+    /// and **removes nothing**.
     ///
     /// Mutation this catches: removing whatever holds the name (a stranger's
     /// container that happens to be called `space-shard-7870` would be
     /// deleted by an orchestrator that holds the Docker socket), or checking
-    /// only one of the two labels.
+    /// only one or two of the three labels (`is_shard_of` without the
+    /// instance: a second stack left at the default cluster name loses its
+    /// running shard).
     #[tokio::test]
     async fn a_name_held_by_a_strangers_container_is_left_alone() {
         for labels in [
             json!({}),
             json!(null),
-            json!({ "space.cluster": "another-cluster", "space.role": "shard" }),
-            json!({ "space.cluster": "test-cluster", "space.role": "orchestrator" }),
-            json!({ "space.role": "shard" }),
+            json!({ "space.cluster": "another-cluster", "space.role": "shard", "space.instance": "inst-a" }),
+            json!({ "space.cluster": "test-cluster", "space.role": "orchestrator", "space.instance": "inst-a" }),
+            json!({ "space.role": "shard", "space.instance": "inst-a" }),
+            json!({ "space.cluster": "test-cluster", "space.role": "shard", "space.instance": "inst-b" }),
+            json!({ "space.cluster": "test-cluster", "space.role": "shard" }),
         ] {
             let fake = Fake::new(move |method, target, _| match (method, target) {
                 ("POST", _) => {
@@ -2013,7 +2335,7 @@ mod tests {
     /// end when the daemon keeps answering 409.
     #[tokio::test]
     async fn a_name_held_by_our_own_leftover_is_freed_and_tried_again() {
-        let ours = || json!({ "space.cluster": "test-cluster", "space.role": "shard" });
+        let ours = || json!({ "space.cluster": "test-cluster", "space.role": "shard", "space.instance": "inst-a" });
         let creates = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&creates);
         let fake = Fake::new(move |method, target, body| match (method, target) {
@@ -2252,11 +2574,15 @@ mod tests {
             ("GET", t) if t.starts_with("/containers/json?") => Reply::Json(
                 200,
                 json!([
-                    { "Id": "aaaa", "Labels": { "space.cluster": "test-cluster", "space.role": "shard" } },
-                    { "Id": "bbbb", "Labels": { "space.cluster": "another", "space.role": "shard" } },
+                    { "Id": "aaaa", "Labels": { "space.cluster": "test-cluster", "space.role": "shard", "space.instance": "inst-a" } },
+                    { "Id": "bbbb", "Labels": { "space.cluster": "another", "space.role": "shard", "space.instance": "inst-a" } },
                     { "Id": "cccc", "Labels": {} },
-                    { "Id": "dddd", "Labels": { "space.cluster": "test-cluster", "space.role": "shard", "space.port": "7871" } },
-                    { "Id": "eeee", "Labels": { "space.cluster": "test-cluster", "space.role": "orchestrator" } },
+                    { "Id": "dddd", "Labels": { "space.cluster": "test-cluster", "space.role": "shard", "space.instance": "inst-a", "space.port": "7871" } },
+                    { "Id": "eeee", "Labels": { "space.cluster": "test-cluster", "space.role": "orchestrator", "space.instance": "inst-a" } },
+                    // Another stack on this host that uses the same cluster
+                    // name, and a shard from before there were instances.
+                    { "Id": "ffff", "Labels": { "space.cluster": "test-cluster", "space.role": "shard", "space.instance": "inst-b" } },
+                    { "Id": "9999", "Labels": { "space.cluster": "test-cluster", "space.role": "shard" } },
                 ]),
             ),
             ("GET", t) if t.starts_with("/images/") => {
@@ -2299,20 +2625,24 @@ mod tests {
     /// `prepare` with nothing configured: the network is the one the
     /// orchestrator's own container is on, the control address its own
     /// address there; of the containers the daemon lists, exactly those
-    /// labelled as this cluster's shards are removed — also when the daemon
-    /// lists others; an image that is there is not pulled.
+    /// labelled as **this orchestrator's** shards (cluster, role and
+    /// instance) are removed — also when the daemon lists others, among them
+    /// the shards of another stack with the same cluster name; an image that
+    /// is there is not pulled.
     ///
     /// Mutation this catches: removing everything the list returns (the
     /// filter is the daemon's; what is deleted must be decided here), listing
-    /// without the label filter, or pulling an image that is present (every
-    /// start would wait for a registry).
+    /// without the label filter, telling "ours" by the cluster's name alone
+    /// (`is_shard_of` without `LABEL_INSTANCE`: `ffff`, a running shard of
+    /// the stack next door, is deleted), or pulling an image that is present
+    /// (every start would wait for a registry).
     #[tokio::test]
     async fn prepare_removes_only_labelled_leftovers_and_pulls_nothing_that_is_there() {
         let networks = json!({ "space_default": { "IPAddress": "172.20.0.2" } });
         let fake = Fake::new(preparing(networks, Arc::new(AtomicUsize::new(1)), ""));
         let docker = DockerLauncher::with_transport(unresolved(), fake.clone());
         let said = docker.prepare().await.expect("ready");
-        let filters = "%7B%22label%22%3A%5B%22space.cluster%3Dtest-cluster%22%2C%22space.role%3Dshard%22%5D%7D";
+        let filters = "%7B%22label%22%3A%5B%22space.cluster%3Dtest-cluster%22%2C%22space.role%3Dshard%22%2C%22space.instance%3Dinst-a%22%5D%7D";
         assert_eq!(
             fake.lines(),
             [
@@ -2330,6 +2660,7 @@ mod tests {
             "dial 172.20.0.2:7900",
             "is on the host",
             "2 leftover shard containers",
+            "(instance \"inst-a\")",
         ] {
             assert!(said.contains(part), "{part}: {said}");
         }
@@ -2420,6 +2751,7 @@ mod tests {
         // Not in a container, and not told.
         let nowhere = DockerOptions {
             self_container: None,
+            self_hostname: None,
             ..unresolved()
         };
         let fake = Fake::new(preparing(json!({}), there(), ""));
@@ -2438,6 +2770,119 @@ mod tests {
             matches!(&err, LaunchError::Unavailable(why) if why.contains("does not answer")),
             "{err:?}"
         );
+    }
+
+    /// The orchestrator finds its own container by the **name it was told**
+    /// and only then by `$HOSTNAME`; a name the daemon does not know is
+    /// skipped, not fatal. With nobody found it says what to set - and with
+    /// network and control address both given it asks nobody.
+    ///
+    /// Mutation this catches: asking for `$HOSTNAME` alone, or treating its
+    /// 404 as the end (a container recreated from an older one's
+    /// configuration - Watchtower - carries the *old* container's short id as
+    /// its host name: the orchestrator would not start after every update).
+    #[tokio::test]
+    async fn the_orchestrator_finds_itself_by_name_before_its_host_name() {
+        let networks = || json!({ "space_default": { "IPAddress": "172.20.0.2" } });
+        let there = || Arc::new(AtomicUsize::new(1));
+        let wanted = Resolved {
+            network: "space_default".into(),
+            control: "172.20.0.2:7900".into(),
+        };
+        // (`preparing` knows the container `orch-1` and no other.)
+        let stale = Some("0ld1d0ld1d00".to_owned());
+
+        // Told its name, with a stale host name: the name is asked, and only it.
+        let named = DockerOptions {
+            self_container: Some("orch-1".into()),
+            self_hostname: stale.clone(),
+            ..unresolved()
+        };
+        let fake = Fake::new(preparing(networks(), there(), ""));
+        let docker = DockerLauncher::with_transport(named, fake.clone());
+        assert_eq!(docker.resolved().await.unwrap(), wanted);
+        assert_eq!(fake.lines(), ["GET /containers/orch-1/json"]);
+
+        // A name the daemon does not know: the host name is asked next.
+        let misnamed = DockerOptions {
+            self_container: Some("not-my-name".into()),
+            self_hostname: Some("orch-1".into()),
+            ..unresolved()
+        };
+        let fake = Fake::new(|method, target, body| match target {
+            "/containers/not-my-name/json" => {
+                Reply::Json(404, json!({ "message": "No such container: not-my-name" }))
+            }
+            _ => preparing(
+                json!({ "space_default": { "IPAddress": "172.20.0.2" } }),
+                Arc::new(AtomicUsize::new(1)),
+                "",
+            )(method, target, body),
+        });
+        let docker = DockerLauncher::with_transport(misnamed, fake.clone());
+        assert_eq!(docker.resolved().await.unwrap(), wanted);
+        assert_eq!(
+            fake.lines(),
+            [
+                "GET /containers/not-my-name/json",
+                "GET /containers/orch-1/json"
+            ]
+        );
+
+        // Only a stale host name, and nothing configured: unavailable, and
+        // the message says what to set.
+        let not_found = |method: &str, target: &str, _: &str| match (method, target) {
+            ("GET", t) if t.starts_with("/containers/") => {
+                Reply::Json(404, json!({ "message": "No such container" }))
+            }
+            _ => Reply::Json(500, json!({ "message": "the test did not expect this" })),
+        };
+        let lost = DockerOptions {
+            self_container: None,
+            self_hostname: stale.clone(),
+            ..unresolved()
+        };
+        let fake = Fake::new(not_found);
+        let docker = DockerLauncher::with_transport(lost.clone(), fake.clone());
+        let err = docker.resolved().await.expect_err("nobody found");
+        let LaunchError::Unavailable(why) = &err else {
+            panic!("{err:?}");
+        };
+        for part in [
+            "\"0ld1d0ld1d00\"",
+            "SPACE_ORCHESTRATOR_DOCKER_SELF",
+            "--docker-network and --docker-control-addr",
+        ] {
+            assert!(why.contains(part), "{part}: {why}");
+        }
+        // One of the two given: the other one is what is missing.
+        let half = DockerOptions {
+            network: Some("space_default".into()),
+            ..lost.clone()
+        };
+        let docker = DockerLauncher::with_transport(half, Fake::new(not_found));
+        let err = docker.resolved().await.expect_err("nobody found");
+        assert!(
+            matches!(&err, LaunchError::Unavailable(why)
+                if why.contains("or pass --docker-control-addr")),
+            "{err:?}"
+        );
+        // Both given: nobody is asked, whatever the names are.
+        let told = DockerOptions {
+            network: Some("space_default".into()),
+            control: Some("orchestrator:7900".into()),
+            ..lost
+        };
+        let fake = Fake::new(not_found);
+        let docker = DockerLauncher::with_transport(told, fake.clone());
+        assert_eq!(
+            docker.resolved().await.unwrap(),
+            Resolved {
+                network: "space_default".into(),
+                control: "orchestrator:7900".into()
+            }
+        );
+        assert!(fake.calls().is_empty());
     }
 
     /// One answer through a pipe of `pipe` bytes.
@@ -2735,6 +3180,9 @@ mod tests {
             (options.network, options.control, options.self_container),
             (None, None, None)
         );
+        assert_eq!(options.self_hostname, None);
+        assert_eq!(options.memory_mib, 2_048);
+        assert!(!options.instance.is_empty());
     }
 
     /// Where there is no unix socket the launcher says so, in words an

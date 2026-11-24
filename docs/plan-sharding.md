@@ -331,7 +331,11 @@ frames, state dumps and logs in `target/dev/shots/phase6/` and `target/phase6/`)
 
 - **Load reports.** Every orchestrated shard reports once a second (`Shard::report_load`,
   switched on in `start_orchestrated`; a standalone shard reports nothing): players, entities
-  (the ships and bodies it simulates — not ghosts, not far replicas), the tick time's mean, p95
+  (the ships and bodies it simulates — not ghosts, not far replicas — **and, since the review,
+  the transfers it has accepted that are not in its world yet**: staged, or committed and waiting
+  for their tick; in that moment the entity is in neither shard's world, and a draining shard
+  that reported "0 and 0" then could be retired with it in its hands — `Shard::load_report`,
+  `tests/acceptance.rs` `a_load_report_counts_a_transfer_that_is_staged`), the tick time's mean, p95
   (nearest rank: of 30 ticks the 29th) and worst over that second, the ticks it has jumped in
   all, and the hot cell with its player count (ties go to the smallest index). **Deviation:**
   the plan named p95, entities and the hot cell; mean, worst and the jumped ticks were added
@@ -346,23 +350,28 @@ frames, state dumps and logs in `target/dev/shots/phase6/` and `target/phase6/`)
   (`begin_carve`: the node is wanted, a shard is launched, the epoch is proposed when it
   registers), up to `--max-shards` (8); at the limit the refusal names it. Of several hot
   shards the lowest id goes first. **When the hot cell is the shard's whole region** — a
-  one-cell shard, in particular the spawn point's cell once it has a shard of its own, where
-  every player joins — **nothing is done**, and the event log says so once per cooldown: "...
+  one-cell shard — **nothing is done**, and the event log says so once per cooldown: "...
   a region cannot be smaller than a cell (1024 m), so no new shard can take part of this load".
+  **The spawn point's cell** (changed in the review, see "Review of phase 6" below): it is
+  carved only while that relieves somebody — the loaded shard has players outside it; with
+  every player of the shard in it nothing is done and the log says "the spawn cell is at
+  capacity".
   **Added:** a report that names no hot cell (a shard that is slow without players) falls back
   to the old octant split, which works for regions of 1024 km and more only.
 - **In.** **Deviation: the pair is measured as one shard would be** — the players of both
   against one capacity, the tick p95 of both summed against one budget — at or below
   `--scale-in-load` (0.35) for `--scale-in-after` (60 s). The newest shard (highest id) goes
   first, so a cluster that grew and shrinks ends with the shards it began with. **Never
-  merged by the autoscaler:** the shard that owns the spawn point; one of the layout cells
-  `--min-shards` stands for (with 4: the three cells beside the spawn point's — the demo area
-  keeps its four areas, and what comes and goes are the shards the autoscaler added); anybody
-  while the cluster is at `--min-shards`. The layout-cell rule is a decision made while
-  building, after a live run in which a quadrant was merged away while the players were out at
-  a carved cell. An operator's merge (web UI) is held to `--min-shards` only: it may merge a
-  layout cell or the spawn point's shard, and the player port follows the new owner at the
-  commit.
+  merged by the autoscaler** (the list as the review left it): a shard the orchestrator did not
+  launch; one of the layout cells `--min-shards` stands for (with 4: the three cells beside the
+  spawn point's — the demo area keeps its four areas, and what comes and goes are the shards
+  the autoscaler added); anybody while the cluster is at `--min-shards`; a shard whose merge
+  target has no fresh report or no room for the players of both. (Until the review: "the shard
+  that owns the spawn point" instead of the first and the last.) The layout-cell rule is a
+  decision made while building, after a live run in which a quadrant was merged away while
+  the players were out at a carved cell. An operator's merge (web UI) is held to
+  `--min-shards` and to the report-and-room rule: it may merge a layout cell or a shard started
+  by hand, and the player port follows the new owner once that shard has read the commit.
 - **No flapping.** The band between the two thresholds; a load that crosses back starts its
   dwell over; `--scale-cooldown` (30 s) per shard after any action that involved it — also
   after "nothing can be done", and for the shard that takes a region back; one action per
@@ -372,8 +381,8 @@ frames, state dumps and logs in `target/dev/shots/phase6/` and `target/phase6/`)
   `--scale-in-after`, `--scale-cooldown`, `--drain-timeout` (30 s, 45 at most); each has an
   environment form (`SPACE_ORCHESTRATOR_SHARD_CAPACITY`, `_SCALE_OUT_LOAD`, `_SCALE_OUT_AFTER`,
   `_SCALE_IN_LOAD`, `_SCALE_IN_AFTER`, `_SCALE_COOLDOWN`, `_DRAIN_TIMEOUT`); seconds on the
-  command line, ticks inside. Settings without a band (in >= out), a capacity of 0, a dwell of
-  0 or a drain over 45 s are refused at startup. What runs is in `/api/state` ->
+  command line, ticks inside. Settings without a band (in >= out), a capacity of 0 or above 100
+  (a shard refuses the 101st player), a dwell of 0 or a drain over 45 s are refused at startup. What runs is in `/api/state` ->
   `autoscaler.config` and on the page's Autoscaler card, which can still be paused.
 - **Drain, then stop: the premise of a merge changed.** A merge used to need `players == 0` and
   the shard was killed at the commit. Now it needs only the shard's fresh report. At the commit
@@ -438,21 +447,144 @@ frames, state dumps and logs in `target/dev/shots/phase6/` and `target/phase6/`)
   `tests/player_port.rs` and `tests/webui.rs` "no load report" became "the shard's own report,
   not the forged one", because real shards report now.
 - **Not done here, and what still looks wrong.**
-  - **Carving the hot spawn cell moves the load, it does not split it**: the players are all
-    in that cell, so the new one-cell shard takes all of them. And since the spawn point's
-    shard is never removed, a cluster that was busy at the spawn point once keeps that fifth
-    shard (the root's shard, three layout cells, the spawn cell). A crowd in one cell cannot be
-    split (section 1: the smallest area is one cell).
-  - While a shard drains it gets no ghosts and no far replicas from the others (it owns no
-    ground), so for the second or so of a drain its bodies are simulated without their
-    neighbours'.
+  - **Carving the hot spawn cell moved the load, it did not split it** — and that shard was
+    never removed. *Changed in the review:* a spawn cell that holds every player of its shard
+    is not carved, and a shard that was given the spawn cell is merged back when cold. What
+    stays: a crowd in one cell cannot be split (section 1: the smallest area is one cell).
+  - While a shard drains it gets no ghosts from the others (it owns no ground), so for the
+    second or so of a drain its bodies are simulated without their neighbours'. (*Since the
+    review* it does stay a far neighbour, both ways, for its minute of grace.)
   - Seen on the live stack: switching fast travel **off at 775 m/s** (the flight model clamps
     to 120 m/s at once) gave a prediction correction of 23 m on that one tick and a drawn step
     of 7-16 m, a second before a change of shard; the change of shard itself had correction 0.
-    It is the fast-travel toggle, not a border, and was not looked at on the code before this
-    phase (not verified whether it is older).
+    It is the fast-travel toggle, not a border. *Fixed in the review* (it is older: `main` has
+    it): `space-client/src/predict.rs` took the shard's word on fast travel before reconciling
+    with the state that came with it, so the replay never saw the ship leave fast travel and
+    skipped the drop to 120 m/s; and an input that arrived after frames had drawn its tick was
+    applied without carrying the difference in the visual offset
+    (`leaving_fast_travel_at_speed_is_no_correction`,
+    `a_late_input_that_leaves_fast_travel_is_no_step_back`). The first look at the fix on a
+    live stack still showed the drawn ship creep back 6 to 8 cm a frame for a few frames above
+    about 850 m/s: the large offset's decay was bounded by the ship's speed times the *wall*
+    time of the frame, and the tick drawn does not advance by exactly that. It is bounded now
+    by how far the picture has come since the last frame (`OwnShip::last_drawn`,
+    `leaving_fast_travel_is_no_step_back_with_uneven_frames`). Live afterwards: five times
+    off at 760 to 1075 m/s, correction 0.000 m each time, no frame in which the drawn ship
+    moved back (smallest step forward 0.42 m; it waits about 0.4 s for the predicted ship and
+    goes on at 120 m/s).
   - Three body transfers were called off by an epoch change at the start of the cluster (known
     since phase 3, section 5).
+
+**Review of phase 6 (phase 8): the orchestrator's half.** A read-only review of the load
+reports, the autoscaler and the drain found the following; each is fixed in `orchestrator.rs` /
+`autoscale.rs`, each has a test that names its mutation, and each mutation was run
+(`target/phase8/mutations.py`: 43 mutations over this block and the review blocks of sections 6
+and 8, none survives; two did at first — the full set without its removals, and the removals
+of despawned bodies unbudgeted — and each got a test).
+
+- **A map change during a drain stranded the draining shard.** A draining shard is not a shard
+  of the map, so it is told of no further epoch — and a shard answers a handoff offered under
+  another epoch than its own `StaleEpoch`. One more epoch while it drained (a carve, a dead
+  shard's replacement) made every offer it still had to make stale: it was stopped at the drain
+  timeout with its players and bodies. **Now no epoch is proposed while a shard drains**
+  (`Orchestrator::drain_refusal`): the autoscaler is not asked, an operator's and the admin
+  verbs' split and merge are refused with the reason ("shard N is draining ... at most S s
+  from now"), a shard that says hello is told to wait and asks again, and no launch is staged.
+  Bounded by `--drain-timeout` + 5 s. A shard of the map that dies meanwhile is replaced when
+  the drain is over. **The one exception, decided:** the shard being drained *into* dies. The
+  drain cannot end well then, so it is ended at once — the draining shard is stopped as it is,
+  the log says "was draining into shard M, which is gone" — and the dead shard's replacement
+  (which no drain may overlap, and which may be the spawn point's owner) is not held up; what
+  the drained shard held is rebuilt by the replacement's commit, once.
+  (`no_map_change_is_made_while_a_shard_drains`,
+  `a_drain_whose_target_dies_is_ended_at_once_and_the_replacement_is_not_held_up`.)
+- **A drain that ended with bodies lost them for good.** At the timeout, or when the shard died,
+  `end_drain` killed and forgot. Now, when the shard was never told to stop and its last report
+  since the commit did not say 0 entities (or there was none), the scene's revision is raised
+  as after a replacement (`respawn_scene`, `RespawnCause::Drained`): every shard drops the
+  scene's bodies and the spawner builds them afresh; the log says "shard N was stopped before
+  it had handed over everything it simulated: the scene demo-area is re-issued as revision R".
+  While a dead shard waits for its replacement the rebuild is left to that commit. A player it
+  still held is back on the connect screen and joins again — that is not repaired.
+  (`a_drain_that_ends_with_bodies_builds_the_scene_afresh`: six cases.)
+- **A draining shard that was declared dead stayed listed as draining** until the timeout
+  (`mark_dead` now ends its drain: `a_draining_shard_that_is_declared_dead_is_not_left_draining`).
+- **Merges.** A merge target without a fresh report counted as an idle shard: no merge into a
+  shard that has not reported, whoever asks (`merged_load` takes a report, not an option).
+  `--shard-capacity` above `MAX_PLAYERS_PER_SHARD` (100) is refused at startup, and a merge —
+  the autoscaler's or an operator's — is refused when the two shards hold more players
+  together than a shard takes (`merge_room_refusal`:
+  `a_merge_needs_the_targets_report_and_room_for_the_players`).
+- **The spawn cell.** Carved with every player of the loaded shard in it, the new one-cell
+  shard was exactly as loaded, could never be relieved and — the spawn point's owner being
+  exempt — was never merged back. The rule now, in both directions: the spawn cell is carved
+  **only while that relieves somebody** (the loaded shard has players outside it); otherwise
+  nothing is done and the event log says, once per cooldown, "the spawn cell is at capacity:
+  a region cannot be smaller than a cell (1024 m) ...". And a shard that was given the spawn
+  cell **is merged back like any carved cell** when it and the shard around it are cold
+  together; the spawn point is then the surrounding shard's again and the player port follows.
+  The spawn point's owner is no longer exempt from anything; the root's shard has no region
+  around it and is never merged for that reason alone.
+  (`the_spawn_cell_is_carved_only_while_that_relieves_somebody`,
+  `a_crowd_on_the_spawn_point_grows_the_cluster_only_when_that_relieves_somebody`.)
+- **Hand-started shards.** With `--min-shards 0` every shard is started by hand, and each was
+  merged away a minute after it went idle. The autoscaler now merges away only a shard the
+  orchestrator launched; an operator can still merge any
+  (`the_autoscaler_merges_away_only_shards_the_orchestrator_launched`).
+- **The run loop waited for the launcher.** `launcher.kill` and `launcher.poll` were awaited
+  inside the beat, one after the other, and a poll's error was dropped. With the Docker
+  launcher's bounds (10 to 15 s a call) a daemon that hung stopped the orchestrator's clock for
+  that long per shard. Now stops and liveness questions run in tasks and report back like
+  launches (`Orchestrator::drive_launcher`); a launch is asked about once at a time; a failed
+  question, and one open for 5 s, is counted (`launcher_failures`) and written to the event log
+  at most once per 10 s with the count of what was not written
+  (`the_launcher_is_asked_and_told_but_never_waited_for` on the orchestrator's own tick with a
+  launcher that answers, fails, hangs; `tests/lifecycle.rs`
+  `a_launcher_that_never_answers_does_not_stop_the_clock` through the real run loop).
+- **The player port named a new owner of the spawn point before that shard knew it was one**
+  (the flake of `tests/player_port.rs`
+  `after_the_roots_shard_is_replaced_the_player_port_names_the_new_owner`): the answer was
+  published at the commit, which was still in the outbox. The order is fixed, not the test:
+  the scene is queued for the new owner behind the commit, and until its answer to that is in
+  the player port says "starting" (`settle_spawn_owner`,
+  `the_player_port_follows_the_owner_of_the_spawn_point`).
+- **A shard's "I hold nothing"** counts the transfers it has accepted that are not in its
+  world yet (the load-report bullet above).
+- **Tests tightened**: `tests/webui.rs` no longer accepts either of two refusals
+  (`merge_refusal` asks "can a change be made at all" first, so the answer right behind a
+  commit is one), shows "no report" as `null` and never as zeros, reads the entity count from
+  the shard instead of a written-down 46, and `scene_told` skips only the exact repeat of the
+  scene told before — any other stale `SceneUpdate` fails the `assert_eq!`;
+  `the_autoscaler_keeps_the_layout_cells_of_min_shards` runs its second half one shard above
+  the minimum, where the layout rule alone decides.
+- **Not done.** A player on a shard that is stopped at the drain timeout is not handed
+  anywhere (it reconnects through the player port). "No map change during a drain" means a
+  dead shard's ground can be without a simulator for up to the drain timeout longer than
+  before.
+- **Looked at on the live stack** (`dev.ps1 -ServersOnly -PortOffset 300`, capacity 2, out
+  after 5 s, in after 15 s, cooldown 10 s, two headless clients, 2026-11-24; tracks, logs and
+  frames in `target/phase8/` and `target/dev/shots/phase8/`). Two clients on the spawn point
+  for 30 s: four pids, and three times "split shard 103 was not carried out: the spawn cell is
+  at capacity ... All 2 of shard 103's player(s) are in it". Both flown 2 km out: the cells
+  they passed and stopped in carved for shards 107 and 108 (a fifth and sixth pid), handed
+  over in place. One flown back: the empty 107 merged, "drained after 1.1 s (0 players, 0
+  entities)", exit status 0. **A merge with a player standing in the region** (the operator's,
+  through the web UI form — the autoscaler does not merge a pair that holds a player at
+  capacity 2): shard 108 drained after 1.6 s, the player on shard 103 without leaving
+  `online`, drawn step 0.0000 m, correction 0. With one player in the spawn cell and one
+  outside the spawn cell was carved (shard 109 with the showcase's 19 bodies) and, 32 s later
+  and cold, merged back: "drained after 4.1 s", the spawn point shard 103's again. **A second
+  map change forced during a drain**: shard 110 merged with a player standing in it and a
+  layout shard's process killed 0.36 s later — "shard 106 lost: its process exited" at tick
+  27661, nothing proposed and nothing launched while 110 drained, "shard 110 is drained after
+  1.7 s (0 players, 0 entities)" at 27700, stopped with exit status 0 at 27706, the
+  replacement registered at 27708 and its epoch committed at 27710; the player was handed
+  over (step 0.0000 m, correction 0). Both clients `online` in every one of 31 000 sampled
+  frames, 0 validation messages. **Also seen:** one transfer of a player's ship was called
+  off by an epoch change (`EpochChanged`) — the autoscaler merged the idle cell the player
+  was just flying into; the ship went to the region's new owner in the same moment (step
+  0.0000 m at 120 m/s, correction 0). Not looked at: a drain that runs into its timeout, and
+  the death of a merge target, on a live stack (both are unit tests only).
 
 ## 4. One address
 
@@ -911,7 +1043,15 @@ harness, `/state` sampled 100 to 200 times a second, 2026-11-24; tracks and fram
   player, three times a second); a `FarUpdate` carries at most 32 KiB, what does not fit waits a
   tick. `tests/far.rs`: sixty balls 600 m off cost a client under `10 s x (60 x 130 B x 5 + 30 x
   80 B)` and the link under the like; four hundred appearing at once never make an update over
-  the bound; a body at rest costs 44 B per refresh and no frame.
+  the bound; a body at rest costs 44 B per refresh and no frame. **Since the review:** removals
+  are budgeted too (3 000 replicas leaving a player's range at once made one update of 36 kB,
+  which the receiver dropped whole: `removals_are_split_over_far_updates_like_everything_else`);
+  a receiver also counts the updates of a peer, 180 a second (`FAR_UPDATES`); and a shard whose
+  region was merged away stays a far neighbour for the minute it is still heard
+  (`far_neighbours`, `a_shard_that_is_merged_away_stays_a_far_neighbour_while_it_drains`: the
+  other shards' players were told its bodies had gone the moment the map changed, and got them
+  back when the handoffs arrived) — so the far replicas of a shard that died and was replaced go
+  by the silence rule, within three seconds, no longer on the tick of the map change.
 - **One entity, one picture: own > ghost > far, in place.** A guid is one of the three on a
   shard. A far update never touches a guid that is in the world; a guid that enters it (a ghost
   update names it, a handoff installs it) stops being a far replica in the same moment, and its
@@ -926,8 +1066,9 @@ harness, `/state` sampled 100 to 200 times a second, 2026-11-24; tracks and fram
   delivering the far updates three ticks late in `from_local_to_ghost_to_far_replica_without_a_gap`;
   the ghost frame that withdraws it now counts as that shard's word).
 - **Smooth at low rates** (`bodies.rs`). A thing is drawn further in the past the further it is
-  from the own ship (`far::draw_delay`: 2 ticks to 12 m, eased up to a step's spacing + 3.5 ticks
-  from 50 m on — 4.5, 6.5, 9.5, 33.5 — continuous, and a function of the **distance alone**, so
+  from the own ship (`far::draw_delay`: 2 ticks to 12 m, eased up to a step's spacing + 4 ticks
+  from 50 m on — 5, 7, 10, 34; it was + 3.5 until the review, see "Fixed in the review" below —
+  continuous, and a function of the **distance alone**, so
   it does not step when a far replica becomes a ghost and then local). Samples more than a tick
   apart are joined by the cubic that leaves and arrives with the **velocities** they carry — a
   six-metre orbit at 0.8 rad/s sampled once a second is followed within 2 cm, where the straight
@@ -1095,12 +1236,54 @@ drawn by `space-client/src/demo_area.rs`; `scripts/harness/sharding.lua` is its 
   whenever a far replica is sent a little off its cadence the stored sample it carries is that
   much older from then on — for a body the shard simulates the same slip costs nothing, because
   what is sent is its state of that tick. Not fixed here (it is phase 5's code).
+  **Fixed in the review (phase 8), with its cause.** What sent a far replica "a little off its
+  cadence" was the shard's own loss handling: a client acknowledges the highest tick it has
+  applied, once per input batch; when two frames arrive between two batches the older one is
+  *presumed lost* and what it carried is sent again two ticks later — and that re-send set
+  `sent.at`, so the gate for the next sample opened two ticks late, for good. Reproduced in
+  `tests/far.rs` (`a_far_sample_is_relayed_on_the_tick_it_arrives_whatever_the_acknowledgements_do`:
+  a client whose every seventh acknowledgement comes a tick late, the shards stepping in a
+  changing order): under the old gate the delay from a sample's tick to its frame climbs from 1
+  tick to 3 at 10 Hz (every other sample overtaken), 5 at 5 Hz and 21 at 1 Hz within 62 s —
+  the live sawtooth. The fix (`replicate::step_is_due`): a step's spacing is counted **between
+  the samples' ticks** (`Sent::sample`, `ComponentLog::sample_of`; from the last send only for
+  what changed and then stopped), so a far sample is relayed in the frame of the tick it
+  reaches the player's shard, whatever was re-sent in between. **The bound:** a far sample is
+  in a frame of the player's shard 0 to 2 ticks after the tick it is of (0 or 1 when the two
+  shards keep their ticks; 2 when the simulating shard runs a tick late), the same for every
+  sample; the client draws a thing at step 1 / 2 / 3 at least 7 / 10 / 34 ticks behind the
+  newest tick it has heard (`far::draw_delay`: the spacing + 4, up from + 3.5, which was
+  written for one tick between the shards) — two ticks between the shards, one for the frame to
+  reach the client, one of slack. Not covered: a frame that is really lost (its sample comes
+  again when the acknowledgement shows the loss, three ticks later or more) and a shard that
+  stalls. The same review made the loss handling itself sound: a delta entry lists what changed
+  since the last frame **known to have arrived** (`Sent::base`), removals included — listing
+  what changed since the last frame *sent* lost for good any one-off change a lost frame
+  carried, a removed `Origin` or `ShipControls::fast` (`replicate.rs`,
+  `a_change_carried_by_a_lost_frame_is_sent_again`,
+  `an_entity_no_frame_is_known_to_have_brought_is_sent_whole_with_what_it_lost`). On the wire
+  nothing changed. **Looked at on the live stack** (four shards, a client idle on the spawn
+  point for 150 s at 60 frames a second, 8 627 frames): the giant rock's moons (step 3, 7.5 to
+  9.4 m/s) move 0.139 to 0.174 m from one frame to the next against a speed times frame time
+  of 0.139 to 0.174 m, off by 0.6 mm at most (before: frozen and leaping up to 7.1 m in 97 of
+  150 s); the far rock's moons (step 2) 0.092 to 0.117 m, off by 0.1 mm; the drifters' spring
+  pair (step 1) 0.037 m, off by 7.9 mm at most. `sample_age_s` runs from 1 tick to 3, 6 and 30
+  ticks for the three steps, every time: the delay is one tick and stays one. The shard's
+  census line reads `29840 B/s to 1 clients` (30.8 kB/s before; 21.7 kB/s before the 11 far
+  bodies, whose bound is 8 840 B/s: 68 samples of 130 B a second —
+  `the_far_content_costs_an_idle_client_what_its_bound_says` holds the far part to exactly
+  that).
 - **Also seen.** At the start of every four-shard cluster the five drifters' transfers to the
   north shard are called off once by the epoch changes of the shards still joining
   (`EpochChanged`, before any client; section 5 had three) and go through right after; no
   transfer was called off in the hour after. `landed` in the harness state is true at touchdown
   on a rock and mostly false again at rest (26 of 74 frames on the far rock, 9 of 70 on the
-  giant one — and 0 of 236 on the planetoid, so not new). A ship flown into the side of a rock
+  giant one — and 0 of 236 on the planetoid, so not new; **fixed since**: `landed` is the
+  client's prediction, which read it off the last tick's contacts, and a ship at rest is put to
+  sleep by the prediction's solver and reports none — a ship asleep in a pull now counts as
+  standing, `space-client/src/predict.rs`, `a_ship_at_rest_on_the_planetoid_stays_landed`; on
+  the live stack since: `landed` in 1 446 of 1 446 frames over the 25.7 s from touchdown on the
+  planetoid, HUD `gravity 1.98 m/s2  landed`). A ship flown into the side of a rock
   stands there (`landed`, the pull at its feet): Space lifts it along the world's up, not away
   from the rock — one flies off sideways. The rocks' texture is the planetoid's 128 x 64 map on
   a ball of 32 and 80 m: smeared into streaks at the poles, a metre and more per texel. A rock's
@@ -1283,7 +1466,9 @@ compose files, `deploy/Dockerfile.orchestrator`, `deploy/Dockerfile.shard`,
   orchestrator image has it baked in), `--docker-network` (`_DOCKER_NETWORK`),
   `--docker-control-addr` (`_DOCKER_CONTROL_ADDR`), `--docker-publish-ip` (`_DOCKER_PUBLISH_IP`,
   default `0.0.0.0`), `--docker-name-prefix` (`_DOCKER_NAME_PREFIX`, default `space-shard-`;
-  a container's name is the prefix and its host port).
+  a container's name is the prefix and its host port); since the review (below) also
+  `--docker-self` (`_DOCKER_SELF`), `--docker-instance` (`_DOCKER_INSTANCE`) and `--shard-memory`
+  (`_SHARD_MEMORY`, MiB, default 2048, 0 = none).
 - **A shard container**: created and started from the image with `Entrypoint ["space-server"]`
   and `--orchestrator <control> --cluster <id> --bind 0.0.0.0:P --advertise 0.0.0.0:P
   --client-endpoint 0.0.0.0:P`, P one host port of `--host-port-range`, the same number inside
@@ -1309,6 +1494,52 @@ compose files, `deploy/Dockerfile.orchestrator`, `deploy/Dockerfile.shard`,
   (it stops when it loses its own, ids are never reused), so a leftover is dead or about to be,
   and holds a host port. A name that is taken is freed only when its container carries both
   labels; a stranger's container of that name is left alone and the launch fails.
+- **Review of phase 6 (phase 8), in `launcher/docker.rs` and `main.rs`; unit-tested against the
+  in-memory daemon, each test naming its mutation.**
+  *Two stacks on one host:* "this cluster's" was decided by `space.cluster` alone, so two stacks
+  left at the default name removed each other's running shards at every start. A shard
+  container now also carries `space.instance=<instance>` and is "ours" only with all three
+  labels — in the list filter, in what is removed, and in the freeing of a taken name. The
+  instance is made once and kept in `<state>.instance` (the state file itself holds only the id
+  counter, which changes), or given with `--docker-instance` (the local compose file passes the
+  compose project's name); it is not a secret. A stack whose state is lost and that is given no
+  instance does not recognise its old leftovers: their names stay taken, the launch says so and
+  removes nothing. `space.launch` / `space.port` are for the operator and are not read.
+  *Finding itself:* by **name** (`--docker-self`, set by both compose files), then by
+  `$HOSTNAME`; a name the daemon does not know is skipped. The Engine resolves
+  `/containers/<x>/json` by id, name or id prefix, never by host name — `$HOSTNAME` only works
+  while it is the default short id, which it is not in a container recreated from an old one's
+  configuration (Watchtower). With `--docker-network` and `--docker-control-addr` both given
+  nothing is inspected; when it cannot find itself and one of them is missing it says which to
+  set. `deploy/proxy/docker-compose.yaml` fixes `hostname` as well.
+  *The image:* a launch whose creation the daemon answers with 404 (the image was removed while
+  the orchestrator ran) pulls it again, under the pull's 300 s bound, and creates once more. The
+  orchestrator removes no image — an unused image of the shard repository under another tag is
+  also what another stack's or a local build looks like; `deploy/proxy/README.md` has a command.
+  *The container:* `ReadonlyRootfs` (a shard writes no file — checked in `space-server`: the
+  only file access is the stall hook's directory and a secret *file*, neither used by the
+  launcher), `PidsLimit` 1024, `Memory` = `MemorySwap` = `--shard-memory`, `User` `10001:10001`
+  by number. *The secret* is taken out of the daemon's words before they are cut to 300
+  characters, not after. *Watchtower:* the docs said `stop_grace_period` gives the old
+  orchestrator its time; under Watchtower it is Watchtower's own stop timeout (10 s by default;
+  `WATCHTOWER_TIMEOUT=30s`) — corrected, **not executed**.
+  **Executed for the review** (Docker Desktop 28.5.1, the images rebuilt from the two real
+  Dockerfiles, compose project `space-phase6` on offset ports, 2026-11-24): four shard
+  containers with `space.instance=space-phase6`, user `10001:10001`, `ReadonlyRootfs` (a
+  `touch /tmp/x` in one: "Read-only file system"), `PidsLimit` 1024, `Memory` = `MemorySwap` =
+  2 GiB, no mount; a host client joined through the player port, 46 bodies, two crossings
+  (drawn step 2.2 and 3.1 mm, correction 0); a second compose project beside it, **with the
+  same cluster name**: `up -d --force-recreate` of the first's orchestrator, and a `docker
+  kill` of it followed by a start ("4 leftover shard containers of cluster "space-phase6-a"
+  (instance "space-phase6") removed") — the second project's four shards kept their container
+  ids throughout, and the other way round; the orchestrator recreated with a **stale host
+  name** (`hostname: 0ld1d0ld1d00`, what Watchtower leaves) started as before, and with a
+  wrong `SPACE_ORCHESTRATOR_DOCKER_SELF` on top it refused to start saying which variable to
+  set; scale-out to a fifth and sixth container, scale-in ("drained after 4.1 s" and "0.9 s",
+  exit status 0, both containers removed); `compose down -v` of each left no container,
+  network or volume; the secrets in none of the logs. **Not executed:** Watchtower itself and
+  its stop timeout; an image removed while the orchestrator runs (the 404 path: unit test
+  only); the image clean-up command; anything on a Linux host.
 - **SIGTERM / Ctrl-C.** The orchestrator leaves its loop and the launcher force-removes
   everything it started under one 20 s bound, then the process exits 0 (compose:
   `stop_grace_period: 30s`). **One new crate in the lockfile for it: `signal-hook-registry`**

@@ -1249,3 +1249,93 @@ async fn the_process_launcher_starts_real_shards_and_replaces_one_that_is_killed
     }
     let _ = std::fs::remove_dir_all(&log_dir);
 }
+
+/// A launcher that starts nothing and, once asked whether what it started is
+/// alive — or told to stop it — never answers: a container daemon that hangs.
+#[derive(Debug, Default)]
+struct SilentLauncher {
+    asked: std::sync::atomic::AtomicU32,
+}
+
+impl Launcher for SilentLauncher {
+    async fn spawn(
+        &self,
+        spec: space_orchestrator::launcher::SpawnSpec,
+    ) -> Result<space_orchestrator::launcher::ShardHandle, space_orchestrator::launcher::LaunchError>
+    {
+        Ok(space_orchestrator::launcher::ShardHandle {
+            launch: spec.launch,
+            shard: None,
+            endpoint: SocketAddr::from(([127, 0, 0, 1], spec.host_port)),
+            process: "nothing".into(),
+        })
+    }
+
+    async fn kill(
+        &self,
+        _launch: LaunchId,
+    ) -> Result<(), space_orchestrator::launcher::LaunchError> {
+        std::future::pending().await
+    }
+
+    async fn poll(
+        &self,
+        _launch: LaunchId,
+    ) -> Result<space_orchestrator::launcher::Poll, space_orchestrator::launcher::LaunchError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// The run loop does not wait for its launcher: with a launcher that never
+/// answers a liveness question, the orchestrator's clock runs on, snapshots
+/// are published and an operator is answered.
+///
+/// Mutation this catches (run): awaiting `launcher.poll` — or `kill` — in the
+/// beat (the state before: the loop stood still for as long as the launcher
+/// took; with the Docker launcher's bounds, 10 to 15 s per shard with a
+/// daemon that hangs. Here: for ever, and the tick never moves again).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launcher_that_never_answers_does_not_stop_the_clock() {
+    let launcher = Arc::new(SilentLauncher::default());
+    let config = OrchestratorConfig {
+        cluster: "silent".into(),
+        min_shards: 1,
+        launcher: LauncherKind::Process,
+        host_port_range: free_port_range(2),
+        ..OrchestratorConfig::default()
+    };
+    let orch = Running::start("silent", config, Arc::clone(&launcher));
+    // The launch "started" (nothing registers), and the loop asks about it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while launcher.asked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the launcher was never asked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // That question is never answered. Two seconds of ticks later the loop
+    // is still beating —
+    let asked_at = orch.ops.snapshot().tick;
+    let later = orch
+        .wait_for("the clock to run on", Duration::from_secs(20), |s| {
+            s.tick >= asked_at + 60
+        })
+        .await;
+    assert!(later.tick >= asked_at + 60);
+    // — still answers an operator —
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        orch.ops
+            .request(space_orchestrator::ops::OperatorCommand::PauseAutoscaler),
+    )
+    .await
+    .expect("an operator is answered while the launcher hangs")
+    .expect("the loop is there");
+    assert!(reply.accepted, "{reply:?}");
+    // — and has asked once, not once per poll interval.
+    assert_eq!(
+        launcher.asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a question that is open is not asked again"
+    );
+    orch.stop().await;
+}
