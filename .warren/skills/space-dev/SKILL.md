@@ -49,8 +49,11 @@ The **wall-clock-sensitive** tests — space-client's `tests/seamless.rs` and `t
 client through real shard loops in real time — have a serial nextest group of their own (`timing`, four
 test slots each, decided before `gpu`; `TIMING_TESTS` in xtask); in the fallback they run with their
 package, after everything else, one at a time. Their bounds are taken around each change of shard and
-compared with the same flight away from one (module docs of `seamless.rs`); do not add a test that
-compares a whole-flight maximum with the test's own `Instant::now()`. `SPACE_SKIP_TIMING=1` skips
+compared with the same flight away from one (module docs of `seamless.rs`), or against the **ticks**
+of the states the link showed (`handoff.rs`'s `Flight`: a state `n` ticks newer is `n/30 s` of flight
+further, whenever its frame arrived; a failure prints the states around it, `SPACE_HANDOFF_TRACE=1`
+prints them anyway); do not add a test that compares a whole-flight maximum with the test's own
+`Instant::now()` or with the time frames arrived at. `SPACE_SKIP_TIMING=1` skips
 `seamless.rs` (the CI's second, renderer-only pass over space-client sets it). Tests that need a tick
 clock set the time themselves (`space_server::clock::ManualTime`, `Pacer`) instead of sleeping.
 Baseline history: Phase 8 394 passed; after the audit 557; after the online-only rework
