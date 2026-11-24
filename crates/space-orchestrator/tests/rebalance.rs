@@ -135,6 +135,7 @@ fn report(s: ShardId, players: u32) -> LoadReport {
         players,
         tick_p95_ms: 1.0,
         load: 0.0,
+        ..Default::default()
     }
 }
 

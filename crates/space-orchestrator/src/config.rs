@@ -31,10 +31,11 @@ pub const EPOCH_ACK_TIMEOUT_TICKS: u64 = 90;
 /// [`crate::autoscale::SCALE_COOLDOWN_TICKS`] and the hysteresis band.
 pub const MIN_EPOCH_INTERVAL_TICKS: u64 = 90;
 
-/// How often a shard reports its load, in ticks (1 s).
+/// How often a shard reports its load, in ticks (1 s;
+/// `space_server::load::REPORT_INTERVAL_TICKS` is the shard's side of it).
 ///
 /// (A shard is declared dead — H15 — when its process exits or its control
-/// link closes, not for a missed report: no shard sends one yet.)
+/// link closes, not for a missed report.)
 pub const LOAD_REPORT_INTERVAL_TICKS: u64 = 30;
 
 /// How long a shard's last load report is believed, in ticks (3 s: three missed
@@ -46,6 +47,11 @@ pub const LOAD_REPORT_INTERVAL_TICKS: u64 = 30;
 /// silence is long enough to ride out a late report and short enough that a
 /// stale one never completes a dwell on its own.
 pub const REPORT_EXPIRY_TICKS: u64 = 3 * LOAD_REPORT_INTERVAL_TICKS;
+
+/// How long a shard that was told to stop ([`space_protocol::ShardRetire`])
+/// is given to end by itself before its link is closed and its process or
+/// container stopped, in ticks (5 s).
+pub const RETIRE_GRACE_TICKS: u64 = 5 * TICK_HZ;
 
 /// How long a shard the orchestrator started may take to register before the
 /// launch is given up, in ticks (30 s).
@@ -75,8 +81,9 @@ pub const LAUNCH_BACKOFF_MAX_TICKS: u64 = 30 * TICK_HZ;
 ///
 /// `Local` runs shards inside the orchestrator's own process (tests, and a
 /// single-container deployment); `Process` starts the `space-server` executable
-/// lying next to the orchestrator's own, one process per shard; `Docker` is the
-/// container launcher (a later slice).
+/// lying next to the orchestrator's own, one process per shard; `Docker`
+/// starts one container per shard through the Docker Engine's socket
+/// ([`crate::launcher::docker`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LauncherKind {
     /// In-process launcher.
@@ -84,7 +91,7 @@ pub enum LauncherKind {
     Local,
     /// One `space-server` process per shard.
     Process,
-    /// Docker launcher (later slice).
+    /// One container per shard, through the Docker socket.
     Docker,
 }
 
@@ -185,6 +192,15 @@ pub struct OrchestratorConfig {
     /// the instant of tick 0, handed to every shard in its welcome so all of
     /// them count the same ticks, a replacement started later included.
     pub tick_origin_us: i64,
+    /// The autoscaler's settings: when a loaded shard is relieved by a new
+    /// one, when an idle one is merged away, and how long it is given to
+    /// hand everything over (`--shard-capacity`, `--scale-out-load`,
+    /// `--scale-out-after`, `--scale-in-load`, `--scale-in-after`,
+    /// `--scale-cooldown`, `--drain-timeout`; [`crate::autoscale`]).
+    pub scale: crate::autoscale::ScaleConfig,
+    /// What the launcher starts shards from, in words, for the operator view
+    /// (the `docker` launcher: the image and the network; empty otherwise).
+    pub launcher_note: String,
 }
 
 impl Default for OrchestratorConfig {
@@ -208,6 +224,8 @@ impl Default for OrchestratorConfig {
             shard_exe: None,
             shard_log_dir: PathBuf::from("."),
             cluster_secret: None,
+            scale: crate::autoscale::ScaleConfig::default(),
+            launcher_note: String::new(),
         }
     }
 }

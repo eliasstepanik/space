@@ -92,10 +92,10 @@ impl ControlPlane {
             scene: SceneStore::in_memory(config.initial_scene),
             cluster_secret: config.cluster_secret.clone().unwrap_or_default(),
             secret_required: config.secret_required(),
+            autoscaler: Autoscaler::with_config(config.scale),
             config,
             ids,
             publisher,
-            autoscaler: Autoscaler::new(),
             peer_token: Secret::new(peer_token),
             unclaimed_root_owner: None,
         }
@@ -1660,6 +1660,7 @@ mod tests {
             players: 90,
             tick_p95_ms: 1.0,
             load: 0.0,
+            ..Default::default()
         };
         // Below the dwell: no action yet.
         assert_eq!(plane.handle_load_report(&report, 10), None);

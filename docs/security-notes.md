@@ -101,7 +101,12 @@ describes current behaviour, not intent.
 4. **A registered shard is believed about itself.** It advertises its own
    address, which the orchestrator publishes to every shard and (through
    redirects) to clients; its load reports, its epoch acks and what it says
-   about its scene are taken at its word — a `SceneAck` naming a revision a
+   about its scene are taken at its word — a load report is what the
+   autoscaler acts on: a shard that reports itself loaded has its hot cell
+   carved for a new shard (a process or a container is started, up to
+   `--max-shards`, once per cooldown), one that reports itself idle may be
+   merged away, and a draining shard that says "0 players, 0 entities" is told
+   to stop; a `SceneAck` naming a revision a
    little ahead of the cluster's makes the orchestrator re-issue the scene
    above it (at most once a second, never further than
    `MAX_REVISION_CATCH_UP`), and a shard that acknowledges a map change it did
@@ -219,7 +224,14 @@ tell it anyway.
   clients (or one host that opens a hundred links) fill it; from then on a
   join is answered `Full` there, while the player port keeps sending new
   players to it. Idle eviction, a queue, or spreading newcomers over the
-  shards around the spawn point are not built.
+  shards around the spawn point are not built. **What the autoscaler does
+  about it** (`docs/plan-sharding.md` §3): when that shard's load stays at
+  0.8 of its capacity for 10 s, the spawn point's cell is carved for a shard
+  of its own — once. That *moves* the crowd (it is all in that cell), it
+  does not split it; from then on the hot cell is the shard's whole region, a
+  region cannot be smaller than a cell (1024 m), and the autoscaler does
+  nothing and says so in the event log once per cooldown. The limit of 100
+  stands.
 * **A shard is believed about its client endpoint** as it is about its
   endpoint (deferred item 4): a registered shard — any local process on a
   secretless loopback control port — can advertise any address, and players
@@ -230,16 +242,86 @@ tell it anyway.
   point answers a fresh join with the same `JoinRedirect`; a client follows
   at most two in a row and then gives up with a readable reason, so two
   shards that disagree about the map cannot bounce it for ever.
-* **Reachability is not solved here.** Shards started by the `process`
+* **Reachability depends on the launcher.** Shards started by the `process`
   launcher bind loopback and advertise `0.0.0.0:<port>` to players; a player
   on another machine is told to dial `<entry host>:<port>` and reaches
-  nothing unless those ports are forwarded. Publishing shards is a later
-  phase (`docs/plan-sharding.md`).
+  nothing unless those ports are forwarded. Shards started by the `docker`
+  launcher (the compose files) publish their port on the host — on every
+  interface by default (`--docker-publish-ip`): the shards' ports
+  (7870-7899/udp) are as public as the player port and have to be open in
+  the host's firewall. See "The Docker socket" below.
+
+## The Docker socket (`space-orchestrator --launcher docker`)
+
+With the `docker` launcher the orchestrator creates, starts, stops and removes
+one container per shard through the Docker Engine's socket
+(`launcher/docker.rs`), and both compose files mount `/var/run/docker.sock`
+into the orchestrator's container for it.
+
+**Whoever can talk to that socket can start a privileged container and mount
+the host's disk. The orchestrator's container is root-equivalent on the
+host** — whether the user inside it is root or not: it is not (uid 10001),
+and compose's `group_add: DOCKER_GID` is exactly what gives it the socket.
+
+What is done:
+
+* **Nothing a player or a shard sends reaches a Docker call.** Every parameter
+  of every call — image, command, ports, network, labels, names — comes from
+  the orchestrator's configuration and its own launch counter, and from the
+  daemon's own answers (container ids). A shard's hello, load report or ack
+  never names an image, a command, a port or a label. What a peer *can* cause
+  is that a call is made at all: a shard that reports load gets a new shard
+  started (deferred item 4), up to `--max-shards`.
+* **A shard container is given nothing**: no socket, no mount, every
+  capability dropped (`CapDrop: ALL`), `no-new-privileges`, not privileged,
+  no restart policy. A shard faces players; the orchestrator does not let it
+  near the daemon.
+* **Only this cluster's containers are removed.** The removal of leftovers at
+  start, and the path that frees a container name that is taken (the daemon's
+  409), touch only containers that carry both of this cluster's labels
+  (`space.cluster=<cluster>`, `space.role=shard`). A stranger's container of
+  the same name is left alone and the launch fails.
+* **The cluster secret travels in the container's environment**
+  (`SPACE_CLUSTER_SECRET`), never in its command, and is scrubbed from every
+  error text the launcher returns. It is visible to anyone who can `docker
+  inspect` on the host — that is, to the root-equivalent only.
+* **Every call is bounded** (10 s; 15 s a remove; 300 s a pull; 20 s for
+  removing everything at shutdown) and answers are read under size limits: a
+  daemon that does not answer is a failed launch, not a hung orchestrator.
+* **The control port stays unpublished**, and **the web UI stays off in
+  production** (loopback and a token locally). The web UI is the one way to
+  operate the orchestrator from outside, and it can split and merge — that is,
+  start and stop containers. Leave it off on a host with the socket mounted
+  unless you need it.
+
+What is not done:
+
+* **No socket proxy.** The orchestrator holds the whole Engine API, of which
+  it needs a few calls. An operator who wants less can put a filtering proxy
+  between the orchestrator and the socket that allows only: containers
+  create / start / inspect / delete / list, images inspect / create (the
+  pull), and point `--docker-socket` at it. That is a recommendation; no
+  such setup was tested here.
+* **The shard image's name is trusted.** Whoever can change the orchestrator's
+  environment (`SPACE_ORCHESTRATOR_SHARD_IMAGE`) or move the registry tag it
+  names runs code as a container on the host. No digest is pinned and no
+  signature checked. No registry credential is handled: a private image is
+  pulled by the operator before the orchestrator starts.
+* **Shard ports are published on every interface** by default
+  (`--docker-publish-ip 0.0.0.0`), with no per-source limit on any of them
+  (as on the player port).
+* **A killed orchestrator leaves its shards behind** for about 10 s (QUIC's
+  idle timeout), then as exited containers until its next start removes them.
+  Stopped with SIGTERM it removes them itself.
 
 ## Orchestrator web UI (`space-orchestrator --webui`)
 
 An admin surface: it shows cluster state and can split, merge, pause the
 autoscaler, re-send the map and switch the scene on every shard. Off by default.
+A split launches a shard and a merge ends in one being stopped: with
+`--launcher process` or `docker` whoever operates the page starts and stops
+processes or containers (never with parameters of their choosing: "The Docker
+socket" below).
 
 * **Transport and auth.** Plain HTTP (no TLS in-tree, by project rule) with HTTP
   Basic auth: any user name, the token as the password, compared in constant
@@ -371,5 +453,5 @@ shard does (`skills/space-visual-test/SKILL.md`).
 ## Known limitations (Phase 3 close-out)
 
 * The H13 frame-gap test relies on lockstepped harness ticks; production continuity rests on the separately-tested commit-gate machinery.
-* The Dockerfiles and compose files are correct-by-inspection only (no Docker daemon in CI).
+* The Dockerfiles and compose files were correct-by-inspection only at that time (no Docker daemon in CI). What has been built and run since, and what has only been parsed: `deploy/README.md`, "What is and is not verified".
 * The Phase-4 present path (swapchain) is validated by build + clippy only (no window system in CI).

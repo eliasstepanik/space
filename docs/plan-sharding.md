@@ -31,7 +31,10 @@ lifts the hold (phase 7).
 Checked in code unless marked otherwise. Written before any of this was built: section 1 is
 implemented now, so what is said here about `split_plan`, `validate`, `merge_target`,
 `recipients`, `scene_anchor` and `free_spawn_point` describes the code *before* it (see the status
-note under section 1 for what they do now). Everything else still stands.
+note under section 1 for what they do now). (Note, 2026-11-24: sections 2 to 6 and 8 are built
+since, phase 6 being the last. The bullets below about the hello, the launchers, load reports,
+merges, the cluster tick, the handoff and the client likewise describe the code *before*; each
+section's status block says what it does now.)
 
 - The map is `ShardMap { epoch, regions }`; a region is an octree node `depth:x:y:z` (depth 64 =
   one 1024 m cell) with an owner and one endpoint. Lookup = the deepest region holding the position.
@@ -116,7 +119,9 @@ above:
   control link, so with a third shard disconnected a split is accepted, launched and then rolled
   back at the deadline (the event log names who did not ack) instead of being refused up front.
 - A merge still needs the shard's own fresh `LoadReport` saying it has no players, and no shard
-  sends one yet: the tests that merge a carved cell say so on the shard's behalf.
+  sends one yet: the tests that merge a carved cell say so on the shard's behalf. (Since phase 6,
+  section 3: shards report, and a merge needs the report but no empty shard — the shard drains
+  after the commit.)
 - The spawn point is a function of the **map** (`scene_anchor`), not of the installed scene: a
   shard nobody gave a scene still puts its players on the point its clients measure from.
 - A shard that does **not** own the spawn point still puts a joiner on its own region's centre
@@ -168,8 +173,8 @@ One path for every shard, launched or started by hand: **start without a region,
   the `peer_token` and is refused without it - shard ports become public in section 4, so map
   membership alone is no longer enough.
 
-**Status: built (phase 1, second half), except the `docker` launcher (section 8).** What it
-became, and where it differs from the bullets above:
+**Status: built (phase 1, second half), except the `docker` launcher (section 8; built in
+phase 6).** What it became, and where it differs from the bullets above:
 
 - **Hello** (`Orchestrator::handle_shard_hello -> Result<ShardWelcome, HelloRefusal>`): a hello
   without id and region is given, in this order, the unclaimed root; the regions of a **dead**
@@ -292,7 +297,11 @@ became, and where it differs from the bullets above:
   timeout, about 11 s, and stop by themselves; the pid file of a killed orchestrator still lists
   them). **Since phase 2 (section 4)** the player port exists: a client that lost its shard dials
   its entry address again and is sent to the replacement, and a shard no longer puts a joiner on
-  its region's centre - the two remarks above about that are history.
+  its region's centre - the two remarks above about that are history. **Since phase 6 (sections 3
+  and 8)** the `docker` launcher is built; the orchestrator leaves its loop on SIGTERM or Ctrl-C
+  and the launcher stops what it started (`Launcher::shutdown`, the `process` launcher too); and
+  a merged shard is no longer stopped at the commit: it drains and is told to stop
+  (`ShardRetire`), so "a merged shard" in the supervision bullet above is history as well.
 
 ## 3. Load and autoscaling
 
@@ -308,6 +317,142 @@ became, and where it differs from the bullets above:
   kept, and peers keep accepting a shard for a while after a map change removed it.
 - Capacity, thresholds and dwell times become flags, so a test can make the cluster scale with a
   handful of clients.
+
+**Status: built (phase 6).** What it became, where it differs from the bullets above, and what
+was measured. The code: `space-server/src/load.rs` (the report), the orchestrator's
+`autoscale.rs` (the decision, a pure function of loads, tick and prior state; `ScaleConfig`) and
+`orchestrator.rs` ("Scaling": `shard_loads`, `scale_out`, `begin_drain`, `drain_pass`,
+`drain_ended`), `space-server/src/shard.rs` (`report_load`, `load_report`, `note_departing`,
+`knows_shard`). Live numbers are from `dev.ps1 -ServersOnly -PortOffset 300` with
+`SPACE_ORCHESTRATOR_SHARD_CAPACITY=2`, `_SCALE_OUT_AFTER=5`, `_SCALE_IN_AFTER=15`,
+`_SCALE_COOLDOWN=10` (the `process` launcher, release build, two headless clients at 60 frames a
+second on the harness, `/state` sampled about 190 times a second, 2026-11-24; raw samples,
+frames, state dumps and logs in `target/dev/shots/phase6/` and `target/phase6/`).
+
+- **Load reports.** Every orchestrated shard reports once a second (`Shard::report_load`,
+  switched on in `start_orchestrated`; a standalone shard reports nothing): players, entities
+  (the ships and bodies it simulates — not ghosts, not far replicas), the tick time's mean, p95
+  (nearest rank: of 30 ticks the 29th) and worst over that second, the ticks it has jumped in
+  all, and the hot cell with its player count (ties go to the smallest index). **Deviation:**
+  the plan named p95, entities and the hot cell; mean, worst and the jumped ticks were added
+  (the last is section 5's "says so in its load report"). The tick time is measured around
+  `Shard::tick` — the simulation and the building of frames, not the socket writes. A report is
+  taken only from the connection that was welcomed as that shard (the rule of section 2), from a
+  draining shard too, and is shown per shard in `/api/state` (`load_report`: `players`,
+  `entities`, `tick_mean_ms`, `tick_p95_ms`, `tick_max_ms`, `ticks_jumped`, `hot_cell { cell,
+  players }`, `load_metric`) and in the page's shard table.
+- **Out.** Load = `max(players / capacity, tick p95 / 33.3 ms)` at or above `--scale-out-load`
+  (0.8) for `--scale-out-after` (10 s): the shard's hot cell is carved for a new shard
+  (`begin_carve`: the node is wanted, a shard is launched, the epoch is proposed when it
+  registers), up to `--max-shards` (8); at the limit the refusal names it. Of several hot
+  shards the lowest id goes first. **When the hot cell is the shard's whole region** — a
+  one-cell shard, in particular the spawn point's cell once it has a shard of its own, where
+  every player joins — **nothing is done**, and the event log says so once per cooldown: "...
+  a region cannot be smaller than a cell (1024 m), so no new shard can take part of this load".
+  **Added:** a report that names no hot cell (a shard that is slow without players) falls back
+  to the old octant split, which works for regions of 1024 km and more only.
+- **In.** **Deviation: the pair is measured as one shard would be** — the players of both
+  against one capacity, the tick p95 of both summed against one budget — at or below
+  `--scale-in-load` (0.35) for `--scale-in-after` (60 s). The newest shard (highest id) goes
+  first, so a cluster that grew and shrinks ends with the shards it began with. **Never
+  merged by the autoscaler:** the shard that owns the spawn point; one of the layout cells
+  `--min-shards` stands for (with 4: the three cells beside the spawn point's — the demo area
+  keeps its four areas, and what comes and goes are the shards the autoscaler added); anybody
+  while the cluster is at `--min-shards`. The layout-cell rule is a decision made while
+  building, after a live run in which a quadrant was merged away while the players were out at
+  a carved cell. An operator's merge (web UI) is held to `--min-shards` only: it may merge a
+  layout cell or the spawn point's shard, and the player port follows the new owner at the
+  commit.
+- **No flapping.** The band between the two thresholds; a load that crosses back starts its
+  dwell over; `--scale-cooldown` (30 s) per shard after any action that involved it — also
+  after "nothing can be done", and for the shard that takes a region back; one action per
+  out-dwell in the whole cluster; one epoch change at a time (section 2).
+- **Settings.** `--shard-capacity` (100; that is also the most a shard takes,
+  `MAX_PLAYERS_PER_SHARD`), `--scale-out-load`, `--scale-out-after`, `--scale-in-load`,
+  `--scale-in-after`, `--scale-cooldown`, `--drain-timeout` (30 s, 45 at most); each has an
+  environment form (`SPACE_ORCHESTRATOR_SHARD_CAPACITY`, `_SCALE_OUT_LOAD`, `_SCALE_OUT_AFTER`,
+  `_SCALE_IN_LOAD`, `_SCALE_IN_AFTER`, `_SCALE_COOLDOWN`, `_DRAIN_TIMEOUT`); seconds on the
+  command line, ticks inside. Settings without a band (in >= out), a capacity of 0, a dwell of
+  0 or a drain over 45 s are refused at startup. What runs is in `/api/state` ->
+  `autoscaler.config` and on the page's Autoscaler card, which can still be paused.
+- **Drain, then stop: the premise of a merge changed.** A merge used to need `players == 0` and
+  the shard was killed at the commit. Now it needs only the shard's fresh report. At the commit
+  the shard owns nothing and **drains** (role `draining` in `/api/state` and on the page):
+  everything it simulates lies on another shard's ground and is offered there by the ordinary
+  handoff, its players redirected as at any crossing. The other shards go on hearing a shard
+  that left the map for `FORMER_SHARD_GRACE_TICKS` = 60 s (`Shard::knows_shard`,
+  `peer_endpoint`) — which is why the drain timeout is capped at 45 s. The orchestrator keeps
+  the reports; when one that arrived **after** the commit says 0 players and 0 entities it sends
+  `ShardRetire` (tag 32). The shard prints `space-server: shard N stops: the orchestrator
+  retired it (...)`, stops and **exits 0** — the one orderly end of an orchestrated shard. The
+  orchestrator logs `shard N is drained after X s (0 players, 0 entities) and is told to stop`
+  and `shard N stopped as it was told (exit status 0)` (the status is the launcher's:
+  `Launcher::exit_code`, which the `process` and `docker` launchers have), closes the link and
+  reaps the process or removes the container. Not drained within `--drain-timeout`: stopped as
+  it is, with a warning that names what it still held ("what it held is gone"). Told to stop
+  and still there after 5 s (`RETIRE_GRACE_TICKS`): link closed, process stopped. A shard that
+  dies while draining is said to have, and nobody is replaced: it owned nothing. A draining
+  shard does not count towards `--min-shards`.
+- **Measured in the fixture** (`space-server/tests/four_cells.rs`,
+  `a_shard_whose_region_is_merged_away_hands_everything_over_and_is_empty`): the diagonal cell's
+  shard with 7 scene bodies and a standing player is empty after 32 ticks, 0 transfers called
+  off, no resting body moved 1 cm.
+- **On the live stack.** Four shards after 1.2 s; idle reports: 0 players, 19/3/6/7 entities,
+  tick mean 0.5-0.7 ms, p95 0.6-1.0 ms, load 0.02-0.03. Two clients joined at the spawn point
+  and lifted off: 5.2 s after the second was online the root's shard (2 of 2 players in cell
+  `64:8388608:8388608:8388608`, load 1.0) was relieved — wanted, launched, registered and
+  committed within 2 ticks of each other on the orchestrator's clock (tick 843 -> 845); both
+  players were handed over 1.1 s later while moving at 5.7 m/s: drawn step 5.7 mm and 3.6 mm,
+  correction 0, 35 bodies listed throughout, 21 of the scene's entities went with the cell.
+  Then, once per about 45 s: "split shard 92 was not carried out: 2 of shard 92's 2 player(s)
+  are in one cell, and that cell is its whole region...". Both flew 1.9 km out in fast travel:
+  5 s after they stopped the root's shard was relieved at cell `64:8388609:...` (a sixth
+  process; handed over in place: 5.1 mm, correction 0). Both flew back: 15 s and the cooldown
+  later `merge shard 93: epoch 7 proposed`, committed in the same tick, `drained after 0.8 s`,
+  `stopped as it was told (exit status 0)` 11 ticks later; its pid left `launched-shards.pid`
+  (six pids, then five); nobody was sent to the connect screen; no player's transfer was called
+  off. In an earlier run of the same day, before the layout-cell rule, a layout quadrant with 7
+  scene bodies was merged instead: `drained after 0.9 s`, and another with 6 bodies `after
+  4.3 s`, exit status 0 both. Four flying crossings of x = -6 afterwards at 25-65 m/s: drawn
+  step 4.5 / 5.6 / 6.7 / 11.4 mm, corrections 0. `scripts/harness/smoke.lua` passed (a third
+  client, exit 0). Both clients ended with 0 validation messages.
+- **Tests.** Each names its mutation and each mutation was run (35 of them,
+  `target/phase6/mutations.py`; three survived the first run and the tests were tightened until
+  none did). `space-server/src/load.rs` (4 unit tests); `tests/four_cells.rs` (the drain above,
+  `a_shard_reports_its_load_once_a_second`); `tests/orchestrated.rs`
+  (`a_shard_told_to_stop_ends_in_an_orderly_way`); `autoscale.rs` (the decision table, the pair
+  load, the cooldown, the hot-cell target, the settings); `orchestrator.rs`
+  (`a_merged_shard_drains_and_is_told_to_stop_only_when_it_is_empty`,
+  `a_drain_that_does_not_end_is_cut_short`,
+  `a_shard_is_merged_on_its_report_and_a_pair_only_when_cold_together`,
+  `the_autoscaler_never_removes_the_spawn_points_shard_nor_goes_below_the_minimum`,
+  `the_autoscaler_keeps_the_layout_cells_of_min_shards`,
+  `the_cluster_grows_at_the_hot_cell_and_shrinks_again_by_draining` — the whole loop on the
+  orchestrator's own tick, no sleeps — `a_loaded_shard_is_not_relieved_beyond_max_shards`);
+  `main.rs` (the scale flags).
+- **Tests whose premise changed.** The merge tests that held "only an empty shard is merged"
+  and "the merged shard is killed at the commit": in `orchestrator.rs` they are now
+  `a_merged_shard_drains...`, `a_shard_is_merged_on_its_report...` and
+  `an_operator_merge_needs_a_report_and_the_shard_drains_after_the_commit`; the two cold-merge
+  tests of `tests/split_merge.rs` now play the drain; in `tests/lifecycle.rs`,
+  `tests/player_port.rs` and `tests/webui.rs` "no load report" became "the shard's own report,
+  not the forged one", because real shards report now.
+- **Not done here, and what still looks wrong.**
+  - **Carving the hot spawn cell moves the load, it does not split it**: the players are all
+    in that cell, so the new one-cell shard takes all of them. And since the spawn point's
+    shard is never removed, a cluster that was busy at the spawn point once keeps that fifth
+    shard (the root's shard, three layout cells, the spawn cell). A crowd in one cell cannot be
+    split (section 1: the smallest area is one cell).
+  - While a shard drains it gets no ghosts and no far replicas from the others (it owns no
+    ground), so for the second or so of a drain its bodies are simulated without their
+    neighbours'.
+  - Seen on the live stack: switching fast travel **off at 775 m/s** (the flight model clamps
+    to 120 m/s at once) gave a prediction correction of 23 m on that one tick and a drawn step
+    of 7-16 m, a second before a change of shard; the change of shard itself had correction 0.
+    It is the fast-travel toggle, not a border, and was not looked at on the code before this
+    phase (not verified whether it is older).
+  - Three body transfers were called off by an epoch change at the start of the cluster (known
+    since phase 3, section 5).
 
 ## 4. One address
 
@@ -396,7 +541,11 @@ became, and where it differs from the bullets above:
 - **Not done here**: shards the `process` launcher starts still **bind loopback**, so a player on
   another machine is sent to `<entry host>:<port>` and reaches nothing - publishing shards is
   section 8's. The compose files are untouched: they run one hand-started shard without a player
-  port, and players dial that shard as before. A player who comes back after its shard died
+  port, and players dial that shard as before.
+  (Since phase 6, section 8: the `docker` launcher's shards bind the wildcard and publish their
+  port on the host, and both compose files run the orchestrator alone, with the player port
+  published. The `process` launcher's shards still bind loopback.) A player who comes back after
+  its shard died
   starts on the spawn point again (nothing of a player is kept across a shard's death). A client
   notices a dead shard through QUIC's idle timeout (about 10 s) before it dials the entry again.
   The player port has no per-source limit, and the spawn point's shard takes 100 players and
@@ -459,7 +608,8 @@ measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-proc
   its clients (`SceneClock::cluster(origin)`), set once and never re-anchored. `main`'s
   wall-clock re-anchoring (`Shard::sync_scene_clock`, 30 ms tolerance) was called by neither
   binary any more and by nothing else; it and its test were removed in the review. (c) "Says so in its load
-  report" is not built: no shard sends a load report yet (section 3). Measured: three shards
+  report" is not built: no shard sends a load report yet (section 3; built in phase 6:
+  `LoadReport::skipped`). Measured: three shards
   started 1.3 s and 0.9 s apart are never more than one tick apart when looked at together
   (`tests/crossing.rs`); on a live four-shard stack every shard's log names the same tick.
 - **Handoff** (`handoff.rs`, "The tick of a state"; H2, H4, H5 and H6 reworded). **Deviation:**
@@ -992,7 +1142,7 @@ by body and tick by tick. Numbers below are from it (debug build) unless a live 
   (`the_floating_crate_on_the_border_is_struck_the_same_on_one_shard`). Left as it is.
 - **Dev default.** `scripts/dev.ps1` / `scripts/dev.sh` start **four shards** (`-MinShards` /
   `--min-shards` default 4; 1 = one shard). The orchestrator binary's own default (0) and the
-  compose files are unchanged.
+  compose files are unchanged (the compose files until phase 6, section 8).
 - **Build profile** (`Cargo.toml`, no dependency added): `rapier3d-f64` and `parry3d-f64` are
   built at opt-level 3 and `space-sim` at 2 in the dev profile. The four-shard tests step minutes
   of physics; 300 ticks of the fixture went from 6.7 s to 0.84 s. The new file's 14 tests take
@@ -1045,12 +1195,131 @@ by body and tick by tick. Numbers below are from it (debug build) unless a live 
 - Compose, local and production: the orchestrator only, socket mounted, player port published,
   control port not published, web UI on loopback as now.
 
+**Status: built (phase 6).** What it became, where it differs from the bullets above, and what
+was run. The code: `space-orchestrator/src/launcher/docker.rs` (`--launcher docker`), the two
+compose files, `deploy/Dockerfile.orchestrator`, `deploy/Dockerfile.shard`,
+`.github/workflows/release-images.yml`.
+
+- **The client.** Hand-rolled HTTP/1.1 over the Engine's unix socket, one connection per
+  request, JSON through `serde_json` (already in the workspace): **no HTTP crate, no Docker
+  crate**. Linux only: on Windows the orchestrator refuses to start with `--launcher docker`,
+  with a sentence that says to use `--launcher process`. The client is generic over its
+  transport, so its 19 tests run against a daemon of their own, in memory — on Windows too.
+  Every call is bounded (10 s; 15 s a remove; 300 s a pull), and an error is a failed launch
+  that feeds the back-off of section 2.
+- **Flags** (each with `SPACE_ORCHESTRATOR_...`): `--docker-socket` (`_DOCKER_SOCKET`, default
+  `/var/run/docker.sock`), `--shard-image` (`_SHARD_IMAGE`, **no default in the binary**; the
+  orchestrator image has it baked in), `--docker-network` (`_DOCKER_NETWORK`),
+  `--docker-control-addr` (`_DOCKER_CONTROL_ADDR`), `--docker-publish-ip` (`_DOCKER_PUBLISH_IP`,
+  default `0.0.0.0`), `--docker-name-prefix` (`_DOCKER_NAME_PREFIX`, default `space-shard-`;
+  a container's name is the prefix and its host port).
+- **A shard container**: created and started from the image with `Entrypoint ["space-server"]`
+  and `--orchestrator <control> --cluster <id> --bind 0.0.0.0:P --advertise 0.0.0.0:P
+  --client-endpoint 0.0.0.0:P`, P one host port of `--host-port-range`, the same number inside
+  and outside, `P/udp` published on the publish IP. The cluster secret is in the container's
+  **environment** (`SPACE_CLUSTER_SECRET`), never in its command, never logged (errors are
+  scrubbed of it). Labels `space.cluster=<cluster>`, `space.role=shard`, `space.launch=<n>`,
+  `space.port=<P>` (**deviation:** not the shard's id — a shard is given its id at the hello,
+  after the container exists; the launch is matched to the registering shard by address, as
+  the `process` launcher's is: container IP and P, the shard advertises `0.0.0.0:P` and the
+  orchestrator fills in the IP it sees). Restart policy `no`, `CapDrop: ALL`,
+  `no-new-privileges`, not privileged, **no mounts, never the socket**.
+- **Deviation: not "removed when it exits".** No `AutoRemove`: an exited container keeps its
+  exit status for the orchestrator's log line, and is removed by the orchestrator (`DELETE
+  ...?force=true`) — on scale-in, on replacement, as surplus.
+- **Deviation: the orchestrator's own IP, not a name, is the default control address** (its
+  container's address on the network + the control port's port). The network is found by
+  inspecting itself through `$HOSTNAME`; a container on several networks with none named is
+  refused. A `name:port` works too: `space-server --orchestrator` now also takes a host name,
+  resolved once at start (`the_orchestrator_is_named_by_address_or_by_name`, in `space-server`'s
+  `main.rs`; the docker flags have their tests in the orchestrator's).
+- **Leftovers are removed, not adopted.** At start every container that carries this cluster's
+  shard labels and that an earlier run left is removed: a shard cannot join a new orchestrator
+  (it stops when it loses its own, ids are never reused), so a leftover is dead or about to be,
+  and holds a host port. A name that is taken is freed only when its container carries both
+  labels; a stranger's container of that name is left alone and the launch fails.
+- **SIGTERM / Ctrl-C.** The orchestrator leaves its loop and the launcher force-removes
+  everything it started under one 20 s bound, then the process exits 0 (compose:
+  `stop_grace_period: 30s`). **One new crate in the lockfile for it: `signal-hook-registry`**
+  (pure Rust, on `libc`, Unix only), through tokio's `signal` feature — std has no signal API
+  and the crate forbids `unsafe`. Should the orchestrator be killed instead, its shards notice
+  the lost link after QUIC's idle timeout (about 10 s), exit non-zero and stay as exited
+  containers until the next start removes them. The `process` launcher got `exit_code` and
+  `shutdown` too; `dev.ps1` / `dev.sh` are unchanged and keep `--launcher process`: Docker is
+  not needed for the dev loop.
+- **Deviation: no registry credential is handled.** An image that is absent is pulled (`POST
+  /images/create`); a private image has to be pulled on the host by the operator (`docker
+  login` + `docker pull`) before the orchestrator starts.
+- **Compose.** `deploy/docker-compose.yaml` and `deploy/proxy/docker-compose.yaml` hold the
+  orchestrator as the whole cluster (and the `client` stream service: opt-in locally, kept in
+  production — whether it is needed there is an open question for the owner): the socket
+  mounted, `group_add: DOCKER_GID` (the orchestrator is not root in its container; local
+  default 0, right for Docker Desktop; required in production), the control port not published,
+  the player port 7777/udp published, the shards' ports 7870-7899/udp published by the shard
+  containers themselves, `SPACE_CLUSTER_SECRET` required with no default in both, `--launcher
+  docker --min-shards 4 --max-shards 8` through the environment, the web UI off in production
+  and on loopback behind a token locally, as before. The fixed container IPs are gone. The
+  `client` service dials the player port **through the host** (`host.docker.internal`): one
+  that dialed the orchestrator's in-network address would be sent on to `<that address>:<shard
+  port>`, where no shard listens.
+- **Images and the order of a release.** `Dockerfile.orchestrator` takes `ARG
+  SPACE_SHARD_IMAGE` into `SPACE_ORCHESTRATOR_SHARD_IMAGE`; `release-images.yml` builds and
+  pushes the three `sha-<commit>` images in the matrix job (the orchestrator's with
+  `SPACE_SHARD_IMAGE=.../space-shard:sha-<commit>`) and moves `:latest` in a second job,
+  `latest`, that needs all three: shard, client, **the orchestrator last**. Watchtower updates
+  the orchestrator only: the old container gets SIGTERM and removes its shards, the new one
+  removes leftovers and starts four shards from its commit's tag. Players of the old shards
+  reconnect through the player port, as after any shard death (about 10 s, back on the spawn
+  point).
+- **Security**: `docs/security-notes.md`, "The Docker socket" — the orchestrator's container
+  is root-equivalent on the host.
+- **Executed** on Windows 11 with Docker Desktop 28.5.1 (Linux engine in WSL2), 2026-11-24:
+  `deploy/docker-compose.yaml` as it is, with a project name, ports moved by environment (player
+  port 8077, shards 8170-8199, web UI 8280), a generated throwaway `SPACE_CLUSTER_SECRET`,
+  `DOCKER_GID=0`, lowered autoscaler thresholds (capacity 2, out after 5 s, in after 15 s,
+  cooldown 10 s) and local image tags. Compose started the orchestrator alone and it created
+  four shard containers (the first registered 0.9 s after the orchestrator started, all four
+  owned their regions after 3.5 s); a headless client on the host joined through
+  `127.0.0.1:8077` and was sent to a shard container's published port (35 bodies listed, frames
+  looked at); four flying crossings between two shard containers at 15-40 m/s: drawn step
+  3.1-4.6 mm, corrections 0; `docker kill` of one shard container: noticed and replaced under a
+  new id in a new container within about a second (lost at tick 2385, the replacement's epoch
+  committed at tick 2416), the scene re-issued once; scale-out: two players in the spawn cell,
+  a fifth container, then both in the next cell, a sixth (0.9 s from "wanted" to registered);
+  scale-in: the far cell's shard merged, drained in 1.1 s, `exit status 0`, container removed;
+  `docker compose stop` (SIGTERM): all five shard containers removed and the orchestrator
+  exited 0 in under 5 s; `down -v` left no container, network or volume. The cluster secret
+  appears in none of the captured logs. That long scenario ran on images built from a
+  throwaway Dockerfile (a single build stage with a cache) with the same runtime stages and the
+  same binaries; the images from `deploy/Dockerfile.orchestrator` and `deploy/Dockerfile.shard`
+  themselves were built and run through a start, a client's join, a killed orchestrator with
+  the leftovers removed at the next start, and `compose down`.
+- **Only parsed** (`docker compose config`): `deploy/proxy/docker-compose.yaml`, with
+  `.env.example` plus a throwaway secret and `DOCKER_GID`.
+- **Not verified.** Anything on a Linux host (a socket group other than 0, a firewall, real
+  published ports to another machine); Watchtower replacing the orchestrator; a pull of the
+  `sha-` tagged shard image from ghcr; a private registry; the `client` stream service in
+  either compose file; `Dockerfile.client` (unchanged); `release-images.yml` (YAML-checked
+  with `.github/scripts/check_yaml.py` only).
+- **Not done here, and what still looks wrong.** No socket proxy restricts the Engine API to
+  the calls the launcher needs; the shard image's name is trusted; shard ports are published on
+  every interface (all in `docs/security-notes.md`). **Seen on Docker Desktop:** in the WSL2 VM
+  the shards' census lines showed a `clock offset` between 0 and **-84 ms** (the hypervisor's
+  time sync steps the VM's wall clock; a process stack on the same machine shows 0.0 ms
+  throughout). All shards share that clock, but each slews by itself, so for seconds at a time
+  two shards were a tick or two apart: two of the later crossings there showed a drawn step of
+  0.40 m and 0.76 m and corrections of 0.05 to 1.2 m (the four measured right after the start:
+  3.1-4.6 mm, 0). Not a defect of the launcher: it is section 5's limit — a wall clock that is
+  stepped — made visible by that VM. Not verified on a real Linux host, where one kernel clock
+  serves every container.
+
 ## 9. The wire (PROTOCOL_VERSION 6 -> 7)
 
 `ShardRegion` + client endpoint. `LoadReport` + entity count, hot cell. `ShardHello` + secret.
 `ShardWelcome` + tick origin. `Snapshot` + `more` (added by the review of phase 3: a snapshot in
 several chunks). Peer hellos carry the peer token in the existing token field.
-Appended variants: `JoinRedirect`, `FarInterest`, `FarUpdate` (`VARIANT_COUNT` 32). The handoff
+Appended variants: `JoinRedirect`, `FarInterest`, `FarUpdate`, `ShardRetire` (added in phase 6:
+the orderly end of a drained shard; `VARIANT_COUNT` 33). The handoff
 messages, the epoch messages and `Hello` keep their layouts.
 
 **Status.** This plan was written as "5 -> 6". While the branch was being built `main` shipped a
@@ -1064,9 +1333,11 @@ protocol 6 of its own - the merged demo area: `SceneClock` (tag 28), `PlayerInpu
 `players`, `missing`) and `FarUpdate` (tag 31: `from`, `tick`, `new`, `changed`, `removed`,
 `refresh`, `held`, `more`) — `VARIANT_COUNT` 32 — and one more replicated component id, 11, the
 `Origin` a shard adds to what it tells clients about a ghost or a far replica (14 bytes: version,
-kind, shard, tick; a client that does not know the id skips it). The load report's new
-fields are still to come and stay inside 7 as long as 7 has not been pushed to `main`; once it
-has, the next layout change is 8. (The handoff state's private components are not wire layout:
+kind, shard, tick; a client that does not know the id skips it). Since phase 6 `LoadReport` ends
+with `entities`, `tick_mean_ms`, `tick_max_ms`, `skipped`, `hot_cell` (`[i64; 3]`) and
+`hot_cell_players` (its last field; the message has a `Default`), and `ShardRetire { shard,
+reason }` is tag 32 — `VARIANT_COUNT` 33. All of it stays inside 7 as long as 7 has not been
+pushed to `main`; once it has, the next layout change is 8. (The handoff state's private components are not wire layout:
 the scene-time component got a ninth byte in phase 3.)
 
 ## 10. Phases

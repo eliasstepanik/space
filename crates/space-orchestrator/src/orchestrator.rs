@@ -77,10 +77,27 @@
 //!   and the spawner builds them afresh — instead of half a scene, or some of
 //!   it twice.
 //!
-//! A merged shard is stopped only when the merge **commits** — until then it
-//! still owns its region. Stopping a shard is closing its control link (a
-//! shard does not run without its orchestrator) and, for one the orchestrator
-//! started, telling the launcher to stop its process.
+//! A merged shard is not stopped when its merge is proposed (until the commit
+//! it still owns its region) **nor when it commits**: it then owns nothing but
+//! still simulates what was on its ground, and **drains** — it hands its
+//! players and bodies to the shards that own the ground now by the ordinary
+//! handoff, keeps reporting, and is told to stop (`ShardRetire`; it exits 0)
+//! when it reports that it holds nothing, or is stopped as it is after the
+//! drain timeout ([`Orchestrator::draining_shards`]). Stopping a shard for
+//! any other reason is closing its control link (a shard does not run without
+//! its orchestrator) and, for one the orchestrator started, telling the
+//! launcher to stop its process or remove its container.
+//!
+//! # Scaling (`docs/plan-sharding.md` §3)
+//!
+//! Every shard reports its load once a second. The autoscaler
+//! ([`crate::autoscale`]) is fed each shard's load and — for the shards it may
+//! merge away — the load of the pair; it answers with at most one action:
+//! relieve a loaded shard, by carving its **hot cell** for a new shard
+//! ([`Orchestrator::begin_carve`]), or merge an idle one away, which then
+//! drains. It never merges the shard that owns the spawn point, nor one of
+//! the layout cells `--min-shards` stands for, nor anybody while the cluster
+//! is at `--min-shards`; and nothing is launched beyond `--max-shards`.
 //!
 //! # Who is heard
 //!
@@ -97,8 +114,8 @@
 //!
 //! # What the orchestrator believes about load
 //!
-//! Only a [`LoadReport`] from a shard that owns a region in the published map is
-//! kept, and only while it is fresh
+//! Only a [`LoadReport`] from a shard that owns a region in the published map
+//! — or that is draining — is kept, and only while it is fresh
 //! ([`crate::config::REPORT_EXPIRY_TICKS`]): a shard that was merged away,
 //! killed, or simply stopped reporting is forgotten — by the autoscaler too —
 //! instead of being re-split or re-merged for ever on its last words.
@@ -169,11 +186,11 @@ use space_protocol::{
 };
 use space_world::NodeRef;
 
-use crate::autoscale::ScaleAction;
+use crate::autoscale::{ScaleAction, ScaleOut, ShardLoad};
 use crate::config::{
     LauncherKind, OrchestratorConfig, LAUNCH_BACKOFF_MAX_TICKS, LAUNCH_BACKOFF_TICKS,
     LAUNCH_REGISTER_TIMEOUT_TICKS, MIN_EPOCH_INTERVAL_TICKS, POLL_INTERVAL_TICKS,
-    REPORT_EXPIRY_TICKS, WANTED_TIMEOUT_TICKS,
+    REPORT_EXPIRY_TICKS, RETIRE_GRACE_TICKS, WANTED_TIMEOUT_TICKS,
 };
 use crate::control::{as_seen_from, client_endpoint_of, ControlPlane, HelloRefusal};
 use crate::epoch::{Outbound, Phase};
@@ -308,6 +325,19 @@ struct Join {
     replaces: Option<ShardId>,
 }
 
+/// A shard whose region was merged away (`docs/plan-sharding.md` §3): it owns
+/// nothing, hands what it simulates to the shards that own the ground now,
+/// and is stopped when it reports that it holds nothing — or as it is, when
+/// that takes longer than the drain timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drain {
+    /// The tick its merge committed at.
+    since: u64,
+    /// The tick it was told to stop at ([`space_protocol::ShardRetire`]),
+    /// once it was.
+    retired_at: Option<u64>,
+}
+
 /// The orchestrator: control plane + the launcher seam.
 ///
 /// `L` is generic rather than `dyn` because [`Launcher`] uses associated-return-
@@ -346,6 +376,14 @@ pub struct Orchestrator<L: Launcher> {
     /// The node a split or a carve asked for, waiting for a shard to register
     /// and take it.
     wanted: Option<Wanted>,
+    /// Shards whose region was merged away and that are handing over what
+    /// they hold ([`Drain`]). Not shards of the map, still connected, still
+    /// reporting; each is told to stop when it is empty.
+    draining: BTreeMap<ShardId, Drain>,
+    /// Set by the run loop's owner to end the loop in an orderly way (a
+    /// signal): the launcher is told to stop and remove everything it
+    /// started ([`Launcher::shutdown`]) before [`Self::run`] returns.
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
     /// Shards known to be dead that still own regions of the published map,
     /// each with whether the orchestrator had launched it. Their regions go to
     /// the next shards that register, before anything else changes.
@@ -530,6 +568,8 @@ impl<L: Launcher> Orchestrator<L> {
             pending_merge: None,
             pending_join: None,
             wanted: None,
+            draining: BTreeMap::new(),
+            stop: None,
             dead: BTreeMap::new(),
             launches: BTreeMap::new(),
             last_launch: 0,
@@ -749,6 +789,21 @@ impl<L: Launcher> Orchestrator<L> {
     #[must_use]
     pub fn load_report(&self, shard: ShardId) -> Option<&LoadReport> {
         self.latest.get(&shard)
+    }
+
+    /// The shards whose region was merged away and that have not been
+    /// stopped yet: they are handing over what they simulate.
+    #[must_use]
+    pub fn draining_shards(&self) -> Vec<ShardId> {
+        self.draining.keys().copied().collect()
+    }
+
+    /// End the run loop when `stop` turns true: the loop then has its
+    /// launcher stop and remove every shard it started
+    /// ([`Launcher::shutdown`]) and returns. The binary sets it from a
+    /// signal handler (SIGTERM, Ctrl-C).
+    pub fn stop_on(&mut self, stop: tokio::sync::watch::Receiver<bool>) {
+        self.stop = Some(stop);
     }
 
     // ------------------------------------------------------------- ingestion
@@ -1481,10 +1536,20 @@ impl<L: Launcher> Orchestrator<L> {
     /// at all (it was stopped when its join aborted), is simply removed and
     /// reaped.
     pub fn note_launch_dead(&mut self, launch: LaunchId) {
+        self.note_launch_exit(launch, None);
+    }
+
+    /// [`Self::note_launch_dead`] with the exit status the launcher saw, if
+    /// it saw one ([`Launcher::exit_code`]): what tells a shard that stopped
+    /// because it was told to (0) from one that died.
+    pub fn note_launch_exit(&mut self, launch: LaunchId, exit: Option<i32>) {
         let Some(entry) = self.launches.get(&launch) else {
             return;
         };
         match entry.shard {
+            // A shard that was merged away and is gone: the end of a drain,
+            // not a death.
+            Some(shard) if self.draining.contains_key(&shard) => self.drain_ended(shard, exit),
             Some(shard) if self.dead.contains_key(&shard) || !self.knows(shard) => {
                 self.launches.remove(&launch);
                 self.pending_launch_kill.push(launch);
@@ -1660,7 +1725,12 @@ impl<L: Launcher> Orchestrator<L> {
     pub fn reconcile_launches(&mut self) {
         let config = &self.control.config;
         let (min, max) = (config.min_shards, config.max_shards);
-        let live = self.live_shards();
+        // (A draining shard is on its way out: not one of the cluster's.)
+        let live: BTreeSet<ShardId> = self
+            .live_shards()
+            .into_iter()
+            .filter(|shard| !self.draining.contains_key(shard))
+            .collect();
         let owners: BTreeSet<ShardId> = self
             .control
             .map()
@@ -1895,7 +1965,9 @@ impl<L: Launcher> Orchestrator<L> {
     /// The report is believed to be from the shard it names: see
     /// [`Self::handle_load_report_from`] for a report off the wire.
     pub fn handle_load_report(&mut self, report: &LoadReport) {
-        if !self.owns_a_region(report.shard) {
+        // (A draining shard owns nothing and is still heard: its report is
+        // how the orchestrator learns that it is empty.)
+        if !self.owns_a_region(report.shard) && !self.draining.contains_key(&report.shard) {
             return;
         }
         self.latest.insert(report.shard, *report);
@@ -2005,8 +2077,7 @@ impl<L: Launcher> Orchestrator<L> {
                 // shard whose link closes stops either way.
                 self.outbox.push((gone, commit.message.clone()));
                 self.outbox.push((gone, push.message.clone()));
-                self.stage_kill(gone);
-                self.forget_shard(gone);
+                self.begin_drain(gone);
             }
             if let Some(Join {
                 shard: new,
@@ -2419,6 +2490,8 @@ impl<L: Launcher> Orchestrator<L> {
         // one action.
         self.expire_stale_reports();
         self.run_autoscaler();
+        // 2.5 Shards that were merged away: stop the ones that are empty.
+        self.drain_pass();
         // 3. The fleet.
         self.expire_lifecycle();
         self.reconcile_launches();
@@ -2516,18 +2589,15 @@ impl<L: Launcher> Orchestrator<L> {
             // shown, but none is fed, so no dwell accrues and nothing fires.
             return;
         }
-        let reports: Vec<LoadReport> = self.latest.values().copied().collect();
-        if reports.is_empty() {
+        let loads = self.shard_loads();
+        if loads.is_empty() {
             return;
         }
-        if let Some(action) = self.control.autoscaler.on_reports(&reports, self.tick) {
+        if let Some(action) = self.control.autoscaler.on_loads(&loads, self.tick) {
             let (decided, outcome) = match action {
-                // The autoscaler's octant is a placeholder (it sees load, not
-                // positions); the split starts at the region's centre octant.
-                ScaleAction::Split { shard, .. } => (
-                    format!("split {shard}"),
-                    self.begin_split(shard, Octant::FromCentre),
-                ),
+                ScaleAction::Split { shard, .. } => {
+                    (format!("split {shard}"), self.scale_out(shard))
+                }
                 ScaleAction::Merge { shard } => (format!("merge {shard}"), self.begin_merge(shard)),
             };
             match &outcome {
@@ -2553,6 +2623,248 @@ impl<L: Launcher> Orchestrator<L> {
                 outcome,
             });
         }
+    }
+
+    /// What the autoscaler is told this tick: the load of every shard of the
+    /// map that has a fresh report, and — for the ones that may be merged
+    /// away — the load it and the shard that would take its region back have
+    /// together.
+    ///
+    /// **Who may be merged away by the autoscaler:** a shard whose region has
+    /// a region around it owned by somebody else ([`topology::merge_target`]:
+    /// never the root's), that does **not own the scene's spawn point** (every
+    /// new player starts there: that shard is never removed), whose region is
+    /// **not one of the layout cells `--min-shards` stands for** (with 4: the
+    /// three cells beside the spawn point's — the demo area stays in its
+    /// four areas, and what comes and goes are the shards the autoscaler
+    /// added), and only while the cluster has more shards than
+    /// `--min-shards`. An operator's merge is held to the last rule only.
+    fn shard_loads(&self) -> Vec<ShardLoad> {
+        let scale = *self.control.autoscaler.config();
+        let map = self.control.map();
+        let min = self.control.config.min_shards;
+        let spare = self.owner_count() > min;
+        let spawn = self.spawn_owner();
+        let layout = topology::layout_cells(self.control.config.root_node());
+        let kept = &layout[..min.saturating_sub(1).min(layout.len())];
+        let keeps = |shard: ShardId| {
+            topology::region_of(map, shard).is_some_and(|region| kept.contains(&region.node))
+        };
+        self.latest
+            .iter()
+            .filter(|(shard, _)| self.owns_a_region(**shard))
+            .map(|(shard, report)| {
+                let merged = (spare && spawn != Some(*shard) && !keeps(*shard))
+                    .then(|| topology::merge_target(map, *shard).ok())
+                    .flatten()
+                    .map(|into| scale.merged_load(report, self.latest.get(&into)));
+                ShardLoad {
+                    shard: *shard,
+                    load: scale.load_of(report),
+                    merged,
+                }
+            })
+            .collect()
+    }
+
+    /// Relieve the loaded `shard` (`docs/plan-sharding.md` §3): ask for its
+    /// **hot cell** — the cell holding most of its players — to be carved for
+    /// a new shard ([`Self::begin_carve`]); the players in it are then that
+    /// shard's and are handed over by the ordinary handoff.
+    ///
+    /// A shard whose hot cell is its whole region cannot be relieved — a
+    /// region is never smaller than a cell — and the answer says so
+    /// ([`crate::autoscale::scale_out_target`]): the spawn point's cell, once
+    /// it has a shard of its own, is where that happens, because every new
+    /// player starts there. A shard that is slow without players is halved
+    /// the old way ([`Self::begin_split`]), where its region is large enough.
+    ///
+    /// # Errors
+    ///
+    /// Why nothing was started; the shard is on cooldown then.
+    fn scale_out(&mut self, shard: ShardId) -> Result<String, String> {
+        let Some(report) = self.latest.get(&shard).copied() else {
+            return Err(format!("no fresh load report from {shard}"));
+        };
+        match crate::autoscale::scale_out_target(self.control.map(), &report) {
+            ScaleOut::Octant => self.begin_split(shard, Octant::FromCentre),
+            ScaleOut::Cell(cell) => {
+                let outcome = self.begin_carve(cell).map(|wanted| {
+                    format!(
+                        "{} of its {} player(s) are in cell {}: {wanted}",
+                        report.hot_cell_players,
+                        report.players,
+                        node_path(cell)
+                    )
+                });
+                // Asked for or not, the shard is left alone for a while.
+                self.control.autoscaler.note_action(shard, self.tick);
+                outcome
+            }
+            ScaleOut::Nothing(why) => {
+                self.control.autoscaler.note_action(shard, self.tick);
+                Err(why)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- draining
+
+    /// `shard`'s merge committed: it owns nothing now. It is **not stopped**:
+    /// it still simulates what was on its ground and may hold players, and
+    /// hands all of it to the shards that own the ground now through the
+    /// ordinary handoff — the other shards go on hearing it for that
+    /// (`space_server::shard::FORMER_SHARD_GRACE_TICKS`). It keeps its
+    /// control link and keeps reporting; [`Self::drain_pass`] stops it when
+    /// it is empty.
+    fn begin_drain(&mut self, shard: ShardId) {
+        // Its load is no longer the autoscaler's business; what it reports
+        // from here on says when it is empty.
+        self.forget_reports(shard);
+        self.draining.insert(
+            shard,
+            Drain {
+                since: self.tick,
+                retired_at: None,
+            },
+        );
+        self.log(
+            EventKind::Shard,
+            Severity::Info,
+            format!(
+                "{shard} owns nothing any more and is draining: it hands its players and bodies \
+                 to the shards that own the ground now, and is stopped when it holds nothing (or \
+                 after {} s)",
+                self.control.autoscaler.config().drain_timeout_ticks / crate::config::TICK_HZ
+            ),
+        );
+    }
+
+    /// Look after the shards that are draining: one that has reported, since
+    /// its merge committed, that it holds **no player and no entity** is told
+    /// to stop ([`space_protocol::ShardRetire`]; it then exits 0); one that
+    /// has not got there within the drain timeout is stopped as it is; and
+    /// one that was told to stop and is still there after
+    /// [`RETIRE_GRACE_TICKS`] is stopped by closing its link.
+    fn drain_pass(&mut self) {
+        let now = self.tick;
+        let timeout = self.control.autoscaler.config().drain_timeout_ticks;
+        let draining: Vec<(ShardId, Drain)> = self.draining.iter().map(|(s, d)| (*s, *d)).collect();
+        for (shard, drain) in draining {
+            if let Some(told) = drain.retired_at {
+                if now.saturating_sub(told) > RETIRE_GRACE_TICKS {
+                    self.log(
+                        EventKind::Shard,
+                        Severity::Warn,
+                        format!(
+                            "{shard} was told to stop {} s ago and is still there: its link is \
+                             closed and its process stopped",
+                            RETIRE_GRACE_TICKS / crate::config::TICK_HZ
+                        ),
+                    );
+                    self.end_drain(shard);
+                }
+                continue;
+            }
+            // Only what it said after the commit counts: before it, a
+            // neighbour could still hand it something.
+            let said = self
+                .latest
+                .get(&shard)
+                .filter(|_| {
+                    self.shard_ticks
+                        .get(&shard)
+                        .is_some_and(|at| *at > drain.since)
+                })
+                .map(|report| (report.players, report.entities));
+            if said == Some((0, 0)) {
+                self.outbox.push((
+                    shard,
+                    Message::ShardRetire(space_protocol::ShardRetire {
+                        shard,
+                        reason: "its region was merged away and it has handed everything over"
+                            .into(),
+                    }),
+                ));
+                if let Some(entry) = self.draining.get_mut(&shard) {
+                    entry.retired_at = Some(now);
+                }
+                self.log(
+                    EventKind::Shard,
+                    Severity::Good,
+                    format!(
+                        "{shard} is drained after {:.1} s (0 players, 0 entities) and is told to \
+                         stop",
+                        now.saturating_sub(drain.since) as f64 / crate::config::TICK_HZ as f64
+                    ),
+                );
+            } else if now.saturating_sub(drain.since) > timeout {
+                let held = match said {
+                    Some((players, entities)) => {
+                        format!("it still holds {players} player(s) and {entities} entities")
+                    }
+                    None => "it has not reported since".to_owned(),
+                };
+                self.log(
+                    EventKind::Shard,
+                    Severity::Warn,
+                    format!(
+                        "{shard} did not drain within {} s ({held}): it is stopped as it is, and \
+                         what it held is gone",
+                        timeout / crate::config::TICK_HZ
+                    ),
+                );
+                self.end_drain(shard);
+            }
+        }
+    }
+
+    /// A draining shard's process exited or its link closed. After it was
+    /// told to stop that is the orderly end (`exit` is its exit status, when
+    /// the launcher saw one); before, it died with what it still held.
+    fn drain_ended(&mut self, shard: ShardId, exit: Option<i32>) {
+        let Some(drain) = self.draining.get(&shard).copied() else {
+            return;
+        };
+        let status = match exit {
+            Some(code) => format!(" (exit status {code})"),
+            None => String::new(),
+        };
+        if drain.retired_at.is_some() && exit.is_none_or(|code| code == 0) {
+            self.log(
+                EventKind::Shard,
+                Severity::Good,
+                format!("{shard} stopped as it was told{status}"),
+            );
+        } else if drain.retired_at.is_some() {
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!("{shard} was told to stop and ended with an error{status}"),
+            );
+        } else {
+            self.log(
+                EventKind::Shard,
+                Severity::Warn,
+                format!("{shard} ended while it was draining{status}: what it still held is gone"),
+            );
+        }
+        self.end_drain(shard);
+    }
+
+    /// Whether the end of `shard`'s process is still to come and will say how
+    /// it ended: the orchestrator launched it and the launcher still has it.
+    fn awaits_exit(&self, shard: ShardId) -> bool {
+        self.launch_of(shard).is_some()
+    }
+
+    /// Take a draining shard out of the cluster for good: its link is closed,
+    /// its process or container stopped and removed, and nothing is
+    /// remembered about it.
+    fn end_drain(&mut self, shard: ShardId) {
+        self.draining.remove(&shard);
+        self.stage_kill(shard);
+        self.forget_shard(shard);
     }
 
     /// The shards that still owe an ack for the prepare in flight (empty when
@@ -2719,23 +3031,23 @@ impl<L: Launcher> Orchestrator<L> {
         })
     }
 
-    /// Turn a merge decision into a topology plan + epoch proposal. The merged
-    /// shard is killed when (and only if) that epoch commits.
+    /// Turn a merge decision into a topology plan + epoch proposal. When (and
+    /// only if) that epoch commits, the merged shard **drains** and is then
+    /// stopped ([`Self::drain_pass`]).
     ///
     /// The shard's region goes back to the owner of the region around it
     /// ([`topology::merge_target`]): its parent node's after an octant split,
     /// the nearest enclosing region's — however many levels up — for a carved
     /// cell.
     ///
-    /// **Only a shard with no players is merged away.** A merge removes the
-    /// shard's region from the map and then the shard itself; there is no step
-    /// in which its players are handed to the parent (once the merge commits
-    /// the parent no longer even knows the shard, so it would refuse the
-    /// offers). "Cold" to the autoscaler means a load at or below the merge
-    /// threshold — up to a third of a full shard — so acting on that alone
-    /// dropped every one of those players. The shard's own fresh report has to
-    /// say `players == 0`; a shard that has not reported is not known to be
-    /// empty and is left alone.
+    /// **A shard with players may be merged away**: once the merge commits it
+    /// hands them, and every body it simulates, to the shards that own the
+    /// ground now — the other shards go on hearing it for that — and is told
+    /// to stop only when it reports that it is empty. (It used to be killed
+    /// at the commit, so only a shard known to be empty could be merged.)
+    /// What a merge does need is the shard's own **fresh report**: it is what
+    /// later says the shard is drained, and a shard that does not report could
+    /// never say so.
     ///
     /// Returns what was started, in words.
     ///
@@ -2763,17 +3075,9 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(absent) = self.absent_recipient(&BTreeSet::new()) {
             return Err(not_connected(absent));
         }
-        let players = self.latest.get(&shard).map(|report| report.players);
-        if players != Some(0) {
+        if !self.latest.contains_key(&shard) {
             self.control.autoscaler.note_action(shard, self.tick);
-            return Err(match players {
-                Some(n) => {
-                    format!("{shard} still has {n} player(s); only an empty shard is merged")
-                }
-                None => {
-                    format!("no fresh load report from {shard}, so it is not known to be empty")
-                }
-            });
+            return Err(no_report(shard));
         }
         let plan = match topology::merge_plan(self.control.map(), shard) {
             Ok(plan) => plan,
@@ -2800,6 +3104,10 @@ impl<L: Launcher> Orchestrator<L> {
         // is staged for killing by the commit (`handle_epoch_ack`), and left
         // alone if the epoch aborts (`tick`).
         self.pending_merge = Some(shard);
+        // The shard that takes the region back gets what comes with it: it
+        // is left alone for a while too.
+        self.control.autoscaler.note_action(plan.into, self.tick);
+        self.control.autoscaler.note_action(shard, self.tick);
         let (child, into) = (node_path(plan.child), plan.into);
         self.in_flight = Some(format!(
             "merge of {shard}, region {child} goes back to {into}"
@@ -2850,6 +3158,16 @@ impl<L: Launcher> Orchestrator<L> {
             .filter(|shard| !self.dead.contains_key(shard))
             .collect();
         for shard in lost {
+            if self.draining.contains_key(&shard) {
+                // A shard that was merged away: the end of its drain. One
+                // the orchestrator launched says how it ended when its
+                // process is seen to have exited (the launcher's poll, a
+                // moment later); for any other the closed link is the end.
+                if !self.awaits_exit(shard) {
+                    self.drain_ended(shard, None);
+                }
+                continue;
+            }
             // (Still in `connected` as far as `declare_dead` can tell would
             // be wrong: put it back for the one call that takes it out.)
             self.connected.insert(shard);
@@ -2923,9 +3241,9 @@ impl<L: Launcher> Orchestrator<L> {
     ///
     /// The rules are `begin_merge`'s: the region must have an enclosing region
     /// owned by another shard (its parent node, or — for a carved cell — the
-    /// nearest region around it, however many levels up), and the shard's own
-    /// fresh load report must say it has no players — a shard that has not
-    /// reported is not known to be empty (H13).
+    /// nearest region around it, however many levels up), and the shard must
+    /// have a fresh load report — one that does not report could never say
+    /// that it has handed everything over (H13).
     #[must_use]
     pub fn merge_refusal(&self, shard: ShardId) -> Option<String> {
         // Looked up, not planned (see `split_refusal`).
@@ -2935,18 +3253,8 @@ impl<L: Launcher> Orchestrator<L> {
         if let Some(needed) = self.min_shards_refusal(shard) {
             return Some(needed);
         }
-        match self.latest.get(&shard).map(|report| report.players) {
-            Some(0) => {}
-            Some(players) => {
-                return Some(format!(
-                    "{shard} still has {players} player(s); only an empty shard is merged"
-                ));
-            }
-            None => {
-                return Some(format!(
-                    "no fresh load report from {shard}, so it is not known to be empty"
-                ));
-            }
+        if !self.latest.contains_key(&shard) {
+            return Some(no_report(shard));
         }
         self.proposal_refusal()
             .or_else(|| self.absent_recipient(&BTreeSet::new()).map(not_connected))
@@ -3221,6 +3529,7 @@ impl<L: Launcher> Orchestrator<L> {
                 paused: self.autoscaler_paused,
                 busy_until: self.control.autoscaler.busy_until(),
                 last_decision: self.last_decision.clone(),
+                config: *self.control.autoscaler.config(),
             },
             scene: SceneView {
                 scene: self.control.scene.scene(),
@@ -3310,6 +3619,7 @@ impl<L: Launcher> Orchestrator<L> {
         let mut ids: BTreeSet<ShardId> = map.regions.iter().map(|r| r.shard).collect();
         ids.extend(self.endpoints.keys().copied());
         ids.extend(self.connected.iter().copied());
+        ids.extend(self.draining.keys().copied());
         ids.extend(joining);
         ids.into_iter()
             .map(|shard| {
@@ -3325,6 +3635,8 @@ impl<L: Launcher> Orchestrator<L> {
                     ShardRole::Dead
                 } else if self.pending_merge == Some(shard) {
                     ShardRole::Merging
+                } else if self.draining.contains_key(&shard) {
+                    ShardRole::Draining
                 } else if self.control.unclaimed_root_owner() == Some(shard) {
                     ShardRole::ReservedRoot
                 } else if regions.is_empty() {
@@ -3337,7 +3649,13 @@ impl<L: Launcher> Orchestrator<L> {
                     players: report.players,
                     tick_p95_ms: report.tick_p95_ms,
                     reported_load: report.load,
-                    load_metric: crate::autoscale::load_metric(report),
+                    load_metric: self.control.autoscaler.config().load_of(report),
+                    entities: report.entities,
+                    tick_mean_ms: report.tick_mean_ms,
+                    tick_max_ms: report.tick_max_ms,
+                    skipped: report.skipped,
+                    hot_cell: (report.hot_cell_players > 0)
+                        .then_some((report.hot_cell, report.hot_cell_players)),
                 });
                 ShardView {
                     shard,
@@ -3548,8 +3866,12 @@ impl<L: Launcher + 'static> Orchestrator<L> {
         ));
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut stop = self.stop.clone();
         loop {
             tokio::select! {
+                // Told to stop (a signal): leave the loop; what was started
+                // is stopped below.
+                () = stopped(&mut stop) => break,
                 inbound = server.next_inbound() => {
                     match inbound {
                         Some(Inbound::Hello { hello, reply, conn, verdict }) => {
@@ -3591,13 +3913,17 @@ impl<L: Launcher + 'static> Orchestrator<L> {
             }
         }
         accept.abort();
-        server.close();
         if let Some(accept) = player_accept {
             accept.abort();
         }
         if let Some(player) = &player {
             player.close();
         }
+        // Whatever the launcher started is stopped and removed, within a
+        // bounded time (containers; processes; nothing for shards that live
+        // in this process): an orchestrator that ends leaves no shard behind.
+        self.launcher.shutdown().await;
+        server.close();
         Ok(())
     }
 
@@ -3723,7 +4049,8 @@ impl<L: Launcher + 'static> Orchestrator<L> {
         if self.tick.is_multiple_of(POLL_INTERVAL_TICKS) {
             for launch in self.launches_to_poll() {
                 if let Ok(Poll::Dead) = self.launcher.poll(launch).await {
-                    self.note_launch_dead(launch);
+                    let exit = self.launcher.exit_code(launch).await;
+                    self.note_launch_exit(launch, exit);
                 }
             }
         }
@@ -3810,6 +4137,27 @@ impl<L: Launcher + 'static> Orchestrator<L> {
         self.printed_event = newest;
         lines
     }
+}
+
+/// Resolves when the loop is told to stop; never without a stop signal.
+async fn stopped(stop: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match stop {
+        Some(stop) => {
+            // (An owner that went away without a word never said "stop".)
+            if stop.wait_for(|told| *told).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Why a shard that has not reported is not merged away.
+fn no_report(shard: ShardId) -> String {
+    format!(
+        "no fresh load report from {shard}, so it is not known to be empty or even there: a shard \
+         that is merged away has to say when it has handed everything over"
+    )
 }
 
 /// The next operator request, or never when no front end is attached.
@@ -3985,6 +4333,7 @@ mod tests {
             players,
             tick_p95_ms: 1.0,
             load: 0.0,
+            ..Default::default()
         }
     }
 
@@ -4351,12 +4700,18 @@ mod tests {
 
     // ------------------------------------------------------------- finding 3
 
-    /// Mutation this catches: staging the kill when the merge is *proposed*.
-    /// The loop then killed the shard in the same tick it sent the prepare: the
-    /// shard never acked, the epoch aborted, and the map kept naming a dead
-    /// owner for its region.
+    /// A merged shard is neither stopped when its merge is proposed nor when
+    /// it commits: it **drains**, and is told to stop when it says — after
+    /// the commit — that it holds no player and no entity.
+    ///
+    /// Mutations this catches: staging the kill when the merge is *proposed*
+    /// (the shard never acked, the epoch aborted, and the map kept naming a
+    /// dead owner); staging it at the commit (the state before: whatever the
+    /// shard still simulated was gone); believing a report from before the
+    /// commit (a neighbour could still hand it something then); retiring a
+    /// shard that still holds a player or a body.
     #[test]
-    fn a_merge_kills_the_child_only_once_the_epoch_commits() {
+    fn a_merged_shard_drains_and_is_told_to_stop_only_when_it_is_empty() {
         let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
         orch.handle_load_report(&report(2, 0));
@@ -4377,7 +4732,8 @@ mod tests {
             "the child still owns its region"
         );
 
-        // Every recipient acks: the merge commits, and only now is the kill staged.
+        // Every recipient acks: the merge commits. The child owns nothing now
+        // and is draining; nobody is stopped.
         let recipients = prepares(&outbox);
         assert!(recipients.iter().any(|(to, _)| *to == child));
         for (shard, epoch) in recipients {
@@ -4385,11 +4741,18 @@ mod tests {
         }
         assert_eq!(orch.map().epoch, 2);
         assert_eq!(orch.map().regions.len(), 1, "the child's region is gone");
-        assert_eq!(orch.take_pending_kill(), vec![child]);
         assert_eq!(orch.pending_merge(), None);
-
-        // The departing shard is told the outcome (commit, then the map) before
-        // it is killed: the loop delivers the outbox ahead of the kills.
+        assert!(orch.take_pending_kill().is_empty(), "a commit stops nobody");
+        assert_eq!(orch.draining_shards(), vec![child]);
+        let role = |orch: &Orchestrator<MockLauncher>| {
+            orch.snapshot()
+                .shards
+                .iter()
+                .find(|s| s.shard == child)
+                .map(|s| s.role)
+        };
+        assert_eq!(role(&orch), Some(ShardRole::Draining));
+        // The departing shard is told the outcome (commit, then the map).
         let to_child: Vec<Message> = orch
             .drain_outbox()
             .into_iter()
@@ -4398,12 +4761,142 @@ mod tests {
             .collect();
         assert!(matches!(to_child.first(), Some(Message::EpochCommit(_))));
         assert!(matches!(to_child.get(1), Some(Message::DirectoryReply(_))));
+        assert!(!orch.control.autoscaler.tracks(child), "no longer scaled");
+
+        let retired = |orch: &mut Orchestrator<MockLauncher>| {
+            orch.drain_outbox()
+                .into_iter()
+                .any(|(to, m)| to == child && matches!(m, Message::ShardRetire(_)))
+        };
+        // What it said before the commit ("0 players") does not count: not
+        // the report it was merged on, and not one that arrives on the very
+        // tick of the commit (it was sent before the shard knew).
+        orch.handle_load_report(&report(2, 0));
+        orch.tick();
+        assert!(!retired(&mut orch), "an old report is not believed");
+        // It still holds a player and five entities: it goes on draining.
+        let holding = |players, entities| LoadReport {
+            entities,
+            ..report(2, players)
+        };
+        orch.handle_load_report(&holding(1, 5));
+        orch.tick();
+        assert!(!retired(&mut orch));
+        // The player is gone, a body is not.
+        orch.handle_load_report(&holding(0, 1));
+        orch.tick();
+        assert!(!retired(&mut orch), "a body is still to be handed over");
+        assert!(orch.take_pending_kill().is_empty());
+        // Empty: told to stop, once.
+        orch.handle_load_report(&holding(0, 0));
+        orch.tick();
+        assert!(retired(&mut orch), "an empty shard is told to stop");
+        assert!(
+            event_texts(&orch)[0].contains("is drained"),
+            "{:?}",
+            event_texts(&orch)[0]
+        );
+        orch.tick();
+        assert!(!retired(&mut orch), "and told once");
+        assert!(orch.take_pending_kill().is_empty(), "it ends by itself");
+
+        // It exits (status 0): the orderly end, not a death.
+        match orch.launch_of(child) {
+            Some(launch) => orch.note_launch_exit(launch, Some(0)),
+            None => orch.note_connected([ShardId::new(1)]),
+        }
+        assert_eq!(orch.take_pending_kill(), vec![child]);
+        assert!(orch.draining_shards().is_empty());
+        assert!(orch.dead_shards().is_empty(), "nobody is replaced");
+        assert!(
+            event_texts(&orch)[0].contains("stopped as it was told"),
+            "{:?}",
+            event_texts(&orch)[0]
+        );
         // And nothing about it is remembered: no report, no autoscaler state.
         assert!(orch.load_report(child).is_none());
         assert!(!orch.control.autoscaler.tracks(child));
+        assert_eq!(role(&orch), None);
         // Its last reports may still arrive; they are dropped (it is off the map).
         orch.handle_load_report(&report(2, 0));
         assert!(orch.load_report(child).is_none());
+    }
+
+    /// A shard that does not get empty is stopped as it is after the drain
+    /// timeout, and one that was told to stop and stays is stopped after a
+    /// grace — each said in the log.
+    ///
+    /// Mutation this catches: no timeout (a shard that cannot hand something
+    /// over would run for ever, out of the map), or the timeout stopping a
+    /// shard that is still within it.
+    #[test]
+    fn a_drain_that_does_not_end_is_cut_short() {
+        let timeout = crate::autoscale::DRAIN_TIMEOUT_TICKS;
+        let merged = || {
+            let mut orch = live(orchestrator_with_a_child());
+            orch.handle_load_report(&report(2, 3));
+            assert!(accepted(
+                &orch.handle_admin(&AdminCommand::ForceMerge(ShardId::new(2)))
+            ));
+            assert!(ack_the_prepare(&mut orch) > 0);
+            assert_eq!(orch.draining_shards(), vec![ShardId::new(2)]);
+            let _ = orch.drain_outbox();
+            orch
+        };
+        let child = ShardId::new(2);
+        // It keeps three players for the whole timeout.
+        let mut orch = merged();
+        for _ in 0..timeout {
+            orch.handle_load_report(&LoadReport {
+                entities: 4,
+                ..report(2, 3)
+            });
+            orch.tick();
+            assert!(
+                orch.take_pending_kill().is_empty(),
+                "still within the timeout"
+            );
+        }
+        orch.tick();
+        assert_eq!(orch.take_pending_kill(), vec![child]);
+        let said = &event_texts(&orch)[0];
+        assert!(
+            said.contains("did not drain within 30 s")
+                && said.contains("3 player(s) and 4 entities"),
+            "{said}"
+        );
+        assert!(orch.draining_shards().is_empty());
+
+        // It is empty and told to stop, and stays connected.
+        let mut orch = merged();
+        orch.tick();
+        orch.handle_load_report(&report(2, 0));
+        orch.tick();
+        for _ in 0..crate::config::RETIRE_GRACE_TICKS {
+            orch.tick();
+            assert!(orch.take_pending_kill().is_empty(), "within the grace");
+        }
+        orch.tick();
+        assert_eq!(orch.take_pending_kill(), vec![child]);
+        assert!(
+            event_texts(&orch)[0].contains("still there"),
+            "{:?}",
+            event_texts(&orch)[0]
+        );
+
+        // It dies while it drains: said, and nobody is replaced (it owned nothing).
+        let mut orch = merged();
+        match orch.launch_of(child) {
+            Some(launch) => orch.note_launch_exit(launch, Some(101)),
+            None => orch.note_connected([ShardId::new(1)]),
+        }
+        assert_eq!(orch.take_pending_kill(), vec![child]);
+        assert!(orch.dead_shards().is_empty());
+        assert!(
+            event_texts(&orch)[0].contains("ended while it was draining"),
+            "{:?}",
+            event_texts(&orch)[0]
+        );
     }
 
     /// Mutation this catches: not clearing the pending merge when its epoch
@@ -4446,43 +4939,385 @@ mod tests {
         );
     }
 
-    /// Mutation this catches: merging on "cold" alone. Cold is a load at or
-    /// below a third of a full shard; a merge removes the shard, and there is no
-    /// step that hands its players to anyone.
+    /// A merge needs the shard's fresh report — it is what later says the
+    /// shard is empty — but not an empty shard: its players are handed over
+    /// by the drain. The autoscaler merges a pair that is cold **together**.
+    ///
+    /// Mutations this catches: merging a shard that reports nothing (it could
+    /// never say it is drained); the autoscaler looking at the shard's own
+    /// load only (two shards at 0.3 each would be merged into one at 0.6).
     #[test]
-    fn only_a_shard_known_to_be_empty_is_merged() {
+    fn a_shard_is_merged_on_its_report_and_a_pair_only_when_cold_together() {
         let mut orch = live(orchestrator_with_a_child());
         let child = ShardId::new(2);
-        // No report at all: not known to be empty.
+        assert_ne!(orch.spawn_owner(), Some(child), "the fixture's premise");
+        // No report at all: not known to be there.
         let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
         assert!(why.contains("not known to be empty"), "{why}");
-        // Three players: cold by the load metric, but not empty.
-        orch.handle_load_report(&report(2, 3));
-        let why = refusal(orch.handle_admin(&AdminCommand::ForceMerge(child)));
-        assert!(why.contains("3 player"), "{why}");
         assert!(orch.drain_outbox().is_empty(), "no prepare was published");
         assert_eq!(orch.pending_merge(), None);
 
-        // The autoscaler path: cold-but-populated for well past the merge dwell
-        // (and its cooldowns) never merges...
+        // The autoscaler: the child is cold (10 players of 100), the root's
+        // shard it would merge into holds 30. Together 0.4: above the
+        // low-water mark of 0.35, for as long as you like.
         for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
-            orch.handle_load_report(&report(2, 3));
+            orch.handle_load_report(&report(2, 10));
+            orch.handle_load_report(&report(1, 30));
             orch.tick();
         }
-        assert_eq!(orch.map().epoch, 1, "a populated shard is never merged");
-        assert!(orch.take_pending_kill().is_empty());
+        assert_eq!(orch.map().epoch, 1, "the pair is not cold together");
+        assert_eq!(orch.pending_merge(), None);
         assert!(orch.drain_outbox().is_empty());
-        // ...and once it reports empty for the dwell, it is.
+        // The root's shard empties to 20: together 0.3, and after the dwell
+        // the child is merged — with its ten players, who are handed over.
         let mut proposed = false;
         for _ in 0..(2 * crate::autoscale::MERGE_DWELL_TICKS) {
-            orch.handle_load_report(&report(2, 0));
+            orch.handle_load_report(&report(2, 10));
+            orch.handle_load_report(&report(1, 20));
             orch.tick();
             if orch.pending_merge() == Some(child) {
                 proposed = true;
                 break;
             }
         }
-        assert!(proposed, "an empty shard, cold for the dwell, is merged");
+        assert!(
+            proposed,
+            "a pair that is cold together for the dwell is merged"
+        );
+    }
+
+    /// The autoscaler never merges the shard that owns the spawn point away,
+    /// and nobody while the cluster is at `--min-shards`.
+    ///
+    /// Mutation this catches: offering every cold shard to the autoscaler
+    /// (the spawn point's shard — where every player joins — would be the
+    /// first to go on a quiet evening).
+    #[test]
+    fn the_autoscaler_never_removes_the_spawn_points_shard_nor_goes_below_the_minimum() {
+        // The first split from the centre carves the octant with the spawn point.
+        let mut orch = live(orchestrator_with_first_id(100));
+        assert!(
+            orch.handle_operator(&OperatorCommand::Split {
+                shard: ShardId::new(1),
+                octant: None,
+                expected_epoch: None,
+            })
+            .accepted
+        );
+        let child = join(&mut orch).shard;
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.spawn_owner(), Some(child));
+        let _ = orch.drain_outbox();
+        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
+            orch.handle_load_report(&report(child.0, 0));
+            orch.handle_load_report(&report(1, 0));
+            orch.tick();
+        }
+        assert_eq!(orch.pending_merge(), None, "the spawn point's shard stays");
+        assert_eq!(orch.map().regions.len(), 2);
+        assert!(orch.snapshot().autoscaler.last_decision.is_none());
+
+        // A child that does not own the spawn point, in a cluster that is to
+        // keep two shards: not merged either, and nothing is even tried.
+        let config = OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let corner = topology::octant_node(
+            &ShardMap::new(
+                1,
+                vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ),
+            ShardId::new(1),
+            0,
+        )
+        .expect("octant 0");
+        let ids = PersistentShardIdAllocator::with_sink(3, Box::new(MemoryCounterSink::default()));
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![
+                ShardRegion::new(root, ShardId::new(1), addr(7_001)),
+                ShardRegion::new(corner, ShardId::new(2), addr(7_002)),
+            ],
+            ids,
+        ));
+        for shard in [1, 2] {
+            orch.handle_shard_hello(&ShardHello {
+                shard: ShardId::new(shard),
+                ..fresh_hello(addr(7_000 + shard as u16))
+            })
+            .ok();
+        }
+        orch.note_connected([ShardId::new(1), ShardId::new(2)]);
+        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
+            orch.handle_load_report(&report(2, 0));
+            orch.handle_load_report(&report(1, 0));
+            orch.tick();
+        }
+        assert_eq!(orch.pending_merge(), None, "two shards are to stay");
+        assert!(orch.snapshot().autoscaler.last_decision.is_none());
+    }
+
+    /// The layout cells `--min-shards` stands for are never merged away by
+    /// the autoscaler, whatever else was added: of an idle layout cell and an
+    /// idle cell the autoscaler carved, the carved one goes, and then nobody.
+    ///
+    /// Mutation this catches: counting shards only (the state before: with
+    /// five shards the newest idle one went — a quadrant of the demo area,
+    /// while the players were out at the cell that had been carved for them).
+    #[test]
+    fn the_autoscaler_keeps_the_layout_cells_of_min_shards() {
+        let config = OrchestratorConfig {
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let layout = topology::layout_cells(root)[0];
+        let k = root.center().cell;
+        let carved = space_world::NodeRef::new(64, [k[0] + 4, k[1], k[2]]);
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        // (The layout cell's shard has the highest id: by "newest first"
+        // alone it would be the one to go.)
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![
+                ShardRegion::new(root, ShardId::new(1), addr(7_001)),
+                ShardRegion::new(carved, ShardId::new(2), addr(7_002)),
+                ShardRegion::new(layout, ShardId::new(3), addr(7_003)),
+            ],
+            ids,
+        ));
+        let links = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let idle = [report(1, 0), report(2, 0), report(3, 0)];
+        let mut merged = None;
+        for _ in 0..(2 * crate::autoscale::MERGE_DWELL_TICKS) {
+            beat(&mut orch, &links, &idle);
+            if let Some(shard) = orch.pending_merge() {
+                merged = Some(shard);
+                break;
+            }
+        }
+        assert_eq!(
+            merged,
+            Some(ShardId::new(2)),
+            "the carved cell, not the layout cell"
+        );
+        assert!(ack_the_prepare(&mut orch) > 0);
+        let _ = orch.drain_outbox();
+        // Two shards are left, which is the minimum; and even with a third
+        // the layout cell would stay.
+        for _ in 0..(3 * crate::autoscale::MERGE_DWELL_TICKS) {
+            beat(&mut orch, &links, &idle);
+            assert_eq!(orch.pending_merge(), None);
+        }
+        assert!(orch.map().regions.iter().any(|r| r.node == layout));
+    }
+
+    /// One beat of a cluster whose shards say `reports`: the reports arrive,
+    /// the orchestrator ticks, and the links of `links` are the ones open.
+    fn beat(orch: &mut Orchestrator<MockLauncher>, links: &[ShardId], reports: &[LoadReport]) {
+        for report in reports {
+            orch.handle_load_report(report);
+        }
+        orch.tick();
+        orch.note_connected(links.iter().copied());
+    }
+
+    /// The whole loop, on the orchestrator's own clock (every tick is a call):
+    /// a shard crowded in one cell is relieved by a new shard that is given
+    /// **that cell**; a shard crowded in its only cell is left alone, and the
+    /// log says why; when the players are gone the new shard is merged back,
+    /// **drains**, is told to stop and is stopped — and the cluster is as it
+    /// began.
+    ///
+    /// Mutations this catches: carving the centre octant instead of the hot
+    /// cell (the players are not in it: nobody is relieved); asking again and
+    /// again for a carve that cannot be (no cooldown after "nothing can be
+    /// done"); merging before the pair has been cold for the dwell; stopping
+    /// the merged shard at the commit.
+    #[test]
+    fn the_cluster_grows_at_the_hot_cell_and_shrinks_again_by_draining() {
+        let scale = crate::autoscale::ScaleConfig {
+            capacity: 2,
+            out_dwell_ticks: 30,
+            in_dwell_ticks: 60,
+            cooldown_ticks: 90,
+            drain_timeout_ticks: 300,
+            ..crate::autoscale::ScaleConfig::default()
+        };
+        let config = OrchestratorConfig {
+            scale,
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ids,
+        ));
+        let one = ShardId::new(1);
+        let k = root.center().cell;
+        let far = [k[0] + 3, k[1], k[2]];
+        let far_cell = space_world::NodeRef::new(64, far);
+        let crowd = |shard: u32, cell: [i64; 3], players: u32| LoadReport {
+            hot_cell: cell,
+            hot_cell_players: players,
+            ..report(shard, players)
+        };
+        let mut links = vec![one];
+
+        // 1. Two players (a full shard here) in one far cell of the root's
+        // ground, for the dwell: that cell is wanted for a new shard.
+        let mut asked_at = None;
+        for t in 0..=40u64 {
+            beat(&mut orch, &links, &[crowd(1, far, 2)]);
+            if orch.wanted_node().is_some() {
+                asked_at = Some(t);
+                break;
+            }
+        }
+        assert_eq!(asked_at, Some(30), "after the dwell, not before");
+        assert_eq!(
+            orch.wanted_node(),
+            Some(far_cell),
+            "the hot cell, nothing else"
+        );
+        let decision = orch.snapshot().autoscaler.last_decision.expect("decided");
+        let said = decision.outcome.expect("carried out");
+        assert!(
+            said.contains("2 of its 2 player(s) are in cell 64:"),
+            "{said}"
+        );
+        // The shard launched for it registers, and the carve commits.
+        let first = join(&mut orch).shard;
+        links.push(first);
+        assert!(ack_the_prepare(&mut orch) > 0);
+        orch.note_connected(links.iter().copied());
+        assert_eq!(orch.map().regions.len(), 2);
+        assert_eq!(orch.map().lookup(&far_cell.center()), Some(first));
+        let _ = orch.drain_outbox();
+
+        // 2. The players are the new shard's now, in its only cell: it is as
+        // loaded as the root's was, and cannot be relieved. Said once per
+        // cooldown, and nothing is asked for or started.
+        for _ in 0..400 {
+            beat(&mut orch, &links, &[crowd(first.0, far, 2), report(1, 0)]);
+            assert_eq!(orch.wanted_node(), None);
+            assert!(orch.take_pending_spawn().is_empty());
+            assert_eq!(orch.pending_merge(), None, "a loaded shard is not merged");
+        }
+        let decision = orch.snapshot().autoscaler.last_decision.expect("decided");
+        let why = decision.outcome.expect_err("nothing can be done");
+        assert!(why.contains("cannot be smaller than a cell"), "{why}");
+        // (The log counts an entry that repeats instead of writing it again.)
+        let said: u32 = orch
+            .events()
+            .newest_first()
+            .filter(|event| event.text.contains("cannot be smaller than a cell"))
+            .map(|event| event.repeats)
+            .sum();
+        assert!(
+            (1..=4).contains(&said),
+            "said, but only once a cooldown: {said} times in 400 ticks"
+        );
+
+        // 3. The players leave. The pair is cold together; after the cooldown
+        // and the dwell the new shard — not the root's — is merged away.
+        let empty = |shard: u32, entities: u32| LoadReport {
+            entities,
+            ..report(shard, 0)
+        };
+        let mut merged_after = None;
+        for t in 0..600u64 {
+            beat(&mut orch, &links, &[empty(first.0, 3), empty(1, 30)]);
+            if orch.pending_merge() == Some(first) {
+                merged_after = Some(t);
+                break;
+            }
+        }
+        let waited = merged_after.expect("the idle shard is merged");
+        assert!(
+            waited >= 60,
+            "not before the pair was cold for the dwell: {waited}"
+        );
+        assert!(ack_the_prepare(&mut orch) > 0);
+        assert_eq!(orch.map().regions.len(), 1);
+        assert_eq!(orch.map().lookup(&far_cell.center()), Some(one));
+        // 4. It drains: three bodies still to hand over, then none.
+        assert_eq!(orch.draining_shards(), vec![first]);
+        let told = |orch: &mut Orchestrator<MockLauncher>| {
+            orch.drain_outbox()
+                .into_iter()
+                .any(|(to, m)| to == first && matches!(m, Message::ShardRetire(_)))
+        };
+        for _ in 0..10 {
+            beat(&mut orch, &links, &[empty(first.0, 3), empty(1, 30)]);
+            assert!(!told(&mut orch), "it still holds three bodies");
+            assert!(orch.take_pending_kill().is_empty());
+        }
+        beat(&mut orch, &links, &[empty(first.0, 0), empty(1, 33)]);
+        assert!(told(&mut orch), "empty: told to stop");
+        // 5. It ends (its process exits 0 / its link closes): stopped, gone.
+        links.retain(|shard| *shard != first);
+        match orch.launch_of(first) {
+            Some(launch) => orch.note_launch_exit(launch, Some(0)),
+            None => orch.note_connected(links.iter().copied()),
+        }
+        assert_eq!(orch.take_pending_kill(), vec![first]);
+        assert!(orch.draining_shards().is_empty() && orch.dead_shards().is_empty());
+        // 6. And the cluster stays as it began, however long it idles: the
+        // root's shard is nobody's to merge, and nothing is launched.
+        for _ in 0..300 {
+            beat(&mut orch, &links, &[empty(1, 33)]);
+            assert!(orch.take_pending_spawn().is_empty());
+            assert_eq!(orch.pending_merge(), None);
+        }
+        assert_eq!(orch.map().regions.len(), 1);
+        assert_eq!(orch.map().regions[0].shard, one);
+    }
+
+    /// At `--max-shards` a loaded shard is not relieved, and the log says so.
+    ///
+    /// Mutation this catches: the autoscaler's carve skipping the shard limit
+    /// (a ninth shard would be launched, refused at its hello, and launched
+    /// again).
+    #[test]
+    fn a_loaded_shard_is_not_relieved_beyond_max_shards() {
+        let config = OrchestratorConfig {
+            max_shards: 1,
+            scale: crate::autoscale::ScaleConfig {
+                capacity: 2,
+                out_dwell_ticks: 30,
+                ..crate::autoscale::ScaleConfig::default()
+            },
+            ..OrchestratorConfig::default()
+        };
+        let root = config.root_node();
+        let ids =
+            PersistentShardIdAllocator::with_sink(100, Box::new(MemoryCounterSink::default()));
+        let mut orch = live(orchestrator_over(
+            config,
+            vec![ShardRegion::new(root, ShardId::new(1), addr(7_001))],
+            ids,
+        ));
+        let k = root.center().cell;
+        let crowded = LoadReport {
+            hot_cell: k,
+            hot_cell_players: 2,
+            ..report(1, 2)
+        };
+        for _ in 0..=60 {
+            beat(&mut orch, &[ShardId::new(1)], &[crowded]);
+            assert_eq!(orch.wanted_node(), None);
+            assert!(orch.take_pending_spawn().is_empty());
+        }
+        let decision = orch.snapshot().autoscaler.last_decision.expect("decided");
+        let why = decision.outcome.expect_err("the cluster is full");
+        assert!(why.contains("--max-shards"), "{why}");
     }
 
     // ------------------------------------------------- finding 2 (the abort)
@@ -4985,22 +5820,17 @@ mod tests {
     }
 
     #[test]
-    fn an_operator_merge_obeys_the_empty_shard_rule_and_kills_only_on_commit() {
+    fn an_operator_merge_needs_a_report_and_the_shard_drains_after_the_commit() {
         let mut orch = orchestrator_with_a_child();
         let child = ShardId::new(2);
         orch.note_connected([ShardId::new(1), child]);
 
         let reply = orch.handle_operator(&merge(2));
         assert!(reply.message.contains("not known to be empty"), "{reply:?}");
-        orch.handle_load_report(&report(2, 3));
-        let reply = orch.handle_operator(&merge(2));
-        assert!(
-            !reply.accepted && reply.message.contains("3 player"),
-            "{reply:?}"
-        );
         assert!(orch.drain_outbox().is_empty(), "no prepare was published");
 
-        orch.handle_load_report(&report(2, 0));
+        // Three players are no obstacle: they are handed over by the drain.
+        orch.handle_load_report(&report(2, 3));
         let reply = orch.handle_operator(&merge(2));
         assert!(reply.accepted, "{reply:?}");
         assert_eq!(orch.pending_merge(), Some(child));
@@ -5019,8 +5849,11 @@ mod tests {
         assert!(ack_the_prepare(&mut orch) > 0);
         assert_eq!(orch.map().epoch, 2);
         assert_eq!(orch.map().regions.len(), 1);
-        assert_eq!(orch.take_pending_kill(), vec![child]);
-        assert!(event_texts(&orch)[0].starts_with("epoch 2 committed: merge of shard 2"));
+        assert!(orch.take_pending_kill().is_empty(), "it drains first");
+        assert_eq!(orch.draining_shards(), vec![child]);
+        assert!(event_texts(&orch)
+            .iter()
+            .any(|text| text.starts_with("epoch 2 committed: merge of shard 2")));
     }
 
     // ------------------------------------------------------------- carving
@@ -5232,13 +6065,24 @@ mod tests {
             "the cell fell back to the root's owner"
         );
         assert_eq!(orch.map().lookup(&other.center()), Some(second));
-        assert_eq!(orch.take_pending_kill(), vec![first]);
-        // The merged shard is told the outcome before it is stopped.
+        // The merged shard is told the outcome, and drains: it is not
+        // stopped before it says it is empty.
+        assert!(orch.take_pending_kill().is_empty());
+        assert_eq!(orch.draining_shards(), vec![first]);
         let sent = orch.drain_outbox();
         assert!(sent
             .iter()
             .any(|(s, m)| *s == first && matches!(m, Message::EpochCommit(c) if c.epoch == 4)));
-        assert!(event_texts(&orch)[0].starts_with("epoch 4 committed: merge of shard 100"));
+        assert!(event_texts(&orch)
+            .iter()
+            .any(|text| text.starts_with("epoch 4 committed: merge of shard 100")));
+        orch.tick();
+        orch.handle_load_report(&report(100, 0));
+        orch.tick();
+        assert!(orch
+            .drain_outbox()
+            .iter()
+            .any(|(s, m)| *s == first && matches!(m, Message::ShardRetire(_))));
     }
 
     /// What `begin_carve` refuses, and that a refusal has no side effect: no
@@ -8780,6 +9624,14 @@ mod tests {
         orch.handle_load_report(&report(2, 0));
         assert!(orch.handle_operator(&merge(2)).accepted);
         assert!(ack_the_prepare(&mut orch) > 0);
+        // (It drains: empty, told to stop, gone.)
+        orch.handle_load_report(&report(2, 0));
+        orch.tick();
+        orch.note_connected([new]);
+        if let Some(launch) = orch.launch_of(ShardId::new(2)) {
+            orch.note_launch_exit(launch, Some(0));
+        }
+        assert!(orch.draining_shards().is_empty());
         assert!(orch.scene_confirmed_by(ShardId::new(2)).is_none());
     }
 

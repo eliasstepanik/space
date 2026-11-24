@@ -2,44 +2,40 @@
 # by .github/workflows/release-images.yml (no build section). Installed in
 # /home/proxy/stacks/space/ next to .env (and a ./state directory).
 #
+# ONE service runs the cluster: the orchestrator. It starts its shards itself -
+# one container each, through the Docker socket mounted below - when it starts,
+# and creates, stops and removes shard containers by itself from then on: four
+# to begin with (the demo area in four areas), up to eight under load, each
+# replaced when it dies. No shard is listed in this file.
+#
+# THE DOCKER SOCKET. Mounting /var/run/docker.sock makes the orchestrator's
+# container root-equivalent on this host. Read docs/security-notes.md, "The
+# Docker socket", before installing this file. The web UI stays off (below).
+#
 # Auto-redeploy: the already-running Watchtower container (polls every 60s) only
 # updates containers that opt in with the label
-# `com.centurylinklabs.watchtower.enable: "true"`; orchestrator, shard-a and client
-# carry it, so a new image on ghcr is pulled and the container recreated within
-# ~60s of the push. The images are public (anonymous pull, no docker login).
-# Every push to main publishes all three.
+# `com.centurylinklabs.watchtower.enable: "true"`. The ORCHESTRATOR carries it;
+# shard containers do not, and are not Watchtower's business: a new orchestrator
+# image is pulled, the old container is stopped (SIGTERM: it removes its shards
+# first, within `stop_grace_period`), and the new one starts its shards from
+# the shard image of ITS OWN COMMIT (`space-shard:sha-<commit>`, baked into the
+# orchestrator image at build time and pushed before the orchestrator's
+# `latest` moves) - so client, shard and orchestrator are always one build.
+# The images are public (anonymous pull, no docker login).
 #
 # The browser viewer page is NOT served here: it is a local development and
 # agent-testing tool (see AGENTS.md and crates/space-viewer/README.md), not part
 # of the deployment.
 #
-# NOT RUN from here (it pulls the published ghcr images and belongs on the
-# host): checked with `docker compose config` against .env.example only. Topology and addressing match deploy/docker-compose.yaml
-# (fixed IPv4s on the bridge: addresses are parsed as socket addresses).
-# Subnet is 172.29.0.0/24 (NOT 172.31.0.0/24 as in deploy/docker-compose.yaml):
-# 172.31.0.0/24 collides with an existing docker network on the proxy host.
+# NOT RUN from this repository (it pulls the published ghcr images and belongs on
+# the host): checked with `docker compose config` against .env.example plus a
+# throwaway secret and DOCKER_GID only.
 #
-# Configuration is by ENVIRONMENT variables, not `command:`: each image's
-# ENTRYPOINT is `/bin/sh -c 'exec <bin> --flags "$ENV"...'` (see deploy/Dockerfile.*),
-# so a compose `command:` would only become ignored positional args to that
-# script. Env vars verified against the Dockerfiles:
-#   orchestrator: ORCHESTRATOR_BIND, ORCHESTRATOR_CONTROL_ADDR (required), SPACE_CLUSTER,
-#                 SPACE_ORCHESTRATOR_SCENE, SPACE_ORCHESTRATOR_WEBUI[_TOKEN] (read by the binary),
-#                 SPACE_CLUSTER_SECRET (read by the binary; REQUIRED: the control port is not on
-#                 loopback - it binds the container's wildcard address, reachable from the
-#                 compose network only - so the orchestrator refuses to start without it)
-#   shard:        ORCHESTRATOR_ADDR (required), SHARD_BIND, SHARD_ADVERTISE (required), SPACE_CLUSTER,
-#                 SPACE_CLUSTER_SECRET (read by the binary; the same value, or its hello is refused)
-#   client:       STREAM_BIND (-> --stream), SPACE_SERVER (-> --server), CLIENT_ARGS (extra flags)
+# Configuration is by ENVIRONMENT variables, not `command:` (the images'
+# ENTRYPOINTs are `/bin/sh -c 'exec <bin> ...'`): see deploy/Dockerfile.orchestrator
+# for the full list the binary reads.
 #
-#   docker compose up -d        # orchestrator + shard-a + client
-
-x-cluster: &cluster
-  SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
-  # The cluster secret (.env; at least 16 characters): what a shard's hello must
-  # carry. No default on purpose: with it empty the orchestrator refuses to
-  # start and says why.
-  SPACE_CLUSTER_SECRET: ${SPACE_CLUSTER_SECRET:-}
+#   docker compose up -d        # the orchestrator (and the stream client)
 
 services:
   orchestrator:
@@ -48,9 +44,24 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     environment:
-      <<: *cluster
+      SPACE_CLUSTER: ${SPACE_CLUSTER:-space-prod}
+      # The cluster secret (.env; at least 16 characters): what a shard's hello
+      # must carry; the orchestrator hands it to the shards it starts. REQUIRED,
+      # no default: compose refuses to start the stack without it.
+      SPACE_CLUSTER_SECRET: "${SPACE_CLUSTER_SECRET:?set SPACE_CLUSTER_SECRET in .env to at least 16 random characters}"
       ORCHESTRATOR_BIND: 0.0.0.0:7900
-      ORCHESTRATOR_CONTROL_ADDR: 172.29.0.10:7900
+      # The shard manager: --launcher docker --min-shards 4 --max-shards 8.
+      SPACE_ORCHESTRATOR_LAUNCHER: docker
+      SPACE_ORCHESTRATOR_MIN_SHARDS: ${SPACE_MIN_SHARDS:-4}
+      SPACE_ORCHESTRATOR_MAX_SHARDS: ${SPACE_MAX_SHARDS:-8}
+      # (SPACE_ORCHESTRATOR_SHARD_IMAGE is NOT set here on purpose: the image
+      # names the shard image of its own commit.)
+      # Host UDP ports for the shards, one each, published by the shard
+      # containers themselves on every interface: they are public, like the
+      # player port. Open them in the host's firewall.
+      SPACE_ORCHESTRATOR_HOST_PORTS: ${SPACE_SHARD_PORTS:-7870-7899}
+      # The one address players type.
+      SPACE_ORCHESTRATOR_PLAYER_BIND: 0.0.0.0:7777
       # Initial scene only: one chosen in the web UI is saved in ./state and wins.
       SPACE_ORCHESTRATOR_SCENE: ${SPACE_SCENE:-demo-area}
       # Operator web UI: OFF while SPACE_WEBUI_BIND is empty. Set BOTH values in
@@ -60,7 +71,16 @@ services:
       SPACE_ORCHESTRATOR_WEBUI_TOKEN: ${SPACE_WEBUI_TOKEN:-}
     volumes:
       - ./state:/var/lib/space
+      # The Docker Engine's socket: how the orchestrator starts and stops its
+      # shards. Root-equivalent on this host - see the header.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The orchestrator is not root in its container; it is given the socket's
+    # group. REQUIRED: `stat -c %g /var/run/docker.sock` on this host.
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the group of /var/run/docker.sock on this host (stat -c %g /var/run/docker.sock)}"
     ports:
+      # The player port: the public entry.
+      - "${PLAYER_PORT:-7777}:7777/udp"
       # The control port (7900/udp) is NOT published: only the shards use it,
       # over the `space` network. Whoever can reach it can try to register as
       # a shard, so it is not reachable from outside this host's containers.
@@ -70,27 +90,9 @@ services:
       #   ssh -L 7980:127.0.0.1:7980 <host>     then http://127.0.0.1:7980/
       - "127.0.0.1:${WEBUI_PORT:-7980}:7980/tcp"
     networks:
-      space:
-        ipv4_address: 172.29.0.10
-    restart: unless-stopped
-
-  shard-a:
-    image: ghcr.io/eliasstepanik/space-shard:${SPACE_TAG:-latest}
-    container_name: space-shard-a
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-    depends_on:
-      - orchestrator
-    environment:
-      <<: *cluster
-      ORCHESTRATOR_ADDR: 172.29.0.10:7900
-      SHARD_BIND: 0.0.0.0:7870
-      SHARD_ADVERTISE: 172.29.0.11:7870
-    ports:
-      - "${SHARD_PORT:-7870}:7870/udp"
-    networks:
-      space:
-        ipv4_address: 172.29.0.11
+      - space
+    # Time to remove its shard containers when it is stopped or replaced.
+    stop_grace_period: 30s
     restart: unless-stopped
 
   client:
@@ -99,24 +101,26 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     depends_on:
-      - shard-a
+      - orchestrator
     # Image ENTRYPOINT runs: space-client --stream "$STREAM_BIND"
     # [--server "$SPACE_SERVER"] $CLIENT_ARGS  (no `command:` on purpose).
     environment:
       STREAM_BIND: 0.0.0.0:8099
-      SPACE_SERVER: 172.29.0.11:7870
+      # A player like any other: the player port ON THE HOST, so that the shard
+      # it is sent on to (`<the host it dialed>:<shard port>`) is that shard's
+      # published port.
+      SPACE_SERVER: host.docker.internal:${PLAYER_PORT:-7777}
       # Extra space-client flags; the scene is the orchestrator's choice.
       CLIENT_ARGS: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${CLIENT_PORT:-8099}:8099/tcp"
-    networks:
-      space:
-        ipv4_address: 172.29.0.12
     # The image renders on software Vulkan (lavapipe, Mesa 25), so no GPU is
     # needed; it exits 1 only when no Vulkan device with
     # VK_KHR_acceleration_structure can be found. Not auto-restarted so that such
-    # a host does not churn sessions. The client itself reconnects when the shard
-    # restarts, and viewer input cannot make it quit.
+    # a host does not churn sessions. The client itself reconnects when its
+    # shard is replaced, and viewer input cannot make it quit.
     restart: "no"
 
 networks:
@@ -125,5 +129,7 @@ networks:
     ipam:
       driver: default
       config:
+        # (Not 172.31.0.0/24: that collides with an existing docker network on
+        # the proxy host.)
         - subnet: 172.29.0.0/24
           gateway: 172.29.0.1

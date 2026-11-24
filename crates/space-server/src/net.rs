@@ -790,6 +790,9 @@ pub struct OrchestratorLink {
     reader: JoinHandle<()>,
     /// Why the link was lost, once it is (`None` while it is up).
     lost: tokio::sync::watch::Receiver<Option<String>>,
+    /// Why the orchestrator told this shard to stop, once it has
+    /// ([`space_protocol::ShardRetire`]; `None` until then).
+    retired: tokio::sync::watch::Receiver<Option<String>>,
     /// The sender task handle.
     sender: JoinHandle<()>,
 }
@@ -893,6 +896,7 @@ impl OrchestratorLink {
         // re-dials. That must not happen silently, so whatever ends the loop is
         // logged — and it is what `lost` reports, so the shard is stopped.
         let (lost_tx, lost) = tokio::sync::watch::channel(None::<String>);
+        let (retired_tx, retired) = tokio::sync::watch::channel(None::<String>);
         let reader = {
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -927,6 +931,15 @@ impl OrchestratorLink {
                                     println!("{}", scene_switch_line(id, before, after));
                                 }
                             }
+                            Message::ShardRetire(retire) => {
+                                // The orderly end: this shard is drained and
+                                // told to stop. Whoever runs it is watching
+                                // for this, and stops it with exit status 0.
+                                // (One that names another shard is not ours.)
+                                if retire.shard == shard.lock().await.shard() {
+                                    let _ = retired_tx.send(Some(retire.reason));
+                                }
+                            }
                             _ => {}
                         },
                         Ok(None) => {
@@ -950,7 +963,23 @@ impl OrchestratorLink {
             reader,
             sender,
             lost,
+            retired,
         }
+    }
+
+    /// Why the orchestrator told this shard to stop, if it has
+    /// ([`space_protocol::ShardRetire`]): the orderly end of a shard whose
+    /// region was merged away and which has handed everything over.
+    #[must_use]
+    pub fn retired_reason(&self) -> Option<String> {
+        self.retired.borrow().clone()
+    }
+
+    /// A watcher that resolves when this shard is told to stop (see
+    /// [`Self::retired_reason`]); never, if it is not.
+    #[must_use]
+    pub fn retired_signal(&self) -> LinkLost {
+        LinkLost(self.retired.clone())
     }
 
     /// Why the link was lost, if it has been: the connection's close reason.

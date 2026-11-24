@@ -456,6 +456,7 @@ async fn nothing_said_on_the_player_port_reaches_the_orchestrator() {
             players: 99,
             tick_p95_ms: 30.0,
             load: 1.0,
+            ..Default::default()
         }),
         Message::SceneAck(SceneAck {
             shard: root.shard,
@@ -493,9 +494,12 @@ async fn nothing_said_on_the_player_port_reaches_the_orchestrator() {
     let after = orch.ops.snapshot();
     assert_eq!(state_of(&after), known);
     assert_eq!(after.events.len(), events_before, "nothing was logged");
+    // (The shard's own report is there — it reports once a second — and
+    // says what the shard said, not the 99 players of the forgery.)
     assert_eq!(
-        after.shards[0].report, None,
-        "no load was reported for the shard"
+        after.shards[0].report.map(|report| report.players),
+        Some(0),
+        "no load was forged for the shard"
     );
     assert_eq!(after.scene, before.scene);
 

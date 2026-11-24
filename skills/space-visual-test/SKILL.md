@@ -83,6 +83,46 @@ one the root, and with it the spawn point). Clients connect to the player
 port; `--player-bind` is off unless given, and then a client has to dial a
 shard — any of them: it is sent to the one that owns the spawn point.
 
+### In containers (Docker)
+
+The dev scripts do not need Docker (they use `--launcher process`). The
+compose stack is the other way to run the same cluster: **the orchestrator
+alone**, which creates one container per shard through the Docker socket
+(`--launcher docker`; a Linux engine — Docker Desktop's counts).
+
+```sh
+docker build -f deploy/Dockerfile.shard -t space/shard:dev .       # once, and after every change: the image shards are started from
+export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"              # required, no default
+docker compose -f deploy/docker-compose.yaml up --build -d         # builds and starts the orchestrator only
+docker ps                                                          # the orchestrator and four space-shard-<port>
+space-client --headless --harness 127.0.0.1:8098 --server 127.0.0.1:7777   # a client on the host: the published player port
+docker compose -f deploy/docker-compose.yaml down                  # SIGTERM: the orchestrator removes its shard containers, then exits 0
+```
+
+- Without the shard image the launches fail and the orchestrator's log says
+  so (`space/shard:dev` is in no registry to pull from).
+- Ports already taken, or a second stack: `SPACE_PLAYER_PORT`,
+  `SPACE_SHARD_PORTS` (a range, e.g. `8170-8199`), `WEBUI_PORT`, and a compose
+  project name (`-p`). The web UI is on the host's loopback behind a token
+  (any user name, password `space-local-dev-token` unless `SPACE_WEBUI_TOKEN`
+  is set): `curl -u x:space-local-dev-token http://127.0.0.1:7980/api/state`.
+- A client on the host dials the **published player port** and is sent on to
+  a shard container's published port (`shard_address` in `/state` is
+  `127.0.0.1:<a shard port>`). A shard's log is `docker logs
+  space-shard-<port>`.
+- To watch it scale: `SPACE_SHARD_CAPACITY`, `SPACE_SCALE_OUT_AFTER`,
+  `SPACE_SCALE_IN_AFTER`, `SPACE_SCALE_COOLDOWN` (section 4, "Scaling").
+- **Known on Docker Desktop:** its VM's wall clock is stepped by the
+  hypervisor, the shards' census lines show `clock offset` up to tens of
+  milliseconds (-84 ms was seen), and while two shards slew by themselves a
+  crossing between them can step by decimetres. A process stack on the same
+  machine shows 0.0 ms. Judge crossings on the process stack; on the
+  containers say what the clock offsets were.
+- The Docker socket makes the orchestrator's container root-equivalent on the
+  host (`docs/security-notes.md`, "The Docker socket"): run this on your own
+  machine, and take it down when you are done (`down -v` also removes the
+  state volume).
+
 ## 2. Drive a client
 
 ### a) Headless + harness API — the default for agents
@@ -238,7 +278,20 @@ A split carves one octant of a region for a newly launched shard; a region
 carved more than one level down (a single cell under the root) is listed under
 the region around it as "carved out of ...", and its merge button gives it
 back to that region's owner. Every shard of the map must acknowledge a map
-change within 3 s, or it is rolled back.
+change within 3 s, or it is rolled back. A merged shard is not stopped at the
+commit: its role becomes `draining`, it hands over what it holds and is told
+to stop when it is empty (section 4, "Scaling"). An operator's merge is held
+to `--min-shards` only; it may merge a layout cell or the spawn point's shard,
+which the autoscaler never does.
+
+**Load and the autoscaler.** Every shard reports once a second; `/api/state`
+has it per shard as `load_report` (`players`, `entities` — the ships and
+bodies it simulates, not ghosts or far replicas — `tick_mean_ms`,
+`tick_p95_ms`, `tick_max_ms`, `ticks_jumped`, `hot_cell { cell, players }`,
+`load_metric`) and the page shows it in the shard table. An idle four-shard
+demo area reads 0 players, tick mean under a millisecond, load 0.02-0.03.
+`autoscaler.config` (and the page's Autoscaler card) says what numbers the
+autoscaler runs on; the card's button still pauses it.
 
 ## 4. What to look at
 
@@ -400,6 +453,54 @@ Check what your change touches, and one step either side of it.
   where a player was is not kept). While the root's shard is being replaced
   the player port answers "the cluster is starting"; afterwards
   `player_port.sends_to_shard` names the replacement.
+  On the compose stack the same test is `docker kill space-shard-<port>` —
+  only a container of a stack **you** started, and look first (`docker ps`,
+  `docker inspect`: it carries `space.cluster=<your cluster>` and
+  `space.role=shard`). The replacement is a new container under a new id
+  within about a second.
+- **Scaling** (`docs/plan-sharding.md` §3). Make the cluster scale with two
+  clients: start the stack with the autoscaler's numbers lowered in the
+  environment —
+
+  ```sh
+  SPACE_ORCHESTRATOR_SHARD_CAPACITY=2 SPACE_ORCHESTRATOR_SCALE_OUT_AFTER=5 \
+  SPACE_ORCHESTRATOR_SCALE_IN_AFTER=15 SPACE_ORCHESTRATOR_SCALE_COOLDOWN=10 \
+    bash scripts/dev.sh --servers-only
+  # PowerShell: $env:SPACE_ORCHESTRATOR_SHARD_CAPACITY = '2' ... ; .\scripts\dev.ps1 -ServersOnly
+  ```
+
+  — and connect two headless clients. **Out:** some five seconds after the
+  second is online the root's shard reports 2 of 2 players in the spawn
+  point's cell (load 1.0) and the event log shows that cell wanted, a shard
+  launched, registered and its epoch committed, all within a few ticks;
+  `launched-shards.pid` has a fifth pid; a second later both clients are on
+  the new shard: **the HUD's shard number changes with no border crossed, and
+  nothing else does** (`handoffs` counts, `shard_address` changes, the drawn
+  step is millimetres, `correction_m` 0, the same bodies listed). From then on
+  the event log says about every 45 s that a split `was not carried out: 2 of
+  shard N's 2 player(s) are in one cell, and that cell is its whole region
+  ...`: a region cannot be smaller than a cell — expected, not a defect. Fly
+  both clients a couple of kilometres out (fast travel) and stop: five
+  seconds later the cell they stand in is carved for a sixth shard. **In:**
+  fly both back; after 15 s and the cooldown the event log says `merge shard
+  N: epoch E proposed`, the shard's role in `/api/state` is `draining` for
+  about a second, then `shard N is drained after 0.8 s (0 players, 0
+  entities) and is told to stop` and `shard N stopped as it was told (exit
+  status 0)`; its log ends with `space-server: shard N stops: the
+  orchestrator retired it (...)` and its pid leaves `launched-shards.pid`.
+  The autoscaler never merges the spawn point's shard nor the three layout
+  cells beside it, so the four areas stay and the spawn cell's shard does too.
+  **A defect:** a client on the connect screen at any point; a log line
+  `called off` for a player's ship; a drain that runs into its timeout (`...
+  what it held is gone`); a shard `told to stop ... and is still there`; an
+  exit status other than 0 for a retired shard; a shard merged while the
+  cluster is at `--min-shards`. The repeatable versions:
+  `the_cluster_grows_at_the_hot_cell_and_shrinks_again_by_draining`
+  (`space-orchestrator`) and
+  `a_shard_whose_region_is_merged_away_hands_everything_over_and_is_empty`
+  (`space-server/tests/four_cells.rs`). Known, seen there: switching fast
+  travel **off** at several hundred m/s is a prediction correction of metres
+  on that tick (23 m at 775 m/s) — the toggle, not a border.
 - **A stalled shard** (a suspended host, a debugger): start the stack with
   `SPACE_DEBUG_STALL_DIR` set to a directory (the orchestrator hands its
   environment to the shards it starts). A file `stall-<shard id>` in it

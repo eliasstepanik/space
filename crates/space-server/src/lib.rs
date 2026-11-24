@@ -56,6 +56,7 @@
 //!   every shard
 //! * [`replicate`] — interest grid, change-tick deltas, the frame budget
 //! * [`handoff`] — the seamless handoff state machine
+//! * [`load`] — what a shard reports to its orchestrator once a second
 //! * [`shard`] — [`Shard`], the state the tick loop drives
 //! * [`net`] — the quinn front end that turns frames into [`Shard`] calls
 //!
@@ -70,6 +71,7 @@ pub mod clock;
 pub mod config;
 pub mod epoch;
 pub mod handoff;
+pub mod load;
 pub mod net;
 pub mod orchestrated;
 pub mod replicate;

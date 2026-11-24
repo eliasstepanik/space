@@ -351,8 +351,31 @@ pub struct Shard {
     /// Whether the scene clock was set ([`Shard::set_scene_clock`]): this
     /// shard counts scene time on a shared clock, not from its own zero.
     scene_clock_set: bool,
+    /// Shards a map change took out of the map a moment ago, with where they
+    /// were reached and the tick until which they are still heard (see
+    /// [`FORMER_SHARD_GRACE_TICKS`]).
+    former: HashMap<ShardId, (std::net::SocketAddr, SimTick)>,
+    /// The tick times since the last load report ([`crate::load`]).
+    load: crate::load::LoadWindow,
+    /// Whether this shard reports its load to an orchestrator
+    /// ([`Shard::report_load`]), and the tick it last did.
+    reports_load: Option<SimTick>,
     stats: ShardStats,
 }
+
+/// How long a shard that a map change removed from the map is still heard by
+/// the others, in ticks (60 s).
+///
+/// A region that is merged away leaves its shard owning nothing, with ships
+/// and bodies still in its world: it **drains** — everything it simulates
+/// lies on another shard's ground now and is offered there by the ordinary
+/// handoff — and is stopped by the orchestrator when it is empty
+/// (`docs/plan-sharding.md` §3). For that the shards of the new map must
+/// still take its offers, commits and ghosts, and know where to answer it,
+/// although their map no longer names it. Long enough for any drain (the
+/// orchestrator gives one up after at most 45 s); a shard that died and was
+/// replaced is "heard" for this long too, and says nothing.
+pub const FORMER_SHARD_GRACE_TICKS: SimTick = 60 * space_sim::TICK_HZ as SimTick;
 
 impl Shard {
     /// An empty shard owning `config.region`.
@@ -395,8 +418,64 @@ impl Shard {
             epoch_participant: EpochParticipant::new(),
             scene: SceneState::UNSET,
             scene_clock_set: false,
+            former: HashMap::new(),
+            load: crate::load::LoadWindow::default(),
+            reports_load: None,
             stats: ShardStats::default(),
         }
+    }
+
+    /// Switch the load reports on: from now on this shard queues a
+    /// [`LoadReport`](space_protocol::LoadReport) for its orchestrator every
+    /// [`crate::load::REPORT_INTERVAL_TICKS`] (an orchestrated shard; a
+    /// standalone one has nobody to tell and never calls this).
+    pub fn report_load(&mut self) {
+        self.reports_load = Some(self.sim.tick());
+    }
+
+    /// What this shard would report about its load right now (and the tick
+    /// times collected since the last report are taken: the next window
+    /// starts here).
+    pub fn load_report(&mut self) -> space_protocol::LoadReport {
+        let cells: Vec<[i64; 3]> = self
+            .clients
+            .values()
+            .filter_map(|client| client.ship)
+            .filter_map(|ship| self.sim.ship_state(ship))
+            .map(|state| state.pos.cell)
+            .collect();
+        let entities = self
+            .sim
+            .bodies()
+            .iter()
+            .filter(|(guid, _, ghost)| !ghost && self.sim.ship_state(*guid).is_some())
+            .count();
+        crate::load::report(
+            self.config.shard,
+            u32::try_from(self.clients.len()).unwrap_or(u32::MAX),
+            &cells,
+            u32::try_from(entities).unwrap_or(u32::MAX),
+            self.stats.skipped,
+            self.load.take(),
+        )
+    }
+
+    /// Remember the shards `new` no longer names, so that they are still
+    /// heard for a while ([`FORMER_SHARD_GRACE_TICKS`]); called with the map
+    /// that is about to be replaced still in place.
+    fn note_departing(&mut self, new: &ShardMap) {
+        let until = self.sim.tick() + FORMER_SHARD_GRACE_TICKS;
+        let own = self.config.shard;
+        for region in &self.shard_map.regions {
+            let shard = region.shard;
+            let stays = new.regions.iter().any(|r| r.shard == shard);
+            if shard != own && shard != ShardId::NONE && !stays && region.endpoint.port() != 0 {
+                self.former.insert(shard, (region.endpoint, until));
+            }
+        }
+        // Whoever is (back) in the map is no former shard.
+        self.former
+            .retain(|shard, _| !new.regions.iter().any(|r| r.shard == *shard));
     }
 
     /// The mapping from this shard's ticks to scene time (see
@@ -496,6 +575,14 @@ impl Shard {
             .filter(|region| region.shard == peer)
             .map(|region| region.endpoint)
             .find(|endpoint| *endpoint != self.config.endpoint && endpoint.port() != 0)
+            // A shard the map named until a moment ago is still answered
+            // where it was (it is draining: [`FORMER_SHARD_GRACE_TICKS`]).
+            .or_else(|| {
+                self.former
+                    .get(&peer)
+                    .filter(|(_, until)| self.sim.tick() <= *until)
+                    .map(|(endpoint, _)| *endpoint)
+            })
     }
 
     /// The region this shard is authoritative for.
@@ -527,6 +614,7 @@ impl Shard {
     /// A new map also ends every re-offer pause: a refusal was a statement about
     /// the map it was made under.
     pub fn set_shard_map(&mut self, map: ShardMap) {
+        self.note_departing(&map);
         self.shard_map = map;
         self.refused.clear();
         self.forget_departed_neighbours();
@@ -589,6 +677,7 @@ impl Shard {
         // leftover staged prepare would otherwise wedge every later prepare
         // (the participant allows one outstanding prepare at a time).
         let _ = self.epoch_participant.discard_through(map.epoch);
+        self.note_departing(&map);
         self.shard_map = map;
         // A refusal under the old map says nothing about the new one.
         self.refused.clear();
@@ -1166,15 +1255,22 @@ impl Shard {
         }
     }
 
-    /// Whether `shard` is one of the ids this shard's map names.
+    /// Whether `shard` is one of the ids this shard's map names — or named
+    /// until a moment ago: a shard whose region was merged away is still
+    /// heard while it hands over what it simulates
+    /// ([`FORMER_SHARD_GRACE_TICKS`]).
     #[must_use]
     pub fn knows_shard(&self, shard: ShardId) -> bool {
         shard != ShardId::NONE
-            && self
+            && (self
                 .shard_map
                 .regions
                 .iter()
                 .any(|region| region.shard == shard)
+                || self
+                    .former
+                    .get(&shard)
+                    .is_some_and(|(_, until)| self.sim.tick() <= *until))
     }
 
     fn on_neighbour_status(&mut self, from: ShardId, status: NeighbourStatus) {
@@ -1610,6 +1706,24 @@ impl Shard {
     /// replication so a commit's entity is in the world when frames are built, and
     /// replication must run last so a frame describes the finished tick.
     pub fn tick(&mut self) -> SimTick {
+        let began = std::time::Instant::now();
+        let tick = self.tick_inner();
+        // What the tick cost, for the load report; and the report itself,
+        // once a second, for a shard that has an orchestrator to tell.
+        self.load
+            .note(u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX));
+        if let Some(last) = self.reports_load {
+            if tick.saturating_sub(last) >= crate::load::REPORT_INTERVAL_TICKS {
+                self.reports_load = Some(tick);
+                let report = self.load_report();
+                self.send_to(Destination::Orchestrator, Message::LoadReport(report));
+            }
+        }
+        tick
+    }
+
+    /// The tick itself ([`Shard::tick`] times it).
+    fn tick_inner(&mut self) -> SimTick {
         // 1. Inputs: filed for the ship this shard simulates, or — for a
         // ship on its way here (its player sends to both shards around the
         // switch) — kept until it is installed. Anything else is dropped: a

@@ -465,6 +465,23 @@ impl Launcher for ProcessLauncher {
             ))),
         }
     }
+
+    async fn exit_code(&self, launch: LaunchId) -> Option<i32> {
+        let mut children = self.table();
+        let shard = children.get_mut(&launch)?;
+        // (`try_wait` on a child that was already reaped by it returns the
+        // status it returned then. A child ended by a signal has no code.)
+        shard.child.try_wait().ok().flatten().and_then(|s| s.code())
+    }
+
+    async fn shutdown(&self) {
+        let mut children = self.table();
+        for (_, mut shard) in children.drain() {
+            let _ = shard.child.kill();
+            let _ = shard.child.wait();
+        }
+        self.write_pid_file(&children);
+    }
 }
 
 #[cfg(test)]

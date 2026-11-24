@@ -4,8 +4,14 @@
 # Build from the REPOSITORY ROOT (the workspace is the build context):
 #   docker build -f deploy/Dockerfile.shard -t space/shard .
 #
-# Built and run locally (Docker 28 on Windows, through docker-compose.yaml):
-# see "What is and is not verified" in deploy/README.md.
+# Nobody starts this image by hand in the shipped stacks: the orchestrator does,
+# one container per shard (`--launcher docker`), with its own command line -
+# `space-server --orchestrator <control address> --cluster <id> --bind 0.0.0.0:<P>
+# --advertise 0.0.0.0:<P> --client-endpoint 0.0.0.0:<P>`, the cluster secret in
+# the environment - so the binary must stay on the PATH under this name. The
+# entrypoint below is for a shard started by hand next to an orchestrator.
+#
+# What was built and run where: "What is and is not verified" in deploy/README.md.
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1.100-bookworm AS build
@@ -23,20 +29,24 @@ RUN useradd --create-home --uid 10001 shard
 COPY --from=build /src/target/release/space-server /usr/local/bin/space-server
 USER shard
 
-# QUIC is UDP. Bind the wildcard so the container's published port is reachable;
-# the address peers/clients should DIAL is passed as SHARD_ADVERTISE.
+# QUIC is UDP. Bind the wildcard so the container's published port is reachable.
 ENV SHARD_BIND=0.0.0.0:7870 \
+    SHARD_ADVERTISE=0.0.0.0:7870 \
     SPACE_CLUSTER=space-local
 EXPOSE 7870/udp
 
-# The orchestrator's control address (ORCHESTRATOR_ADDR) and the advertised
-# address (SHARD_ADVERTISE) are required, as `ip:port` (they are parsed as socket
-# addresses, not resolved as host names). An optional SHARD_CLAIM_REGION
-# (`depth:x:y:z`) is added by the shell below when set. The id and region come
-# from the orchestrator's welcome: no `--shard` here (H9).
+# By hand: the orchestrator's control address (ORCHESTRATOR_ADDR, `ip:port` or
+# `name:port`) is required. SHARD_ADVERTISE is the address other shards dial
+# (`0.0.0.0:<port>`, the default: the orchestrator fills in the address it sees
+# this container at); SHARD_CLIENT_ENDPOINT, when set, is where players dial it
+# (`0.0.0.0:<host port>` = the host they dialed the player port on). An optional
+# SHARD_CLAIM_REGION (`depth:x:y:z`) is added when set. The id and the region
+# come from the orchestrator's welcome: no `--shard` here (H9). The cluster
+# secret is read by the binary from SPACE_CLUSTER_SECRET.
 ENTRYPOINT ["/bin/sh", "-c", "exec space-server \
-  --orchestrator \"${ORCHESTRATOR_ADDR:?set ORCHESTRATOR_ADDR=ip:port}\" \
+  --orchestrator \"${ORCHESTRATOR_ADDR:?set ORCHESTRATOR_ADDR=host:port}\" \
   --cluster \"$SPACE_CLUSTER\" \
   --bind \"$SHARD_BIND\" \
-  --advertise \"${SHARD_ADVERTISE:?set SHARD_ADVERTISE=ip:port}\" \
+  --advertise \"$SHARD_ADVERTISE\" \
+  ${SHARD_CLIENT_ENDPOINT:+--client-endpoint \"$SHARD_CLIENT_ENDPOINT\"} \
   ${SHARD_CLAIM_REGION:+--claim-region \"$SHARD_CLAIM_REGION\"}", "space-shard"]

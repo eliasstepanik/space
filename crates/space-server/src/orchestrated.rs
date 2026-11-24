@@ -304,12 +304,22 @@ impl RunningShard {
         } = self;
         let stopped = crate::net::supervise(serve, ticking).await;
         watchdog.abort();
-        let lost = link.lost_reason();
+        let (retired, lost) = (link.retired_reason(), link.lost_reason());
         link.close();
-        match lost {
-            Some(why) => Err(lost_line(shard, &why)),
-            None => stopped,
+        match (retired, lost) {
+            // Told to stop: the one orderly end (the link the orchestrator
+            // closes right behind its word is not a loss).
+            (Some(_), _) => Ok(()),
+            (None, Some(why)) => Err(lost_line(shard, &why)),
+            (None, None) => stopped,
         }
+    }
+
+    /// Whether the orchestrator has told this shard to stop
+    /// ([`space_protocol::ShardRetire`]).
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.link.retired_reason().is_some()
     }
 
     /// Whether the shard is still serving, ticking and linked to its
@@ -337,6 +347,11 @@ fn lost_line(shard: ShardId, why: &str) -> String {
         "{shard} lost its orchestrator ({why}); a shard does not run without one, so it stops \
          (the orchestrator replaces it under a new id)"
     )
+}
+
+/// What a shard says when it stops because its orchestrator told it to.
+fn retired_line(shard: ShardId, why: &str) -> String {
+    format!("{shard} stops: the orchestrator retired it ({why})")
 }
 
 /// Register with the orchestrator at `orch_addr`, adopt the welcome, and start
@@ -411,6 +426,9 @@ pub async fn start_orchestrated_on(
     let mut shard = Shard::new(config);
     shard.set_shard_map(welcome.shard_map.clone());
     shard.set_endpoints(endpoint, client_endpoint);
+    // The orchestrator hears once a second what this shard holds and how
+    // long its ticks take (`crate::load`): what it scales the cluster on.
+    shard.report_load();
     let shard = Arc::new(Mutex::new(shard));
 
     // The cluster's peer token: presented to every neighbour, required of
@@ -442,12 +460,17 @@ pub async fn start_orchestrated_on(
     // No orchestrator, no shard: stop serving and ticking the moment the
     // link is lost, whoever is (or is not) waiting on `RunningShard::wait`.
     let watchdog = {
-        let lost = link.lost_signal();
+        let (lost, retired) = (link.lost_signal(), link.retired_signal());
         let (serve, ticking) = (serve.abort_handle(), ticking.abort_handle());
         let (net, id) = (Arc::clone(&net), welcome.shard);
         tokio::spawn(async move {
-            let why = lost.wait().await;
-            eprintln!("space-server: {}", lost_line(id, &why));
+            // (Biased: a shard that was told to stop and then sees its link
+            // closed was told to stop.)
+            tokio::select! {
+                biased;
+                why = retired.wait() => println!("space-server: {}", retired_line(id, &why)),
+                why = lost.wait() => eprintln!("space-server: {}", lost_line(id, &why)),
+            }
             ticking.abort();
             serve.abort();
             net.close();

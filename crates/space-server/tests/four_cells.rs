@@ -1660,3 +1660,149 @@ fn the_same_script_on_one_shard_and_on_four() {
         );
     }
 }
+
+/// **A shard whose region is merged away drains** (`docs/plan-sharding.md`
+/// §3): the map changes under it, it owns nothing, and everything it
+/// simulates — the scene's bodies on what was its ground, a player standing
+/// there — is handed to the shard that owns the ground now by the ordinary
+/// handoff, until it holds nothing and reports so. The others still hear it
+/// although their map no longer names it.
+///
+/// Mutations this catches: `Shard::knows_shard` naming only the shards of
+/// the map (the offers of the drained shard are dropped: after ten seconds it
+/// still holds every body and its player); `peer_endpoint` without the former
+/// shard's address is the same over real sockets (not seen by this fixture,
+/// which delivers by id).
+#[test]
+fn a_shard_whose_region_is_merged_away_hands_everything_over_and_is_empty() {
+    let mut c = Cluster::four();
+    c.tick_n(90);
+    // A player walks onto the diagonal cell's ground and stands there.
+    let mut pilot = Pilot::join(&mut c, "drained");
+    let stand = [BORDER_X - 9.0, 3.0, BORDER_Z - 9.0];
+    assert_eq!(c.owner(stand), DIAGONAL);
+    pilot.put(&mut c, stand, [0.0; 3]);
+    for _ in 0..240 {
+        pilot.step(&mut c, [0.0; 3]);
+        if pilot.on == DIAGONAL {
+            break;
+        }
+    }
+    assert_eq!(pilot.on, DIAGONAL, "the player is on the diagonal shard");
+    let own = |c: &Cluster| {
+        c.shard(DIAGONAL)
+            .body_list()
+            .iter()
+            .filter(|body| !body.ghost)
+            .count()
+    };
+    let before = c.shard_mut(DIAGONAL).load_report();
+    assert_eq!(before.players, 1);
+    assert!(
+        before.entities >= 2,
+        "the ship and scene bodies: {before:?}"
+    );
+    assert_eq!(before.entities as usize, own(&c));
+    assert_eq!(
+        (before.hot_cell, before.hot_cell_players),
+        (c.at(stand).cell, 1)
+    );
+    let bodies: Vec<EntityGuid> = c.names.iter().map(|(_, g)| *g).collect();
+    let where_before: Vec<[f64; 3]> = bodies.iter().map(|g| c.rel(*g)).collect();
+    let resting: Vec<bool> = bodies
+        .iter()
+        .map(|g| c.state(*g).is_some_and(|s| s.vel == [0.0; 3]))
+        .collect();
+
+    // The merge commits: the diagonal cell goes back to the root's shard.
+    let mut merged = c.shard(ROOT).shard_map().clone();
+    merged.regions.retain(|region| region.shard != DIAGONAL);
+    merged.epoch += 1;
+    for shard in &mut c.shards {
+        shard.apply_epoch(merged.clone());
+    }
+    assert_eq!(c.owner(stand), ROOT);
+    let aborted_before: usize = c.shards.iter().map(|s| s.stats().aborted).sum();
+
+    let mut drained_after = None;
+    for tick in 0..300 {
+        pilot.step(&mut c, [0.0; 3]);
+        if own(&c) == 0 && c.shard(DIAGONAL).stats().clients == 0 {
+            drained_after = Some(tick);
+            break;
+        }
+    }
+    let ticks = drained_after.unwrap_or_else(|| {
+        panic!(
+            "the diagonal shard still holds {} entities and {} client(s) ten seconds after its \
+             region was merged away",
+            own(&c),
+            c.shard(DIAGONAL).stats().clients
+        )
+    });
+    println!("drained {} entities in {ticks} ticks", before.entities);
+    let after = c.shard_mut(DIAGONAL).load_report();
+    assert_eq!((after.players, after.entities), (0, 0), "{after:?}");
+    assert_eq!(pilot.on, ROOT, "the player went to the owner of the ground");
+    let aborted_after: usize = c.shards.iter().map(|s| s.stats().aborted).sum();
+    assert_eq!(aborted_after, aborted_before, "no transfer was called off");
+    // Every body is simulated once, by a shard of the map, and none of the
+    // ones at rest moved by the change of shard.
+    c.tick_n(30);
+    for ((guid, was), rests) in bodies.iter().zip(&where_before).zip(&resting) {
+        let on = c.simulators(*guid);
+        assert_eq!(on.len(), 1, "{guid} is simulated by {on:?}");
+        assert_ne!(on[0], DIAGONAL);
+        if *rests {
+            let moved = dist(c.rel(*guid), *was);
+            assert!(
+                moved < 0.01,
+                "{guid} moved {moved:.4} m while it was handed over"
+            );
+        }
+    }
+}
+
+/// An orchestrated shard reports its load once a second: who it holds and
+/// where most of its players are.
+///
+/// Mutation this catches: `Shard::tick` not queueing the report (the
+/// orchestrator would scale on nothing), or queueing one every tick.
+#[test]
+fn a_shard_reports_its_load_once_a_second() {
+    let mut c = Cluster::one();
+    let pilot = Pilot::join(&mut c, "counted");
+    c.shard_mut(ROOT).report_load();
+    let mut reports = Vec::new();
+    for _ in 0..95 {
+        c.shard_mut(ROOT).tick();
+        for out in c.shard_mut(ROOT).take_outbox() {
+            if let (Destination::Orchestrator, Message::LoadReport(report)) =
+                (out.dest, out.message)
+            {
+                reports.push(report);
+            }
+        }
+    }
+    assert_eq!(reports.len(), 3, "one a second for three seconds");
+    let report = reports[2];
+    assert_eq!(report.shard, ROOT);
+    assert_eq!(report.players, 1);
+    let ship = c
+        .shard(ROOT)
+        .sim()
+        .ship_state(pilot.ship)
+        .expect("the ship");
+    assert_eq!(
+        (report.hot_cell, report.hot_cell_players),
+        (ship.pos.cell, 1)
+    );
+    let scene = space_scene::body_defs(Scene::DemoArea).len();
+    assert_eq!(
+        report.entities as usize,
+        scene + 1,
+        "the scene and the ship"
+    );
+    assert!(report.tick_mean_ms > 0.0 && report.tick_mean_ms <= report.tick_max_ms);
+    assert!(report.tick_p95_ms <= report.tick_max_ms);
+}

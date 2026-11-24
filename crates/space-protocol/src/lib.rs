@@ -62,7 +62,9 @@ pub use codec::{
     check_hello, decode_frame, encode_frame, try_encode_frame, CodecError, FRAME_HEADER_LEN,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
-pub use control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+pub use control::{
+    AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport, ShardRetire,
+};
 pub use far::{FarInterest, FarPlayer, FarUpdate, Origin, OriginKind, FAR_RANGE, ORIGIN_COMPONENT};
 pub use guid::EntityGuid;
 pub use messages::{

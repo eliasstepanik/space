@@ -334,6 +334,9 @@ pub enum ShardRole {
     Dead,
     /// The shard the merge in flight removes once its epoch commits.
     Merging,
+    /// Its region was merged away: it owns nothing and is handing over what
+    /// it simulates, and is stopped when it is empty.
+    Draining,
     /// Known (it said hello) but it owns no region of the committed map.
     Unowned,
 }
@@ -348,6 +351,7 @@ impl ShardRole {
             ShardRole::Joining => "joining",
             ShardRole::Dead => "dead",
             ShardRole::Merging => "merging",
+            ShardRole::Draining => "draining",
             ShardRole::Unowned => "unowned",
         }
     }
@@ -401,8 +405,18 @@ pub struct ReportView {
     /// The load figure the shard itself put in the report.
     pub reported_load: f32,
     /// The metric the autoscaler computes from the report
-    /// ([`crate::autoscale::load_metric`]).
+    /// ([`crate::autoscale::ScaleConfig::load_of`]).
     pub load_metric: f64,
+    /// Ships and bodies the shard simulates.
+    pub entities: u32,
+    /// Its mean tick time over the last second, in milliseconds.
+    pub tick_mean_ms: f32,
+    /// Its worst tick time over the last second, in milliseconds.
+    pub tick_max_ms: f32,
+    /// Ticks it has jumped since it started.
+    pub skipped: u64,
+    /// The cell holding most of its players and how many, if it has any.
+    pub hot_cell: Option<([i64; 3], u32)>,
 }
 
 /// An epoch change that has been prepared and not yet committed or aborted.
@@ -431,6 +445,8 @@ pub struct AutoscalerView {
     pub busy_until: u64,
     /// Its most recent decision and what became of it.
     pub last_decision: Option<Decision>,
+    /// The settings it decides by.
+    pub config: crate::autoscale::ScaleConfig,
 }
 
 /// One autoscaler decision.

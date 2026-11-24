@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 use space_ecs::ComponentId;
 
-use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+use crate::control::{
+    AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport, ShardRetire,
+};
 use crate::far::{FarInterest, FarUpdate};
 use crate::guid::EntityGuid;
 use crate::scene::{SceneAck, SceneClock, SceneState};
@@ -734,6 +736,9 @@ pub enum Message {
     /// Shard -> shard: far replicas, what I simulate in view of your players
     /// ([`FarUpdate`], protocol 7).
     FarUpdate(FarUpdate),
+    /// Orchestrator -> shard: you are drained, stop ([`ShardRetire`],
+    /// protocol 7). Only ever sent on a shard's control link.
+    ShardRetire(ShardRetire),
 }
 
 impl Message {
@@ -743,7 +748,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 32;
+    pub const VARIANT_COUNT: u32 = 33;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -784,6 +789,7 @@ impl Message {
             Message::JoinRedirect(_) => 29,
             Message::FarInterest(_) => 30,
             Message::FarUpdate(_) => 31,
+            Message::ShardRetire(_) => 32,
         }
     }
 

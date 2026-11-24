@@ -1,90 +1,87 @@
-# Space cluster: one orchestrator + ONE shard on a user-defined bridge network.
+# Space cluster, local: ONE service, the orchestrator. It starts its shards
+# itself - one container each, through the Docker socket mounted below - when
+# it starts, and creates, stops and removes shard containers by itself from
+# then on (four to begin with, up to eight under load, replaced when one dies).
 #
 #   export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"     # required, see below
 #   docker compose -f deploy/docker-compose.yaml up --build
+#   space-client --server 127.0.0.1:7777                       # a client on the host
 #
-# Run locally with Docker 28, including the `stream` profile: see "What is and
-# is not verified" in deploy/README.md.
+# `up --build` builds the orchestrator image only. The shard image has to exist
+# under the name the orchestrator starts shards from (SPACE_SHARD_IMAGE below,
+# default `space/shard:dev`) - build it once, and again after every change:
 #
-# The cluster starts with ONE shard. The orchestrator pre-allocates the root
-# region's owner and the first region-less hello (shard-a, no --shard, no region
-# claim) adopts it. Every further shard that registers the same way is given a
-# region by the orchestrator (the next layout cell beside the scene's spawn
-# point), up to --max-shards; a split starts its own (`--launcher local`: inside
-# the orchestrator's process).
+#   docker build -f deploy/Dockerfile.shard -t space/shard:dev .
 #
-# The control port binds 0.0.0.0 in the container, and a control port that is not
-# on loopback takes a shard's hello only with the CLUSTER SECRET (and the
-# orchestrator refuses to start without one). Both services are given it from
-# SPACE_CLUSTER_SECRET, which has NO default: the repository holds no secret.
-# Set it in your shell or in a `.env` file next to this compose file (which is
-# not checked in) to at least 16 random characters; without it `docker compose`
-# stops with a message saying so, before anything is started.
+# (The orchestrator pulls an image that is not on the host; `space/shard:dev`
+# exists in no registry, so without the build the launch fails and says so.)
 #
-# The control port (7900/udp) is NOT published on the host: only the shards
-# use it, and they reach it over the compose network. Whoever can reach it can
-# try to register as a shard, so it stays where only the shards are.
+# What is where:
 #
-# Addressing: `--orchestrator`, `--control-addr` and `--advertise` are parsed as
-# socket ADDRESSES, not resolved as host names, so every container gets a fixed
-# IPv4 on the bridge subnet below.
+#   orchestrator   control port 7900/udp   NOT published: shards only, over the
+#                                          `space` network, with the cluster secret
+#                  player port  7777/udp   published: the one address players type
+#                  web UI       7980/tcp   published on the host's LOOPBACK only
+#                                          (any user name, password = SPACE_WEBUI_TOKEN,
+#                                          by default `space-local-dev-token`)
+#   shards         7870-7899/udp           each shard container publishes its own
+#                                          port; a player is sent on to
+#                                          `<the host it dialed>:<that port>`
 #
-#   orchestrator  172.31.0.10:7900   binds 0.0.0.0:7900, shards dial 172.31.0.10:7900
-#                                    (inside the compose network only)
-#                 172.31.0.10:7980   operator web UI (HTTP), on the host at
-#                                    http://127.0.0.1:7980/ (any user name,
-#                                    password = SPACE_WEBUI_TOKEN, by default
-#                                    `space-local-dev-token`)
-#   shard-a       172.31.0.11:7870   binds 0.0.0.0:7870, advertises 172.31.0.11:7870
-#   client        172.31.0.12:8099   (profile "stream" only) ws:// pixel stream,
-#                                    plays on shard-a at 172.31.0.11:7870
+# THE DOCKER SOCKET. Mounting /var/run/docker.sock makes this container able to
+# do anything on the host that root can (start a privileged container, mount
+# the host's disk). That is what "the orchestrator manages its shards" costs;
+# docs/security-notes.md, "The Docker socket", says what is done about it:
+# nothing a player or a shard sends reaches a Docker call, shards get no
+# socket, no mount and no privilege, and the web UI - the one way to operate
+# the orchestrator from outside - stays on loopback behind a token.
 #
-# Shards advertise their in-network address (peers dial each other over the
-# bridge). Clients on the host use the published UDP port 7871; a shard that
-# must hand out a host-reachable address to clients would advertise the host
-# address instead (the plan's two-address case, R12, is not implemented here).
+# The orchestrator does not run as root in its container. It is given the
+# socket's GROUP instead (`group_add`): DOCKER_GID, default 0 - right for Docker
+# Desktop, where the socket is root:root. On a Linux host set it to the
+# socket's group: `export DOCKER_GID=$(stat -c %g /var/run/docker.sock)`.
 #
-# The shard registers with ShardHello and is placed by the orchestrator. If it
-# restarts it re-advertises the same address, which the orchestrator recognises
-# as that shard having come back: it is given the old one's region under a NEW
-# id (and the scene is rebuilt once). A shard that loses the orchestrator exits,
-# and `restart: unless-stopped` starts a fresh one. The orchestrator runs
-# `--launcher local`: `--launcher docker` is deferred.
+# SPACE_CLUSTER_SECRET has NO default: the repository holds no secret. Set it in
+# your shell or in a `.env` file next to this compose file (which is not checked
+# in) to at least 16 random characters; without it `docker compose` stops with a
+# message saying so, before anything is started. The orchestrator hands it to
+# the shards it starts, in their environment (never on a command line).
 #
-# The streaming client is OPT-IN so a plain `up` stays orchestrator + shard:
+# Stopping: `docker compose down` sends the orchestrator SIGTERM; it removes
+# its shard containers (bounded: 20 s) and exits - `stop_grace_period` below
+# gives it that time. Should it be killed instead, its shards notice within
+# about ten seconds and exit, and the next start removes what is left of them
+# (containers labelled space.cluster=<SPACE_CLUSTER>, space.role=shard) first.
 #
-#   docker compose -f deploy/docker-compose.yaml --profile stream up --build
-#
-# It publishes the ws:// stream on host TCP 8099. The wasm viewer is served
-# separately by any static file server (see deploy/README.md), e.g. open
-# index.html?ws=ws://127.0.0.1:8099.
-
-x-cluster: &cluster
-  SPACE_CLUSTER: space-local
-  # What a shard's hello must carry (at least 16 characters). REQUIRED, and
-  # there is no default: a secret that is checked in is not one.
-  SPACE_CLUSTER_SECRET: "${SPACE_CLUSTER_SECRET:?set SPACE_CLUSTER_SECRET to at least 16 random characters, in your shell or in deploy/.env - the cluster secret has no default}"
-
-x-shard: &shard
-  build:
-    context: ..
-    dockerfile: deploy/Dockerfile.shard
-  image: space/shard:dev
-  depends_on:
-    - orchestrator
-  restart: unless-stopped
+# The streaming client is OPT-IN (`--profile stream`); it reaches the cluster
+# the way a player does, through the host's published ports.
 
 services:
   orchestrator:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.orchestrator
-    image: space/orchestrator:dev
+      args:
+        SPACE_SHARD_IMAGE: ${SPACE_SHARD_IMAGE:-space/shard:dev}
+    image: ${SPACE_ORCHESTRATOR_IMAGE:-space/orchestrator:dev}
     environment:
-      <<: *cluster
+      SPACE_CLUSTER: ${SPACE_CLUSTER:-space-local}
+      # What a shard's hello must carry (at least 16 characters). REQUIRED, and
+      # there is no default: a secret that is checked in is not one.
+      SPACE_CLUSTER_SECRET: "${SPACE_CLUSTER_SECRET:?set SPACE_CLUSTER_SECRET to at least 16 random characters, in your shell or in deploy/.env - the cluster secret has no default}"
       ORCHESTRATOR_BIND: 0.0.0.0:7900
-      # What shards dial; distinct from the wildcard bind above.
-      ORCHESTRATOR_CONTROL_ADDR: 172.31.0.10:7900
+      # The shard manager: --launcher docker --min-shards 4 --max-shards 8.
+      SPACE_ORCHESTRATOR_LAUNCHER: docker
+      SPACE_ORCHESTRATOR_MIN_SHARDS: ${SPACE_MIN_SHARDS:-4}
+      SPACE_ORCHESTRATOR_MAX_SHARDS: ${SPACE_MAX_SHARDS:-8}
+      SPACE_ORCHESTRATOR_SHARD_IMAGE: ${SPACE_SHARD_IMAGE:-space/shard:dev}
+      # Host UDP ports for the shards, one each, published by the shard
+      # containers themselves; and the host address they are published on.
+      SPACE_ORCHESTRATOR_HOST_PORTS: ${SPACE_SHARD_PORTS:-7870-7899}
+      SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP: ${SPACE_SHARD_PUBLISH_IP:-0.0.0.0}
+      SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX: ${SPACE_SHARD_NAME_PREFIX:-space-shard-}
+      # The one address players type.
+      SPACE_ORCHESTRATOR_PLAYER_BIND: 0.0.0.0:7777
       # The scene every shard runs until an operator picks another one in the
       # web UI (that choice is kept on the state volume and wins on restart).
       SPACE_ORCHESTRATOR_SCENE: ${SPACE_SCENE:-demo-area}
@@ -94,30 +91,31 @@ services:
       # loopback interface. Set SPACE_WEBUI_TOKEN before publishing it anywhere.
       SPACE_ORCHESTRATOR_WEBUI: 0.0.0.0:7980
       SPACE_ORCHESTRATOR_WEBUI_TOKEN: ${SPACE_WEBUI_TOKEN:-space-local-dev-token}
+      # The autoscaler's thresholds, when you want to watch it with a handful
+      # of clients (empty = the defaults: 100 players a shard, out at 0.8 for
+      # 10 s, in at 0.35 for 60 s, 30 s cooldown).
+      SPACE_ORCHESTRATOR_SHARD_CAPACITY: ${SPACE_SHARD_CAPACITY:-}
+      SPACE_ORCHESTRATOR_SCALE_OUT_AFTER: ${SPACE_SCALE_OUT_AFTER:-}
+      SPACE_ORCHESTRATOR_SCALE_IN_AFTER: ${SPACE_SCALE_IN_AFTER:-}
+      SPACE_ORCHESTRATOR_SCALE_COOLDOWN: ${SPACE_SCALE_COOLDOWN:-}
     volumes:
       - orchestrator-state:/var/lib/space
+      # The Docker Engine's socket: how the orchestrator starts and stops its
+      # shards. Root-equivalent on the host - see the header.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
     ports:
-      # Only the web UI, on the host's loopback. The control port (7900/udp)
-      # is deliberately not here: the shards reach it over the `space` network.
-      - "127.0.0.1:7980:7980/tcp"
+      # The player port. (The control port, 7900/udp, is deliberately not
+      # here: the shards reach it over the `space` network.)
+      - "${SPACE_PLAYER_PORT:-7777}:7777/udp"
+      # The web UI, on the host's loopback.
+      - "127.0.0.1:${WEBUI_PORT:-7980}:7980/tcp"
     networks:
-      space:
-        ipv4_address: 172.31.0.10
+      - space
+    # Time to remove its shard containers on `down` / `stop`.
+    stop_grace_period: 30s
     restart: unless-stopped
-
-  shard-a:
-    <<: *shard
-    container_name: space-shard-a
-    environment:
-      <<: *cluster
-      ORCHESTRATOR_ADDR: 172.31.0.10:7900
-      SHARD_BIND: 0.0.0.0:7870
-      SHARD_ADVERTISE: 172.31.0.11:7870
-    ports:
-      - "7871:7870/udp"
-    networks:
-      space:
-        ipv4_address: 172.31.0.11
 
   client:
     profiles: ["stream"]
@@ -127,19 +125,20 @@ services:
     image: space/client:dev
     container_name: space-client
     depends_on:
-      - shard-a
+      - orchestrator
     environment:
       STREAM_BIND: 0.0.0.0:8099
-      # The shard's in-network address (an `ip:port`, like the other fixed IPs).
-      SPACE_SERVER: 172.31.0.11:7870
+      # A player like any other: the player port ON THE HOST, so that the
+      # shard it is sent on to (`<the host it dialed>:<shard port>`) is the
+      # shard's published port.
+      SPACE_SERVER: host.docker.internal:${SPACE_PLAYER_PORT:-7777}
       # Extra space-client flags (e.g. "--size 1280x720 --quality medium").
       # The scene is not one of them: the orchestrator decides it.
       CLIENT_ARGS: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8099:8099/tcp"
-    networks:
-      space:
-        ipv4_address: 172.31.0.12
     restart: unless-stopped
 
 volumes:
@@ -148,8 +147,3 @@ volumes:
 networks:
   space:
     driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.31.0.0/24
-          gateway: 172.31.0.1

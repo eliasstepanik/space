@@ -318,15 +318,16 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     let state = wait_for_state(
         ui,
         Duration::from_secs(5),
-        "the shard to show as connected",
-        |s| s.contains("\"connected\":true"),
+        "the shard to show as connected and to have reported",
+        |s| s.contains("\"connected\":true") && s.contains("\"load_report\":{"),
     )
     .await;
     assert_eq!(map_epoch(&state), 1);
     assert_eq!(region_count(&state), 1);
+    // (The shard's own report: it reports once a second, from its first tick.)
     assert!(
-        state.contains("\"load_report\":null"),
-        "no report is not zero: {state}"
+        state.contains("\"load_report\":{\"players\":0,"),
+        "the shard's report is shown: {state}"
     );
     assert!(!state.contains("peer-secret-never-shown"));
 
@@ -352,7 +353,7 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
         "shard 1",
         &root.endpoint.to_string(),
         "connected",
-        "no report yet",
+        "0 player(s), 35 entities, tick mean",
         "registered from",
     ] {
         assert!(page.body.contains(needle), "the page lacks {needle:?}");
@@ -469,7 +470,9 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     let taken = post(ui, "/action/split", &again).await;
     assert_eq!(taken.header("X-Space-Result"), Some("refused"), "{taken:?}");
     assert!(taken.body.contains("already carved out"), "{taken:?}");
-    // ---- a merge is refused honestly: no load report says the shard is empty.
+    // ---- a merge right behind the commit is refused honestly: the new shard
+    // has not reported yet (a shard that is merged away has to be heard), or
+    // - it reports within its first second - the last change is too recent.
     let merge = post(
         ui,
         "/action/merge",
@@ -478,7 +481,10 @@ async fn the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits() {
     .await;
     assert_eq!(merge.status, 303, "{merge:?}");
     assert_eq!(merge.header("X-Space-Result"), Some("refused"));
-    assert!(merge.body.contains("not known to be empty"), "{merge:?}");
+    assert!(
+        merge.body.contains("not known to be empty") || merge.body.contains("too recently"),
+        "{merge:?}"
+    );
     let state = get(ui, "/api/state").await.body;
     assert_eq!(map_epoch(&state), 2, "the refusals changed nothing");
     assert_eq!(region_count(&state), 2);
@@ -577,6 +583,19 @@ async fn next_scene_told(player: &space_net::Conn) -> SceneState {
     }
 }
 
+/// The next scene at revision `revision` or above that a player connection
+/// is told. A shard says its scene again every five seconds, on the cluster
+/// clock (`SCENE_REANNOUNCE_TICKS`), so a repeat of the scene *before* a
+/// change can lie between the change and its announcement: those are skipped.
+async fn scene_told(player: &space_net::Conn, revision: u64) -> SceneState {
+    loop {
+        let state = next_scene_told(player).await;
+        if state.revision >= revision {
+            return state;
+        }
+    }
+}
+
 /// The `"scene":{…}` object of the cluster in the JSON state (its head).
 fn cluster_scene(json: &str) -> String {
     let start = json
@@ -666,7 +685,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
     )
     .await
     .expect("a player joins the root shard");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 2));
+    assert_eq!(scene_told(&player, 2).await, at(Scene::Materials, 2));
 
     // ---- refused requests change nothing: an unknown name, another origin,
     // no form token, a GET.
@@ -742,7 +761,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
             "the page after the redirect must not show {stale:?}"
         );
     }
-    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 3));
+    assert_eq!(scene_told(&player, 3).await, at(Scene::Galaxy, 3));
 
     // ---- the same scene again, at once (the second half of a double click):
     // not a switch, and the answer says so — while the browser, which shows
@@ -833,7 +852,7 @@ async fn a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players
         "both shards report the same scene: {state}"
     );
     wait_for_scene(&root, at(Scene::Materials, 4), Duration::from_secs(5)).await;
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 4));
+    assert_eq!(scene_told(&player, 4).await, at(Scene::Materials, 4));
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("saved"),
         "4 materials\n"
@@ -1044,7 +1063,7 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
     )
     .await
     .expect("a player joins");
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 9));
+    assert_eq!(scene_told(&player, 9).await, at(Scene::Materials, 9));
 
     // The operator switches to galaxy. For the orchestrator that is revision
     // 2 — which the shard, at 9, will not adopt.
@@ -1071,7 +1090,7 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
         "re-issued one above the shard's revision: {accepted:?}"
     );
     assert_eq!(scene_of(&root).await, at(Scene::Galaxy, 10));
-    assert_eq!(next_scene_told(&player).await, at(Scene::Galaxy, 10));
+    assert_eq!(scene_told(&player, 10).await, at(Scene::Galaxy, 10));
     let scene_file = space_orchestrator::scene::scene_path(&cluster.state_path);
     assert_eq!(
         std::fs::read_to_string(&scene_file).expect("saved"),
@@ -1108,7 +1127,7 @@ async fn a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestr
             .contains("All 1 connected shard switched to materials (revision 11)"),
         "{accepted:?}"
     );
-    assert_eq!(next_scene_told(&player).await, at(Scene::Materials, 11));
+    assert_eq!(scene_told(&player, 11).await, at(Scene::Materials, 11));
 
     root.abort();
     ui_task.abort();

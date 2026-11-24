@@ -397,6 +397,91 @@ async fn a_shard_stops_when_it_loses_its_orchestrator() {
     assert!(refused.is_err(), "a stopped shard welcomes nobody");
 }
 
+/// **The orderly end.** A shard the orchestrator tells to stop
+/// (`ShardRetire`: its region was merged away and it has handed everything
+/// over) stops serving and ticking, and `wait` returns `Ok` — the process
+/// exits 0 — also when the orchestrator closes the link right behind its
+/// word. A retire that names another shard is not this one's, and before
+/// either it reports its load once a second.
+///
+/// Mutations this catches: the link's reader dropping `ShardRetire` (the
+/// shard would run on until its link is closed and then exit non-zero, like a
+/// death); `wait` looking at the lost link first (told to stop and then cut
+/// off would be an error); obeying a retire for another id.
+#[tokio::test]
+async fn a_shard_told_to_stop_ends_in_an_orderly_way() {
+    let (orch, seen) = scripted_orchestrator(vec![Answer::Welcome(3)]);
+    let shard = start_orchestrated(options(), orch).await.expect("welcomed");
+    let endpoint = shard.endpoint;
+    let link = seen.lock().expect("seen").welcomed.pop().expect("its link");
+
+    // It reports its load without being asked.
+    let report = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let next = tokio::select! {
+                m = link.recv_control() => m,
+                m = link.recv_stream() => m,
+            };
+            if let Ok(Some(Message::LoadReport(report))) = next {
+                break report;
+            }
+        }
+    })
+    .await
+    .expect("a load report within ten seconds");
+    assert_eq!(report.shard, ShardId::new(3));
+    assert_eq!((report.players, report.hot_cell_players), (0, 0));
+
+    // Not its id: nothing happens.
+    link.send_reliable(&Message::ShardRetire(space_protocol::ShardRetire {
+        shard: ShardId::new(4),
+        reason: "somebody else".into(),
+    }))
+    .await
+    .expect("sent");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(shard.is_running() && !shard.is_retired());
+
+    // Its id: it stops, and the link the orchestrator then closes is no loss.
+    link.send_reliable(&Message::ShardRetire(space_protocol::ShardRetire {
+        shard: ShardId::new(3),
+        reason: "drained".into(),
+    }))
+    .await
+    .expect("sent");
+    let told = Instant::now();
+    while !shard.is_retired() {
+        assert!(
+            told.elapsed() < Duration::from_secs(10),
+            "the shard hears it"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    link.close(0, "retired");
+    // (Long enough for the shard to have seen its link close as well: what
+    // `wait` then has to say is still "told to stop".)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(10), shard.wait())
+        .await
+        .expect("the shard stops by itself");
+    assert_eq!(stopped, Ok(()), "told to stop is not an error");
+    // And it no longer answers anybody.
+    let client = space_net::client_endpoint_for(endpoint).expect("client endpoint");
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        space_net::connect_within(
+            &client,
+            endpoint,
+            SERVER_NAME,
+            &space_net::hello("late"),
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .expect("bounded");
+    assert!(refused.is_err(), "a stopped shard welcomes nobody");
+}
+
 /// A shard's two addresses are the orchestrator's word. Its hello carries
 /// what it was started with — an advertised address that may lack an IP, and
 /// the client endpoint it asks for — and it then runs on the region of its

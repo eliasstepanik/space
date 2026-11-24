@@ -320,6 +320,14 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             o.float("tick_p95_ms", f64::from(report.tick_p95_ms));
             o.float("reported_load", f64::from(report.reported_load));
             o.float("load_metric", report.load_metric);
+            o.uint("entities", u64::from(report.entities));
+            o.float("tick_mean_ms", f64::from(report.tick_mean_ms));
+            o.float("tick_max_ms", f64::from(report.tick_max_ms));
+            o.uint("ticks_jumped", report.skipped);
+            o.opt_object("hot_cell", report.hot_cell, |o, (cell, players)| {
+                o.string("cell", &format!("{}:{}:{}", cell[0], cell[1], cell[2]));
+                o.uint("players", u64::from(players));
+            });
             o.tick("tick", report.tick, now);
         });
         o.opt_object("autoscaler", shard.scale, |o, scale| {
@@ -414,15 +422,14 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             },
         );
         o.object("config", |o| {
-            o.float("split_threshold", crate::autoscale::SPLIT_THRESHOLD);
-            o.float("merge_threshold", crate::autoscale::MERGE_THRESHOLD);
-            o.uint("split_dwell_ticks", crate::autoscale::SPLIT_DWELL_TICKS);
-            o.uint("merge_dwell_ticks", crate::autoscale::MERGE_DWELL_TICKS);
-            o.uint("cooldown_ticks", crate::autoscale::SCALE_COOLDOWN_TICKS);
-            o.float(
-                "max_players_per_shard",
-                crate::autoscale::MAX_PLAYERS_PER_SHARD,
-            );
+            let scale = scaler.config;
+            o.float("split_threshold", scale.out_load);
+            o.float("merge_threshold", scale.in_load);
+            o.uint("split_dwell_ticks", scale.out_dwell_ticks);
+            o.uint("merge_dwell_ticks", scale.in_dwell_ticks);
+            o.uint("cooldown_ticks", scale.cooldown_ticks);
+            o.uint("drain_timeout_ticks", scale.drain_timeout_ticks);
+            o.float("max_players_per_shard", f64::from(scale.capacity));
             o.float("tick_budget_ms", crate::autoscale::TICK_BUDGET_MS);
         });
     });

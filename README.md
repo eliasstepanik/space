@@ -79,8 +79,10 @@ The scripts start **four shards** behind the one address (`-MinShards` /
 `pos` x = -6 / z = -4, and what a player does there — walk across, push a
 crate over a border, knock a stack over it — is what it would be on one
 shard. That is the scripts' default only: `space-orchestrator` itself starts
-no shard unless told to (`--min-shards`, default 0), and the compose files
-are unchanged.
+no shard unless told to (`--min-shards`, default 0). The compose files run
+the orchestrator alone with `--launcher docker --min-shards 4`: it starts its
+shards as containers ([`deploy/README.md`](deploy/README.md)). The dev scripts
+do not need Docker.
 
 By hand:
 
@@ -140,6 +142,39 @@ again: where a player was is not kept). A shard that loses its orchestrator
 exits by itself. The web UI and `/api/state` show the player port, which shard
 it sends players to, and where each shard's players dial it.
 
+`--launcher docker` does the same with **one container per shard**, through
+the Docker Engine's socket (Linux only; on Windows the orchestrator refuses to
+start with it and names `--launcher process`): created from `--shard-image`
+(the orchestrator image names the shard image of its own commit), named
+`space-shard-<port>`, its UDP port published on the host under the same
+number, the cluster secret in its environment, no mount, no capability and no
+restart policy; removed when it is no longer needed, when the orchestrator is
+told to stop (SIGTERM, Ctrl-C), and — what an orchestrator that was killed
+left behind — at the next start. Both compose files hold the orchestrator
+alone. **Whoever holds the Docker socket is root on the host**: read
+[`docs/security-notes.md`](docs/security-notes.md), "The Docker socket",
+before mounting it anywhere.
+
+**Scaling.** Every shard reports its load once a second: players, the ships
+and bodies it simulates, its tick times, and its *hot cell* — the 1024 m cell
+holding most of its players. Load is `max(players / capacity, tick p95 /
+33.3 ms)`. A shard at 0.8 or more for 10 s has its hot cell carved for a new
+shard, up to `--max-shards`. A shard that, together with the shard it would
+merge into, stays at 0.35 or less for 60 s is merged away: its region goes
+back, it **drains** — hands its ships and bodies to the shards that own the
+ground now, by the ordinary handoff, its players included — and is told to
+stop when it reports nothing left (it exits 0), or stopped as it is after
+`--drain-timeout`. The autoscaler never removes the shard that owns the spawn
+point nor the layout cells `--min-shards` stands for, never goes below
+`--min-shards`, and leaves a shard alone for 30 s after any change that
+involved it. A crowd inside one cell cannot be split: a region is never
+smaller than a cell, and the event log says so. Every number is a flag
+(`--shard-capacity`, `--scale-out-load`, `--scale-out-after`,
+`--scale-in-load`, `--scale-in-after`, `--scale-cooldown`, `--drain-timeout`,
+each with a `SPACE_ORCHESTRATOR_...` variable), so a test can make a cluster
+scale with two clients; the rules and what was measured are in
+[`docs/plan-sharding.md`](docs/plan-sharding.md) §3.
+
 The orchestrator's control port takes any shard on a loopback address. On any
 other address a shard needs the **cluster secret** (`SPACE_CLUSTER_SECRET` on
 both, or `--cluster-secret` / `--cluster-secret-file` on the orchestrator), and
@@ -155,8 +190,9 @@ starts does not inherit the orchestrator's own settings
 ### Scenes and the orchestrator web UI
 
 Open `http://127.0.0.1:7980/`. The page is part of the orchestrator (server-
-rendered, no JavaScript) and shows the cluster, the map, the shards, the
-autoscaler and recent events; the same state is JSON at `/api/state`. From it
+rendered, no JavaScript) and shows the cluster, the map, the shards with their
+load reports, the autoscaler with its settings and recent events; the same
+state is JSON at `/api/state`. From it
 you can split and merge regions, pause the autoscaler and **switch the scene on
 every shard**. Connected clients follow within a second.
 

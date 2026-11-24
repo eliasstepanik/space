@@ -36,10 +36,7 @@ use space_protocol::shard::ShardId;
 use space_world::NodeRef;
 
 use super::ServerInfo;
-use crate::autoscale::{
-    MAX_PLAYERS_PER_SHARD, MERGE_DWELL_TICKS, MERGE_THRESHOLD, SCALE_COOLDOWN_TICKS,
-    SPLIT_DWELL_TICKS, SPLIT_THRESHOLD, TICK_BUDGET_MS,
-};
+use crate::autoscale::TICK_BUDGET_MS;
 use crate::config::{
     EPOCH_ACK_TIMEOUT_TICKS, EPOCH_LEAD_TICKS, MIN_EPOCH_INTERVAL_TICKS, REPORT_EXPIRY_TICKS,
     TICK_HZ,
@@ -682,27 +679,37 @@ fn cards(h: &mut Html, input: &PageInput<'_>) {
         h.pill("ok", "active");
     }
     h.raw("</dd>\n");
+    let scale = scaler.config;
     h.fact(
         "load",
         format_args!(
-            "max(players / {MAX_PLAYERS_PER_SHARD:.0}, tick p95 / {TICK_BUDGET_MS:.1} ms)"
+            "max(players / {}, tick p95 / {TICK_BUDGET_MS:.1} ms)",
+            scale.capacity
         ),
     );
     h.fact(
-        "split",
+        "scale out",
         format_args!(
-            "load ≥ {SPLIT_THRESHOLD:.2} for {}",
-            span(seconds(SPLIT_DWELL_TICKS))
+            "load ≥ {:.2} for {}: the shard's hot cell is carved for a new shard (up to {} \
+             shards)",
+            scale.out_load,
+            span(seconds(scale.out_dwell_ticks)),
+            s.max_shards
         ),
     );
     h.fact(
-        "merge",
+        "scale in",
         format_args!(
-            "load ≤ {MERGE_THRESHOLD:.2} for {}, 0 players",
-            span(seconds(MERGE_DWELL_TICKS))
+            "a shard and the one it merges into together ≤ {:.2} for {}: merged, drained \
+             (within {}), stopped; never the spawn point's shard nor the layout cells, never \r
+             below {} shards",
+            scale.in_load,
+            span(seconds(scale.in_dwell_ticks)),
+            span(seconds(scale.drain_timeout_ticks)),
+            s.min_shards
         ),
     );
-    h.fact("cooldown per shard", span(seconds(SCALE_COOLDOWN_TICKS)));
+    h.fact("cooldown per shard", span(seconds(scale.cooldown_ticks)));
     if scaler.busy_until > now {
         h.fact(
             "next action",
@@ -952,6 +959,10 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
                 h.raw(" ");
                 h.pill("info", "being merged away");
             }
+            ShardRole::Draining => {
+                h.raw(" ");
+                h.pill("info", "draining: merged away, handing over");
+            }
             ShardRole::Unowned => {
                 h.raw(" ");
                 h.pill("dim", "owns no region");
@@ -1000,13 +1011,28 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
         }
         h.raw("</td><td>");
         match view.report {
-            Some(report) => h.text(format_args!(
-                "{} player(s), tick p95 {:.1} ms, load {:.2}, {}",
-                report.players,
-                report.tick_p95_ms,
-                report.load_metric,
-                ago(now, report.tick)
-            )),
+            Some(report) => {
+                h.text(format_args!(
+                    "{} player(s), {} entities, tick mean {:.1} / p95 {:.1} / worst {:.1} ms, \
+                     load {:.2}, {}",
+                    report.players,
+                    report.entities,
+                    report.tick_mean_ms,
+                    report.tick_p95_ms,
+                    report.tick_max_ms,
+                    report.load_metric,
+                    ago(now, report.tick)
+                ));
+                if let Some((cell, players)) = report.hot_cell {
+                    h.text(format_args!(
+                        "; {players} in cell {}:{}:{}",
+                        cell[0], cell[1], cell[2]
+                    ));
+                }
+                if report.skipped > 0 {
+                    h.text(format_args!("; {} ticks jumped", report.skipped));
+                }
+            }
             None => h.raw("<span class=\"dim\">no report yet</span>"),
         }
         h.raw("</td><td>");
@@ -1019,12 +1045,12 @@ fn shards(h: &mut Html, input: &PageInput<'_>) {
                 (Some(since), _) => h.text(format_args!(
                     "hot for {} of {}",
                     span(seconds(now.saturating_sub(since))),
-                    span(seconds(SPLIT_DWELL_TICKS))
+                    span(seconds(s.autoscaler.config.out_dwell_ticks))
                 )),
                 (None, Some(since)) => h.text(format_args!(
                     "cold for {} of {}",
                     span(seconds(now.saturating_sub(since))),
-                    span(seconds(MERGE_DWELL_TICKS))
+                    span(seconds(s.autoscaler.config.in_dwell_ticks))
                 )),
                 (None, None) => h.raw("<span class=\"dim\">within the band</span>"),
             },

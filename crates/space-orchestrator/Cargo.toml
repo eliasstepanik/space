@@ -20,7 +20,16 @@ space-net = { path = "../space-net" }
 # split/merge loop is verifiable in-sandbox (plan §3.4).
 space-server = { path = "../space-server" }
 quinn = { workspace = true }
-tokio = { workspace = true }
+# `signal`: the orchestrator stops and removes the shards it started when it is
+# told to stop (SIGTERM from `docker stop` / compose, Ctrl-C). std has no signal
+# API and this crate forbids `unsafe`, so there is no way to hear one without
+# it; the feature adds one pure-Rust crate on Unix (`signal-hook-registry`, on
+# `libc`, which the lockfile already has) and none on Windows.
+tokio = { workspace = true, features = ["signal"] }
+# The Docker launcher speaks JSON to the Docker Engine API over its socket
+# (hand-rolled HTTP/1.1, `launcher/docker.rs`). Already in the lockfile (xtask,
+# space-mcp): no new crate.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

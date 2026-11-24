@@ -217,6 +217,12 @@ fn all_messages() -> Vec<Message> {
             players: 87,
             tick_p95_ms: 21.5,
             load: 0.645_7,
+            entities: 412,
+            tick_mean_ms: 9.25,
+            tick_max_ms: 30.5,
+            skipped: 3,
+            hot_cell: [-1, 0, 549_755_813_887],
+            hot_cell_players: 61,
         }),
         Message::DirectoryQuery(DirectoryQuery {}),
         Message::DirectoryReply(DirectoryReply {
@@ -275,12 +281,21 @@ fn all_messages() -> Vec<Message> {
             }],
             missing: vec![guid(4, 9)],
         }),
+        far_update_message(),
         last_message(),
     ]
 }
 
-/// The last message in tag order (`FarUpdate`, tag 31).
+/// The last message in tag order (`ShardRetire`, tag 32).
 fn last_message() -> Message {
+    Message::ShardRetire(space_protocol::ShardRetire {
+        shard: shard(5),
+        reason: "its region was merged away and it is drained".into(),
+    })
+}
+
+/// `FarUpdate` (tag 31).
+fn far_update_message() -> Message {
     Message::FarUpdate(space_protocol::FarUpdate {
         from: shard(2),
         tick: 31,
@@ -318,7 +333,7 @@ fn roundtrip_all() {
     let messages = all_messages();
     // Every declared variant of `Message` is exercised; the count is asserted so
     // a new variant that is not added here fails the test.
-    assert_eq!(messages.len(), 41);
+    assert_eq!(messages.len(), 42);
     for message in &messages {
         let frame = encode_frame(message);
         assert_eq!(
@@ -492,13 +507,13 @@ fn truncated_rejected() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // `Message::VARIANT_COUNT` is 32, so the valid wire tags are `0..=31`.
-    // The boundary that matters is tag 32 — the first tag past the last variant.
+    // `Message::VARIANT_COUNT` is 33, so the valid wire tags are `0..=32`.
+    // The boundary that matters is tag 33 — the first tag past the last variant.
     // (An earlier revision tested the literals 28/29 while the count was 25:
     // unknown only incidentally, and "passing" for ever as variants were
     // appended — which is why the bound below is the count itself.)
-    assert_eq!(Message::VARIANT_COUNT, 32);
-    let first_invalid = Message::VARIANT_COUNT; // 32
+    assert_eq!(Message::VARIANT_COUNT, 33);
+    let first_invalid = Message::VARIANT_COUNT; // 33
     let mut payload = first_invalid.to_be_bytes().to_vec();
     payload.extend_from_slice(&[0xAA; 8]);
     let mut frame = Vec::new();
@@ -510,7 +525,7 @@ fn unknown_tag_rejected() {
         Err(CodecError::UnknownTag { tag: first_invalid })
     );
 
-    // The last valid tag (31, `FarUpdate`) must decode, proving 32 is the
+    // The last valid tag (32, `ShardRetire`) must decode, proving 33 is the
     // first rejection and not an off-by-one that also drops the last variant.
     let last_valid = last_message();
     assert_eq!(last_valid.wire_tag(), Message::VARIANT_COUNT - 1);
@@ -916,7 +931,7 @@ impl Rng {
         }
     }
     fn message(&mut self) -> Message {
-        match self.below(32) {
+        match self.below(33) {
             0 => Message::Hello(Hello {
                 protocol: self.u32_below(4),
                 player_token: self.string(),
@@ -1055,6 +1070,12 @@ impl Rng {
                 },
             }),
             17 => Message::LoadReport(LoadReport {
+                entities: self.u32_below(5_000),
+                tick_mean_ms: self.f32(),
+                tick_max_ms: self.f32(),
+                skipped: self.next_u64(),
+                hot_cell: [self.next_u64() as i64, self.next_u64() as i64, -3],
+                hot_cell_players: self.u32_below(100),
                 shard: self.shard(),
                 players: self.u32_below(1_000),
                 tick_p95_ms: self.f32(),
@@ -1131,7 +1152,7 @@ impl Rng {
                     .collect(),
                 missing: (0..self.below(4)).map(|_| self.guid()).collect(),
             }),
-            _ => Message::FarUpdate(space_protocol::FarUpdate {
+            31 => Message::FarUpdate(space_protocol::FarUpdate {
                 from: self.shard(),
                 tick: self.next_u64(),
                 new: self.entities(),
@@ -1140,6 +1161,10 @@ impl Rng {
                 refresh: self.below(2) == 0,
                 held: (0..self.below(4)).map(|_| self.guid()).collect(),
                 more: self.below(2) == 0,
+            }),
+            _ => Message::ShardRetire(space_protocol::ShardRetire {
+                shard: self.shard(),
+                reason: self.string(),
             }),
         }
     }

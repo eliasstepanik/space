@@ -618,6 +618,7 @@ fn forged_as(shard: ShardId, epoch: u64, scene: SceneState) -> Vec<Message> {
             players: 77,
             tick_p95_ms: 1.0,
             load: 0.0,
+            ..Default::default()
         }),
         Message::EpochAck(EpochAck { shard, epoch }),
         Message::SceneAck(SceneAck {
@@ -736,7 +737,13 @@ async fn a_refused_hello_is_closed_and_nothing_else_it_says_is_heard() {
     );
     assert_eq!(after.next_shard_id, before.next_shard_id, "and no id spent");
     let shard = &after.shards[0];
-    assert!(shard.report.is_none(), "no forged load report: {shard:?}");
+    // (Its own report, yes — the shard reports once a second — but not the
+    // forged one, which claims 77 players.)
+    assert_eq!(
+        shard.report.map(|report| report.players),
+        Some(0),
+        "no forged load report: {shard:?}"
+    );
     assert_eq!(
         shard.scene,
         Some(scene),
@@ -876,6 +883,7 @@ async fn a_connection_speaks_only_for_the_shard_it_was_admitted_as() {
                 players: 3,
                 tick_p95_ms: 1.0,
                 load: 0.0,
+                ..Default::default()
             }),
             Message::SceneAck(SceneAck {
                 shard: one,

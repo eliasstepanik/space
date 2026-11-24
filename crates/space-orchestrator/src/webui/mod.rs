@@ -1495,6 +1495,7 @@ mod tests {
             players: 3,
             tick_p95_ms: f32::NAN,
             load: f32::INFINITY,
+            ..Default::default()
         });
         orch.tick();
         let (handle, _port) = crate::ops::channel(orch.snapshot());
@@ -2217,6 +2218,7 @@ mod tests {
             players: 0,
             tick_p95_ms: 1.0,
             load: 0.0,
+            ..Default::default()
         });
         let path = crate::snapshot::node_path(cell);
         let (handle, port) = crate::ops::channel(orch.snapshot());

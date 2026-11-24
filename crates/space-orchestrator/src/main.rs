@@ -108,10 +108,56 @@
 //! |---|---|---|
 //! | `--min-shards <n>` | `SPACE_ORCHESTRATOR_MIN_SHARDS` | how many shards the orchestrator keeps running **by itself**; default 0: it starts none (they are started by hand, or by a split). 4 on the demo area = its four quadrants. At most 8 (the root's shard and one per layout cell), and not more than `--max-shards` or `--max-regions`: anything else is refused at startup |
 //! | `--max-shards <n>` | `SPACE_ORCHESTRATOR_MAX_SHARDS` | the most shards the cluster may have (default 8); one more that registers is refused for good |
-//! | `--launcher local\|process\|docker` | `SPACE_ORCHESTRATOR_LAUNCHER` | how a shard is started: `local` inside this process (the default), `process` as a `space-server` process, `docker` not yet |
+//! | `--launcher local\|process\|docker` | `SPACE_ORCHESTRATOR_LAUNCHER` | how a shard is started: `local` inside this process (the default), `process` as a `space-server` process, `docker` as a container (below) |
 //! | `--shard-exe <path>` | `SPACE_ORCHESTRATOR_SHARD_EXE` | the executable `process` starts; default: the `space-server` lying next to this executable |
 //! | `--shard-log-dir <dir>` | `SPACE_ORCHESTRATOR_SHARD_LOG_DIR` | where `process` writes `shard-<port>.log` per shard and `launched-shards.pid`; default: the working directory |
-//! | `--host-port-range <a>-<b>` | `SPACE_ORCHESTRATOR_HOST_PORTS` | the UDP ports `process` hands its shards, one each (default 7870-7899). **Keep it out of the operating system's dynamic port range**; the binary does not check that |
+//! | `--host-port-range <a>-<b>` | `SPACE_ORCHESTRATOR_HOST_PORTS` | the UDP ports `process` and `docker` hand their shards, one each (default 7870-7899). **Keep it out of the operating system's dynamic port range**; the binary does not check that |
+//!
+//! ## The `docker` launcher
+//!
+//! One container per shard, created, started, stopped and removed through
+//! the Docker Engine's socket ([`space_orchestrator::launcher::docker`]):
+//! the compose file then holds the orchestrator alone. Linux only.
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--docker-socket <path>` | `SPACE_ORCHESTRATOR_DOCKER_SOCKET` | the Engine's socket (default `/var/run/docker.sock`) |
+//! | `--shard-image <ref>` | `SPACE_ORCHESTRATOR_SHARD_IMAGE` | the image a shard container is created from. **No default in the binary**: the orchestrator image has the variable baked in at build time, naming the shard image of its own commit (`…/space-shard:sha-<commit>`), so shard and orchestrator are always the same build. Pulled if it is not on the host; a private image has to be pulled by the operator first (no registry credentials are handled here) |
+//! | `--docker-network <name>` | `SPACE_ORCHESTRATOR_DOCKER_NETWORK` | the network the shards join; default: the orchestrator container's own, found by inspecting itself |
+//! | `--docker-control-addr <host:port>` | `SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR` | what the shards dial to reach the control port; default: the orchestrator container's own address on that network and the control port's port. A name (the compose service) works too: `space-server --orchestrator` resolves it |
+//! | `--docker-publish-ip <ip>` | `SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP` | the host address each shard's UDP port is published on (default `0.0.0.0`: every interface — the shards' ports are public, like the player port) |
+//! | `--docker-name-prefix <text>` | `SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX` | container names are this and the host port (default `space-shard-`: `space-shard-7870`) |
+//!
+//! A shard container gets the cluster secret in its environment (never on
+//! its command line), the labels `space.cluster`, `space.role=shard`,
+//! `space.launch` and `space.port`, no restart policy (the orchestrator
+//! replaces a shard that dies), no mount, no capability, and never the
+//! socket. At start the orchestrator **removes** every container carrying
+//! its cluster's shard label that an earlier run left (a shard cannot join a
+//! new orchestrator: it stops when it loses its own), and on SIGTERM or
+//! Ctrl-C it removes the ones it started before it exits.
+//!
+//! **Whoever can use the Docker socket is root on the host.** Mounting it
+//! makes the orchestrator's container that; see `docs/security-notes.md`.
+//!
+//! # Scaling
+//!
+//! Every shard reports its load once a second; the orchestrator relieves a
+//! loaded shard by carving its **hot cell** (the cell holding most of its
+//! players) for a new one, and merges an idle shard away — its region goes
+//! back, it hands over what it holds, and is stopped when it is empty
+//! ([`space_orchestrator::autoscale`]). Never below `--min-shards`, never
+//! above `--max-shards`, never the shard that owns the spawn point.
+//!
+//! | flag | environment fallback | |
+//! |---|---|---|
+//! | `--shard-capacity <players>` | `SPACE_ORCHESTRATOR_SHARD_CAPACITY` | players at which a shard counts as full (default 100, which is also the most a shard takes). Load = max(players / capacity, tick p95 / 33.3 ms) |
+//! | `--scale-out-load <x>` | `SPACE_ORCHESTRATOR_SCALE_OUT_LOAD` | load at or above which a shard is relieved (default 0.8) |
+//! | `--scale-out-after <s>` | `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER` | … once it has stayed there this long (default 10) |
+//! | `--scale-in-load <x>` | `SPACE_ORCHESTRATOR_SCALE_IN_LOAD` | load of a shard **and** the one it would merge into together, at or below which it is merged away (default 0.35) |
+//! | `--scale-in-after <s>` | `SPACE_ORCHESTRATOR_SCALE_IN_AFTER` | … once they have stayed there this long (default 60) |
+//! | `--scale-cooldown <s>` | `SPACE_ORCHESTRATOR_SCALE_COOLDOWN` | how long a shard is left alone after any change that involved it (default 30) |
+//! | `--drain-timeout <s>` | `SPACE_ORCHESTRATOR_DRAIN_TIMEOUT` | how long a merged shard is given to hand everything over before it is stopped as it is (default 30, at most 45) |
 //!
 //! A shard that dies — its process exits, or its control connection closes —
 //! is replaced: its regions go to a new shard under a **new id**, and the
@@ -169,9 +215,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use space_orchestrator::autoscale::ScaleConfig;
 use space_orchestrator::boot::boot;
 use space_orchestrator::config::{LauncherKind, OrchestratorConfig, Secret};
-use space_orchestrator::launcher::docker::DockerLauncher;
+use space_orchestrator::launcher::docker::{DockerLauncher, DockerOptions};
 use space_orchestrator::launcher::local::LocalLauncher;
 use space_orchestrator::launcher::process::ProcessLauncher;
 use space_orchestrator::launcher::Launcher;
@@ -186,6 +233,90 @@ struct Options {
     peer_token: Option<Secret>,
     /// The web UI to serve; `None` (the default) serves none.
     webui: Option<WebUiConfig>,
+    /// What the `docker` launcher is given (read only with `--launcher docker`).
+    docker: DockerOptions,
+}
+
+/// The flags that are a name and a value and nothing more: each with its
+/// environment fallback. (`--launcher docker`'s six, and the seven of the
+/// autoscaler.)
+const TEXT_FLAGS: &[(&str, &str)] = &[
+    ("--docker-socket", "SPACE_ORCHESTRATOR_DOCKER_SOCKET"),
+    ("--shard-image", "SPACE_ORCHESTRATOR_SHARD_IMAGE"),
+    ("--docker-network", "SPACE_ORCHESTRATOR_DOCKER_NETWORK"),
+    (
+        "--docker-control-addr",
+        "SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR",
+    ),
+    (
+        "--docker-publish-ip",
+        "SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP",
+    ),
+    (
+        "--docker-name-prefix",
+        "SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX",
+    ),
+    ("--shard-capacity", "SPACE_ORCHESTRATOR_SHARD_CAPACITY"),
+    ("--scale-out-load", "SPACE_ORCHESTRATOR_SCALE_OUT_LOAD"),
+    ("--scale-out-after", "SPACE_ORCHESTRATOR_SCALE_OUT_AFTER"),
+    ("--scale-in-load", "SPACE_ORCHESTRATOR_SCALE_IN_LOAD"),
+    ("--scale-in-after", "SPACE_ORCHESTRATOR_SCALE_IN_AFTER"),
+    ("--scale-cooldown", "SPACE_ORCHESTRATOR_SCALE_COOLDOWN"),
+    ("--drain-timeout", "SPACE_ORCHESTRATOR_DRAIN_TIMEOUT"),
+];
+
+/// The autoscaler's settings from the flags and the environment (`text`
+/// looks a flag up: the flag's value, else its variable's). Seconds become
+/// ticks; what cannot be run with is an error ([`ScaleConfig::check`]).
+fn parse_scale(text: &dyn Fn(&str) -> Option<String>) -> Result<ScaleConfig, String> {
+    let mut scale = ScaleConfig::default();
+    let number = |flag: &str| -> Result<Option<f64>, String> {
+        text(flag)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .ok_or_else(|| format!("{flag} needs a number (got {value})"))
+            })
+            .transpose()
+    };
+    let seconds = |flag: &str| -> Result<Option<u64>, String> {
+        Ok(number(flag)?.map(|s| {
+            (s * space_orchestrator::config::TICK_HZ as f64)
+                .round()
+                .min(1e12) as u64
+        }))
+    };
+    if let Some(players) = number("--shard-capacity")? {
+        if players.fract() != 0.0 || players > f64::from(u32::MAX) {
+            return Err(format!(
+                "--shard-capacity needs a whole number of players (got {players})"
+            ));
+        }
+        scale.capacity = players as u32;
+    }
+    if let Some(load) = number("--scale-out-load")? {
+        scale.out_load = load;
+    }
+    if let Some(load) = number("--scale-in-load")? {
+        scale.in_load = load;
+    }
+    if let Some(ticks) = seconds("--scale-out-after")? {
+        scale.out_dwell_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--scale-in-after")? {
+        scale.in_dwell_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--scale-cooldown")? {
+        scale.cooldown_ticks = ticks;
+    }
+    if let Some(ticks) = seconds("--drain-timeout")? {
+        scale.drain_timeout_ticks = ticks;
+    }
+    scale.check()?;
+    Ok(scale)
 }
 
 const USAGE: &str =
@@ -194,6 +325,12 @@ const USAGE: &str =
                      [--state <path>] [--first-id <n>] [--launcher local|process|docker] \
                      [--min-shards <n>] [--max-shards <n>] [--shard-exe <path>] \
                      [--shard-log-dir <dir>] [--host-port-range <a>-<b>] \
+                     [--docker-socket <path>] [--shard-image <ref>] [--docker-network <name>] \
+                     [--docker-control-addr <host:port>] [--docker-publish-ip <ip>] \
+                     [--docker-name-prefix <text>] \
+                     [--shard-capacity <players>] [--scale-out-load <x>] [--scale-out-after <s>] \
+                     [--scale-in-load <x>] [--scale-in-after <s>] [--scale-cooldown <s>] \
+                     [--drain-timeout <s>] \
                      [--cluster-secret <secret> | --cluster-secret-file <path>] \
                      [--peer-token <secret> | --peer-token-file <path>] \
                      [--scene demo-area|materials|galaxy] [--max-regions <n>] \
@@ -204,7 +341,14 @@ const USAGE: &str =
      SPACE_ORCHESTRATOR_PLAYER_BIND for --player-bind; \
      SPACE_ORCHESTRATOR_MIN_SHARDS, SPACE_ORCHESTRATOR_MAX_SHARDS, SPACE_ORCHESTRATOR_LAUNCHER, \
      SPACE_ORCHESTRATOR_SHARD_EXE, SPACE_ORCHESTRATOR_SHARD_LOG_DIR and \
-     SPACE_ORCHESTRATOR_HOST_PORTS for the shard flags; SPACE_CLUSTER_SECRET and \
+     SPACE_ORCHESTRATOR_HOST_PORTS for the shard flags; SPACE_ORCHESTRATOR_DOCKER_SOCKET, \
+     SPACE_ORCHESTRATOR_SHARD_IMAGE, SPACE_ORCHESTRATOR_DOCKER_NETWORK, \
+     SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR, SPACE_ORCHESTRATOR_DOCKER_PUBLISH_IP and \
+     SPACE_ORCHESTRATOR_DOCKER_NAME_PREFIX for the docker launcher; \
+     SPACE_ORCHESTRATOR_SHARD_CAPACITY, SPACE_ORCHESTRATOR_SCALE_OUT_LOAD, \
+     SPACE_ORCHESTRATOR_SCALE_OUT_AFTER, SPACE_ORCHESTRATOR_SCALE_IN_LOAD, \
+     SPACE_ORCHESTRATOR_SCALE_IN_AFTER, SPACE_ORCHESTRATOR_SCALE_COOLDOWN and \
+     SPACE_ORCHESTRATOR_DRAIN_TIMEOUT for scaling; SPACE_CLUSTER_SECRET and \
      SPACE_CLUSTER_SECRET_FILE for the cluster secret; SPACE_ORCHESTRATOR_PEER_TOKEN and \
      SPACE_ORCHESTRATOR_PEER_TOKEN_FILE for the peer token; for the --webui flags \
      SPACE_ORCHESTRATOR_WEBUI, SPACE_ORCHESTRATOR_WEBUI_TOKEN, \
@@ -382,6 +526,9 @@ impl Options {
         let mut host_ports: Option<String> = None;
         let mut cluster_secret: Option<String> = None;
         let mut cluster_secret_file: Option<PathBuf> = None;
+        // The plain name-and-value flags (`TEXT_FLAGS`), as given.
+        let mut texts: std::collections::BTreeMap<&'static str, String> =
+            std::collections::BTreeMap::new();
         let mut i = 0;
         while i < args.len() {
             let flag = args[i].as_str();
@@ -475,7 +622,12 @@ impl Options {
                 "--webui-host" => {
                     webui.hosts.push(value("--webui-host")?.clone());
                 }
-                other => return Err(format!("unknown argument {other}\n{USAGE}")),
+                other => match TEXT_FLAGS.iter().find(|(name, _)| *name == other) {
+                    Some((name, _)) => {
+                        texts.insert(name, value(name)?.clone());
+                    }
+                    None => return Err(format!("unknown argument {other}\n{USAGE}")),
+                },
             }
             i += if flag == "--help" || flag == "-h" {
                 1
@@ -536,6 +688,70 @@ impl Options {
         }
         if let Some(range) = host_ports.or_else(|| set(ENV_HOST_PORTS)) {
             config.host_port_range = parse_port_range(&range)?;
+        }
+        // A plain flag's value: the flag, else its variable.
+        let text = |flag: &str| -> Option<String> {
+            texts.get(flag).cloned().or_else(|| {
+                TEXT_FLAGS
+                    .iter()
+                    .find(|(name, _)| *name == flag)
+                    .and_then(|(_, variable)| set(variable))
+            })
+        };
+        config.scale = parse_scale(&text)?;
+        // The docker launcher's settings. Only the control address is
+        // checked here (it ends up on a shard's command line); the rest is
+        // the launcher's to find wanting, when it is the one chosen.
+        let defaults = DockerOptions::default();
+        let docker = DockerOptions {
+            socket: text("--docker-socket").map_or(defaults.socket, |p| PathBuf::from(p.trim())),
+            image: text("--shard-image").map_or_else(String::new, |i| i.trim().to_owned()),
+            network: text("--docker-network").map(|n| n.trim().to_owned()),
+            control: text("--docker-control-addr").map(|c| c.trim().to_owned()),
+            control_port: config.bind.port(),
+            publish_ip: text("--docker-publish-ip")
+                .map_or(defaults.publish_ip, |ip| ip.trim().to_owned()),
+            name_prefix: text("--docker-name-prefix")
+                .map_or(defaults.name_prefix, |p| p.trim().to_owned()),
+            cluster: config.cluster.clone(),
+            // A container's host name is its id unless somebody chose another.
+            self_container: env("HOSTNAME").filter(|name| !name.trim().is_empty()),
+        };
+        if config.launcher == LauncherKind::Docker {
+            if docker.image.is_empty() {
+                return Err(
+                    "--launcher docker needs the shard image: --shard-image <ref> \
+                     (SPACE_ORCHESTRATOR_SHARD_IMAGE; the orchestrator image sets it to the shard \
+                     image of its own commit)"
+                        .to_owned(),
+                );
+            }
+            if !docker.publish_ip.is_empty()
+                && docker.publish_ip.parse::<std::net::IpAddr>().is_err()
+            {
+                return Err(format!(
+                    "--docker-publish-ip {:?} is not an IP address",
+                    docker.publish_ip
+                ));
+            }
+            let plain = |text: &str| {
+                !text.is_empty()
+                    && text
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-:[]".contains(c))
+            };
+            if docker
+                .control
+                .as_deref()
+                .is_some_and(|c| !plain(c) || !c.contains(':'))
+            {
+                return Err("--docker-control-addr needs a host:port".to_owned());
+            }
+            if !plain(&docker.name_prefix) || docker.name_prefix.contains(':') {
+                return Err(
+                    "--docker-name-prefix may hold letters, digits, '.', '_' and '-'".to_owned(),
+                );
+            }
         }
         // The cluster secret: a flag wins over the environment, the secret
         // itself over a file naming it.
@@ -604,6 +820,7 @@ impl Options {
             config,
             peer_token: peer_token.map(Secret::new),
             webui: webui.resolve(env)?,
+            docker,
         })
     }
 }
@@ -623,9 +840,10 @@ fn main() -> Result<(), String> {
 /// Build the control plane and run the loop until the endpoint is closed.
 async fn run(options: Options, started: Instant) -> Result<(), String> {
     let Options {
-        config,
+        mut config,
         peer_token,
         webui,
+        docker,
     } = options;
     let webui = webui.map(|webui| webui.with_started(started));
     // A tick origin that has not come yet: every shard would refuse its
@@ -660,10 +878,14 @@ async fn run(options: Options, started: Instant) -> Result<(), String> {
             serve(config, peer_token, webui, launcher).await
         }
         LauncherKind::Docker => {
-            // Deferred (bollard is not in the offline cache): fail fast with the
-            // launcher's own error rather than at the first split.
-            let launcher = DockerLauncher::new();
+            config.launcher_note = format!("containers of {}", docker.image);
+            let launcher = DockerLauncher::new(docker);
+            // Fail now rather than at the first launch: no socket, no
+            // network to put the shards on, no image. What an earlier run
+            // left behind is removed here, before anything is started.
             launcher.ensure_available().map_err(|e| e.to_string())?;
+            let found = launcher.prepare().await.map_err(|e| e.to_string())?;
+            println!("space-orchestrator: {found}");
             serve(config, peer_token, webui, launcher).await
         }
     }
@@ -706,7 +928,47 @@ async fn serve<L: Launcher + 'static>(
         }
         None => None,
     };
-    orchestrator.run().await.map_err(|e| e.to_string())
+    // Told to stop (SIGTERM from `docker stop` / compose, Ctrl-C): the loop
+    // ends, and before it returns the launcher stops and removes the shards
+    // it started — an orchestrator that is stopped leaves none behind.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    orchestrator.stop_on(stop_rx);
+    tokio::spawn(async move {
+        let signal = stop_signal().await;
+        println!("space-orchestrator: {signal}: stopping, and stopping the shards it started");
+        let _ = stop_tx.send(true);
+        // (Kept: dropping the sender would read as "nobody will ever say stop".)
+        std::future::pending::<()>().await;
+    });
+    orchestrator.run().await.map_err(|e| e.to_string())?;
+    println!("space-orchestrator: stopped");
+    Ok(())
+}
+
+/// Wait for the signal that tells this process to stop, and name it.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => tokio::select! {
+                _ = terminate.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "interrupted",
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "interrupted"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be installed: never told to stop this way.
+            std::future::pending::<()>().await;
+        }
+        "interrupted"
+    }
 }
 
 /// One line for the startup log: who starts the shards, and whether a shard
@@ -899,13 +1161,173 @@ mod tests {
         assert!(parse(&["--control-addr", "nope"]).is_err());
     }
 
+    /// The docker launcher's settings: an image is required (the binary has
+    /// no default: the orchestrator image names the shard image of its own
+    /// commit), everything else has one, and each has a variable.
+    ///
+    /// Mutations this catches: a default image in the binary (an orchestrator
+    /// would start shards of whatever `latest` is — another commit, refused
+    /// at the protocol gate at best); a control address or a name prefix that
+    /// is passed on unchecked.
+    #[test]
+    fn the_docker_launcher_is_configured_by_flags_or_variables() {
+        let err = parse(&["--launcher", "docker"]).expect_err("no image");
+        assert!(err.contains("--shard-image"), "{err}");
+        // The image alone is enough; the rest are the defaults.
+        let options = parse_with(
+            &[
+                "--launcher",
+                "docker",
+                "--bind",
+                "0.0.0.0:7900",
+                "--min-shards",
+                "4",
+            ],
+            &[
+                (
+                    "SPACE_ORCHESTRATOR_SHARD_IMAGE",
+                    "ghcr.io/x/space-shard:sha-abc1234",
+                ),
+                ("HOSTNAME", "0123456789ab"),
+            ],
+        )
+        .expect("parses");
+        assert_eq!(options.config.launcher, LauncherKind::Docker);
+        let docker = &options.docker;
+        assert_eq!(docker.image, "ghcr.io/x/space-shard:sha-abc1234");
+        assert_eq!(docker.socket, PathBuf::from("/var/run/docker.sock"));
+        assert_eq!(
+            (docker.network.as_deref(), docker.control.as_deref()),
+            (None, None)
+        );
+        assert_eq!(docker.control_port, 7900);
+        assert_eq!(docker.publish_ip, "0.0.0.0");
+        assert_eq!(docker.name_prefix, "space-shard-");
+        assert_eq!(docker.cluster, options.config.cluster);
+        assert_eq!(docker.self_container.as_deref(), Some("0123456789ab"));
+        // Flags win over variables.
+        let options = parse_with(
+            &[
+                "--launcher",
+                "docker",
+                "--shard-image",
+                "space-dev/shard:local",
+                "--docker-socket",
+                "/run/docker.sock",
+                "--docker-network",
+                "space_net",
+                "--docker-control-addr",
+                "orchestrator:7900",
+                "--docker-publish-ip",
+                "127.0.0.1",
+                "--docker-name-prefix",
+                "space-test-",
+                "--cluster",
+                "c1",
+            ],
+            &[("SPACE_ORCHESTRATOR_SHARD_IMAGE", "other:tag")],
+        )
+        .expect("parses");
+        let docker = &options.docker;
+        assert_eq!(docker.image, "space-dev/shard:local");
+        assert_eq!(docker.socket, PathBuf::from("/run/docker.sock"));
+        assert_eq!(docker.network.as_deref(), Some("space_net"));
+        assert_eq!(docker.control.as_deref(), Some("orchestrator:7900"));
+        assert_eq!(docker.publish_ip, "127.0.0.1");
+        assert_eq!(docker.name_prefix, "space-test-");
+        assert_eq!(docker.cluster, "c1");
+        let with = |flag: &str, value: &str| {
+            parse(&["--launcher", "docker", "--shard-image", "i:t", flag, value])
+        };
+        assert!(with("--docker-publish-ip", "everywhere").is_err());
+        assert!(with("--docker-control-addr", "no-port").is_err());
+        assert!(with("--docker-control-addr", "a b:7900").is_err());
+        assert!(with("--docker-name-prefix", "bad/name").is_err());
+        // Not asked for, not checked: another launcher needs no image.
+        assert!(parse(&["--launcher", "process"]).is_ok());
+    }
+
+    /// On a platform without the Docker socket the launcher says so at
+    /// startup, with what to use instead.
+    #[cfg(not(unix))]
     #[tokio::test]
-    async fn the_docker_launcher_is_an_unavailable_error_not_a_panic() {
-        let options = parse(&["--launcher", "docker"]).expect("parses");
+    async fn the_docker_launcher_refuses_to_start_where_it_cannot_run() {
+        let options = parse(&["--launcher", "docker", "--shard-image", "i:t"]).expect("parses");
         let err = run(options, Instant::now())
             .await
-            .expect_err("docker is deferred");
-        assert!(err.contains("bollard"), "{err}");
+            .expect_err("no unix socket here");
+        assert!(err.contains("--launcher process"), "{err}");
+    }
+
+    /// The autoscaler's thresholds are flags (seconds on the command line,
+    /// ticks inside), with variables, and settings that cannot work are
+    /// refused at startup.
+    ///
+    /// Mutations this catches: seconds taken as ticks (a 10 s dwell would be
+    /// a third of a second); a flag that parses and is not applied.
+    #[test]
+    fn the_autoscaler_is_configured_by_flags_or_variables() {
+        let defaults = parse(&[]).expect("parses").config.scale;
+        assert_eq!(defaults, ScaleConfig::default());
+        assert_eq!(
+            (defaults.capacity, defaults.out_load, defaults.in_load),
+            (100, 0.8, 0.35)
+        );
+        assert_eq!(
+            (
+                defaults.out_dwell_ticks,
+                defaults.in_dwell_ticks,
+                defaults.cooldown_ticks,
+                defaults.drain_timeout_ticks
+            ),
+            (300, 1_800, 900, 900)
+        );
+        let scale = parse_with(
+            &[
+                "--shard-capacity",
+                "2",
+                "--scale-out-load",
+                "0.9",
+                "--scale-out-after",
+                "5",
+                "--scale-in-load",
+                "0.4",
+                "--scale-cooldown",
+                "7.5",
+            ],
+            &[
+                ("SPACE_ORCHESTRATOR_SCALE_IN_AFTER", "20"),
+                ("SPACE_ORCHESTRATOR_DRAIN_TIMEOUT", "45"),
+                ("SPACE_ORCHESTRATOR_SCALE_OUT_AFTER", "99"),
+            ],
+        )
+        .expect("parses")
+        .config
+        .scale;
+        assert_eq!(
+            scale,
+            ScaleConfig {
+                capacity: 2,
+                out_load: 0.9,
+                out_dwell_ticks: 150,
+                in_load: 0.4,
+                in_dwell_ticks: 600,
+                cooldown_ticks: 225,
+                drain_timeout_ticks: 1_350,
+            }
+        );
+        for (flag, value) in [
+            ("--shard-capacity", "0"),
+            ("--shard-capacity", "2.5"),
+            ("--scale-in-load", "0.9"),
+            ("--scale-out-load", "0.2"),
+            ("--scale-out-after", "0"),
+            ("--drain-timeout", "46"),
+            ("--scale-cooldown", "soon"),
+            ("--scale-in-after", "-1"),
+        ] {
+            assert!(parse(&[flag, value]).is_err(), "{flag} {value}");
+        }
     }
 
     #[test]

@@ -126,12 +126,40 @@ fn plane_with_root(root_owner: ShardId) -> ControlPlane {
     ControlPlane::new(config, ids, EpochPublisher::new(map), "secret".into())
 }
 
+/// Play the end of a drain: the merged `gone` reports that it is empty, is
+/// told to stop ([`Message::ShardRetire`]) and — nobody closes its link in
+/// this fixture — is stopped when the grace has passed.
+fn drain_and_stop(orch: &mut Orchestrator<RecordingLauncher>, gone: ShardId) {
+    orch.tick();
+    orch.handle_load_report(&cold_report(gone));
+    orch.tick();
+    let told = orch
+        .drain_outbox()
+        .into_iter()
+        .any(|(to, m)| to == gone && matches!(m, Message::ShardRetire(_)));
+    assert!(told, "the drained shard is told to stop");
+    assert!(
+        orch.take_pending_kill().is_empty(),
+        "and left to end by itself"
+    );
+    for _ in 0..=space_orchestrator::config::RETIRE_GRACE_TICKS {
+        orch.tick();
+    }
+    assert_eq!(
+        orch.take_pending_kill(),
+        vec![gone],
+        "stopped after the grace"
+    );
+    assert!(orch.draining_shards().is_empty());
+}
+
 fn hot_report(s: ShardId) -> LoadReport {
     LoadReport {
         shard: s,
         players: 90,
         tick_p95_ms: 1.0,
         load: 0.0,
+        ..Default::default()
     }
 }
 
@@ -143,6 +171,7 @@ fn cold_report(s: ShardId) -> LoadReport {
         players: 0,
         tick_p95_ms: 1.0,
         load: 0.0,
+        ..Default::default()
     }
 }
 
@@ -298,9 +327,12 @@ fn a_cold_child_merges_the_epoch_and_stages_a_kill() {
         for (r, epoch) in recipients {
             orch.handle_epoch_ack(r, epoch);
         }
-        // Committed: only now is the cold child staged for kill.
-        let kills = orch.take_pending_kill();
-        assert_eq!(kills, vec![shard(2)], "the cold child is staged for kill");
+        // Committed: the cold child owns nothing now and drains; it is
+        // stopped once it has said that it is empty (the premise before
+        // phase 6: it was killed at the commit).
+        assert!(orch.take_pending_kill().is_empty(), "a commit stops nobody");
+        assert_eq!(orch.draining_shards(), vec![shard(2)]);
+        drain_and_stop(&mut orch, shard(2));
         staged_kill = true;
         break;
     }
@@ -373,7 +405,8 @@ fn a_cold_carved_cell_merges_back_into_the_roots_owner() {
         for (r, epoch) in recipients {
             orch.handle_epoch_ack(r, epoch);
         }
-        assert_eq!(orch.take_pending_kill(), vec![shard(2)]);
+        assert!(orch.take_pending_kill().is_empty(), "a commit stops nobody");
+        drain_and_stop(&mut orch, shard(2));
         merged = true;
         break;
     }
@@ -718,6 +751,7 @@ async fn a_cell_is_carved_with_the_local_launcher_committed_and_merged_back() {
         players: 0,
         tick_p95_ms: 1.0,
         load: 0.0,
+        ..Default::default()
     };
     let mut refusal = Some(String::new());
     for _ in 0..40 {

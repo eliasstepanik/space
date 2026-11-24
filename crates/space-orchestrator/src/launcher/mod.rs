@@ -11,8 +11,9 @@
 //! * [`process::ProcessLauncher`] — one `space-server` process per shard: the
 //!   executable lying next to the orchestrator's own, on a host port of the
 //!   configured range, logging to a file of its own.
-//! * [`docker::DockerLauncher`] — **deferred stub**: every call returns
-//!   [`LaunchError::Unavailable`] (see `docker.rs`).
+//! * [`docker::DockerLauncher`] — one container per shard, created, started,
+//!   stopped and removed through the Docker Engine's socket (Linux; elsewhere
+//!   it says so and refuses to start).
 //!
 //! # A launch has no shard id
 //!
@@ -109,7 +110,8 @@ pub enum LaunchError {
     Unreachable(LaunchId),
     /// The launcher cannot answer this question.
     Unsupported(String),
-    /// The launcher is not available in this build (the deferred Docker stub).
+    /// The launcher cannot run here (the Docker launcher without a socket it
+    /// can use, a process launcher without its executable).
     Unavailable(String),
 }
 
@@ -183,6 +185,25 @@ pub trait Launcher: Send + Sync {
         &self,
         launch: LaunchId,
     ) -> impl std::future::Future<Output = Result<Poll, LaunchError>> + Send;
+
+    /// The exit status of what `launch` started, once it has been seen to
+    /// have exited and while the launcher still knows it (until
+    /// [`Launcher::kill`] reaps it): `Some(0)` is a shard that stopped because
+    /// it was told to (`ShardRetire`), anything else one that died. `None`
+    /// when the launcher cannot tell (it still runs, it was never seen, or the
+    /// launcher has no such notion — the default).
+    fn exit_code(&self, launch: LaunchId) -> impl std::future::Future<Output = Option<i32>> + Send {
+        let _ = launch;
+        async { None }
+    }
+
+    /// Stop and remove **everything** this launcher started, within a
+    /// bounded time: the orchestrator is shutting down (a signal). The
+    /// default does nothing — a launcher whose shards end with the process
+    /// (in-process ones) or are stopped when it is dropped needs no more.
+    fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// The address a shard on this host dials to reach `control`.

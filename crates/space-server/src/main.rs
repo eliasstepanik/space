@@ -228,7 +228,7 @@ impl Options {
                 }
                 "--orchestrator" => {
                     let text = value("--orchestrator")?;
-                    orchestrator = Some(text.parse::<SocketAddr>().map_err(|e| e.to_string())?);
+                    orchestrator = Some(control_address(text)?);
                 }
                 "--claim-region" => {
                     let text = value("--claim-region")?;
@@ -334,6 +334,24 @@ impl Options {
 
 /// The root depth a `--claim-region`-less orchestrated launch falls back to.
 ///
+/// The orchestrator's control address from `--orchestrator`: an `ip:port`,
+/// or a `name:port` that is looked up **once, now** (a container reaches the
+/// orchestrator by its service or container name on their network; the
+/// first address the name resolves to is the one dialed, and a shard that
+/// loses its orchestrator stops rather than look again).
+fn control_address(text: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    use std::net::ToSocketAddrs;
+    text.to_socket_addrs()
+        .map_err(|e| {
+            format!("--orchestrator {text}: not an ip:port, and not a name that resolves ({e})")
+        })?
+        .next()
+        .ok_or_else(|| format!("--orchestrator {text}: the name resolves to no address"))
+}
+
 /// Matches the orchestrator's default root depth so a bare `--orchestrator`
 /// claims the root; the orchestrator overrides the placement in its welcome
 /// anyway (the value here only seeds the standalone map before the welcome).
@@ -504,6 +522,30 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Options, String> {
         Options::parse(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    /// `--orchestrator` takes an address or a name; a name that does not
+    /// resolve is refused with the flag in the message, not dialed.
+    ///
+    /// Mutation this catches: parsing only a `SocketAddr` (a shard container
+    /// given `orchestrator:7900` would not start).
+    #[test]
+    fn the_orchestrator_is_named_by_address_or_by_name() {
+        assert_eq!(
+            control_address("10.1.2.3:7900"),
+            Ok("10.1.2.3:7900".parse().unwrap())
+        );
+        let by_name = control_address("localhost:7900").expect("localhost resolves");
+        assert!(
+            by_name.ip().is_loopback() && by_name.port() == 7900,
+            "{by_name}"
+        );
+        let err = control_address("no-such-host.invalid:7900").expect_err("no such name");
+        assert!(
+            err.contains("--orchestrator no-such-host.invalid:7900"),
+            "{err}"
+        );
+        assert!(control_address("localhost").is_err(), "a port is required");
     }
 
     #[test]
