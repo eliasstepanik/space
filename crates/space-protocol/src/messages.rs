@@ -605,6 +605,13 @@ pub struct ShardWelcome {
     pub shard_map: ShardMap,
     /// The secret shards present to each other (see the type docs).
     pub peer_token: String,
+    /// The cluster's **tick origin** (protocol 7): the instant of tick 0, µs
+    /// of UTC since the Unix epoch. Every shard of the cluster counts its
+    /// ticks from it — tick `n` is due at `origin + n / 30 s`
+    /// ([`SceneClock::cluster`](crate::SceneClock::cluster)) — so a tick
+    /// number names the same instant on every shard, whenever each was
+    /// started, a replacement included. The **last** field of the message.
+    pub tick_origin_us: i64,
 }
 
 impl core::fmt::Debug for ShardWelcome {
@@ -615,6 +622,7 @@ impl core::fmt::Debug for ShardWelcome {
             .field("region", &self.region)
             .field("shard_map", &self.shard_map)
             .field("peer_token", &redacted(&self.peer_token))
+            .field("tick_origin_us", &self.tick_origin_us)
             .finish()
     }
 }

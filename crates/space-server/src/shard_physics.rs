@@ -35,8 +35,13 @@ pub const SPAWN_CLEARANCE: f64 = 0.01;
 pub(super) struct GhostEntry {
     /// The shard that simulates it.
     pub(super) from: ShardId,
-    /// A ship (no hysteresis; replicated as a ship nobody here flies).
+    /// A ship (the ship's hysteresis; replicated as a ship nobody here
+    /// flies).
     ship: bool,
+    /// A ship a player flies on the shard that simulates it (it carries the
+    /// player model as its visual): in an island's key its home is that
+    /// shard (see [`crate::border`], "Players' ships").
+    player: bool,
     /// Its replicated components as last received (`Owner` set to 0: a
     /// session of another shard means nothing here, and must never be
     /// mistaken for one of ours).
@@ -89,8 +94,14 @@ struct IslandInfo {
     members: Vec<EntityGuid>,
     /// The ghosts touching them, ascending.
     ghosts: Vec<EntityGuid>,
+    /// The members a client of this shard flies, ascending: they are not
+    /// moved with the island (see [`crate::border`], "Players' ships").
+    players: Vec<EntityGuid>,
     /// The one-hop key this shard announces for its members.
     announce: (EntityGuid, ShardId),
+    /// The member (or ghost) the island's home is taken from: the lowest
+    /// guid of the two-hop key.
+    key: EntityGuid,
     /// The shard the island belongs on (the two-hop key's home).
     target: ShardId,
     /// Whether going there is a body going home after an interaction (the
@@ -138,6 +149,45 @@ const OWNER: u16 = <Owner as ComponentDef>::ID;
 const PARTS: u16 = <PartStates as ComponentDef>::ID;
 const PART_STATES: u16 = <PartStates as ComponentDef>::ID;
 const RESIDUAL: u16 = <PosResidual as ComponentDef>::ID;
+const VISUAL: u16 = <space_sim::Visual as ComponentDef>::ID;
+
+/// Whether a replicated component list is a player's ship: a ship that
+/// carries the player model (`Shard::mark_player`).
+fn is_player_ship(list: &[(u16, Vec<u8>)]) -> bool {
+    component(list, CONTROLS).is_some()
+        && component(list, VISUAL)
+            .and_then(|b| space_sim::body::decode_visual(b).ok())
+            .is_some_and(|v| v.0 == space_scene::visual::PLAYER)
+}
+
+/// A component list moved on `ticks` ticks along its velocities (every
+/// part): what a body handed over late has done in the meantime, as far as
+/// its last state says (see [`crate::handoff`], guarantee 4).
+fn advanced_components(mut list: Components, ticks: SimTick) -> Components {
+    if ticks == 0 {
+        return list;
+    }
+    let dt = f64::from(space_sim::dt()) * ticks as f64;
+    let on = |s: &mut ShipState| {
+        if s.vel != [0.0; 3] {
+            s.pos = WorldPos::from_f64_metres_around(s.pos, s.vel.map(|v| f64::from(v) * dt));
+        }
+    };
+    for (id, bytes) in &mut list {
+        if *id == SHIP_STATE {
+            if let Ok(mut s) = space_sim::wire::decode_ship_state(bytes) {
+                on(&mut s);
+                *bytes = space_sim::wire::encode_ship_state(&s);
+            }
+        } else if *id == PARTS {
+            if let Ok(mut p) = space_sim::articulation::decode_part_states(bytes) {
+                p.0.iter_mut().for_each(on);
+                *bytes = space_sim::articulation::encode_part_states(&p);
+            }
+        }
+    }
+    list
+}
 
 /// The replicated components of `guid`, a local entity or a ghost (a ghost's
 /// as its owner sent them, with the motion it is driven with here).
@@ -567,10 +617,11 @@ impl Shard {
     // ------------------------------------------------------------- islands
 
     /// The shard a body of ours belongs on by its own position: the
-    /// region's owner once it is [`border::BODY_HYSTERESIS`] inside it, or
-    /// once it has been inside it for [`border::SETTLE_TICKS`] (a body
-    /// resting just past a border is settled there too).
-    fn home_local(&self, guid: EntityGuid) -> ShardId {
+    /// region's owner once it is [`border::BODY_HYSTERESIS`] inside it (a
+    /// ship: [`border::SHIP_HYSTERESIS`]), or once it has been inside it for
+    /// [`border::SETTLE_TICKS`] (a body resting just past a border is
+    /// settled there too).
+    pub(super) fn home_local(&self, guid: EntityGuid) -> ShardId {
         let Some(state) = self.sim.ship_state(guid) else {
             return self.config.shard;
         };
@@ -578,7 +629,11 @@ impl Shard {
             .sim
             .entity_of(guid)
             .is_some_and(|e| self.sim.world().get::<ShipControls>(e).is_some());
-        let hysteresis = if ship { 0.0 } else { border::BODY_HYSTERESIS };
+        let hysteresis = if ship {
+            border::SHIP_HYSTERESIS
+        } else {
+            border::BODY_HYSTERESIS
+        };
         let home = border::home(&self.shard_map, state.pos, self.config.shard, hysteresis);
         if home != self.config.shard {
             return home;
@@ -688,17 +743,21 @@ impl Shard {
         }
     }
 
-    /// The shard a ghost belongs on by its own position, as its owner
-    /// computes it.
+    /// The shard a ghost belongs on in an island's key, as its owner
+    /// computes it: by its own position — or, for a player's ship, the shard
+    /// that simulates it (see [`crate::border`], "Players' ships").
     fn home_ghost(&self, guid: EntityGuid) -> ShardId {
         let Some(entry) = self.ghosts.get(&guid) else {
             return ShardId::NONE;
         };
+        if entry.player {
+            return entry.from;
+        }
         let Some(state) = self.sim.state_of(guid) else {
             return entry.from;
         };
         let hysteresis = if entry.ship {
-            0.0
+            border::SHIP_HYSTERESIS
         } else {
             border::BODY_HYSTERESIS
         };
@@ -710,6 +769,9 @@ impl Shard {
     /// [`crate::border`], "Islands and consolidation").
     pub(super) fn border_pass(&mut self) {
         self.wind_clocks();
+        // The ships our clients fly: in a key they count with this shard as
+        // their home, and no island moves them.
+        let flown: HashSet<EntityGuid> = self.clients.values().filter_map(|c| c.ship).collect();
         let islands = self.sim.islands(IslandQuery {
             margin: border::ISLAND_MARGIN,
             lead_time: border::ISLAND_LEAD,
@@ -730,7 +792,12 @@ impl Shard {
                 }
             };
             for guid in &island.bodies {
-                consider((*guid, self.home_local(*guid)));
+                let home = if flown.contains(guid) {
+                    self.config.shard
+                } else {
+                    self.home_local(*guid)
+                };
+                consider((*guid, home));
             }
             for guid in &ghosts {
                 consider((*guid, self.home_ghost(*guid)));
@@ -766,8 +833,9 @@ impl Shard {
             // held until that has been its wish for a while (see `border`,
             // "Hysteresis").
             let wish = key2.1;
-            // An island with a ship in it follows the ship (a ship has no
-            // hysteresis: a player is on the shard the map names).
+            // An island with a ship in it is not held: its bodies go where
+            // its key says at once (to the shard of the player touching
+            // them).
             let with_ship = island.bodies.iter().any(|guid| {
                 self.sim
                     .entity_of(*guid)
@@ -788,10 +856,18 @@ impl Shard {
             for guid in &island.bodies {
                 view.of.insert(*guid, index);
             }
+            let players = island
+                .bodies
+                .iter()
+                .copied()
+                .filter(|guid| flown.contains(guid))
+                .collect();
             view.islands.push(IslandInfo {
                 members: island.bodies,
                 ghosts,
+                players,
                 announce: key1,
+                key: key2.0,
                 target,
                 going_home,
             });
@@ -813,7 +889,9 @@ impl Shard {
             view.islands.push(IslandInfo {
                 members: vec![guid],
                 ghosts: Vec::new(),
+                players: Vec::new(),
                 announce: (guid, home),
+                key: guid,
                 target,
                 going_home: target != self.config.shard,
             });
@@ -821,27 +899,60 @@ impl Shard {
         self.island_view = view;
     }
 
-    /// The islands to hand off this tick, with where to: every island whose
-    /// home is another known shard and none of whose members is already in a
-    /// transfer or paused for that shard.
+    /// What to hand off this tick, with where to (see [`crate::border`]):
+    ///
+    /// * the **bodies** of every island whose home is another known shard,
+    ///   together, if none of them is already in a transfer or paused for
+    ///   that shard;
+    /// * every **player's ship** whose own position puts it on another known
+    ///   shard — wherever its island goes or stays. If it is its island's
+    ///   key, the island's bodies travel with it (one group, the ship
+    ///   first), when all of them are free to; the ship goes either way.
     pub(super) fn islands_to_hand_off(&self) -> Vec<(Vec<EntityGuid>, ShardId, bool)> {
+        let elsewhere =
+            |to: ShardId| to != self.config.shard && to != ShardId::NONE && self.knows_shard(to);
+        let free = |guid: &EntityGuid, to: ShardId| {
+            !self.ledger.is_busy(*guid)
+                && !self.pending_commits.iter().any(|p| p.guid == *guid)
+                && !self
+                    .refused
+                    .get(guid)
+                    .is_some_and(|(refused_by, _)| *refused_by == to)
+                && self.sim.ship_state(*guid).is_some()
+        };
         let mut out = Vec::new();
         for island in &self.island_view.islands {
             let to = island.target;
-            if to == self.config.shard || to == ShardId::NONE || !self.knows_shard(to) {
-                continue;
+            if elsewhere(to) {
+                let bodies: Vec<EntityGuid> = island
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|guid| island.players.binary_search(guid).is_err())
+                    .collect();
+                if !bodies.is_empty() && bodies.iter().all(|guid| free(guid, to)) {
+                    out.push((bodies, to, island.going_home));
+                }
             }
-            let free = island.members.iter().all(|guid| {
-                !self.ledger.is_busy(*guid)
-                    && !self.pending_commits.iter().any(|p| p.guid == *guid)
-                    && !self
-                        .refused
-                        .get(guid)
-                        .is_some_and(|(refused_by, _)| *refused_by == to)
-                    && self.sim.ship_state(*guid).is_some()
-            });
-            if free {
-                out.push((island.members.clone(), to, island.going_home));
+            for ship in &island.players {
+                let to = self.home_local(*ship);
+                if !(elsewhere(to) && free(ship, to)) {
+                    continue;
+                }
+                let mut group = vec![*ship];
+                // The bodies the player touches follow the player.
+                if island.key == *ship {
+                    let bodies: Vec<EntityGuid> = island
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|guid| island.players.binary_search(guid).is_err())
+                        .collect();
+                    if bodies.iter().all(|guid| free(guid, to)) {
+                        group.extend(bodies);
+                    }
+                }
+                out.push((group, to, false));
             }
         }
         out
@@ -864,9 +975,10 @@ impl Shard {
         };
         let mut state = EntitySnapshot::new(guid, list);
         state.components.push(TransferKind::Body.component(lead));
-        state
-            .components
-            .push(scene_time_component(self.sim.scene_time()));
+        state.components.push(scene_time_component(
+            self.sim.scene_time(),
+            self.scene_clock_set,
+        ));
         let offer =
             Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
         self.ledger
@@ -891,9 +1003,10 @@ impl Shard {
                 state
             }
         };
-        state
-            .components
-            .push(scene_time_component(self.sim.scene_time()));
+        state.components.push(scene_time_component(
+            self.sim.scene_time(),
+            self.scene_clock_set,
+        ));
         Some(state)
     }
 
@@ -943,7 +1056,14 @@ impl Shard {
             return;
         }
         self.drop_ghost(guid, false);
-        let components = carried_components(&self.sim, pending.components, pending.scene_time);
+        // What it has done since the state was taken, if the commit came
+        // late: on along its velocity (guarantee 4).
+        let late = pending
+            .state_tick
+            .map_or(0, |at| self.sim.tick().saturating_sub(at));
+        self.stats.caught_up += late;
+        let components = advanced_components(pending.components, late);
+        let components = carried_components(&self.sim, components, pending.scene_time);
         match self.sim.import_entity(guid, &components) {
             Ok(_) => {
                 self.index_now(guid);
@@ -986,11 +1106,13 @@ impl Shard {
             Some(list) => {
                 self.index_now(guid);
                 let ship = component(&list, CONTROLS).is_some();
+                let player = is_player_ship(&list);
                 self.ghosts.insert(
                     guid,
                     GhostEntry {
                         from: to,
                         ship,
+                        player,
                         components: zero_owner(list),
                         reckoned: 0,
                         island: None,
@@ -1093,11 +1215,13 @@ impl Shard {
                 }
             }
             let ship = component(&merged, CONTROLS).is_some();
+            let player = is_player_ship(&merged);
             self.ghosts.insert(
                 guid,
                 GhostEntry {
                     from,
                     ship,
+                    player,
                     components: merged,
                     reckoned: 0,
                     island,

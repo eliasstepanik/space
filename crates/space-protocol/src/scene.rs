@@ -309,6 +309,26 @@ impl SceneClock {
         Self { tick, time_us }
     }
 
+    /// The tick origin of a shard that is given none: 2026-01-01T00:00:00Z.
+    ///
+    /// A fixed instant, so standalone shards started by hand at different
+    /// times — the two shards of the `two-shards` setup — count the same
+    /// ticks without being told anything, and so does an orchestrator that
+    /// is given no origin of its own.
+    pub const DEFAULT_ORIGIN_US: i64 = 1_767_225_600_000_000;
+
+    /// The **cluster clock** with tick origin `origin_us`: tick 0 is at that
+    /// instant (µs of UTC since the Unix epoch), tick `n` exactly
+    /// `n / 30 s` later. Every shard of a cluster runs on the same one (the
+    /// orchestrator hands the origin out in its `ShardWelcome`), which is
+    /// what makes a tick number mean the same instant on all of them — and
+    /// it is the mapping to scene time each of them tells its clients, so
+    /// there is one clock, not two.
+    #[must_use]
+    pub const fn cluster(origin_us: i64) -> Self {
+        Self::new(0, origin_us)
+    }
+
     /// Scene time at `tick`, µs: `time_us + (tick - self.tick) · 1e6 / 30`,
     /// rounded toward minus infinity (exact integer arithmetic).
     #[must_use]

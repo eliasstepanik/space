@@ -426,6 +426,128 @@ became, and where it differs from the bullets above:
   move without a step beyond centimetres, speed rises without a flat spot, no input is lost. And
   the same while turning, and back across.
 
+**Status: built (phase 3).** What it became, where it differs from the bullets above, and what was
+measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-process shards started
+137 ms apart, the client core flown frame by frame at about 120 frames a second, a debug build,
+2026-11-24) unless a live stack is named; "before" is the same rig on the code as it was
+(`7c26931`).
+
+- **What a crossing looked like before.** Every shard counted from its own start, so at every
+  change of shard the client's draw clock **snapped** by the difference of the two shards' ticks
+  (-4.3, -8.3, +3.9, +8.5 ticks between shards started 137 ms apart), its prediction was built
+  anew from the new shard's first word with no inputs to replay, and the ship as drawn was about
+  **two ticks of flight** off — 0.7 to 0.9 m at 13 m/s — which the client then absorbed over a
+  third of a second (a visible glide, not a cut; above 2 m it would have been a cut). The
+  existing two-shard test saw none of it: it watches the shard's word (0.21 m worst), not what is
+  drawn. On the shards' side the ship was installed on "accept tick + lead" of the accepting
+  shard's own clock, a tick early or late by the two loops' phase: a tick nobody simulated, now
+  and then. Inputs sent between the commit and the switch went to the shard that no longer had
+  the ship.
+- **Cluster clock** (`space-server/src/clock.rs`): `ShardWelcome` ends with `tick_origin_us`
+  (`OrchestratorConfig::tick_origin_us`, `--tick-origin`), every shard runs `clock::run` on
+  `TickClock::new(origin)`: tick `n` is due at `origin + n / 30 s`, the wall clock is read once,
+  late ticks are made up (8 at most), a longer stall is jumped over (`Shard::skip_to`,
+  `ShardStats::skipped`, three log lines a minute). **Deviations:** (a) the default origin is a
+  **fixed instant** (`SceneClock::DEFAULT_ORIGIN_US`, 2026-01-01T00:00:00Z) for the orchestrator
+  and for a standalone shard alike, so the dev scripts give nothing and two shards started by
+  hand agree without a flag; `space-server --tick-origin` exists for whoever wants another
+  timeline. Tick numbers are therefore large (8.5e8 today); nothing casts one to `f32`. (b) It is
+  **not a second clock beside `SceneClock`**: the cluster clock *is* the scene clock a shard tells
+  its clients (`SceneClock::cluster(origin)`), set once and never re-anchored. `main`'s
+  wall-clock re-anchoring (`Shard::sync_scene_clock`, 30 ms tolerance) is called by neither
+  binary any more; it is left for a shard driven by a loop of its own. (c) "Says so in its load
+  report" is not built: no shard sends a load report yet (section 3). Measured: three shards
+  started 1.3 s and 0.9 s apart are never more than one tick apart when looked at together
+  (`tests/crossing.rs`); on a live four-shard stack every shard's log names the same tick.
+- **Handoff** (`handoff.rs`, "The tick of a state"; H2, H4, H5 and H6 reworded). **Deviation:**
+  no new private component. A handoff state has carried its scene time since `main`'s orbits
+  (`SCENE_TIME_COMPONENT`), and on the cluster clock that *is* the tick; it got a ninth byte,
+  "read off a shared clock". The accepting shard reads the tick off its own clock and installs
+  the entity **on it**: a commit that is early waits for the tick (the plan only had the late
+  case), one that is on time is installed before the next step — the tick after the commit is
+  the accepting shard's, none is lost — and one that is late is brought forward: a ship by the
+  flight model's free-flight step under the inputs kept for those ticks, a body along its
+  velocity. **Deviation:** no "local pull" in the catch-up (a body at rest on a floor would be
+  sunk by it), no contacts, and a ship in fast travel only coasts; at most 15 ticks, beyond which
+  the two clocks are taken not to agree and the old rule applies (accept tick + lead) — as it
+  does between shards stepped by hand, which is why the 41 acceptance tests pass unchanged.
+  `ShardStats::caught_up` counts the ticks made up: 0 in every flight of the client tests but the
+  fast one over the demo area (11 ticks in all, among some hundred transfers, most of them
+  bodies; which entities they were was not looked at). Checked tick for tick against a ship that
+  never changed shard, bit for bit: on time, 1/2/4 ticks late, early (`tests/crossing.rs`).
+- **Inputs.** The client sends every batch to both shards while a handoff is in flight; the
+  accepting shard keeps what it is sent for a staged ship (`staged_inputs`, 45 at most), replays
+  the catch-up's ticks from it and files the rest at the install; the input floor is the install
+  tick. **Added:** the client now gives **every tick exactly one input** (`link::inputs_for`).
+  It used to tag each batch with its clock's estimate, which names a tick twice now and then and
+  skips one as often; a skipped tick coasts on the shard, which in fast travel is a fifteenth of
+  the speed gone. Measured: a key pressed 0.3 to 1.25 s after the offer — before the commit, at
+  it, after the switch — shows in the shard's word after 94 to 105 ms, as one pressed far from
+  any border does (74 to 110 ms); in fast travel the prediction's corrections went from up to
+  1.0 m to 0.
+- **Client** (`link.rs`, "One timeline across the switch"; `predict.rs`): at the switch the
+  link checks that the new shard's first tick is within 6 of the tick it expects; then nothing
+  but the session changes — tick, sent inputs, `input_ack`, and the history of every entity both
+  shards report (merged by guid, `ShipView::continue_from`). The draw clock and the prediction are
+  keyed by ship and `Replica::tick_epoch`, which only goes up onto a shard that counts other
+  ticks (then everything starts over, as before). Measured over 12 crossings at 11-14 m/s
+  through all four cells, both borders both ways: drawn ship off by at most **3.5 mm** from
+  where the frame before puts it (before: 0.7-0.9 m), drawn velocity steps 0.12 m/s (the
+  thrust's own), clock 0.02 ticks, **correction 0.0000 m**, one handoff per crossing, 1.13 s at
+  most from a metre past the border. Beside the showcase (8 crossings through the zero-g
+  corner): all 35 bodies in sight before and after are drawn in every frame between, once; the
+  largest move of one beyond its motion 3 cm. In fast travel (up to 330 m/s, ten metres a tick):
+  0.13 m at the switch frames, 1 ms of flight — what any frame of fast travel shows (99 % under
+  1.04 ms): its velocity is not smooth, because the speed limit follows the distance to the
+  nearest surface.
+- **Ship hysteresis** (`border::SHIP_HYSTERESIS` = 1 m, and the 3 s settle rule bodies have): a
+  ship is offered once it is a metre inside the region it entered, measured to the nearest
+  ground of the shard that simulates it — exactly, round the corner where four cells meet
+  (`near_territory_distance`; `home` used a lower bound that held a body on the wrong one of
+  three shards) — or once it has been inside for three seconds. Measured: walking along x = -6
+  for 20 s, weaving 0.27 m to either side: **0 handoffs** (before: 13 in 14 legs); standing a
+  hair across it: one, after three seconds, and none in the next six.
+- **Is the second of lead needed, and does a player notice it?** It is what the client is given
+  to open its second connection, and the commit waits for it. Nothing is frozen meanwhile: the
+  old shard simulates the ship as before, inputs act as fast as anywhere (above), nothing drawn
+  steps. A player sees it in the HUD's shard number, which changes a metre and a second after
+  the border, and in nothing else. It was not shortened. What it does cost is that for that
+  second the ship is simulated by the shard it has left — 15 m into the neighbour's ground at
+  flying speed, hundreds in fast travel — and meets that shard's bodies as ghosts unless the
+  island rule has moved them first.
+- **On a live stack** (`dev.ps1 -MinShards 4`, release build, two headless clients at 120
+  frames a second driven through the harness, `/state` sampled about 140 times a second; the
+  raw samples are in `target/dev/shots/phase3/`): 40 crossings of both borders, both ways —
+  12 at 10-15 m/s, 16 at walking speed (2 m/s), 12 in fast travel (28-355 m/s). The drawn ship
+  was off from where the sample before put it by at most 4.0 mm flying and 3.6 mm walking
+  (0.012 and 0.06 of a tick of motion), and by 0.22 m in the median, 0.29 m at most in fast
+  travel (0.05 and 0.10 of a tick of motion — fast travel's own unevenness); the draw clock
+  stepped by at most 0.057 ticks at a switch; `correction_m` was 0 at every one of the 40;
+  from a metre past the border to the new shard number took 1.00-1.30 s (median 1.12); all
+  35 bodies were listed throughout. Standing 10 cm across x = -6 for 15 s: one handoff (after
+  three seconds), then none; walking along it for 20 s, 0.32 m to either side at most: none.
+  One client standing 1.25 m and 9.2 m beside the path of another that crossed ten times
+  each: 0 handoffs, the same session, the other drawn in every sample. (In an earlier run the
+  two ships collided — the pilot's lane was a metre off — and the one who stood was knocked
+  across the border and then handed over, once, for where it was.) A floating crate knocked
+  from x = -17 over the border to x = -1 was in every sample of both clients, never moved
+  backwards, and the two clients' views of it were never more than 0.1 m apart. All four
+  shards' log lines name the same tick at the same moment; no shard jumped a tick; no
+  player's transfer was called off; both clients ended with 0 validation messages.
+- **Not done here, and what still looks wrong.** Hosts whose clocks differ (decision 5: one
+  host). The web UI does not show the tick origin. A player in fast travel takes every body its
+  second of motion reaches along (the whole showcase, from a hundred metres up) and they come
+  back afterwards: correct, invisible to clients, but tens of body handoffs per fly-by, some
+  refused by the crossing rule (section 7): after half an hour of the live run above the root's
+  shard had handed 659 entities out and counted 197 body transfers called off. Bodies that have
+  been knocked further than the ghost margin from a border (two crates ended up six kilometres
+  out) are drawn by the clients of the shard that simulates them and by nobody else, so the
+  count of bodies in sight changes at a border by exactly those: that is section 6's far
+  replicas, not a crossing. Fast travel's velocity kinks are the flight
+  model's, not a border's. Noticed while reading, not verified: `ShipView::apply` treats every
+  chunk of a snapshot as the whole interest set, so a snapshot too large for one frame would
+  lose its earlier chunks on the client (the demo area's fits one).
+
 ## 6. Far replicas and level of detail
 
 - Two tiers across shards: **ghosts** as today (near a border, in the physics world) and **far
@@ -448,23 +570,37 @@ became, and where it differs from the bullets above:
 
 ## 7. Physics across four borders
 
-**Seen on a live four-shard stack (2026-11-24, after the merge with `main`; not solved):**
+**Seen on a live four-shard stack (2026-11-24, after the merge with `main`), and solved in
+phase 3** (the rules: `border.rs`, "Players' ships"; the tests: `space-server/tests/crossing.rs`,
+`space-client/tests/seamless.rs`):
 
-- **A standing player is handed over because another flew by.** A ship within island reach of
-  another ship's motion (0.5 m + 1 s of it: some 10-30 m at flying speed) is one island with it,
-  and the island's home is that of its lowest guid. A player standing 9 m beside the path of one
-  who crossed x = -6 and came back was handed to the neighbour shard and back at **every**
-  crossing (12 handoffs in 6 crossings, without moving; 65 m away: none). The same happens to a
-  player standing on the spawn point when a newcomer walks off towards a border, 4-6 m away.
-  Nothing jumps and no second ship appears, but each is a session switch for somebody who did
-  nothing. Ships need to be left out of islands they do not touch, or given the hysteresis
-  section 5 plans.
-- **A crossing beside the showcase's bodies takes 3 s instead of 1.** From the spawn point over
-  x = -6 at z about 0 (twice), and from the bowl's side over x = -6 at z about -35 (twice; the
-  way back took 1 s): one attempt is called off (the shards' `aborted` counters rise), the 2 s
-  re-offer pause runs, the second attempt goes through. Thirty-five other crossings, away from
-  bodies, took 0.99-1.07 s. Not looked into further than that: which member of the group is
-  refused, and why, is the first thing the four-shard fixture below should show.
+- **A standing player was handed over because another flew by.** Confirmed as the cause: the
+  island rule moved a player's ship like any member. Two ships within reach of each other's
+  second of motion are one island, its home was that of its lowest guid, and *every* member was
+  offered there — so the player whose ship has the higher guid (the one who joined later) went
+  wherever the other one's home was. (With the order of joining reversed — the one who stands
+  has the lower guid — the same fly-bys handed nobody over who did not cross: 0 handoffs.) Now
+  a player's ship
+  is never moved by an island: it is offered for its own position only, and in an island's key
+  it counts with the shard that simulates it. Measured: a player 1.5 m and 9 m beside the path
+  of one who crossed ten times: 0 handoffs, the same session throughout.
+- **A crossing beside the showcase's bodies took 3 s instead of 1.** The refusal was "crossing
+  island transfer; the lower shard id takes it": as the ship came near, the corner's shard sent
+  the crates its second of motion reached to the ship's shard (consolidation), one of them was
+  under way at the moment the ship's shard offered the ship *in a group with its bodies*, and the
+  accepting shard refused the group's first member — the ship — because it was itself sending a
+  member of that island the other way. The whole group was called off and paused for two
+  seconds. Deterministic on the way out of the spawn cell (3.11-3.12 s, four times of four), not
+  on the way back (1.11-1.14 s). Now the crossing rule is for bodies only, a player's ship
+  commits when its own gate opens whatever becomes of the bodies travelling with it, and a
+  refused body calls off the group's bodies, not the ship. Measured: 1.10-1.13 s, eight of
+  eight. Shards now say which transfer was called off and why (`Shard::recent_aborts`, a few
+  log lines per ten seconds).
+
+**Still open for this section** (seen in phase 3's runs): bodies follow a player across a border
+and back in numbers (above, section 5's last bullet); two shards still refuse each other's body
+groups by the crossing rule now and then (harmless: retried after the pause, no client sees
+it).
 
 `space-server/tests/physics.rs` gets a four-shard fixture with the borders through the showcase:
 islands whose members have three or four homes, ghost refresh between every pair, hysteresis at
@@ -499,9 +635,11 @@ protocol 6 of its own - the merged demo area: `SceneClock` (tag 28), `PlayerInpu
 `ShipControls` - and that 6 stands as released. Everything of this branch is therefore
 **protocol 7**, on top of it: built so far are `ShardHello` + optional client endpoint + secret,
 `ShardRegion` + client endpoint, `RejectReason::Starting`, the peer token in a shard's hello and
-`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30). `FarInterest`/`FarUpdate` (30, 31), the tick
-origin and the load report's new fields are still to come and stay inside 7 as long as 7 has not
-been pushed to `main`; once it has, the next layout change is 8.
+`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30), and since phase 3 `ShardWelcome` + tick origin
+(`tick_origin_us`, its last field). `FarInterest`/`FarUpdate` (30, 31) and the load report's new
+fields are still to come and stay inside 7 as long as 7 has not been pushed to `main`; once it
+has, the next layout change is 8. (The handoff state's private components are not wire layout:
+the scene-time component got a ninth byte in phase 3.)
 
 ## 10. Phases
 

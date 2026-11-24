@@ -8,14 +8,14 @@
 //! lets the acceptance tests run two shards inside one process and hand their
 //! outboxes to each other.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use space_protocol::{
     EntityGuid, HandoffReason, Hello, InputTick, JoinRedirect, Message, NeighbourStatus,
     PlayerInput, Redirect, RejectReason, SceneAck, SceneClock, SceneState, ShardId, ShardMap,
     ShardRegion, StaleEpoch, Welcome,
 };
-use space_sim::{ShipState, SimTick, SimWorld};
+use space_sim::{ShipControls, ShipState, SimTick, SimWorld};
 use space_world::{NodeRef, WorldPos};
 
 use crate::config::{
@@ -23,7 +23,9 @@ use crate::config::{
     REOFFER_BACKOFF_TICKS, SCENE_REANNOUNCE_TICKS,
 };
 use crate::epoch::EpochParticipant;
-use crate::handoff::{Ledger, TransferKind, HANDOFF_LEAD, HANDOFF_TIMEOUT_TICKS};
+use crate::handoff::{
+    Ledger, TransferKind, HANDOFF_LEAD, HANDOFF_TIMEOUT_TICKS, MAX_CATCH_UP, MAX_STAGED_INPUTS,
+};
 use crate::replicate::{
     self, ClientReplica, ComponentLog, Components, Frame, GuidIndex, Interest, PassCache, Visible,
 };
@@ -154,7 +156,41 @@ pub struct ShardStats {
     pub bodies: usize,
     /// Ghosts of neighbours' bodies held here.
     pub ghosts: usize,
+    /// Ticks this shard jumped over because it could not keep up with the
+    /// cluster clock (see [`crate::clock`]).
+    pub skipped: SimTick,
+    /// Ticks handed-over entities were brought forward at their install
+    /// because the commit arrived late (see [`crate::handoff`], guarantee 4).
+    pub caught_up: SimTick,
 }
+
+/// One transfer that was called off, as [`Shard::recent_aborts`] lists it
+/// and the shard's log says it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbortNote {
+    /// This shard's tick when it happened.
+    pub tick: SimTick,
+    /// The entity whose transfer it was.
+    pub entity: EntityGuid,
+    /// The other shard of the transfer.
+    pub peer: ShardId,
+    /// Whether this shard was the one offering the entity (`true`) or the
+    /// one that had staged it.
+    pub offering: bool,
+    /// Whether the entity is a ship a client of this shard flies.
+    pub player: bool,
+    /// Whether it was called off here (`true`) or by the peer's abort.
+    pub by_us: bool,
+    /// Why.
+    pub reason: HandoffReason,
+}
+
+/// How many [`AbortNote`]s a shard keeps.
+const ABORT_NOTES: usize = 64;
+/// Abort log lines per window of [`ABORT_LINE_WINDOW`] ticks.
+const ABORT_LINES: u32 = 6;
+/// The window of [`ABORT_LINES`], ticks (ten seconds).
+const ABORT_LINE_WINDOW: SimTick = 10 * space_sim::TICK_HZ as SimTick;
 
 /// A commit that has arrived but not been installed yet.
 ///
@@ -163,21 +199,32 @@ pub struct ShardStats {
 /// the state as of the offering shard's activation tick, so stepping it earlier
 /// would double-step.
 ///
-/// The two ticks are deliberately separate. `activation_tick` is the *offering*
-/// shard's clock and is only meaningful for input reconciliation (the client's
-/// pending inputs are tagged with the old shard's ticks); `install_at` is
-/// **our** clock, derived when we accepted the offer. Two shards run independent
-/// loops and drift, so one number cannot serve both.
+/// **When** it is installed is decided by the tick the state describes
+/// (`state_tick`, see [`crate::handoff`], "The tick of a state"): the first
+/// tick pass that finds our clock at or past it installs the entity and, if
+/// it is past it, brings it forward by the ticks in between. Only when the
+/// two shards' clocks do not agree (`state_tick` is `None`) are the old two
+/// numbers used: `activation_tick`, the *offering* shard's clock, as the
+/// input-ack floor, and `install_at`, **our** clock, derived when we accepted
+/// the offer.
 #[derive(Debug)]
 struct PendingCommit {
     guid: EntityGuid,
     session: u64,
     state: ShipState,
     /// The offering shard's activation tick: the input-ack floor we hand the
-    /// client, whose inputs are tagged in that clock.
+    /// client when the clocks do not agree (its inputs are then tagged in
+    /// that clock).
     activation_tick: SimTick,
-    /// Our own tick at which to install (see [`crate::handoff::Incoming`]).
+    /// Our own tick at which to install: the state's tick, or — clocks that
+    /// do not agree — the accept tick plus the lead (see
+    /// [`crate::handoff::Incoming`]).
     install_at: SimTick,
+    /// The tick of **our** clock the state describes, when the sender's
+    /// scene time of it lies within [`MAX_CATCH_UP`] of our present.
+    state_tick: Option<SimTick>,
+    /// Whether the ship was in fast travel (its `ShipControls`).
+    fast: bool,
     /// What arrives: a player's ship (spawned from `state`) or a body
     /// (imported from `components`).
     kind: TransferKind,
@@ -205,6 +252,11 @@ pub struct Shard {
     ledger: Ledger,
     /// Commits waiting for their activation tick (see [`PendingCommit`]).
     pending_commits: Vec<PendingCommit>,
+    /// Inputs for ships that are on their way here (staged, or committed and
+    /// not yet installed), by ship and tick: their players send them to both
+    /// shards around the switch, and the install replays the ones for the
+    /// ticks it catches up on and files the rest (guarantee 5).
+    staged_inputs: HashMap<EntityGuid, BTreeMap<SimTick, PlayerInput>>,
     /// Entities a peer refused, with the peer and the tick before which they are
     /// not offered to it again (see
     /// [`REOFFER_BACKOFF_TICKS`](crate::config::REOFFER_BACKOFF_TICKS)).
@@ -238,6 +290,11 @@ pub struct Shard {
     next_group: u64,
     /// What the last census line said (see `Shard::report_census`).
     census: Option<ShardStats>,
+    /// The transfers called off lately, newest last (see [`AbortNote`]).
+    abort_notes: std::collections::VecDeque<AbortNote>,
+    /// Abort lines written in the current window, and the tick it began at
+    /// (a few lines per ten seconds; the rest are counted).
+    abort_lines: (SimTick, u32, u64),
     /// The shard map this shard publishes and follows.
     shard_map: ShardMap,
     /// The shard's epoch-protocol participation (Phase 3): the staged prepare,
@@ -270,6 +327,7 @@ impl Shard {
             next_serial: 1,
             ledger: Ledger::new(),
             pending_commits: Vec::new(),
+            staged_inputs: HashMap::new(),
             refused: HashMap::new(),
             outbox: Vec::new(),
             departing: Vec::new(),
@@ -283,6 +341,8 @@ impl Shard {
             sent_home: HashMap::new(),
             next_group: 0,
             census: None,
+            abort_notes: std::collections::VecDeque::new(),
+            abort_lines: (0, 0, 0),
             shard_map: map,
             epoch_participant: EpochParticipant::new(),
             scene: SceneState::UNSET,
@@ -312,8 +372,13 @@ impl Shard {
     /// calls re-anchor it only when it has drifted more than
     /// [`crate::config::SCENE_CLOCK_TOLERANCE_US`] from the wall clock (a
     /// skipped tick), and tell every client. Returns whether it re-anchored.
-    /// The run loops call it after every tick; a shard nobody calls it on
-    /// counts scene time from 0 at tick 0 (deterministic, for tests).
+    ///
+    /// For a shard driven by a loop of its own that counts its ticks from
+    /// its own start and may skip one. The binaries' shards do not use it:
+    /// they run on the cluster's clock ([`crate::clock`],
+    /// [`Shard::start_clock`]), whose scene time is exact by construction
+    /// and never re-anchored. A shard neither is called on counts scene time
+    /// from 0 at tick 0 (deterministic, for tests).
     pub fn sync_scene_clock(&mut self, now_us: i64) -> bool {
         let tick = self.sim.tick();
         let drift = now_us - self.sim.scene_clock().time_us_at(tick);
@@ -322,6 +387,25 @@ impl Shard {
         }
         self.set_scene_clock(SceneClock::new(tick, now_us));
         true
+    }
+
+    /// Start counting at `tick` ([`Shard::start_clock`]).
+    pub(crate) fn restart_ticks(&mut self, tick: SimTick) {
+        self.sim.reset_clock(tick);
+    }
+
+    /// Jump forward to `tick` without simulating the ticks in between: what
+    /// a shard does that is too far behind the cluster clock to make them up
+    /// ([`crate::clock`]). The world stands still across the jump (and inputs
+    /// filed for the skipped ticks are dropped); every timeout simply finds
+    /// that much time gone. A `tick` at or before the present does nothing.
+    pub fn skip_to(&mut self, tick: SimTick) {
+        let at = self.sim.tick();
+        if tick <= at {
+            return;
+        }
+        self.stats.skipped += tick - at;
+        self.sim.reset_clock(tick);
     }
 
     /// This shard's id.
@@ -1128,7 +1212,9 @@ impl Shard {
                 return;
             }
         }
-        if self.is_crossing_offer(&offer) {
+        // (Bodies only: a player's ship goes where it is, whatever crosses
+        // it — see [`crate::border`], "Players' ships".)
+        if kind == TransferKind::Body && self.is_crossing_offer(&offer) {
             refuse(
                 self,
                 HandoffReason::Other(
@@ -1261,23 +1347,50 @@ impl Shard {
         // is simulated on is strictly the first tick after the state it arrived
         // with.
         //
-        // The install gate is `local_activation_tick` — **our** clock, derived when
-        // we accepted — never the commit's `activation_tick`, which is the offering
-        // shard's clock and drifts against ours (the two shards run independent
-        // tick loops). Comparing the two directly would double-step the ship (if we
-        // lag) or freeze it (if we lead).
+        // The install gate is the tick the state describes, on **our** clock
+        // (`state_tick`): the sender's scene time of it, read off our own
+        // scene clock. On one cluster clock that is the sender's commit tick
+        // itself; between shards that count differently but both follow the
+        // wall clock it is the tick of ours nearest to that instant. Before
+        // it we wait (stepping the state earlier would double-step it), past
+        // it the install brings the entity forward. That needs both clocks
+        // to be shared ones. Where one of them counts from its own zero
+        // (shards stepped by hand), or the instant lies further from our
+        // present than any delivery explains, the gate is
+        // `local_activation_tick`, derived when we accepted — never the
+        // commit's `activation_tick`, which is the offering shard's clock.
+        let scene_time = crate::handoff::scene_time_of(&commit.state);
+        let state_tick = crate::handoff::shared_scene_time_of(&commit.state)
+            .filter(|_| self.scene_clock_set)
+            .and_then(|sent| self.local_tick_of(sent));
         self.pending_commits.push(PendingCommit {
             guid: commit.entity,
             session,
             state,
             activation_tick: commit.activation_tick,
-            install_at: staged.local_activation_tick,
+            install_at: state_tick.unwrap_or(staged.local_activation_tick),
+            state_tick,
+            fast: decode_ship_controls(&commit.state).is_some_and(|c| c.fast),
             kind: staged.kind,
             components,
             from: staged.from,
-            scene_time: crate::handoff::scene_time_of(&commit.state)
-                .or_else(|| crate::handoff::scene_time_of(&staged.state)),
+            scene_time: scene_time.or_else(|| crate::handoff::scene_time_of(&staged.state)),
         });
+    }
+
+    /// The tick of this shard's clock that is nearest to scene time `sent_us`
+    /// — if it lies within [`MAX_CATCH_UP`] ticks of the present, either way.
+    /// `None` means the instant is nowhere near our present: the shard that
+    /// named it does not count scene time as we do (see `on_commit`).
+    fn local_tick_of(&self, sent_us: i64) -> Option<SimTick> {
+        let half_tick = 500_000 / SceneClock::TICKS_PER_SECOND;
+        let tick = self
+            .sim
+            .scene_clock()
+            .tick_at(sent_us.saturating_add(half_tick));
+        let now = self.sim.tick();
+        (tick.saturating_add(MAX_CATCH_UP) >= now && tick <= now.saturating_add(MAX_CATCH_UP))
+            .then_some(tick)
     }
 
     fn on_abort(&mut self, abort: space_protocol::HandoffAbort) {
@@ -1285,21 +1398,82 @@ impl Shard {
         // simulating whatever we have (guarantee 6).
         if let Some(outgoing) = self.ledger.take_outgoing(abort.entity) {
             self.stats.aborted += 1;
+            self.note_abort(abort.entity, outgoing.to, true, false, abort.reason.clone());
             // The peer turned our offer down. The ship is still on its side of
             // the boundary, so the handoff pass would offer it again on the very
             // next tick, be refused again, and so on at tick rate.
             self.pause_reoffer(abort.entity, outgoing.to);
-            // An island moves together or not at all (guarantee 6).
-            for member in self.ledger.group_members(outgoing.group) {
-                self.abort_outgoing(
+            // An island moves together or not at all (guarantee 6) — but a
+            // player's ship is not held back by the bodies travelling with
+            // it: when one of those is refused, the bodies stay and the ship
+            // goes on.
+            for member in self.group_to_abort_with(outgoing.kind, outgoing.group) {
+                self.abort_one_outgoing(
                     member,
                     HandoffReason::Other("a group member was refused".into()),
                 );
                 self.pause_reoffer(member, outgoing.to);
             }
-        } else if self.ledger.take_incoming(abort.entity).is_some() {
+        } else if let Some(staged) = self.ledger.take_incoming(abort.entity) {
             self.stats.aborted += 1;
+            self.note_abort(abort.entity, staged.from, false, false, abort.reason);
         }
+    }
+
+    /// Remember that a transfer was called off, and say so in the log — a
+    /// few lines per ten seconds, the rest counted (a body that keeps being
+    /// refused must not fill the log).
+    fn note_abort(
+        &mut self,
+        entity: EntityGuid,
+        peer: ShardId,
+        offering: bool,
+        by_us: bool,
+        reason: HandoffReason,
+    ) {
+        let tick = self.sim.tick();
+        let player = self.session_of(entity).is_some();
+        if tick.saturating_sub(self.abort_lines.0) >= ABORT_LINE_WINDOW {
+            self.abort_lines.0 = tick;
+            self.abort_lines.1 = 0;
+        }
+        if self.abort_lines.1 < ABORT_LINES {
+            self.abort_lines.1 += 1;
+            let held_back = std::mem::take(&mut self.abort_lines.2);
+            let more = if held_back == 0 {
+                String::new()
+            } else {
+                format!(" ({held_back} more like it were not written)")
+            };
+            eprintln!(
+                "space-server: {} at tick {tick}: the handoff of {}{entity} {} {peer} was called off {}: {reason:?}{more}",
+                self.config.shard,
+                if player { "the player's ship " } else { "" },
+                if offering { "to" } else { "from" },
+                if by_us { "here" } else { "by it" },
+            );
+        } else {
+            self.abort_lines.2 += 1;
+        }
+        self.abort_notes.push_back(AbortNote {
+            tick,
+            entity,
+            peer,
+            offering,
+            player,
+            by_us,
+            reason,
+        });
+        while self.abort_notes.len() > ABORT_NOTES {
+            self.abort_notes.pop_front();
+        }
+    }
+
+    /// The transfers called off lately (the last 64), oldest first: which
+    /// entity, with which shard, by whom and why.
+    #[must_use]
+    pub fn recent_aborts(&self) -> Vec<AbortNote> {
+        self.abort_notes.iter().cloned().collect()
     }
 
     /// Do not offer `entity` to `to` again for
@@ -1310,32 +1484,57 @@ impl Shard {
     }
 
     fn abort_outgoing(&mut self, entity: EntityGuid, reason: HandoffReason) {
-        let group = self.ledger.outgoing().get(&entity).map_or(0, |e| e.group);
+        let (kind, group) = self
+            .ledger
+            .outgoing()
+            .get(&entity)
+            .map_or((TransferKind::Body, 0), |e| (e.kind, e.group));
+        self.abort_one_outgoing(entity, reason.clone());
+        // The rest of its island goes back too (guarantee 6).
+        for member in self.group_to_abort_with(kind, group) {
+            self.abort_one_outgoing(member, reason.clone());
+        }
+    }
+
+    /// Call the outgoing transfer of `entity` off, and nothing else.
+    fn abort_one_outgoing(&mut self, entity: EntityGuid, reason: HandoffReason) {
         if let Some(abort) = self
             .ledger
             .abort_outgoing(entity, self.config.shard, reason.clone())
         {
             self.stats.aborted += 1;
+            self.note_abort(entity, abort.to, true, true, reason);
             self.send_to(Destination::Shard(abort.to), Message::HandoffAbort(abort));
         }
-        // The rest of its island goes back too (guarantee 6).
-        for member in self.ledger.group_members(group) {
-            if let Some(abort) =
-                self.ledger
-                    .abort_outgoing(member, self.config.shard, reason.clone())
-            {
-                self.stats.aborted += 1;
-                self.send_to(Destination::Shard(abort.to), Message::HandoffAbort(abort));
-            }
-        }
+    }
+
+    /// The members of outgoing group `group` that are called off with a
+    /// member of `kind`: all of them when a player's ship is (the bodies
+    /// were travelling with it), the bodies only when a body is — a
+    /// player's ship is handed over for where it is, whatever becomes of
+    /// what travels with it (see [`crate::border`], "Players' ships").
+    fn group_to_abort_with(&self, kind: TransferKind, group: u64) -> Vec<EntityGuid> {
+        self.ledger
+            .group_members(group)
+            .into_iter()
+            .filter(|member| {
+                kind == TransferKind::Ship
+                    || self
+                        .ledger
+                        .outgoing()
+                        .get(member)
+                        .is_some_and(|e| e.kind == TransferKind::Body)
+            })
+            .collect()
     }
 
     fn abort_incoming(&mut self, entity: EntityGuid, reason: HandoffReason) {
         if let Some(abort) = self
             .ledger
-            .abort_incoming(entity, self.config.shard, reason)
+            .abort_incoming(entity, self.config.shard, reason.clone())
         {
             self.stats.aborted += 1;
+            self.note_abort(entity, abort.from, false, true, reason);
             self.send_to(Destination::Shard(abort.from), Message::HandoffAbort(abort));
         }
     }
@@ -1350,14 +1549,44 @@ impl Shard {
     /// replication so a commit's entity is in the world when frames are built, and
     /// replication must run last so a frame describes the finished tick.
     pub fn tick(&mut self) -> SimTick {
-        // 1. Inputs.
+        // 1. Inputs: filed for the ship this shard simulates, or — for a
+        // ship on its way here (its player sends to both shards around the
+        // switch) — kept until it is installed. Anything else is dropped: a
+        // ship that left is the other shard's to drive, and its ghost here
+        // takes no input.
+        let now = self.sim.tick();
         for client in self.clients.values_mut() {
             if client.pending_inputs.is_empty() {
                 continue;
             }
             let inputs = std::mem::take(&mut client.pending_inputs);
-            let next = self.sim.tick().saturating_add(1);
-            self.sim.apply_inputs(next, &inputs);
+            let Some(ship) = client.ship else {
+                continue;
+            };
+            if self.sim.ship_state(ship).is_some() {
+                self.sim.apply_inputs(now.saturating_add(1), &inputs);
+            } else if self.ledger.has_incoming(ship)
+                || self.pending_commits.iter().any(|p| p.guid == ship)
+            {
+                let kept = self.staged_inputs.entry(ship).or_default();
+                for input in inputs {
+                    let wanted = input.tick.saturating_add(MAX_CATCH_UP) > now
+                        && input.tick <= now.saturating_add(space_sim::sim_world::MAX_INPUT_LEAD);
+                    if wanted {
+                        kept.insert(input.tick, input);
+                    }
+                }
+                while kept.len() > MAX_STAGED_INPUTS {
+                    kept.pop_first();
+                }
+            }
+        }
+        // (A transfer that was called off leaves nothing behind.)
+        if !self.staged_inputs.is_empty() {
+            let (ledger, pending) = (&self.ledger, &self.pending_commits);
+            self.staged_inputs.retain(|guid, _| {
+                ledger.has_incoming(*guid) || pending.iter().any(|p| p.guid == *guid)
+            });
         }
         // 1.5 The scene's physics, if the map moved its anchor since it was
         // built (an idempotent check otherwise).
@@ -1430,17 +1659,24 @@ impl Shard {
         self.sim.tick()
     }
 
-    /// Install every commit whose **local** install tick has been reached.
+    /// Install every commit whose install tick has been reached.
     ///
     /// Called from [`Shard::tick`] immediately before the step, so the entity
-    /// joins the world with the state it arrived with and the step that follows
-    /// produces the next state — never stepped twice for one tick (guarantee 2)
-    /// and never rewound to the offer's older state (guarantee 4).
+    /// joins the world with the state of the tick the world is at and the
+    /// step that follows produces the next one — never stepped twice for one
+    /// tick (guarantee 2) and never rewound to the offer's older state
+    /// (guarantee 4).
     ///
-    /// The gate is `install_at`, this shard's own clock, derived at accept time;
-    /// the commit's `activation_tick` (the offering shard's clock) is used only as
-    /// the client's input-ack floor, because the client's pending inputs are tagged
-    /// in the old shard's clock.
+    /// The gate is `install_at`: the tick the committed state describes
+    /// (`state_tick`), so a commit that arrives before this shard has got
+    /// there waits, and one that arrives after it is installed at once and
+    /// **brought forward** by the ticks in between — a ship with the flight
+    /// model and the inputs its player sent here for those ticks
+    /// ([`catch_up_ship`]), a body along its velocity. The client's
+    /// input-ack floor is then this tick: every input up to it has been
+    /// applied, by the old shard or by the catch-up (guarantee 5). Between
+    /// shards whose clocks do not agree the gate is the accept tick plus the
+    /// lead and the floor the commit's `activation_tick`, as it always was.
     fn install_pending_commits(&mut self, tick: SimTick) {
         let due: Vec<PendingCommit> = self
             .pending_commits
@@ -1471,8 +1707,20 @@ impl Shard {
                 continue;
             }
             self.remove_ghost(pending.guid);
+            let inputs = self.staged_inputs.remove(&pending.guid).unwrap_or_default();
+            // What the ship has done since its state was taken, if the commit
+            // came late: flown on, under the inputs its player sent us.
+            let late = pending.state_tick.map_or(0, |at| tick.saturating_sub(at));
+            let (mut state, fast) = catch_up_ship(
+                pending.state,
+                pending.fast,
+                &self.sim.params(),
+                &inputs,
+                tick - late,
+                late,
+            );
+            self.stats.caught_up += late;
             // Where it was relative to the planet it is near, by our clock.
-            let mut state = pending.state;
             if let Some(sent) = pending.scene_time {
                 let c = self.sim.carry(state.pos, sent, self.sim.scene_time());
                 if c != [0.0; 3] {
@@ -1483,18 +1731,35 @@ impl Shard {
             let entity = self
                 .sim
                 .spawn_ship(pending.guid, pending.session, pending.state);
+            if fast {
+                if let Some(controls) = self.sim.world_mut().get_mut::<ShipControls>(entity) {
+                    controls.fast = true;
+                }
+            }
             self.guids.insert(pending.guid, entity);
             self.interest
                 .upsert(pending.guid, entity, pending.state.pos);
             self.mark_player(pending.guid, pending.session);
             self.stats.received += 1;
             self.note_sender_holds_ghost(pending.from, pending.guid);
+            // The inputs for the ticks to come are the simulation's now.
+            let ahead: Vec<PlayerInput> = inputs.range(tick + 1..).map(|(_, i)| *i).collect();
+            if !ahead.is_empty() {
+                self.sim.apply_inputs(tick, &ahead);
+            }
             // A client driving this ship must not be sent a delta against a tick
-            // it never saw, and its inputs up to activation were already applied
-            // by the old shard (guarantee 5).
+            // it never saw, and its inputs up to this tick were already applied:
+            // by the old shard up to the state's tick, by the catch-up since
+            // (guarantee 5). (Clocks that do not agree: up to the old shard's
+            // activation tick, in the old shard's clock.)
+            let floor = if pending.state_tick.is_some() {
+                tick
+            } else {
+                pending.activation_tick
+            };
             for client in self.clients.values_mut() {
                 if client.ship == Some(pending.guid) {
-                    client.replica.input_ack_floor = pending.activation_tick;
+                    client.replica.input_ack_floor = floor;
                     client.replica.ack_tick = tick;
                 }
             }
@@ -1618,9 +1883,10 @@ impl Shard {
         // (see [`OWNER_TOKEN_COMPONENT`]).
         let mut state = with_owner_token(state, &self.owner_token_of(guid));
         state.components.push(TransferKind::Ship.component(lead));
-        state
-            .components
-            .push(crate::handoff::scene_time_component(self.sim.scene_time()));
+        state.components.push(crate::handoff::scene_time_component(
+            self.sim.scene_time(),
+            self.scene_clock_set,
+        ));
         let offer =
             Ledger::offer_with_lead(guid, self.config.shard, to, self.epoch(), tick, state, lead);
         self.ledger
@@ -1692,21 +1958,56 @@ impl Shard {
         let is_ready = |e: &crate::handoff::Outgoing| {
             tick >= e.activation_tick && e.accepted && e.client_connected
         };
+        // The player's ship of a group, if it has one: the group goes when
+        // the ship does.
+        let ship_of = |group: u64| {
+            self.ledger.group_members(group).into_iter().find(|m| {
+                self.ledger
+                    .outgoing()
+                    .get(m)
+                    .is_some_and(|e| e.kind == TransferKind::Ship)
+            })
+        };
         let mut ready: Vec<EntityGuid> = self
             .ledger
             .outgoing()
             .iter()
             .filter(|(_, e)| is_ready(e))
-            // A member of a group commits only together with all the others.
-            .filter(|(_, e)| {
-                self.ledger
+            .filter(|(_, e)| match (e.kind, ship_of(e.group)) {
+                // A player's ship waits for nothing but its own gate.
+                (TransferKind::Ship, _) => true,
+                // A body travelling with a ship goes on the tick the ship
+                // goes.
+                (TransferKind::Body, Some(ship)) => {
+                    self.ledger.outgoing().get(&ship).is_some_and(is_ready)
+                }
+                // A member of a group of bodies commits only together with
+                // all the others.
+                (TransferKind::Body, None) => self
+                    .ledger
                     .group_members(e.group)
                     .iter()
-                    .all(|m| self.ledger.outgoing().get(m).is_some_and(is_ready))
+                    .all(|m| self.ledger.outgoing().get(m).is_some_and(is_ready)),
             })
             .map(|(g, _)| *g)
             .collect();
         ready.sort_unstable();
+        // The bodies of a group whose ship goes now and which are not ready
+        // themselves (not accepted yet) stay behind: they follow as an
+        // island that touches the ship's ghost.
+        let left_behind: Vec<EntityGuid> = ready
+            .iter()
+            .filter_map(|guid| self.ledger.outgoing().get(guid))
+            .filter(|e| e.kind == TransferKind::Ship && e.group != 0)
+            .flat_map(|e| self.ledger.group_members(e.group))
+            .filter(|member| !ready.contains(member))
+            .collect();
+        for guid in left_behind {
+            self.abort_one_outgoing(
+                guid,
+                HandoffReason::Other("the ship it was travelling with went ahead".into()),
+            );
+        }
         for guid in ready {
             let kind = self
                 .ledger
@@ -1916,6 +2217,56 @@ fn decode_ship_state(snapshot: &space_protocol::EntitySnapshot) -> Option<ShipSt
         .find(|(c, _)| *c == id)
         .map(|(_, p)| p.clone())?;
     space_sim::wire::decode_ship_state(&payload).ok()
+}
+
+/// Decode the [`ShipControls`] out of an [`EntitySnapshot`], if it carries them.
+fn decode_ship_controls(snapshot: &space_protocol::EntitySnapshot) -> Option<ShipControls> {
+    let id = <ShipControls as space_ecs::ComponentDef>::ID;
+    let payload = snapshot.components.iter().find(|(c, _)| *c == id)?;
+    space_protocol::codec::decode_raw::<ShipControls>(&payload.1)
+        .ok()
+        .map(|(controls, _)| controls)
+}
+
+/// Bring a handed-over ship forward by the `late` ticks after `from`: the
+/// ticks between the one its committed state describes and the one it is
+/// installed on (see [`Shard::install_pending_commits`]). Returns the state
+/// and whether the ship is in fast travel after them.
+///
+/// Each tick is the flight model's free-flight step
+/// ([`space_sim::physics::ship_velocity_step`], then the pose) under the
+/// input `inputs` holds for it — a tick without one coasts, as in the
+/// simulation. It is **not** the full physics: no gravity, no contact, no
+/// spring acts on the ship for those ticks (the step that follows the install
+/// resolves what it then touches), and a ship in fast travel simply flies on
+/// along its velocity (its speed limit depends on the scene around it).
+/// That is the price of a late commit; one that arrives within its tick
+/// costs nothing (`late == 0` returns `state` untouched).
+fn catch_up_ship(
+    mut state: ShipState,
+    mut fast: bool,
+    params: &space_sim::ShipParams,
+    inputs: &BTreeMap<SimTick, PlayerInput>,
+    from: SimTick,
+    late: SimTick,
+) -> (ShipState, bool) {
+    use space_sim::physics;
+    for tick in (from + 1)..=(from + late) {
+        let input = inputs.get(&tick);
+        if let Some(input) = input {
+            if fast && !input.fast {
+                // Leaving fast travel drops to the normal top speed at once.
+                physics::limit_speed(&mut state, f64::from(physics::top_speed(params)));
+            }
+            fast = input.fast;
+        }
+        if !fast {
+            let (thrust, torque) = input.map_or(([0.0; 3], [0.0; 3]), |i| (i.thrust, i.torque));
+            physics::ship_velocity_step(&mut state, thrust, torque, params, [0.0; 3]);
+        }
+        physics::ship_pose_step(&mut state);
+    }
+    (state, fast)
 }
 
 /// The private component id a [`HandoffOffer`]'s state carries the owner's player

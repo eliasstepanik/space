@@ -1217,6 +1217,7 @@ impl<L: Launcher> Orchestrator<L> {
             // The published map: the node is not the new shard's yet.
             shard_map: self.control.map().clone(),
             peer_token: self.control.peer_token.expose().to_owned(),
+            tick_origin_us: self.control.config.tick_origin_us,
         })
     }
 
@@ -1295,6 +1296,7 @@ impl<L: Launcher> Orchestrator<L> {
                 .with_client_endpoint(client_endpoint_of(hello)),
             shard_map: self.control.map().clone(),
             peer_token: self.control.peer_token.expose().to_owned(),
+            tick_origin_us: self.control.config.tick_origin_us,
         })
     }
 
@@ -6387,6 +6389,56 @@ mod tests {
     /// the dead shard as a recipient (the change that replaces it could never
     /// commit — the state before this change, for every change); leaving the
     /// revision alone (half a scene) or raising it on every tick.
+    #[test]
+    fn every_shard_is_welcomed_with_the_clusters_tick_origin() {
+        let origin = 1_763_900_000_000_000;
+        let mut orch = fresh_cluster(OrchestratorConfig {
+            min_shards: 2,
+            tick_origin_us: origin,
+            ..OrchestratorConfig::default()
+        });
+        // The root's shard, then the first layout cell's.
+        orch.tick();
+        let root = join(&mut orch);
+        orch.tick();
+        let second = join(&mut orch);
+        assert!(ack_the_prepare(&mut orch) > 0);
+        for _ in 0..MIN_EPOCH_INTERVAL_TICKS {
+            orch.tick();
+        }
+        let _ = orch.drain_outbox();
+        // The second one dies; its replacement registers much later.
+        let launch = orch.launch_of(second.shard).expect("launched");
+        orch.note_launch_dead(launch);
+        let _ = (orch.take_pending_kill(), orch.take_pending_launch_kill());
+        for _ in 0..100 {
+            orch.tick();
+        }
+        let replacement = join(&mut orch);
+        assert_ne!(replacement.shard, second.shard, "a new id");
+        for welcome in [&root, &second, &replacement] {
+            assert_eq!(
+                welcome.tick_origin_us, origin,
+                "{}: every shard counts from the cluster's origin",
+                welcome.shard
+            );
+        }
+        // Without one configured it is the fixed default: what a standalone
+        // shard counts from too.
+        assert_eq!(
+            OrchestratorConfig::default().tick_origin_us,
+            space_protocol::SceneClock::DEFAULT_ORIGIN_US
+        );
+    }
+
+    /// (Above: the root's shard, a layout cell's and a replacement are all
+    /// handed the tick origin the cluster was configured with — the
+    /// replacement long after the others — and the default is the fixed one.
+    ///
+    /// Mutation it catches: an origin taken per welcome (the orchestrator's
+    /// clock at the hello): a replacement would count other ticks than the
+    /// shards it joins, and every handoff to or from it would start a
+    /// client's clock over.)
     #[test]
     fn a_dead_shard_is_replaced_under_a_new_id_and_the_scene_revision_rises_once() {
         let mut orch = fresh_cluster(OrchestratorConfig {

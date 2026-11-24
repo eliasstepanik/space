@@ -179,6 +179,12 @@ pub struct OrchestratorConfig {
     /// orchestrator starts itself, and a hello needs it only when the control
     /// port is not on loopback ([`Self::secret_required`]).
     pub cluster_secret: Option<Secret>,
+    /// The cluster's tick origin, µs of UTC since the Unix epoch
+    /// (`--tick-origin`; default
+    /// [`SceneClock::DEFAULT_ORIGIN_US`](space_protocol::SceneClock::DEFAULT_ORIGIN_US)):
+    /// the instant of tick 0, handed to every shard in its welcome so all of
+    /// them count the same ticks, a replacement started later included.
+    pub tick_origin_us: i64,
 }
 
 impl Default for OrchestratorConfig {
@@ -198,6 +204,7 @@ impl Default for OrchestratorConfig {
             initial_scene: space_protocol::Scene::DEFAULT,
             min_shards: 0,
             max_shards: Self::DEFAULT_MAX_SHARDS,
+            tick_origin_us: space_protocol::SceneClock::DEFAULT_ORIGIN_US,
             shard_exe: None,
             shard_log_dir: PathBuf::from("."),
             cluster_secret: None,

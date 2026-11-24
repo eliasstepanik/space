@@ -115,7 +115,14 @@ physics bodies drawn, nearest first: `guid`, `visual` — `crate`, `ball`,
 `plank`, `door`, `chain`, `pendulum` — `position` in the frame of
 `scene_position`, `distance`, `speed`, `parts`, `in_view`), `bodies_in_view`,
 and `correction_m` / `correction_max_m` (how far the client's prediction of
-its own ship was from the shard's word). `?wait=1` on a
+its own ship was from the shard's word). **What is drawn** is `drawn_position`
+(the frame of `scene_position`), `drawn_velocity` and `drawn_tick`: the own
+ship as the last frame showed it — predicted ahead of the shard and
+interpolated between ticks, so it moves every frame, where `scene_position`
+is the shard's word and steps thirty times a second — and the fractional tick
+it was drawn at; `others_drawn` counts the other players and ships in the
+frame. Look at these, not at `scene_position`, for a step or a rubber band
+(section 4, "Seamless crossing"). `?wait=1` on a
 frame blocks until the next one. `frame.jpg` is small and fine for looking;
 `frame.png` is lossless (and large) for pixel-exact checks. Input is
 the same vocabulary a person has: keys (`w a s d space shift`, `enter backspace
@@ -277,27 +284,41 @@ Check what your change touches, and one step either side of it.
   show four regions, each with a connected owner; `fleet` says what the
   orchestrator keeps running and what is starting. From the spawn point
   (`pos 0 0 0`, the root's shard) cross x = -6 and z = -4: the HUD's shard
-  number changes at each crossing, `handoffs` counts up and `/state`'s
-  `shard_address` changes with it (`address` does not); nothing may
-  vanish or turn black. A crossing takes about a second from the border to
-  the new shard number (the handoff's lead), **into** the spawn point's cell
-  as out of it; more than two is a defect, and so is a client log line
-  `does not take this client`. Seen on a live four-shard stack and not
-  solved: a crossing right beside the showcase's bodies (x = -6 at z about
-  0, coming from the spawn point; x = -6 at z about -35 from the bowl's
-  side) took about 3 s — the time of one attempt called off, the 2 s pause
-  and a second attempt; the shards' `aborted` counters rise with it. The
-  ship's physics island takes bodies along there
-  (`space-server/src/border.rs`; four borders are `docs/plan-sharding.md`
-  §7). A second client that only looks on keeps its `shard`,
-  `session` and `handoffs` while the first crosses (only a ship's own player
-  is redirected; the HUD's `players` stays what it was) **if it stands
-  clear of the mover** — some tens of metres: within reach of the mover's
-  motion (0.5 m plus one second of it) the two ships are one physics island,
-  which is moved to the mover's shard and back, so the bystander's HUD shard
-  number flips and its `handoffs` rises by two per fly-by although it never
-  moved. Its picture does not jump and no second ship appears (the shards'
-  logs: the ship counts add up to the number of players at every line). Stop one shard **by its pid**, never by name:
+  number changes about a second after the ship is **a metre past** the
+  border (the ship's hysteresis, then the handoff's lead: the second the
+  shards give the client to connect), `handoffs` counts up and `/state`'s
+  `shard_address` changes with it (`address` does not); nothing may vanish
+  or turn black. **Into** the spawn point's cell as out of it; more than
+  1.6 s from a metre past the border is a defect, and so is a client log
+  line `does not take this client`, a shard log line `the handoff of the
+  player's ship ... was called off`, or one `could not keep up` (a shard
+  that fell behind the cluster clock). A second client that only looks on
+  keeps its `shard`, `session` and `handoffs` while the first crosses, also
+  when the first flies right past it: a player's ship is handed over for
+  where it is, not for who is near (`space-server/src/border.rs`, "Players'
+  ships"). The bodies a player's second of motion reaches do change shard
+  with it and back (the shards' handoff counters run; their `aborted`
+  counters may rise for **bodies** — two shards offering each other members
+  of one island — never for a player).
+- **Seamless crossing** (`docs/plan-sharding.md` §5): a change of shard
+  shows in the HUD's shard number and in nothing else. Sample `/state` as
+  fast as it answers while crossing and look at what is **drawn**:
+  `drawn_position` moves on by `drawn_velocity` times the time between two
+  samples (at 15 m/s a tick is half a metre; a step at the switch of more
+  than a few centimetres is a defect), `drawn_tick` runs on (it never
+  restarts: every shard counts the cluster's ticks; all four shards' log
+  lines name the same tick for the same moment), `correction_m` stays
+  where it is in ordinary flight (millimetres), and the bodies and players
+  in sight before and after are in every frame between (`bodies`,
+  `others_drawn`; a burst of `frame.jpg?wait=1` across the border shows it).
+  A key pressed during the second of the handoff acts as fast as anywhere
+  else. Standing on a border, or walking along it within a metre, is no
+  handoff; stopping just across it is one, three seconds later. The
+  repeatable version is `crates/space-client/tests/seamless.rs`. In **fast
+  travel** the picture is as good at a border as anywhere else, which is
+  not perfect: the speed limit follows the distance to the nearest surface,
+  so the velocity changes all the time.
+  Stop one shard **by its pid**, never by name:
   `target/dev/launched-shards.pid` lists the pids of exactly the shards the
   orchestrator has running (it rewrites the file whenever one starts, stops
   or is seen to have exited) — and check what a pid is before you stop it

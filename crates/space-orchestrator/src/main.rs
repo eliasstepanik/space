@@ -84,6 +84,17 @@
 //! split that would exceed it is refused, for the autoscaler and the operator
 //! alike.
 //!
+//! # The cluster's clock
+//!
+//! `--tick-origin <unix microseconds>` is the instant of the cluster's tick
+//! 0. Every shard is handed it in its welcome and counts its ticks from it
+//! (tick `n` is due `n / 30 s` after it), so a tick number names the same
+//! instant on every shard — whenever each was started, a replacement
+//! included — and a player's ship can be handed from one to the next without
+//! a step (`space_server::clock`). The default is a fixed instant
+//! (2026-01-01T00:00:00Z, the one a standalone shard uses too); there is
+//! rarely a reason to give another.
+//!
 //! # Shards
 //!
 //! Every shard starts without a region and is given one when it registers:
@@ -183,6 +194,7 @@ const USAGE: &str =
                      [--cluster-secret <secret> | --cluster-secret-file <path>] \
                      [--peer-token <secret> | --peer-token-file <path>] \
                      [--scene demo-area|materials|galaxy] [--max-regions <n>] \
+                     [--tick-origin <unix microseconds>] \
                      [--webui <addr:port>] [--webui-token <secret> | --webui-token-file <path>] \
                      [--webui-host <name>[:<port>]]... \
      (environment fallbacks: SPACE_ORCHESTRATOR_SCENE for --scene; \
@@ -434,6 +446,12 @@ impl Options {
                 }
                 "--scene" => {
                     scene = Some(value("--scene")?.clone());
+                }
+                "--tick-origin" => {
+                    config.tick_origin_us =
+                        value("--tick-origin")?.parse::<i64>().map_err(|e| {
+                            format!("--tick-origin: {e} (microseconds since the Unix epoch)")
+                        })?;
                 }
                 "--max-regions" => {
                     config.max_regions = value("--max-regions")?

@@ -39,10 +39,11 @@
 //!   each ghost in [`space_protocol::IslandKey`]), then folds in the keys the
 //!   owners of those ghosts announced (two hops). Both shards on either side
 //!   of a border therefore arrive at the same key within a tick.
-//! * The island belongs on the key's home. A shard holding members of an
+//! * The island belongs on the key's home. A shard holding bodies of an
 //!   island whose home is another shard hands them to it, all in one group
 //!   (the handoff commits a group together or not at all). So contacts and
-//!   joints across a border are always solved by one solver.
+//!   joints across a border are always solved by one solver. (A ship a
+//!   player flies is the exception on both counts: see "Players' ships".)
 //! * While a body is in such an island it may be simulated by a shard whose
 //!   region does not contain it — the one exception to "the shard a body is
 //!   on is the one the map names". When the island dissolves, each body's own
@@ -56,8 +57,8 @@
 //! * **Distance.** A body is taken over by the region it is in once it is
 //!   [`BODY_HYSTERESIS`] inside it ([`home`]): a pendulum swinging over a
 //!   border, a crate pushed a little across one and back, do not change shard
-//!   at every swing. Ships have none (a player's ship is on the shard the map
-//!   names, as before physics), so a ship's island follows the ship.
+//!   at every swing. A ship has [`SHIP_HYSTERESIS`], half of a body's (see
+//!   "Players' ships" below).
 //! * **Settling.** A body that has been inside another shard's territory
 //!   for [`SETTLE_TICKS`] in a row is taken over too, however close to the
 //!   border it is: on distance alone a body resting within the hysteresis of
@@ -75,7 +76,7 @@
 //!   interaction: if any of its members was in a group within the last
 //!   [`HOLD_TICKS`], it waits until the island has wanted to go to the same
 //!   shard for that long, continuously. (Not an island with a ship in it: it
-//!   follows the ship, which has no hysteresis.) A swinging pendulum whose reach
+//!   goes where its key says at once.) A swinging pendulum whose reach
 //!   flickers in and out of a group of crates therefore does not send the
 //!   crates to and fro at every swing (seen in a live run of the demo area
 //!   split by a border) — and a body that simply rests near others of its
@@ -87,6 +88,51 @@
 //!   slower than the hold (a spring pair drifting in and out of a parked
 //!   player's reach, seen live) — waits twice as long the next time, up to
 //!   [`MAX_HOLD_DOUBLINGS`] doublings.
+//!
+//! # Players' ships
+//!
+//! A ship a player flies is handed over **for where it is, and for nothing
+//! else**:
+//!
+//! * **It is never moved by an island.** An island's home is where its
+//!   *bodies* go; a player's ship in it stays on the shard that simulates it
+//!   until its own position says otherwise. (It used to travel with its
+//!   island: a player standing still was handed to the neighbour shard and
+//!   back because somebody else flew past within a second's reach — an
+//!   island of two ships whose key was the other one.)
+//! * **Bodies follow the player, not the other way round.** In an island's
+//!   key a player's ship counts with the shard that **simulates** it as its
+//!   home (both sides know that shard: the one it is local to, and the one
+//!   that holds its ghost). So the bodies a player touches are consolidated
+//!   on the player's shard, as before. When the player is handed over and
+//!   its ship is its island's key, the island's bodies **travel with it**:
+//!   offered in one group with the ship's lead, committed on the tick the
+//!   ship is committed, installed with it — a crate being pushed across a
+//!   border is on the ship's shard at every tick.
+//! * **It waits for nothing but its own gate.** The ship commits when the
+//!   accepting shard has accepted it and its player has connected there. A
+//!   body of its group that is refused, or not accepted by then, stays
+//!   behind — with the group's other bodies — and follows a few ticks after
+//!   the ship has arrived, as an island that touches the ghost the ship
+//!   left; in between the ship and those bodies collide as body against
+//!   ghost. And the rule that settles two shards offering each other members
+//!   of one island (the lower shard id takes it) is never applied to a
+//!   player's ship. (Both used to call the player's handoff off: crossing
+//!   into the demo area's zero-g corner the accepting shard was sending a
+//!   crate the other way at that moment, refused the whole group as a
+//!   "crossing island transfer", and the player waited out the two seconds
+//!   of the re-offer pause — three seconds for a crossing instead of one.)
+//! * **Hysteresis.** The ship is offered to the region it has entered once
+//!   it is [`SHIP_HYSTERESIS`] inside it — measured to the nearest ground of
+//!   the shard that simulates it ([`near_territory_distance`], exact around a
+//!   corner where three or four shards meet) — or once it has been inside it
+//!   for [`SETTLE_TICKS`], like a body. A player standing on a border, or
+//!   walking along one and straying less than that to either side, is not
+//!   handed back and forth; one who stops just across it is taken over three
+//!   seconds later, once.
+//!
+//! A ship nobody flies is a body like any other here, with the ship's
+//! hysteresis.
 //!
 //! Exactness has a speed limit: an island is only noticed once both sides see
 //! each other's bodies as ghosts, i.e. within [`GHOST_MARGIN`] (plus the
@@ -154,6 +200,12 @@ pub const ISLAND_LEAD: f64 = 1.0;
 /// How far inside another shard's territory an unowned body must be before
 /// that shard takes it over, metres.
 pub const BODY_HYSTERESIS: f64 = 2.0;
+/// How far inside another shard's territory a ship must be before that shard
+/// takes it over, metres (see the module docs, "Players' ships"). A dead
+/// band of two metres around a border: wide enough for a player who stands
+/// on it or walks along it, crossed in a fifteenth of a second at flying
+/// speed.
+pub const SHIP_HYSTERESIS: f64 = 1.0;
 /// A body inside another shard's territory this long in a row is settled
 /// there and taken over, however close to the border (see "Hysteresis").
 pub const SETTLE_TICKS: SimTick = 3 * space_sim::TICK_HZ as SimTick;
@@ -272,6 +324,50 @@ pub fn territory_distance(map: &ShardMap, shard: ShardId, pos: WorldPos) -> f64 
         .fold(f64::INFINITY, f64::min)
 }
 
+/// How far `pos` is from the nearest ground `map` gives `shard`, metres —
+/// **exactly**, where that ground lies in the cell of `pos` or in one of the
+/// 26 cells around it; [`f64::INFINITY`] where it does not (it is then more
+/// than a cell away). 0 where `shard` owns `pos`.
+///
+/// A region is a whole number of cells, so who owns a point depends on its
+/// cell alone, and the nearest point of a neighbouring cell is found by
+/// crossing the cell faces between: the distance is the root of the squared
+/// distances to the faces crossed. Unlike [`territory_distance`] this does
+/// not take the nearest face of the *region* around `pos` for the way out:
+/// beside the corner where four shards' cells meet, the ground behind that
+/// face is somebody else's, and the simulator's own ground lies diagonally
+/// across the corner.
+#[must_use]
+pub fn near_territory_distance(map: &ShardMap, shard: ShardId, pos: WorldPos) -> f64 {
+    let half = f64::from(space_world::CELL_HALF);
+    let mut best = f64::INFINITY;
+    for dx in -1i64..=1 {
+        for dy in -1i64..=1 {
+            for dz in -1i64..=1 {
+                let step = [dx, dy, dz];
+                let cell = [0, 1, 2].map(|k| pos.cell[k].wrapping_add(step[k]));
+                let probe = WorldPos {
+                    cell,
+                    local: [0.0; 3],
+                };
+                if map.lookup(&probe) != Some(shard) {
+                    continue;
+                }
+                let d2: f64 = (0..3)
+                    .map(|k| match step[k] {
+                        -1 => f64::from(pos.local[k]) + half,
+                        1 => half - f64::from(pos.local[k]),
+                        _ => 0.0,
+                    })
+                    .map(|d| d * d)
+                    .sum();
+                best = best.min(d2.sqrt());
+            }
+        }
+    }
+    best
+}
+
 /// The shard a body belongs on by its own position: the shard simulating it
 /// (`simulator`) while it is in that shard's territory or within
 /// `hysteresis` metres of it, otherwise the shard the map names (or the
@@ -281,7 +377,7 @@ pub fn home(map: &ShardMap, pos: WorldPos, simulator: ShardId, hysteresis: f64) 
     match map.lookup(&pos) {
         Some(owner) if owner == simulator => simulator,
         Some(owner) if owner != ShardId::NONE => {
-            if hysteresis > 0.0 && territory_distance(map, simulator, pos) <= hysteresis {
+            if hysteresis > 0.0 && near_territory_distance(map, simulator, pos) <= hysteresis {
                 simulator
             } else {
                 owner
@@ -366,6 +462,72 @@ mod tests {
         assert!((territory_distance(&side, ShardId::new(2), p) - 0.5).abs() < 1e-3);
         assert_eq!(home(&side, p, ShardId::new(2), 1.0), ShardId::new(2));
         assert_eq!(home(&side, p, ShardId::new(2), 0.0), ShardId::new(1));
+    }
+
+    /// Where four cells meet, the distance to a shard's ground is measured
+    /// to that ground — round the corner if need be — and the hysteresis
+    /// holds a body or a ship on its simulator only while that is near.
+    ///
+    /// Mutation this catches: measuring to the nearest face of the cell the
+    /// point is in (`territory_distance`): half a metre from the face to a
+    /// *third* shard's cell then counts as half a metre from the simulator's
+    /// ground, thirty metres away, and the hysteresis never lets go.
+    #[test]
+    fn near_a_corner_of_four_cells_the_distance_is_to_the_shards_own_ground() {
+        let (root, west, north, diagonal) = (
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+            ShardId::new(4),
+        );
+        // The root owns cell [1,1,1] (and the layer below); the three cells
+        // that meet it along the vertical edge x = z = 512 are carved out.
+        let map = ShardMap::new(
+            1,
+            vec![
+                region(63, [0, 0, 0], 1),
+                region(64, [0, 1, 1], 2),
+                region(64, [1, 1, 0], 3),
+                region(64, [0, 1, 0], 4),
+            ],
+        );
+        // Metres from the corner edge, at mid height of the upper layer.
+        let at = |x: f64, z: f64| {
+            WorldPos::from_f64_metres_around(
+                WorldPos::new([1, 1, 1], [-512.0, 0.0, -512.0]),
+                [x, 0.0, z],
+            )
+        };
+        let near = |shard, x, z| near_territory_distance(&map, shard, at(x, z));
+        assert_eq!(map.lookup(&at(3.0, 4.0)), Some(root));
+        assert_eq!(map.lookup(&at(-3.0, 4.0)), Some(west));
+        assert_eq!(map.lookup(&at(3.0, -4.0)), Some(north));
+        assert_eq!(map.lookup(&at(-3.0, -4.0)), Some(diagonal));
+        assert_eq!(near(root, 3.0, 4.0), 0.0);
+        assert!(
+            (near(root, -3.0, 4.0) - 3.0).abs() < 1e-3,
+            "straight across"
+        );
+        assert!(
+            (near(root, -3.0, -4.0) - 5.0).abs() < 1e-3,
+            "round the corner"
+        );
+        // In the diagonal cell, half a metre from the west cell and thirty
+        // from the corner: the root's ground is thirty metres away.
+        let p = at(-30.0, -0.5);
+        assert_eq!(map.lookup(&p), Some(diagonal));
+        assert!((near_territory_distance(&map, west, p) - 0.5).abs() < 1e-3);
+        assert!((near_territory_distance(&map, root, p) - 30.004).abs() < 1e-2);
+        assert!(
+            territory_distance(&map, root, p) < 1.0,
+            "what the lower bound says (and why `home` does not use it)"
+        );
+        assert_eq!(home(&map, p, west, SHIP_HYSTERESIS), west, "held: 0.5 m");
+        assert_eq!(home(&map, p, root, SHIP_HYSTERESIS), diagonal, "let go");
+        assert_eq!(home(&map, p, root, BODY_HYSTERESIS), diagonal);
+        // More than a cell from anything of `north`'s: not near at all.
+        let far = WorldPos::new([-1, 1, 3], [0.0; 3]);
+        assert_eq!(near_territory_distance(&map, north, far), f64::INFINITY);
     }
 
     #[test]

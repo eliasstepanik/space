@@ -62,7 +62,9 @@ impl Running {
     }
 }
 
-/// Bind a shard on loopback and start serving and ticking it at 30 Hz.
+/// Bind a shard on loopback and start serving and ticking it at 30 Hz, on
+/// the tick clock a standalone `space-server` runs on (`clock::run` with the
+/// default tick origin): both shards count the same ticks.
 fn start(id: u32, region: NodeRef) -> Running {
     let net = Arc::new(ShardNet::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind"));
     let shard = Arc::new(AsyncMutex::new(Shard::new(ShardConfig::new(
@@ -76,19 +78,11 @@ fn start(id: u32, region: NodeRef) -> Running {
             let _ = net.serve(shard).await;
         }
     });
-    let ticker = tokio::spawn({
-        let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
-        async move {
-            let mut clock =
-                tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-            clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                clock.tick().await;
-                shard.lock().await.tick();
-                net.flush(&shard).await;
-            }
-        }
-    });
+    let ticker = tokio::spawn(space_server::clock::run(
+        Arc::clone(&shard),
+        Arc::clone(&net),
+        space_server::clock::TickClock::new(space_protocol::SceneClock::DEFAULT_ORIGIN_US),
+    ));
     Running {
         net,
         shard,
@@ -358,6 +352,9 @@ async fn fly_to_a(link: &ServerLink, spawn_shard: &Running) -> space_client::lin
     // by half a cell), and never backwards.
     flight.assert_seamless(1);
     assert_eq!(flight.handoff_times.len(), 1);
+    // And on one timeline: the shards count the same ticks, so the link's
+    // ticks never started over.
+    assert_eq!(arrived.tick_epoch, 0, "{arrived:?}");
     let at_switch = arrived.offset();
     assert!(
         at_switch[0] < BORDER_X && at_switch[0] > -60.0,

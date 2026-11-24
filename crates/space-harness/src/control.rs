@@ -156,6 +156,27 @@ pub struct ClientState {
     /// area; empty elsewhere): what a script steers by.
     #[serde(default)]
     pub sky: Vec<SkyBodyState>,
+    /// The ship **as the last frame drew it**, metres from the scene's spawn
+    /// point (the frame of [`scene_position`](Self::scene_position)):
+    /// predicted ahead of the shard's word and interpolated between ticks, so
+    /// it moves every frame — where `scene_position` is the shard's word and
+    /// moves thirty times a second. What a player sees; what to look at for a
+    /// step or a rubber band. `None` until the client predicts its ship.
+    #[serde(default)]
+    pub drawn_position: Option<[f64; 3]>,
+    /// The ship's velocity as drawn, metres/second.
+    #[serde(default)]
+    pub drawn_velocity: Option<[f64; 3]>,
+    /// The tick of the shard's clock the ship was drawn at, with its fraction
+    /// (a few ticks ahead of [`tick`](Self::tick)). Every shard of a cluster
+    /// counts the same ticks, so it runs on through a shard transition; a
+    /// step in it is a clock that started over.
+    #[serde(default)]
+    pub drawn_tick: Option<f64>,
+    /// How many other players' characters and unflown ships the last frame
+    /// drew.
+    #[serde(default)]
+    pub others_drawn: u32,
 }
 
 /// One body of the solar system as the client draws it ([`ClientState::sky`]).
@@ -719,6 +740,10 @@ mod tests {
             "nearest",
             "nearest_surface_m",
             "sky",
+            "drawn_position",
+            "drawn_velocity",
+            "drawn_tick",
+            "others_drawn",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }

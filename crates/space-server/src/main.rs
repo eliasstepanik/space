@@ -18,6 +18,15 @@
 //! an error rather than a setting that would silently lose. Shards wired
 //! together by hand with `--peer` should all be given the same `--scene`.
 //!
+//! `--tick-origin <unix microseconds>` is the instant a **standalone** shard
+//! counts its ticks from: tick `n` is due `n / 30 s` after it
+//! ([`space_server::clock`]). The default is a fixed instant
+//! ([`space_protocol::SceneClock::DEFAULT_ORIGIN_US`]), so shards started by
+//! hand at different times count the same ticks without being told anything
+//! — which is what lets one hand a ship to the other without a step. Give
+//! `--peer` shards the same origin if you give one at all. An orchestrated
+//! shard takes none: its welcome names the cluster's.
+//!
 //! # Orchestrated
 //!
 //! ```text
@@ -76,7 +85,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use space_protocol::{Scene, SceneState, ShardId, ShardMap, ShardRegion};
 use space_world::NodeRef;
@@ -128,12 +136,18 @@ struct Options {
     /// [`Scene::DEFAULT`]). Never set together with `orchestrator`: there the
     /// orchestrator says which scene it is.
     scene: Scene,
+    /// The tick origin a standalone shard counts from (`--tick-origin`, µs of
+    /// UTC since the Unix epoch; default
+    /// [`SceneClock::DEFAULT_ORIGIN_US`](space_protocol::SceneClock::DEFAULT_ORIGIN_US),
+    /// the same for every shard that is given none). Never set together with
+    /// `orchestrator`: there the orchestrator's welcome names it.
+    tick_origin_us: i64,
 }
 
 /// The usage line, printed for `--help` and for any parse error.
 const USAGE: &str = "usage: space-server --shard <id> --region <depth:x:y:z> \
                      [--bind <addr:port>] [--peer <shard>:<addr:port>:<depth:x:y:z>] \
-                     [--scene demo-area|materials|galaxy] \
+                     [--scene demo-area|materials|galaxy] [--tick-origin <unix microseconds>] \
                      [--orchestrator <addr:port> [--cluster <id>] [--advertise <addr:port>] \
                      [--client-endpoint <addr:port>] [--cluster-secret-file <path>] \
                      [--claim-region <depth:x:y:z>]] \
@@ -163,6 +177,7 @@ impl Options {
         let mut cluster = "space-local".to_owned();
         let mut cluster_secret_file: Option<std::path::PathBuf> = None;
         let mut scene: Option<Scene> = None;
+        let mut tick_origin: Option<i64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -227,6 +242,12 @@ impl Options {
                     let text = value("--scene")?;
                     scene = Some(text.parse::<Scene>().map_err(|e| format!("--scene: {e}"))?);
                 }
+                "--tick-origin" => {
+                    let text = value("--tick-origin")?;
+                    tick_origin = Some(text.parse::<i64>().map_err(|e| {
+                        format!("--tick-origin: {e} (microseconds since the Unix epoch)")
+                    })?);
+                }
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
             i += if flag == "--help" || flag == "-h" {
@@ -267,6 +288,12 @@ impl Options {
                 "--cluster-secret-file requires --orchestrator\n{USAGE}"
             ));
         }
+        if tick_origin.is_some() && orchestrated {
+            return Err(format!(
+                "--tick-origin is for a standalone shard; with --orchestrator the cluster's \
+                 tick origin is the orchestrator's (space-orchestrator --tick-origin)\n{USAGE}"
+            ));
+        }
         if scene.is_some() && orchestrated {
             return Err(format!(
                 "--scene is for a standalone shard; with --orchestrator the scene is the \
@@ -297,6 +324,7 @@ impl Options {
             cluster,
             cluster_secret_file,
             scene: scene.unwrap_or(Scene::DEFAULT),
+            tick_origin_us: tick_origin.unwrap_or(space_protocol::SceneClock::DEFAULT_ORIGIN_US),
         })
     }
 }
@@ -434,26 +462,16 @@ async fn run(options: Options) -> Result<(), String> {
         tokio::spawn(async move { net.serve(shard).await })
     };
 
-    // The 30 Hz loop: one step, then everything the step queued goes out. The
-    // interval's first tick fires immediately, which is what a cold start wants
-    // — an empty world stepped once costs nothing and the first client to
-    // connect is served on the tick it joins.
-    let ticking = tokio::spawn(async move {
-        let mut clock = tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-        // A tick that overruns must not be made up in a burst: the simulation
-        // would run ahead of the network for free. Skip it instead.
-        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            clock.tick().await;
-            {
-                let mut shard = shard.lock().await;
-                shard.tick();
-                // The scene clock follows the wall clock (re-anchored only on drift).
-                shard.sync_scene_clock(space_server::config::wall_clock_us());
-            }
-            net.flush(&shard).await;
-        }
-    });
+    // The 30 Hz loop, on the tick clock (`space_server::clock`): every tick
+    // when it is due on the timeline that starts at the tick origin, then
+    // everything the step queued goes out. Standalone shards started at
+    // different times — the two of a handoff setup — therefore count the same
+    // ticks, as the shards of an orchestrator's cluster do.
+    let ticking = tokio::spawn(space_server::clock::run(
+        shard,
+        net,
+        space_server::clock::TickClock::new(options.tick_origin_us),
+    ));
 
     // `serve` returns only when the endpoint is closed, so in practice the
     // process runs until it is killed. The tick loop is watched too: if it ever
@@ -772,6 +790,40 @@ mod tests {
         assert!(err.contains("standalone"), "{err}");
         // Without the flag an orchestrated shard parses as before.
         assert!(parse(&["--orchestrator", "127.0.0.1:7900"]).is_ok());
+    }
+
+    /// A standalone shard counts from the fixed default origin unless told
+    /// another; an orchestrated one is told by its orchestrator, so the flag
+    /// there is an error.
+    ///
+    /// Mutation this catches: a default taken from the clock at start (two
+    /// shards started by hand would count different ticks).
+    #[test]
+    fn the_tick_origin_is_the_fixed_default_or_the_flags() {
+        let alone = &["--shard", "1", "--region", "64:0:0:0"];
+        assert_eq!(
+            parse(alone).expect("parses").tick_origin_us,
+            space_protocol::SceneClock::DEFAULT_ORIGIN_US
+        );
+        let given = parse(&[
+            "--shard",
+            "1",
+            "--region",
+            "64:0:0:0",
+            "--tick-origin",
+            "1763900000000000",
+        ])
+        .expect("parses");
+        assert_eq!(given.tick_origin_us, 1_763_900_000_000_000);
+        for bad in ["soon", "1.5", ""] {
+            let mut args = alone.to_vec();
+            args.extend(["--tick-origin", bad]);
+            let err = parse(&args).expect_err(bad);
+            assert!(err.contains("--tick-origin"), "{bad:?}: {err}");
+        }
+        let err = parse(&["--orchestrator", "127.0.0.1:7900", "--tick-origin", "0"])
+            .expect_err("an orchestrated shard is told its origin");
+        assert!(err.contains("standalone"), "{err}");
     }
 
     #[test]

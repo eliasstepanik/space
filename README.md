@@ -238,6 +238,18 @@ shards. Fly across (`+X`: hold `D`, about 15 s) and the first shard hands the
 ship to its neighbour: the client opens the second connection, the shards
 commit, and the HUD changes to `shard 2  handoffs 1` without the view jumping.
 
+The shards of a cluster count the same ticks — from the cluster's tick
+origin, which the orchestrator hands every shard it welcomes and a standalone
+shard takes from `--tick-origin` (both default to one fixed instant) — so a
+tick number names the same instant on every shard. The accepting shard
+installs the ship on the tick its committed state describes, with the inputs
+the client has been sending to both shards since it was redirected, and the
+client's clock, prediction and view carry on: on the four shard areas of
+`-MinShards 4` the borders at `pos` x = -6 and z = -4 show in the HUD's shard
+number (about a second after the ship is a metre across) and in nothing else.
+Standing on a border or walking along it is no handoff, and a player is
+handed over for where it is, not because another flew past.
+
 Physics bodies cross the same way, with nobody to redirect: near a border each
 shard shows its neighbour's bodies as ghosts, bodies that may touch are moved
 onto one shard before they do, and a body that leaves a region is handed to

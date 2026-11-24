@@ -121,6 +121,7 @@ fn scripted_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>
                         region: region.clone(),
                         shard_map: ShardMap::new(1, vec![region]),
                         peer_token: PEER_TOKEN.to_owned(),
+                        tick_origin_us: TICK_ORIGIN_US,
                     };
                     let _ = conn.send_reliable(&Message::ShardWelcome(welcome)).await;
                     shared.lock().expect("seen").welcomed.push(conn);
@@ -129,6 +130,65 @@ fn scripted_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>
         }
     });
     (addr, seen)
+}
+
+/// The tick origin the scripted orchestrator welcomes its shards with: some
+/// instant that is not the default one.
+const TICK_ORIGIN_US: i64 = 1_763_900_000_000_000;
+
+/// Two shards registered more than a second apart run on the clock of the
+/// origin their welcome names: the same tick at the same instant (one apart
+/// at most: each steps when the tick is due), the tick that is due by the
+/// wall clock, and the cluster clock as the scene clock they tell clients.
+///
+/// Mutation this catches: a shard that ignores the welcome's origin (the
+/// default one: the two would still agree with each other, and be 50 million
+/// ticks from the tick that is due), one that counts from its own start.
+#[tokio::test]
+async fn orchestrated_shards_count_from_the_origin_their_welcome_names() {
+    let (orch, _seen) = scripted_orchestrator(vec![Answer::Welcome(7), Answer::Welcome(8)]);
+    let first = tokio::time::timeout(Duration::from_secs(20), start_orchestrated(options(), orch))
+        .await
+        .expect("in time")
+        .expect("welcomed");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let second = tokio::time::timeout(Duration::from_secs(20), start_orchestrated(options(), orch))
+        .await
+        .expect("in time")
+        .expect("welcomed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let clock = space_protocol::SceneClock::cluster(TICK_ORIGIN_US);
+    let looks = 30;
+    let mut apart = Vec::new();
+    for _ in 0..looks {
+        let (a, b) = (first.state.lock().await, second.state.lock().await);
+        let due = clock.tick_at(space_server::config::wall_clock_us());
+        let (ta, tb) = (a.sim().tick(), b.sim().tick());
+        assert_eq!(
+            a.scene_clock(),
+            clock,
+            "the cluster clock is the scene clock"
+        );
+        assert_eq!(b.scene_clock(), clock);
+        drop((a, b));
+        apart.push(ta.abs_diff(tb));
+        for tick in [ta, tb] {
+            // (A tick of slack either way for the wall clock read here, and
+            // some for a machine busy with other tests.)
+            assert!(
+                tick <= due + 1 && tick + 5 >= due,
+                "tick {tick} where {due} is due by the wall clock"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(23)).await;
+    }
+    let close = apart.iter().filter(|d| **d <= 1).count();
+    assert!(
+        close >= looks * 9 / 10 && apart.iter().all(|d| *d <= 4),
+        "the two shards' ticks, apart: {apart:?}"
+    );
+    first.abort();
+    second.abort();
 }
 
 /// A shard that is told "not yet" asks again — with a pause that grows — and

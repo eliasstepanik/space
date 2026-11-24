@@ -290,6 +290,7 @@ impl ControlPlane {
             region,
             shard_map: self.map().clone(),
             peer_token: self.peer_token.expose().to_owned(),
+            tick_origin_us: self.config.tick_origin_us,
         })
     }
 

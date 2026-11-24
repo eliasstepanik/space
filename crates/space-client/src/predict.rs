@@ -8,7 +8,9 @@
 //! the shard's tick *now*, as a fractional number of ticks, from the newest
 //! tick heard and the time since it arrived — smoothed, so the arrival jitter
 //! of the frames does not shake the picture, and snapped when it is far off
-//! (a stall, a shard transition: every shard has its own clock). Other
+//! (a stall, or a transition onto a shard that counts other ticks:
+//! [`Replica::tick_epoch`]; the shards of a cluster count the same, and the
+//! clock simply runs on through a transition between them). Other
 //! entities are drawn [`crate::bodies::INTERPOLATION_DELAY`] ticks behind it;
 //! the own ship is drawn ahead of it.
 //!
@@ -69,8 +71,9 @@ pub struct Clock {
     estimate: Option<f64>,
     /// When it was last advanced.
     at: Option<Instant>,
-    /// The shard and session the estimate is for: a transition starts over.
-    domain: (u64, u64),
+    /// The tick timeline the estimate is on ([`Replica::tick_epoch`]): a
+    /// transition onto another one starts over.
+    domain: u64,
 }
 
 impl Clock {
@@ -94,7 +97,7 @@ impl Clock {
         }
         let since = now.saturating_duration_since(heard).as_secs_f64().min(1.0);
         let target = replica.tick as f64 + since * hz();
-        let domain = (replica.handoffs, replica.session);
+        let domain = replica.tick_epoch;
         let elapsed = self
             .at
             .map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f64());
@@ -160,12 +163,16 @@ const COPYABLE: [ComponentId; 9] = [
     PosResidual::ID,
 ];
 
-/// What a prediction is for: a change of any of these builds it anew.
+/// What a prediction is for: a change of any of these builds it anew. Not
+/// the shard and not the session: a ship handed from one shard of a cluster
+/// to the next is the same ship on the same tick timeline, and its
+/// prediction — the inputs still to be confirmed, the bodies around it, the
+/// correction being absorbed — simply goes on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Key {
     guid: EntityGuid,
-    session: u64,
-    handoffs: u64,
+    /// The tick timeline ([`Replica::tick_epoch`]).
+    tick_epoch: u64,
     scene: Scene,
     /// Whether the shard has said which scene it runs (a shard nobody gave
     /// one simulates an empty world).
@@ -223,9 +230,14 @@ impl OwnShip {
                 log::warn!("space-client: the prediction has no scene: {e}");
             }
         }
-        let predictor =
-            PredictedPhysics::new(world, key.guid, key.session, state, replica.state_tick())
-                .ok()?;
+        let predictor = PredictedPhysics::new(
+            world,
+            key.guid,
+            replica.session,
+            state,
+            replica.state_tick(),
+        )
+        .ok()?;
         Some(Self {
             key,
             predictor,
@@ -241,14 +253,15 @@ impl OwnShip {
     }
 
     /// Whether this prediction is still the one for `replica` in `scene`
-    /// (same ship, session, shard clock, scene and anchor).
+    /// (same ship, tick timeline, scene and anchor).
     #[must_use]
     pub fn is_for(&self, replica: &Replica, scene: Scene) -> bool {
         key_of(replica, scene) == Some(self.key)
     }
 
-    /// Carry the visual offset of `previous` over (a new prediction after a
-    /// shard transition should not jump either).
+    /// Carry the visual offset of `previous` over (a new prediction — after
+    /// a transition onto a shard that counts other ticks, or a change of
+    /// scene — should not jump either).
     pub fn inherit(&mut self, previous: &Self, shown_before: Option<WorldPos>, now: Instant) {
         self.corrections = previous.corrections.clone();
         if let Some(before) = shown_before {
@@ -504,8 +517,7 @@ impl OwnShip {
 fn key_of(replica: &Replica, scene: Scene) -> Option<Key> {
     Some(Key {
         guid: replica.ship?,
-        session: replica.session,
-        handoffs: replica.handoffs,
+        tick_epoch: replica.tick_epoch,
         scene,
         scene_set: replica.scene.is_set(),
         anchor: replica.anchor(),
@@ -515,6 +527,43 @@ fn key_of(replica: &Replica, scene: Scene) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock runs on through a change of shard on one tick timeline,
+    /// and starts over when the timeline changes.
+    ///
+    /// Mutation this catches: a clock keyed by shard or session (it snaps at
+    /// every handoff, and everything drawn by it with it).
+    #[test]
+    fn the_clock_runs_on_through_a_change_of_shard() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut replica = Replica::default();
+        replica.tick = 1_000;
+        replica.tick_seen = Some(t0);
+        replica.session = 7;
+        replica.shard = Some(ShardId::new(1));
+        let mut clock = Clock::new();
+        let first = clock.update(&replica, t0).expect("a reading");
+        assert!((first - 1_000.0).abs() < 1e-9);
+        // 100 ms on, the shard changed; its newest tick is one behind what
+        // the clock expects (a frame's delivery).
+        replica.session = 9;
+        replica.shard = Some(ShardId::new(2));
+        replica.handoffs = 1;
+        replica.tick = 1_002;
+        replica.tick_seen = Some(at(100));
+        let on = clock.update(&replica, at(100)).expect("a reading");
+        assert!(
+            (on - 1_003.0).abs() < 0.5 && on > 1_002.5,
+            "steered, not snapped back to the newest tick heard: {on}"
+        );
+        // Onto another timeline: the clock is the new shard's.
+        replica.tick_epoch = 1;
+        replica.tick = 40;
+        replica.tick_seen = Some(at(133));
+        let other = clock.update(&replica, at(133)).expect("a reading");
+        assert!((other - 40.0).abs() < 1e-9, "{other}");
+    }
 
     #[test]
     fn the_ship_is_drawn_one_tick_behind_the_newest_input() {

@@ -255,6 +255,7 @@ fn all_messages() -> Vec<Message> {
             region: region(40, [0, 0, 0], 5),
             shard_map: sample_map(),
             peer_token: "peer-secret".into(),
+            tick_origin_us: 1_763_900_000_000_000,
         }),
         Message::SceneSet(SceneState::new(Scene::Galaxy.id(), 4)),
         Message::SceneAck(SceneAck {
@@ -1077,6 +1078,7 @@ impl Rng {
                 region: self.region(),
                 shard_map: self.map(),
                 peer_token: self.string(),
+                tick_origin_us: self.next_u64() as i64,
             }),
             25 => Message::SceneSet(self.scene_state()),
             26 => Message::SceneAck(SceneAck {
@@ -1477,6 +1479,7 @@ fn a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it() {
         region: region(40, [0, 0, 0], 5),
         shard_map: sample_map(),
         peer_token: "peer-s3cr3t-token".into(),
+        tick_origin_us: 0,
     });
     let printed = format!("{welcome:?}");
     assert!(!printed.contains("peer-s3cr3t-token"), "{printed}");

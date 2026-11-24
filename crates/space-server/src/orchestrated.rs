@@ -409,24 +409,14 @@ pub async fn start_orchestrated(
         tokio::spawn(async move { net.serve(shard).await })
     };
     let state = Arc::clone(&shard);
-    let ticking = {
-        let net = Arc::clone(&net);
-        tokio::spawn(async move {
-            let mut clock =
-                tokio::time::interval(Duration::from_secs_f64(f64::from(space_sim::dt())));
-            clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                clock.tick().await;
-                {
-                    let mut shard = shard.lock().await;
-                    shard.tick();
-                    // The scene clock follows the wall clock (re-anchored only on drift).
-                    shard.sync_scene_clock(crate::config::wall_clock_us());
-                }
-                net.flush(&shard).await;
-            }
-        })
-    };
+    // The cluster's clock: this shard counts the ticks every other shard of
+    // the cluster counts, from the origin the welcome names — whenever it
+    // was started, a replacement included (`crate::clock`).
+    let ticking = tokio::spawn(crate::clock::run(
+        shard,
+        Arc::clone(&net),
+        crate::clock::TickClock::new(welcome.tick_origin_us),
+    ));
     // No orchestrator, no shard: stop serving and ticking the moment the
     // link is lost, whoever is (or is not) waiting on `RunningShard::wait`.
     let watchdog = {

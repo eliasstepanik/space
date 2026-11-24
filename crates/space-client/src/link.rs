@@ -72,6 +72,35 @@
 //! new shard cannot be reached, or the handoff is aborted, nothing changes:
 //! the old connection was never given up.
 //!
+//! ## One timeline across the switch
+//!
+//! The shards of a cluster count the same ticks (the cluster's clock,
+//! `space_server::clock`): a tick number names the same instant on the shard
+//! the ship leaves and on the one that takes it. The link relies on that:
+//!
+//! * **Inputs go to both shards** from the moment the second connection is
+//!   up until the switch — the same batch, tagged with the same tick. The old
+//!   shard applies the ones up to its commit; the new one keeps what it is
+//!   sent for a ship that is on its way and applies the rest from the tick it
+//!   installs the ship on. Nothing a player does around the switch is lost,
+//!   and nothing is applied twice (a shard only ever steps the ship it
+//!   simulates).
+//! * **The view continues.** At the switch the new shard's frames take over,
+//!   and nothing else changes: the tick the link counts by, the inputs it has
+//!   sent ([`ServerLink::take_sent`] — the app's prediction keeps replaying
+//!   them), the `input_ack`, and the motion histories of every entity the
+//!   new shard reports too, merged by guid ([`Tracked::history`]): a body
+//!   or a player seen before and after is one object with one history, not a
+//!   new one that starts where the old one stopped.
+//!
+//! Whether the new shard's ticks do continue the old one's is checked at the
+//! switch, against the link's own estimate of the present tick
+//! ([`SWITCH_TOLERANCE`]). Between shards that count differently — standalone
+//! shards given different tick origins, shards driven by loops of their own —
+//! the link starts over instead, as it always did: new ticks, new histories,
+//! and [`Replica::tick_epoch`] goes up, which tells the app to restart its
+//! clock and its prediction.
+//!
 //! # The anchor
 //!
 //! Every client must agree on *where* the scene is, so it is tied to the map
@@ -128,7 +157,8 @@
 //! keeps the mapping of the shard being played on ([`Replica::scene_clock`]);
 //! during a handoff the accepting shard's is held back and taken at the
 //! switch, together with that shard's ticks — a mapping is only meaningful
-//! with the ticks of the shard that made it.
+//! with the ticks of the shard that made it. (The shards of one cluster all
+//! tell the same mapping: it is the cluster's clock, see below.)
 //!
 //! # Prediction
 //!
@@ -185,6 +215,35 @@ pub const INPUT_LEAD: u64 = 3;
 /// ticks the server has not simulated yet instead of all being stale.
 const MAX_TICK_EXTRAPOLATION: u64 = 30;
 
+/// The most ticks one input batch covers: the ticks since the last batch,
+/// each with its own input (see [`inputs_for`]). After a longer stall the
+/// ticks before these are in the past and get none.
+const MAX_INPUT_FILL: u64 = 4;
+
+/// The ticks an input batch sent now carries inputs for: `first..=last`.
+///
+/// `estimate` is the tick the link's clock says an input sent now belongs to
+/// ([`input_tick`]); `sent` the last tick an input was sent for. A batch goes
+/// out every thirtieth of a second, but the estimate comes from frames that
+/// arrive with jitter: read naively it names the same tick twice now and
+/// then, and skips one as often. A tick without an input **coasts** on the
+/// shard — in fast travel that is a fifteenth of the speed gone, for
+/// nothing. So the link gives every tick exactly one input: it continues
+/// where it stopped (`sent + 1`), runs at most one tick ahead of its clock
+/// (`None`: nothing to send this time), and when the clock has moved on by
+/// more than one it fills the ticks in between, [`MAX_INPUT_FILL`] at most.
+fn inputs_for(estimate: u64, sent: Option<u64>) -> Option<(u64, u64)> {
+    let Some(sent) = sent else {
+        return Some((estimate, estimate));
+    };
+    let first = sent + 1;
+    if first > estimate + 1 {
+        return None;
+    }
+    let last = estimate.max(first);
+    Some((first.max(last.saturating_sub(MAX_INPUT_FILL - 1)), last))
+}
+
 /// The most sent inputs the link keeps for an app that does not take them
 /// ([`ServerLink::take_sent`]): ten seconds' worth.
 const SENT_LOG: usize = 300;
@@ -193,6 +252,13 @@ const SENT_LOG: usize = 300;
 /// complete before it is abandoned (the shards time a handoff out long before
 /// this; a later redirect then starts afresh).
 const REDIRECT_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How far the first tick heard from the shard that took the ship over may be
+/// from the tick the link expects at that moment, in ticks, for the two
+/// shards to count as being on one timeline (see the module docs, "One
+/// timeline across the switch"). On the cluster's clock the difference is the
+/// delivery of a frame or two; anything like this far apart is two clocks.
+pub const SWITCH_TOLERANCE: u64 = 6;
 
 /// The most [`JoinRedirect`](space_protocol::JoinRedirect)s one join follows:
 /// the entry address may send the player on (the orchestrator's player port
@@ -427,6 +493,11 @@ pub struct Replica {
     pub frames: u64,
     /// Completed shard transitions.
     pub handoffs: u64,
+    /// How often the ticks started over: it goes up at a shard transition
+    /// onto a shard that does not continue the previous one's ticks (see the
+    /// module docs, "One timeline across the switch"). While it stays, every
+    /// tick of this view is on one timeline.
+    pub tick_epoch: u64,
     /// The scene the server says to draw, and the revision it was chosen at
     /// ([`SceneState::UNSET`] until the first [`Message::SceneUpdate`]). It
     /// survives a shard transition; compare it with the value last drawn to
@@ -655,6 +726,37 @@ impl ShipView {
     }
 }
 
+impl ShipView {
+    /// Make this view — what the shard that took the ship over has reported
+    /// — the continuation of `previous`, the view of the shard played on
+    /// until now, on the same tick timeline: every entity both report keeps
+    /// the motion `previous` recorded before this view's first word on it.
+    /// What only `previous` knew is not this shard's to report and is gone.
+    fn continue_from(&mut self, previous: &ShipView) {
+        for seen in &mut self.ships {
+            let Some(before) = previous
+                .ships
+                .iter()
+                .find(|old| old.ship.guid == seen.ship.guid)
+            else {
+                continue;
+            };
+            let first = seen.history.front().map_or(u64::MAX, |sample| sample.tick);
+            let news = std::mem::take(&mut seen.history);
+            seen.history = before
+                .history
+                .iter()
+                .filter(|sample| sample.tick < first)
+                .cloned()
+                .collect();
+            // Through `record`, so a gap is treated as on one connection.
+            for sample in news {
+                seen.record(sample);
+            }
+        }
+    }
+}
+
 /// `held` updated by a delta entry's `changes`: a listed component replaces
 /// the held one, an empty payload removes it, one not listed stays. In id
 /// order.
@@ -817,18 +919,30 @@ impl Replica {
         ship_state_of(entity)
     }
 
-    /// Continue this view on another shard after a handoff: a new session and
-    /// a new tick domain (every shard runs its own clock), the same ship, the
-    /// same origin and the same scene. `ships` is what the new shard has
-    /// reported on its connection so far (its ticks are that shard's).
-    fn switch_to(&mut self, session: u64, shard: ShardId, ships: ShipView) {
+    /// Continue this view on another shard after a handoff: a new session,
+    /// the same ship, the same origin and the same scene. `ships` is what the
+    /// new shard has reported on its connection so far.
+    ///
+    /// `continuous`: the new shard's ticks continue the old one's (the
+    /// cluster's clock). Then nothing but the session changes — the tick, the
+    /// ship's last state and its `input_ack` stand until the new shard's next
+    /// word, and the entities both shards report keep their histories
+    /// ([`ShipView::continue_from`]). Otherwise the ticks start over
+    /// ([`Replica::tick_epoch`] goes up) and the view is the new shard's
+    /// alone.
+    fn switch_to(&mut self, session: u64, shard: ShardId, mut ships: ShipView, continuous: bool) {
         self.session = session;
         self.shard = Some(shard);
-        self.tick = 0;
-        self.state_tick = 0;
-        self.input_ack = 0;
-        self.frame_ack = 0;
         self.handoffs += 1;
+        if continuous {
+            ships.continue_from(&self.ships);
+        } else {
+            self.tick = 0;
+            self.state_tick = 0;
+            self.input_ack = 0;
+            self.frame_ack = 0;
+            self.tick_epoch += 1;
+        }
         self.ships = ships;
     }
 
@@ -931,6 +1045,9 @@ struct Pending {
     /// The entity the redirect was about: the ship being handed over.
     entity: EntityGuid,
     opened: Instant,
+    /// The highest tick of a frame heard on this connection (0: none yet):
+    /// what the inputs sent to this shard acknowledge.
+    tick: u64,
     /// The newest scene this shard has announced on this connection, kept for
     /// the moment it becomes the shard being played on.
     scene: Option<SceneState>,
@@ -954,8 +1071,12 @@ struct Shared {
     fast: bool,
     /// Input batches sent.
     seq: u64,
+    /// The last tick an input was sent for ([`inputs_for`]); `None` before
+    /// the first, and after a switch onto a shard that counts other ticks.
+    input_sent: Option<u64>,
     /// The inputs sent since the app last took them ([`ServerLink::take_sent`]),
-    /// in the clock of the shard being played on (cleared at a switch).
+    /// in the clock of the shard being played on (cleared at a switch onto a
+    /// shard that counts other ticks).
     sent: VecDeque<PlayerInput>,
     /// The address the player dialed first — what was typed, or `--server`.
     /// A client endpoint without an IP (`0.0.0.0:port`) means "this host,
@@ -1053,6 +1174,7 @@ impl ServerLink {
             thrust: [0.0; 3],
             fast: false,
             seq: 0,
+            input_sent: None,
             sent: VecDeque::new(),
             entry,
             active: conn.clone(),
@@ -1107,9 +1229,11 @@ impl ServerLink {
     }
 
     /// The inputs sent since the last call, oldest first, each tagged with
-    /// the tick the shard is to apply it at (in the clock of the shard being
-    /// played on: a shard transition drops what was sent to the old one). A
-    /// prediction replays them on top of the shard's last word.
+    /// the tick the shard is to apply it at. A prediction replays them on top
+    /// of the shard's last word — across a shard transition too: the shards
+    /// of a cluster count the same ticks, and around the switch every input
+    /// went to both. (Only a transition onto a shard that counts other ticks
+    /// drops what was sent to the old one: [`Replica::tick_epoch`].)
     pub fn take_sent(&self) -> Vec<PlayerInput> {
         lock(&self.shared).sent.drain(..).collect()
     }
@@ -1224,7 +1348,7 @@ async fn send_inputs(shared: SharedRef) {
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         clock.tick().await;
-        let (conn, batch) = {
+        let (conn, batch, also) = {
             let mut s = lock(&shared);
             if s.active.is_closed() {
                 return;
@@ -1242,29 +1366,49 @@ async fn send_inputs(shared: SharedRef) {
             let Some(entity) = s.replica.ship else {
                 continue;
             };
-            let tick = input_tick(s.replica.tick, s.tick_seen.elapsed());
-            s.seq += 1;
-            let input = PlayerInput {
-                entity,
-                thrust: s.thrust,
-                torque: [0.0; 3],
-                tick,
-                fast: s.fast,
+            // One input for every tick, and none twice.
+            let estimate = input_tick(s.replica.tick, s.tick_seen.elapsed());
+            let Some((first, tick)) = inputs_for(estimate, s.input_sent) else {
+                continue;
             };
-            s.sent.push_back(input);
+            s.input_sent = Some(tick);
+            s.seq += 1;
+            let inputs: Vec<PlayerInput> = (first..=tick)
+                .map(|tick| PlayerInput {
+                    entity,
+                    thrust: s.thrust,
+                    torque: [0.0; 3],
+                    tick,
+                    fast: s.fast,
+                })
+                .collect();
+            s.sent.extend(inputs.iter().copied());
             while s.sent.len() > SENT_LOG {
                 s.sent.pop_front();
             }
             let batch = InputTick {
                 tick,
                 seq: s.seq,
-                inputs: vec![input],
+                inputs,
                 ack_tick: s.replica.tick,
             };
-            (s.active.clone(), batch)
+            // A handoff in flight: the shard that is taking the ship over
+            // gets the same input (see the module docs, "One timeline across
+            // the switch"), acknowledging what *it* has sent so far.
+            let also = s.pending.as_ref().filter(|p| !p.conn.is_closed()).map(|p| {
+                let batch = InputTick {
+                    ack_tick: p.tick,
+                    ..batch.clone()
+                };
+                (p.conn.clone(), batch)
+            });
+            (s.active.clone(), batch, also)
         };
         // A failed send on a live connection is a lost input, like any other.
         let _ = conn.send(&Message::InputTick(batch)).await;
+        if let Some((conn, batch)) = also {
+            let _ = conn.send(&Message::InputTick(batch)).await;
+        }
     }
 }
 
@@ -1461,6 +1605,12 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
         return;
     };
     pending.ships.apply(message);
+    let heard = match message {
+        Message::Snapshot(frame) => Some(frame.tick),
+        Message::Delta(frame) => Some(frame.tick),
+        _ => None,
+    };
+    pending.tick = pending.tick.max(heard.unwrap_or(0));
     // The ship we have been flying — or, before any frame has named it, the
     // one the redirect was about.
     let ours = flying.unwrap_or(pending.entity);
@@ -1490,14 +1640,32 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     };
     let retired = std::mem::replace(&mut s.active, pending.conn);
     s.active_generation = pending.generation;
+    // Does this shard count the ticks the old one counted? Its frame's tick
+    // against the tick the link expects now: on one cluster clock they are a
+    // frame's delivery apart.
+    let expected = s.replica.tick + ticks_in(s.tick_seen.elapsed()).min(MAX_TICK_EXTRAPOLATION);
+    let continuous =
+        s.replica.tick > 0 && heard.is_some_and(|tick| tick.abs_diff(expected) <= SWITCH_TOLERANCE);
+    let before = s.replica.tick;
     s.replica
-        .switch_to(pending.session, pending.shard, pending.ships);
+        .switch_to(pending.session, pending.shard, pending.ships, continuous);
     s.replica.apply(message);
-    let now = Instant::now();
-    s.tick_seen = now;
-    s.replica.tick_seen = Some(now);
-    // What was sent to the old shard is in its clock, not this one's.
-    s.sent.clear();
+    if !continuous || s.replica.tick != before {
+        let now = Instant::now();
+        s.tick_seen = now;
+        s.replica.tick_seen = Some(now);
+    }
+    if !continuous {
+        // What was sent to the old shard is in its clock, not this one's.
+        s.sent.clear();
+        s.input_sent = None;
+        log::info!(
+            "space-client: shard {} counts other ticks than the shard before it (tick {} where \
+             {expected} was expected); starting over",
+            pending.shard.0,
+            heard.unwrap_or(0)
+        );
+    }
     // What the new shard announced while the handoff was in flight now comes
     // from the shard being played on. (A newer revision was taken when it
     // arrived; an older one still changes nothing.)
@@ -1633,6 +1801,7 @@ async fn open_redirect(
             shard: redirect.new_shard,
             entity: redirect.entity,
             opened: Instant::now(),
+            tick: 0,
             scene: None,
             scene_clock: None,
             ships: ShipView::default(),
@@ -1654,6 +1823,41 @@ async fn open_redirect(
 mod tests {
     use super::*;
     use space_protocol::Snapshot;
+
+    /// Every tick gets one input: the sender continues where it stopped,
+    /// fills what the clock skipped, and waits when it is a tick ahead.
+    ///
+    /// Mutation this catches: tagging each batch with the clock's estimate
+    /// alone (a tick the estimate skips gets no input and the ship coasts
+    /// through it; one it names twice gets two).
+    #[test]
+    fn every_tick_gets_exactly_one_input() {
+        assert_eq!(inputs_for(100, None), Some((100, 100)), "the first");
+        assert_eq!(inputs_for(101, Some(100)), Some((101, 101)), "in step");
+        assert_eq!(inputs_for(100, Some(100)), Some((101, 101)), "one ahead");
+        assert_eq!(inputs_for(100, Some(101)), None, "not two ahead");
+        assert_eq!(inputs_for(103, Some(100)), Some((101, 103)), "filled");
+        assert_eq!(
+            inputs_for(200, Some(100)),
+            Some((197, 200)),
+            "after a stall: the last few, not a hundred"
+        );
+        // Whatever the estimates do (a jittery clock: repeats, skips), the
+        // ticks sent are consecutive.
+        let estimates = [10, 10, 12, 13, 13, 13, 16, 17, 19, 19, 20, 22, 22, 23];
+        let (mut sent, mut all) = (None, Vec::new());
+        for estimate in estimates {
+            if let Some((first, last)) = inputs_for(estimate, sent) {
+                all.extend(first..=last);
+                sent = Some(last);
+            }
+        }
+        assert_eq!(
+            all,
+            (10..=24).collect::<Vec<u64>>(),
+            "consecutive, one ahead at most"
+        );
+    }
 
     #[test]
     fn server_name_matches_the_shards_certificate() {
@@ -1792,7 +1996,7 @@ mod tests {
         let from_new = frame(40, vec![ship(guid, 3, 512.5)]);
         assert!(!r.apply(&from_new), "not ours until the switch");
         assert!(Replica::frame_has_ship_of(&from_new, 3, guid));
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         assert!(r.apply(&from_new));
         assert_eq!(
             (r.session, r.shard, r.handoffs),
@@ -1904,7 +2108,7 @@ mod tests {
         assert_eq!(r.scene, scene(Scene::Materials, 3));
 
         // The handoff itself keeps the scene.
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         assert_eq!(r.scene, scene(Scene::Materials, 3));
         assert_eq!(r.handoffs, 1);
     }
@@ -2050,7 +2254,7 @@ mod tests {
         assert_eq!(r.anchor(), anchor, "known before any frame");
         r.apply(&frame(10, vec![ship(guid, 7, 300.0)]));
         assert_eq!(r.anchor(), anchor, "not where the ship appeared");
-        r.switch_to(3, ShardId::new(2), ShipView::default());
+        r.switch_to(3, ShardId::new(2), ShipView::default(), false);
         r.apply(&frame(4, vec![ship(guid, 3, 400.0)]));
         assert_eq!(r.anchor(), anchor);
 
@@ -2302,10 +2506,120 @@ mod tests {
         // The frame that shows our ship there is an ordinary delta.
         let switch = delta(4, vec![ship(ours, 9, 1.0)], vec![]);
         pending.apply(&switch);
-        r.switch_to(9, ShardId::new(2), pending);
+        r.switch_to(9, ShardId::new(2), pending, false);
         r.apply(&switch);
         assert_eq!(r.others().map(|s| s.guid).collect::<Vec<_>>(), [other]);
         assert_eq!(r.ship, Some(ours));
+    }
+
+    /// A switch onto a shard that counts the same ticks changes the session
+    /// and nothing else: the tick, the ship's last state and its `input_ack`
+    /// stand, every entity the new shard reports too keeps the motion the
+    /// old one showed, and what only the old shard knew is gone.
+    ///
+    /// Mutation this catches: zeroing the ticks at every switch (the app's
+    /// clock snaps and its prediction is rebuilt — `tick_epoch` is how it
+    /// would notice), taking the new shard's view as it is (every body and
+    /// player starts a new history: drawn two ticks behind, it stands still
+    /// for those two ticks and then jumps), keeping what the new shard never
+    /// reported (a ghost that nobody will ever remove).
+    #[test]
+    fn a_switch_on_one_timeline_keeps_the_ticks_and_the_histories() {
+        let (ours, both, old_only, new_only) = (
+            EntityGuid::new(ShardId::new(1), 1),
+            EntityGuid::new(ShardId::new(1), 2),
+            EntityGuid::new(ShardId::new(1), 3),
+            EntityGuid::new(ShardId::new(2), 5),
+        );
+        let mut r = Replica::new(7, ShardId::new(1));
+        for tick in 96..=100 {
+            let x = tick as f64;
+            let mut f = delta(
+                tick,
+                vec![
+                    ship(ours, 7, x),
+                    ship(both, 0, 2.0 * x),
+                    ship(old_only, 0, 5.0),
+                ],
+                vec![],
+            );
+            if let Message::Delta(d) = &mut f {
+                d.input_ack = tick;
+            }
+            r.apply(&f);
+        }
+        let history = |r: &Replica, guid| -> Vec<u64> {
+            r.entity(guid)
+                .map(|t| t.history.iter().map(|s| s.tick).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(history(&r, both), [96, 97, 98, 99, 100]);
+        // The new shard's first frame: the tick after, our ship under its
+        // session, the entity both report as its ghost, one of its own.
+        let mut switch = frame(
+            101,
+            vec![
+                ship(ours, 9, 101.0),
+                ship(both, 0, 202.0),
+                ship(new_only, 4, 0.0),
+            ],
+        );
+        if let Message::Snapshot(s) = &mut switch {
+            s.input_ack = 100;
+        }
+        let mut pending = ShipView::default();
+        pending.apply(&switch);
+        r.switch_to(9, ShardId::new(2), pending, true);
+        assert_eq!((r.tick, r.state_tick(), r.input_ack()), (100, 100, 100));
+        assert_eq!((r.tick_epoch, r.handoffs, r.session), (0, 1, 9));
+        assert!(
+            r.apply(&switch),
+            "the frame names our ship under the new session"
+        );
+        assert_eq!((r.tick, r.state_tick(), r.input_ack()), (101, 101, 100));
+        assert_eq!(r.ship, Some(ours));
+        assert_eq!(history(&r, both), [96, 97, 98, 99, 100, 101], "one history");
+        assert_eq!(history(&r, ours), [96, 97, 98, 99, 100, 101]);
+        assert_eq!(history(&r, new_only), [101]);
+        assert!(r.entity(old_only).is_none(), "not this shard's to report");
+        assert_eq!(
+            r.others().map(|s| s.guid).collect::<Vec<_>>(),
+            [both, new_only]
+        );
+        // A sample the old shard had for a tick the new one reports too (or
+        // a later one) is not kept beside it.
+        let mut later = Replica::new(7, ShardId::new(1));
+        for tick in 100..=103 {
+            later.apply(&delta(
+                tick,
+                vec![ship(ours, 7, 0.0), ship(both, 0, tick as f64)],
+                vec![],
+            ));
+        }
+        let mut pending = ShipView::default();
+        pending.apply(&frame(102, vec![ship(ours, 9, 0.0), ship(both, 0, 102.0)]));
+        later.switch_to(9, ShardId::new(2), pending, true);
+        assert_eq!(history(&later, both), [100, 101, 102]);
+        assert_eq!(later.tick, 103, "the clock does not run backwards");
+
+        // Onto a shard that counts other ticks: everything starts over, and
+        // the app is told.
+        let mut other = Replica::new(7, ShardId::new(1));
+        other.apply(&delta(
+            100,
+            vec![ship(ours, 7, 0.0), ship(both, 0, 1.0)],
+            vec![],
+        ));
+        let mut pending = ShipView::default();
+        let first = frame(5_000, vec![ship(ours, 9, 0.0), ship(both, 0, 1.0)]);
+        pending.apply(&first);
+        other.switch_to(9, ShardId::new(2), pending, false);
+        assert_eq!(
+            (other.tick, other.state_tick(), other.tick_epoch),
+            (0, 0, 1)
+        );
+        other.apply(&first);
+        assert_eq!(history(&other, both), [5_000]);
     }
 
     /// Inputs are tagged ahead of the server's clock even when frames stop

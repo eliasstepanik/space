@@ -106,7 +106,10 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        entry address that was dialed, which may have sent the
                        client on),
                        fast, nearest, nearest_surface_m, sky (name, position, radius,
-                       surface_m)
+                       surface_m),
+                       drawn_position, drawn_velocity, drawn_tick (the ship as the
+                       last frame drew it: predicted, interpolated between ticks),
+                       others_drawn
 GET  /frame.png        the current picture, lossless PNG
 GET  /frame.jpg        the same as JPEG (?quality=1..100)
                        ?wait=1   block until the next frame

@@ -237,6 +237,18 @@ pub struct AppConfig {
     pub escape_quits: bool,
 }
 
+/// The own ship as a frame drew it ([`App::drawn_ship`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnShip {
+    /// The fractional tick of the shard's clock it was drawn at.
+    pub tick: f64,
+    /// Where, metres from the scene's spawn point (what the HUD's `pos`
+    /// measures from).
+    pub position: [f64; 3],
+    /// Its velocity there, m/s.
+    pub velocity: [f32; 3],
+}
+
 /// A connection attempt in flight.
 struct Attempt {
     /// The address in canonical form, for the screen and the state.
@@ -410,6 +422,9 @@ pub struct App {
     bodies: BodyRenderer,
     /// The bodies the last frame drew.
     drawn_bodies: Vec<Drawn>,
+    /// The other ships and players of the last frame as drawn: guid, and
+    /// where in the scene (around the spawn point).
+    drawn_others: Vec<(EntityGuid, WorldPos)>,
 }
 
 impl std::fmt::Debug for App {
@@ -453,6 +468,7 @@ impl App {
             base: None,
             bodies: BodyRenderer::new(),
             drawn_bodies: Vec::new(),
+            drawn_others: Vec::new(),
         };
         if config.server.is_some() {
             app.connect();
@@ -661,6 +677,7 @@ impl App {
         self.base = None;
         self.bodies.forget();
         self.drawn_bodies.clear();
+        self.drawn_others.clear();
         match error {
             Some(error) => {
                 log::warn!("space-client: {error}");
@@ -880,6 +897,45 @@ impl App {
         Some(WorldPos::delta(anchor, ship.pos))
     }
 
+    /// The own ship as the last frame drew it: predicted ahead of the shard
+    /// and interpolated between ticks ([`crate::predict::OwnShip`]). `None`
+    /// while not playing and until there is a prediction.
+    #[must_use]
+    pub fn drawn_ship(&self) -> Option<DrawnShip> {
+        let Net::Online(session) = &self.net else {
+            return None;
+        };
+        let (shown, anchor) = (session.shown?, session.replica.anchor()?);
+        Some(DrawnShip {
+            tick: shown.tick,
+            position: WorldPos::delta(anchor, shown.state.pos),
+            velocity: shown.state.vel,
+        })
+    }
+
+    /// The other ships and players of the last frame as drawn: each one's
+    /// guid and where it is, metres from the scene's spawn point.
+    #[must_use]
+    pub fn drawn_others(&self) -> Vec<(EntityGuid, [f64; 3])> {
+        let spawn = self.world.spawn();
+        self.drawn_others
+            .iter()
+            .map(|(guid, place)| (*guid, WorldPos::delta(spawn, *place)))
+            .collect()
+    }
+
+    /// The physics bodies of the last frame as drawn (all of them: the
+    /// harness state lists the nearest only): each one's guid and where its
+    /// root part is, metres from the scene's spawn point.
+    #[must_use]
+    pub fn drawn_bodies(&self) -> Vec<(EntityGuid, [f64; 3])> {
+        let spawn = self.world.spawn();
+        self.drawn_bodies
+            .iter()
+            .map(|b| (b.guid, WorldPos::delta(spawn, b.place)))
+            .collect()
+    }
+
     /// Where the player's eye point is in the scene: the ship's place as
     /// drawn (predicted), or the spawn point until the shard has shown the
     /// ship.
@@ -1000,6 +1056,8 @@ impl App {
         };
         let mut headings = std::mem::take(&mut self.headings);
         let mut seen: Vec<EntityGuid> = Vec::new();
+        let mut drawn_others = std::mem::take(&mut self.drawn_others);
+        drawn_others.clear();
         for tracked in replica.other_ships() {
             let other = &tracked.ship;
             let pos = behind
@@ -1009,6 +1067,7 @@ impl App {
             let pos = WorldPos::from_f64_metres_around(pos, c);
             let place = scene_place(spawn, anchor, pos);
             seen.push(other.guid);
+            drawn_others.push((other.guid, place));
             // A player (here or, as a ghost, on a neighbouring shard) is a
             // character; a ship nobody flies is the ship model.
             if !tracked.is_player() {
@@ -1029,6 +1088,7 @@ impl App {
         }
         headings.retain(|(guid, _)| seen.contains(guid));
         self.headings = headings;
+        self.drawn_others = drawn_others;
         // The physics bodies, at the same moment.
         let t = behind.unwrap_or(replica.tick as f64);
         self.drawn_bodies = self.bodies.draw(
@@ -1176,6 +1236,12 @@ impl App {
                 }
                 state.bodies = self.body_states(session);
                 state.fast = self.controls.fast;
+                if let Some(drawn) = self.drawn_ship() {
+                    state.drawn_position = Some(drawn.position);
+                    state.drawn_velocity = Some(drawn.velocity.map(f64::from));
+                    state.drawn_tick = Some(drawn.tick);
+                }
+                state.others_drawn = u32::try_from(self.drawn_others.len()).unwrap_or(u32::MAX);
                 let bodies = self.world.sky_bodies(&session.sky_time());
                 let eye = self.eye(session);
                 if let Some((body, surface)) = crate::scenes::nearest(&bodies, eye) {

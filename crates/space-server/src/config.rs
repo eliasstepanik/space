@@ -71,6 +71,8 @@ pub const SCENE_REANNOUNCE_TICKS: SimTick = 5 * space_sim::TICK_HZ as SimTick;
 
 /// How far a shard's scene clock may drift from the wall clock, µs, before
 /// the shard re-anchors it ([`crate::Shard::sync_scene_clock`]): 30 ms.
+/// (Only for a shard that keeps its clock that way; one on the cluster's
+/// clock, [`crate::clock`], never drifts and never re-anchors.)
 ///
 /// A shard's tick count falls behind the wall clock whenever its loop skips a
 /// tick (a stall), so its mapping from ticks to scene time drifts; past this
