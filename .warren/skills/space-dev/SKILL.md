@@ -7,7 +7,7 @@ description: Use when developing, testing, packaging or debugging the space engi
 
 Rust workspace, toolchain pinned in `rust-toolchain.toml` (1.100.0 + rustfmt, clippy,
 `wasm32-unknown-unknown`). All crates are 0.1.0. Rules and workflow: `AGENT.md` (binding).
-Visual testing: `skills/space-visual-test/SKILL.md`. Docs: `docs/plan.md` (phases),
+Visual testing: `.warren/skills/space-visual-test/SKILL.md`. Docs: `docs/plan.md` (phases),
 `docs/plan-phase3.md`, `docs/plan-sharding.md` (seamless sharding: the map, the anchor, what comes next),
 `docs/security-notes.md`, `spikes/ENVIRONMENT.md` (GPU env),
 `deploy/README.md` (pipeline, web UI, what is/isn't verified).
@@ -452,7 +452,7 @@ Both: `--stdio` (default) or `--http 127.0.0.1:PORT`.
 Typical loop: start server, `shard_status` -> addr; client `connect`; `send_input`; `advance_ticks`;
 `ship_state` vs `client_status` to check replication; `capture_frame` to inspect pixels.
 For anything a real client shows (connect screen, HUD, scene switches) prefer the harness in
-`skills/space-visual-test/SKILL.md`: it drives the real `space-client`.
+`.warren/skills/space-visual-test/SKILL.md`: it drives the real `space-client`.
 
 ## Run the stack by hand
 `scripts/dev.ps1` / `scripts/dev.sh`: `-Topology orchestrated|single|two-shards` (default orchestrated:
@@ -487,4 +487,4 @@ shards, the client core frame by frame: nothing that is drawn may step at a chan
 Ports: 7777 what a client connects to (the player port, or the shard in `single`/`two-shards`), 7778 the
 second shard of `two-shards`, 7870-7899 shards the orchestrator starts, 7900 orchestrator control, 7980 web UI, 8097
 viewer page, 8098 harness API, 8099 stream.
-Everything else about running and looking at it: `skills/space-visual-test/SKILL.md`. Containers: `deploy/README.md`.
+Everything else about running and looking at it: `.warren/skills/space-visual-test/SKILL.md`. Containers: `deploy/README.md`.

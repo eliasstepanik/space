@@ -1,12 +1,12 @@
 # AGENT.md
 
 Rules and workflow for anyone — AI agent or human — changing this repository.
-They are binding. The how-to lives in the skills folder; read both skills
-before you change code:
+They are binding. The how-to lives in `.warren/skills/` (Warren loads them
+as this project's skills); read both skills before you change code:
 
-- [`skills/space-dev/SKILL.md`](skills/space-dev/SKILL.md) — layout, build, CI,
+- [`.warren/skills/space-dev/SKILL.md`](.warren/skills/space-dev/SKILL.md) — layout, build, CI,
   GPU tests, the invariants that must not break, the release pipeline.
-- [`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md) —
+- [`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md) —
   the visual test loop: start the stack, drive a client, look at the frames.
 
 `AGENTS.md` and `CLAUDE.md` only point here.
@@ -34,7 +34,7 @@ Every change goes through these steps, in this order.
 1. **Understand.** Read the skill, the crate's module docs and the tests of the
    area you touch. State what you are about to change and why.
 2. **Change.** Small, in the crate that owns the behaviour. Keep the invariants
-   listed in `skills/space-dev/SKILL.md` (wire gate, handoff freeze, pure Rust,
+   listed in `.warren/skills/space-dev/SKILL.md` (wire gate, handoff freeze, pure Rust,
    `forbid(unsafe_code)`, no TLS in-tree).
 3. **Check.** `cargo fmt`, `cargo clippy -D warnings` and the tests of every
    crate you touched; then the whole thing: `cargo run -p xtask -- ci`. On a
@@ -44,7 +44,7 @@ Every change goes through these steps, in this order.
    client — by looking at real frames. Passing tests are not a substitute.
    This is not optional and it is not only for renderer work: a new flag, a
    changed message, a web UI field, a camera tweak all end with you looking at
-   the result. How: `skills/space-visual-test/SKILL.md`.
+   the result. How: `.warren/skills/space-visual-test/SKILL.md`.
 5. **Report.** Say what you ran and what you saw, with the commands and the
    pictures. Say plainly what you did not verify and what still looks wrong.
    Never report a check you did not run.
@@ -59,7 +59,7 @@ You are expected to *use* the game while you build it.
 |---|---|
 | start the whole stack | `scripts/dev.ps1` (Windows) / `scripts/dev.sh` (Linux): the orchestrator (player port, web UI), the **four shards** it starts — the demo area in four shard areas that meet at HUD `pos` x = -6 / z = -4 — and a client pointed at the player port. The orchestrator starts the shards itself (one `space-server` process each, logs in `target/dev/shard-<port>.log`), replaces one that dies, and `-Stop` stops them too |
 | run it on one shard, or on more | the same with `-MinShards N` / `--min-shards N` (1 to 8; 1 = no borders anywhere). The client's address stays the player port |
-| watch the cluster scale | the dev scripts with `SPACE_ORCHESTRATOR_SHARD_CAPACITY=2`, `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER=5`, `SPACE_ORCHESTRATOR_SCALE_IN_AFTER=15`, `SPACE_ORCHESTRATOR_SCALE_COOLDOWN=10` in the environment and two clients: a loaded shard's hot cell is carved for a new shard, an idle shard is merged away, drains and stops (`skills/space-visual-test/SKILL.md`, "Scaling") |
+| watch the cluster scale | the dev scripts with `SPACE_ORCHESTRATOR_SHARD_CAPACITY=2`, `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER=5`, `SPACE_ORCHESTRATOR_SCALE_IN_AFTER=15`, `SPACE_ORCHESTRATOR_SCALE_COOLDOWN=10` in the environment and two clients: a loaded shard's hot cell is carved for a new shard, an idle shard is merged away, drains and stops (`.warren/skills/space-visual-test/SKILL.md`, "Scaling") |
 | run it in containers | `deploy/docker-compose.yaml`: **the orchestrator alone**, which starts its shard containers through the Docker socket (`--launcher docker`, Linux engine only). The dev scripts do not need Docker: they keep `--launcher process` |
 | drive a client without a human | the harness: `space-client --headless --harness 127.0.0.1:8098`, then `GET /state`, `GET /frame.png`, `POST /input`, `POST /script` |
 | script a user | Lua: `space-client --headless --script scripts/harness/smoke.lua` — the exit code is the script's result |

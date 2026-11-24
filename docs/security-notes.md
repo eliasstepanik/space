@@ -439,7 +439,7 @@ It changes nothing but that log line; nothing sets it.
 `debug_stall`): when the environment variable `SPACE_DEBUG_STALL_DIR` names a directory, a file
 `stall-<shard id>` in it holding a number of milliseconds (60 000 at most) makes that shard's loop
 stand still that long, once; the file is removed first. It exists to look at what a suspended
-shard does (`skills/space-visual-test/SKILL.md`).
+shard does (`.warren/skills/space-visual-test/SKILL.md`).
 
 * **Off unless the variable is set**, and nothing sets it: not the compose files, not the dev
   scripts. The orchestrator's `process` launcher passes its own environment on to the shards it

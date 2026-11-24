@@ -18,8 +18,8 @@ shows — the *scene* — is chosen on the server side, for everyone at once.
 | `space-mcp*`, `xtask` | MCP servers for agentic testing; CI driver and `xtask viewer` |
 
 Working on it: [`AGENT.md`](AGENT.md) is the rulebook and the workflow (it
-applies to people and to AI agents), [`skills/space-dev/SKILL.md`](skills/space-dev/SKILL.md)
-has the invariants and CI, [`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md)
+applies to people and to AI agents), [`.warren/skills/space-dev/SKILL.md`](.warren/skills/space-dev/SKILL.md)
+has the invariants and CI, [`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md)
 the visual test loop. Deployment: [`deploy/README.md`](deploy/README.md).
 
 ## Play
@@ -264,7 +264,7 @@ space-client --headless --server 127.0.0.1:7777 --script scripts/harness/physics
 
 The harness is loopback-only without credentials; any other address needs a
 bearer token in `SPACE_HARNESS_TOKEN`. Details in
-[`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md).
+[`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md).
 
 ### In a browser
 

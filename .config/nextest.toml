@@ -5,7 +5,7 @@
 # Two kinds of test must not be run like that:
 #
 # * The tests of the GPU packages create a Vulkan device when one is available,
-#   and GPU tests must not run in parallel (skills/space-dev/SKILL.md). On CI
+#   and GPU tests must not run in parallel (.warren/skills/space-dev/SKILL.md). On CI
 #   they skip (no usable device), but on a developer machine with a real GPU a
 #   plain nextest run would start many devices at once. The `gpu` group runs
 #   them one at a time; every other test stays parallel.

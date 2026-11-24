@@ -476,7 +476,7 @@ impl Pacer {
 }
 
 /// A stall on request, for looking at what a suspended shard does
-/// (`skills/space-visual-test/SKILL.md`): with `SPACE_DEBUG_STALL_DIR` set,
+/// (`.warren/skills/space-visual-test/SKILL.md`): with `SPACE_DEBUG_STALL_DIR` set,
 /// a file `stall-<shard id>` in that directory holding a number of
 /// milliseconds makes this shard's loop stand still that long, once (the
 /// file is removed first). The shard is held while it does, as a suspended

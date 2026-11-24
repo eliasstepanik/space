@@ -140,7 +140,7 @@ fn test_target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) 
 }
 
 /// Packages whose tests create a Vulkan device when one is usable. GPU tests
-/// must not run in parallel (skills/space-dev/SKILL.md): on CI they skip, but
+/// must not run in parallel (.warren/skills/space-dev/SKILL.md): on CI they skip, but
 /// on a machine with a real GPU a parallel run would start many devices at
 /// once. `.config/nextest.toml` puts the same packages in a `max-threads = 1`
 /// test group for the nextest path. (The wall-clock-sensitive tests among

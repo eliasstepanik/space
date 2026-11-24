@@ -171,11 +171,16 @@ impl FakeClient {
         );
         let hub = Hub::new();
         let shared = Arc::new(Shared::default());
+        // The connect prompt is there the moment `start` returns, as a real
+        // client's first state is: a caller must not see the hub's empty
+        // default (0x0, no screen) because the thread has not run yet.
+        let sim = Sim::new(&options);
+        hub.publish_state(sim.state.clone());
         let thread = {
             let (hub, shared) = (Arc::clone(&hub), Arc::clone(&shared));
             std::thread::Builder::new()
                 .name("fake-client".into())
-                .spawn(move || run(&hub, &shared, &options))
+                .spawn(move || run(sim, &hub, &shared, &options))
                 .expect("cannot start the fake client's thread")
         };
         Self {
@@ -505,9 +510,7 @@ impl Sim {
 }
 
 /// The fake render loop.
-fn run(hub: &Hub, shared: &Shared, options: &FakeOptions) {
-    let mut sim = Sim::new(options);
-    hub.publish_state(sim.state.clone());
+fn run(mut sim: Sim, hub: &Hub, shared: &Shared, options: &FakeOptions) {
     while !shared.stop.load(Ordering::Relaxed) {
         if shared.paused.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(1));
