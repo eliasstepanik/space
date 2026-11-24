@@ -18,3 +18,14 @@ artifacts/*.png
 /*.ppm
 /*.glb
 /space-orchestrator.id*
+
+# Warren: only its working folders under .warren/ are local; the rest of
+# .warren/ (skills, agents, warren-config.toml) is committed. rustup/tmp are
+# the toolchain and temp dirs the space-dev skill's CI command uses.
+/.warren/rustup/
+/.warren/tmp/
+/.warren/out/
+/.warren/refs/
+/.warren/uploads/
+/.warren/blender/
+/.warren/cache/
