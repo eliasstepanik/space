@@ -88,7 +88,8 @@ use crate::messages::Message;
 /// `DirectoryReply`, `ShardWelcome`, a `ShardHello`'s claim);
 /// [`crate::RejectReason::Starting`] and the message [`crate::JoinRedirect`]
 /// (wire tag 29) were appended; [`crate::ShardWelcome`] ends with the cluster's
-/// tick origin (`tick_origin_us`). These change the layouts of existing
+/// tick origin (`tick_origin_us`); [`crate::Snapshot`] ends with `more`
+/// ("further chunks of this snapshot follow"). These change the layouts of existing
 /// messages, so the version bumps: a v6 peer would fail to decode a v7 map
 /// mid-handshake instead of refusing it with a reason. [`crate::Hello`]
 /// keeps its layout, as in every version: a peer of another version is still

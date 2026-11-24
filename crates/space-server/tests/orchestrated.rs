@@ -18,9 +18,11 @@ use space_protocol::{
     Message, Reject, RejectReason, ShardHello, ShardId, ShardMap, ShardRegion, ShardWelcome,
     Welcome,
 };
+use space_server::clock::{ManualTime, TimeSource};
 use space_server::net::{peer_hello, peer_hello_with, SERVER_NAME};
 use space_server::orchestrated::{
-    register_within, start_orchestrated, OrchestratedOptions, REGISTER_BACKOFF_MIN,
+    register_within, start_orchestrated, start_orchestrated_on, OrchestratedOptions, RunningShard,
+    REGISTER_BACKOFF_MIN,
 };
 use space_world::NodeRef;
 
@@ -136,10 +138,30 @@ fn scripted_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>
 /// instant that is not the default one.
 const TICK_ORIGIN_US: i64 = 1_763_900_000_000_000;
 
+/// Wait (in real time, but only for the loop to take its turn) until
+/// `shard` is at `tick`; panics if it is not within ten seconds, and if it
+/// is ever past it.
+async fn at_tick(shard: &RunningShard, tick: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = shard.state.lock().await.sim().tick();
+        assert!(now <= tick, "tick {now}, past the {tick} that is due");
+        if now == tick {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still at tick {now}, {tick} is due"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Two shards registered more than a second apart run on the clock of the
-/// origin their welcome names: the same tick at the same instant (one apart
-/// at most: each steps when the tick is due), the tick that is due by the
-/// wall clock, and the cluster clock as the scene clock they tell clients.
+/// origin their welcome names: each is at exactly the tick that is due — the
+/// test sets the time (`ManualTime`), so "due" is a number, not a reading of
+/// a busy machine's clock — and never past it; the cluster clock is the scene
+/// clock they tell clients.
 ///
 /// Mutation this catches: a shard that ignores the welcome's origin (the
 /// default one: the two would still agree with each other, and be 50 million
@@ -147,48 +169,72 @@ const TICK_ORIGIN_US: i64 = 1_763_900_000_000_000;
 #[tokio::test]
 async fn orchestrated_shards_count_from_the_origin_their_welcome_names() {
     let (orch, _seen) = scripted_orchestrator(vec![Answer::Welcome(7), Answer::Welcome(8)]);
-    let first = tokio::time::timeout(Duration::from_secs(20), start_orchestrated(options(), orch))
-        .await
-        .expect("in time")
-        .expect("welcomed");
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    let second = tokio::time::timeout(Duration::from_secs(20), start_orchestrated(options(), orch))
-        .await
-        .expect("in time")
-        .expect("welcomed");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 100 s after the origin: tick 3000.
+    let time = ManualTime::at(TICK_ORIGIN_US + 100_000_000);
     let clock = space_protocol::SceneClock::cluster(TICK_ORIGIN_US);
-    let looks = 30;
-    let mut apart = Vec::new();
-    for _ in 0..looks {
-        let (a, b) = (first.state.lock().await, second.state.lock().await);
-        let due = clock.tick_at(space_server::config::wall_clock_us());
-        let (ta, tb) = (a.sim().tick(), b.sim().tick());
+    let start = || {
+        let source: Arc<dyn TimeSource> = time.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                start_orchestrated_on(options(), orch, source),
+            )
+            .await
+            .expect("in time")
+            .expect("welcomed")
+        }
+    };
+    let first = start().await;
+    at_tick(&first, 3_000).await;
+    // 1.2 s later, in steps the loop makes up without a jump.
+    for step in 1..=6u64 {
+        time.advance(200_000);
+        at_tick(&first, 3_000 + 6 * step).await;
+    }
+    let second = start().await;
+    at_tick(&second, 3_036).await;
+    for step in 1..=10u64 {
+        time.advance(100_000);
+        at_tick(&first, 3_036 + 3 * step).await;
+        at_tick(&second, 3_036 + 3 * step).await;
+    }
+    for shard in [&first, &second] {
+        let shard = shard.state.lock().await;
         assert_eq!(
-            a.scene_clock(),
+            shard.scene_clock(),
             clock,
             "the cluster clock is the scene clock"
         );
-        assert_eq!(b.scene_clock(), clock);
-        drop((a, b));
-        apart.push(ta.abs_diff(tb));
-        for tick in [ta, tb] {
-            // (A tick of slack either way for the wall clock read here, and
-            // some for a machine busy with other tests.)
-            assert!(
-                tick <= due + 1 && tick + 5 >= due,
-                "tick {tick} where {due} is due by the wall clock"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(23)).await;
+        assert_eq!(shard.sim().scene_time(), clock.time_us_at(3_066));
+        assert_eq!(shard.stats().skipped, 0);
     }
-    let close = apart.iter().filter(|d| **d <= 1).count();
-    assert!(
-        close >= looks * 9 / 10 && apart.iter().all(|d| *d <= 4),
-        "the two shards' ticks, apart: {apart:?}"
-    );
     first.abort();
     second.abort();
+}
+
+/// A welcome that names a tick origin this host's clock has not reached is
+/// refused: the shard does not start, and says why.
+///
+/// Mutation this catches: starting anyway — tick 0 until the origin comes,
+/// a shard that serves players and never steps.
+#[tokio::test]
+async fn a_welcome_with_a_tick_origin_in_the_future_is_refused() {
+    let (orch, _seen) = scripted_orchestrator(vec![Answer::Welcome(7)]);
+    let source: Arc<dyn TimeSource> = ManualTime::at(TICK_ORIGIN_US - 5_000_000);
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        start_orchestrated_on(options(), orch, source),
+    )
+    .await
+    .expect("in time");
+    let why = match refused {
+        Ok(running) => {
+            running.abort();
+            panic!("the shard started on a clock that has no tick yet");
+        }
+        Err(why) => why,
+    };
+    assert!(why.contains("future") && why.contains("5.000 s"), "{why}");
 }
 
 /// A shard that is told "not yet" asks again — with a pause that grows — and

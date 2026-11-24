@@ -438,6 +438,7 @@ async fn snapshot_stream_round_trips() {
             vec![(0, space_sim_wire_placeholder_payload())],
         )],
         input_ack: 2,
+        more: false,
     });
     assert_eq!(MessageClass::of(&msg), MessageClass::Stream);
     conn.send(&msg).await.expect("send snapshot");

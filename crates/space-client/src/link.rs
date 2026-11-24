@@ -248,6 +248,34 @@ fn inputs_for(estimate: u64, sent: Option<u64>) -> Option<(u64, u64)> {
 /// ([`ServerLink::take_sent`]): ten seconds' worth.
 const SENT_LOG: usize = 300;
 
+/// How many of the inputs sent last the link keeps to say again to a shard
+/// it has just connected to for a handoff ([`resend_tail`]): the ticks a
+/// commit can be ahead of the connection — the input lead, a batch's fill
+/// and what the estimate of the present tick may be off by.
+const RESEND_LOG: usize = (INPUT_LEAD + MAX_INPUT_FILL + SWITCH_TOLERANCE) as usize;
+
+/// The inputs the shard that is taking the ship over has to be sent the
+/// moment its connection is up: of the `recent` ones, those for ticks after
+/// `newest_frame_tick` — the ticks the old shard may not have stepped yet.
+///
+/// Inputs are tagged [`INPUT_LEAD`] ticks ahead and each goes out once.
+/// Those sent just **before** the second connection existed went to the old
+/// shard only; if the commit follows the connect within the lead, some of
+/// them are for ticks the *new* shard simulates, and it never heard them:
+/// the ship coasted for up to three ticks at every crossing with a quick
+/// commit. So the link says them again, once, to the new shard. A tick the
+/// old shard did step is not applied twice: a shard only applies an input
+/// for a tick it simulates the ship on (the new one keeps what it is sent
+/// for a staged ship and files what is for ticks after its install), and
+/// one input per tick is kept.
+fn resend_tail(recent: &VecDeque<PlayerInput>, newest_frame_tick: u64) -> Vec<PlayerInput> {
+    recent
+        .iter()
+        .filter(|input| input.tick > newest_frame_tick)
+        .copied()
+        .collect()
+}
+
 /// How long a connection opened for a redirect may wait for the handoff to
 /// complete before it is abandoned (the shards time a handoff out long before
 /// this; a later redirect then starts afresh).
@@ -533,6 +561,10 @@ pub struct OtherShip {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ShipView {
     ships: Vec<Tracked>,
+    /// A snapshot that is arriving in several chunks
+    /// ([`space_protocol::Snapshot::more`]): the tick of its first chunk and
+    /// every entity its chunks have named so far. `None` between snapshots.
+    arriving: Option<(u64, Vec<EntityGuid>)>,
 }
 
 /// One entity a shard replicates — a ship or a physics body — as the client
@@ -655,10 +687,24 @@ impl ShipView {
         // same tick on) stays, with its history.
         match message {
             // A snapshot is the whole interest set: what it does not name is
-            // gone — unless a newer frame has already said otherwise.
-            Message::Snapshot(_) => self
-                .ships
-                .retain(|seen| seen.tick > tick || named(seen.ship.guid)),
+            // gone — unless a newer frame has already said otherwise. The
+            // **whole** snapshot: one that does not fit a frame arrives in
+            // chunks, a tick apart, and only the last of them (`more` is
+            // false) ends it. Until then the names are collected and nothing
+            // is dropped; taking each chunk for the whole kept only the last
+            // chunk's entities, for good — the shard counts every entity it
+            // sent as known and does not send one at rest again.
+            Message::Snapshot(snapshot) => {
+                let (first_tick, mut names) =
+                    self.arriving.take().unwrap_or_else(|| (tick, Vec::new()));
+                names.extend(entities.iter().map(|e| e.guid));
+                if snapshot.more {
+                    self.arriving = Some((first_tick, names));
+                } else {
+                    self.ships
+                        .retain(|seen| seen.tick > first_tick || names.contains(&seen.ship.guid));
+                }
+            }
             Message::Delta(d) => self.ships.retain(|seen| {
                 seen.tick > tick || !d.removed.contains(&seen.ship.guid) || named(seen.ship.guid)
             }),
@@ -1078,6 +1124,10 @@ struct Shared {
     /// in the clock of the shard being played on (cleared at a switch onto a
     /// shard that counts other ticks).
     sent: VecDeque<PlayerInput>,
+    /// The last [`RESEND_LOG`] inputs sent, whether or not the app took
+    /// them: what a shard connected to for a handoff is told again
+    /// ([`resend_tail`]).
+    recent: VecDeque<PlayerInput>,
     /// The address the player dialed first — what was typed, or `--server`.
     /// A client endpoint without an IP (`0.0.0.0:port`) means "this host,
     /// that port", for a join redirect and a handoff redirect alike.
@@ -1176,6 +1226,7 @@ impl ServerLink {
             seq: 0,
             input_sent: None,
             sent: VecDeque::new(),
+            recent: VecDeque::new(),
             entry,
             active: conn.clone(),
             active_generation: 0,
@@ -1385,6 +1436,10 @@ async fn send_inputs(shared: SharedRef) {
             s.sent.extend(inputs.iter().copied());
             while s.sent.len() > SENT_LOG {
                 s.sent.pop_front();
+            }
+            s.recent.extend(inputs.iter().copied());
+            while s.recent.len() > RESEND_LOG {
+                s.recent.pop_front();
             }
             let batch = InputTick {
                 tick,
@@ -1658,6 +1713,7 @@ fn on_frame(shared: &SharedRef, generation: u64, message: &Message) {
     if !continuous {
         // What was sent to the old shard is in its clock, not this one's.
         s.sent.clear();
+        s.recent.clear();
         s.input_sent = None;
         log::info!(
             "space-client: shard {} counts other ticks than the shard before it (tick {} where \
@@ -1792,7 +1848,7 @@ async fn open_redirect(
         }
         Err(e) => return Err(format!("{addr}: {e}")),
     };
-    {
+    let tail = {
         let mut s = lock(shared);
         if let Some(previous) = s.pending.replace(Pending {
             conn: conn.clone(),
@@ -1812,6 +1868,21 @@ async fn open_redirect(
             let reader = spawn_reader(shared, player_token, conn.clone(), generation, datagrams);
             s.track(reader);
         }
+        // From here on the sender gives this shard every batch too. What
+        // went out just before, for ticks still to come, it has not heard.
+        let tail = resend_tail(&s.recent, s.replica.tick);
+        s.seq += 1;
+        tail.last().map(|last| InputTick {
+            tick: last.tick,
+            seq: s.seq,
+            inputs: tail.clone(),
+            ack_tick: 0,
+        })
+    };
+    // Before the status that opens the commit's gate: the inputs for the
+    // ticks the commit may fall on ([`resend_tail`]).
+    if let Some(batch) = tail {
+        let _ = conn.send(&Message::InputTick(batch)).await;
     }
     // The gate the shards' commit waits for.
     conn.send_reliable(&neighbour_status(redirect))
@@ -1859,6 +1930,100 @@ mod tests {
         );
     }
 
+    /// What a shard that has just been connected to for a handoff is told
+    /// again: the inputs already sent for ticks that are still to come — and
+    /// nothing older.
+    ///
+    /// Mutation this catches: saying nothing again (the inputs tagged up to
+    /// the lead ahead before the connection existed reach only the old
+    /// shard: a commit within the lead leaves the new shard without the
+    /// ticks right after it), saying everything again (ticks long stepped).
+    #[test]
+    fn a_shard_joined_for_a_handoff_is_told_the_inputs_still_to_come() {
+        let ship = EntityGuid::new(ShardId::new(1), 1);
+        let input = |tick| PlayerInput {
+            entity: ship,
+            thrust: [1.0, 0.0, 0.0],
+            torque: [0.0; 3],
+            tick,
+            fast: false,
+        };
+        // The newest frame is of tick 100; inputs were sent up to 103 (the
+        // lead), and the log still holds older ones.
+        let recent: VecDeque<PlayerInput> = (92..=103).map(input).collect();
+        let tail = resend_tail(&recent, 100);
+        assert_eq!(
+            tail.iter().map(|i| i.tick).collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        assert!(
+            resend_tail(&recent, 103).is_empty(),
+            "nothing still to come"
+        );
+        assert!(resend_tail(&VecDeque::new(), 100).is_empty());
+        assert!(
+            RESEND_LOG as u64 >= INPUT_LEAD + MAX_INPUT_FILL,
+            "the log covers what one batch can be ahead"
+        );
+    }
+
+    fn chunk(tick: u64, entities: Vec<EntitySnapshot>, more: bool) -> Message {
+        let Message::Snapshot(mut snapshot) = frame(tick, entities) else {
+            unreachable!("`frame` builds a snapshot");
+        };
+        snapshot.more = more;
+        Message::Snapshot(snapshot)
+    }
+
+    /// A snapshot that arrives in three chunks is one snapshot: every entity
+    /// of every chunk is held afterwards, and what none of them named is
+    /// dropped — when the last chunk arrives, not before.
+    ///
+    /// Mutation this catches: taking every chunk for the whole interest set
+    /// (after the third chunk only its entities are left — and the shard,
+    /// which counts all of them as known, never sends the others again while
+    /// they rest), never ending a snapshot (the stale entity stays for good).
+    #[test]
+    fn a_snapshot_in_three_chunks_is_one_snapshot() {
+        let guid = |n| EntityGuid::new(ShardId::new(1), n);
+        let mut r = Replica::new(7, ShardId::new(1));
+        // Held from before: the own ship and something the new snapshot will
+        // not name.
+        r.apply(&chunk(
+            10,
+            vec![ship(guid(1), 7, 0.0), ship(guid(99), 0, 5.0)],
+            false,
+        ));
+        assert_eq!(r.tracked().count(), 2);
+        // A new snapshot, a tick per chunk.
+        r.apply(&chunk(
+            20,
+            vec![ship(guid(1), 7, 1.0), ship(guid(2), 0, 2.0)],
+            true,
+        ));
+        r.apply(&chunk(
+            21,
+            vec![ship(guid(3), 0, 3.0), ship(guid(4), 0, 4.0)],
+            true,
+        ));
+        assert!(
+            r.entity(guid(99)).is_some(),
+            "nothing is dropped before the snapshot is complete"
+        );
+        r.apply(&chunk(22, vec![ship(guid(5), 0, 5.0)], false));
+        let mut held: Vec<u64> = r.tracked().map(|t| t.ship.guid.serial).collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            vec![1, 2, 3, 4, 5],
+            "every chunk's entities, no other"
+        );
+        assert_eq!(r.ship, Some(guid(1)), "the own ship among them");
+        // The next snapshot starts afresh: one chunk, and it is the whole.
+        r.apply(&chunk(30, vec![ship(guid(1), 7, 1.5)], false));
+        assert_eq!(r.tracked().count(), 1);
+    }
+
     #[test]
     fn server_name_matches_the_shards_certificate() {
         assert_eq!(SERVER_NAME, space_server::net::SERVER_NAME);
@@ -1871,6 +2036,7 @@ mod tests {
             epoch: 1,
             entities,
             input_ack: 0,
+            more: false,
         })
     }
 

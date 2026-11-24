@@ -69,18 +69,6 @@ pub const REOFFER_BACKOFF_TICKS: SimTick = 2 * space_sim::TICK_HZ as SimTick;
 /// comparison (the clients are only walked on the tick it is due).
 pub const SCENE_REANNOUNCE_TICKS: SimTick = 5 * space_sim::TICK_HZ as SimTick;
 
-/// How far a shard's scene clock may drift from the wall clock, µs, before
-/// the shard re-anchors it ([`crate::Shard::sync_scene_clock`]): 30 ms.
-/// (Only for a shard that keeps its clock that way; one on the cluster's
-/// clock, [`crate::clock`], never drifts and never re-anchors.)
-///
-/// A shard's tick count falls behind the wall clock whenever its loop skips a
-/// tick (a stall), so its mapping from ticks to scene time drifts; past this
-/// it is moved back onto the wall clock — the planets jump by that much, and
-/// what they carry with them. Two shards on hosts with synchronised clocks
-/// therefore agree on the scene time to within about twice this.
-pub const SCENE_CLOCK_TOLERANCE_US: i64 = 30_000;
-
 /// Microseconds of UTC since the Unix epoch, now (what scene time is).
 #[must_use]
 pub fn wall_clock_us() -> i64 {

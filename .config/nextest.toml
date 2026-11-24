@@ -2,18 +2,40 @@
 # is installed).
 #
 # nextest runs every test in its own process, as many at once as there are CPUs.
-# The tests of the packages below create a Vulkan device when one is available,
-# and GPU tests must not run in parallel (skills/space-dev/SKILL.md). On CI they
-# skip (no usable device), but on a developer machine with a real GPU a plain
-# nextest run would start many devices at once. This group runs them one at a
-# time; every other test stays parallel.
+# Two kinds of test must not be run like that:
 #
-# Keep the package list in sync with `GPU_PACKAGES` in xtask/src/main.rs (its
-# `cargo test` fallback passes `--test-threads=1` for the same packages; a unit
-# test there checks the two lists agree).
+# * The tests of the GPU packages create a Vulkan device when one is available,
+#   and GPU tests must not run in parallel (skills/space-dev/SKILL.md). On CI
+#   they skip (no usable device), but on a developer machine with a real GPU a
+#   plain nextest run would start many devices at once. The `gpu` group runs
+#   them one at a time; every other test stays parallel.
+#
+# * The wall-clock-sensitive tests fly a real client through real shard loops
+#   in real time and look at what every frame shows (space-client's
+#   `tests/seamless.rs` and `tests/handoff.rs`; they render nothing). Their
+#   bounds are taken so that a busy machine does not fail them (see the module
+#   docs of seamless.rs), but they should not have to compete for the CPU
+#   either. The `timing` group runs them one at a time, and each asks for four
+#   of nextest's test slots (`threads-required`): on a two-core CI runner that
+#   is all of them — the test runs alone — and on a large machine it leaves
+#   room for the four shards and the client it starts.
+#
+# The first override that matches a test decides its group, so `timing` comes
+# before `gpu` (both tests' package is a GPU package).
+#
+# Keep the lists in sync with `GPU_PACKAGES` and `TIMING_TESTS` in
+# xtask/src/main.rs (its `cargo test` fallback runs the GPU packages — the
+# timing tests are among them — after everything else, with
+# `--test-threads=1`; a unit test there checks the lists agree).
 
 [test-groups]
 gpu = { max-threads = 1 }
+timing = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(space-client) & (binary(seamless) | binary(handoff))'
+test-group = 'timing'
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = 'package(space-render) | package(space-client) | package(space-mcp-client)'

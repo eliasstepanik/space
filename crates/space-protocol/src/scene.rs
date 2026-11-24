@@ -329,6 +329,27 @@ impl SceneClock {
         Self::new(0, origin_us)
     }
 
+    /// Why a shard whose wall clock reads `wall_us` cannot run on the cluster
+    /// clock with tick origin `origin_us`, if it cannot: the origin lies in
+    /// the future. There is then no tick to be at ([`SceneClock::tick_at`]
+    /// saturates at 0), and a shard that waited for tick 1 would stand still
+    /// — for an hour, for a year — while it lets players in. `None`: fine.
+    ///
+    /// The orchestrator and a standalone shard check their `--tick-origin`
+    /// with this before they start, and a shard checks the origin its
+    /// `ShardWelcome` names (its own clock may be the one that is wrong).
+    #[must_use]
+    pub fn origin_refusal(origin_us: i64, wall_us: i64) -> Option<String> {
+        (origin_us > wall_us).then(|| {
+            format!(
+                "the tick origin {origin_us} lies {:.3} s in the future of this host's clock \
+                 ({wall_us}, microseconds since the Unix epoch): there is no tick to run yet. \
+                 Give an origin in the past, or set the host's clock",
+                (i128::from(origin_us) - i128::from(wall_us)) as f64 / 1e6
+            )
+        })
+    }
+
     /// Scene time at `tick`, µs: `time_us + (tick - self.tick) · 1e6 / 30`,
     /// rounded toward minus infinity (exact integer arithmetic).
     #[must_use]

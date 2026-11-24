@@ -410,6 +410,8 @@ became, and where it differs from the bullets above:
   up jumps forward and says so in its log and its load report. Standalone shards take
   `--tick-origin` (the dev script gives both the same); tests that step shards by hand stay at 0.
   All shards run on one host (decision 5), so their clocks agree; drift between hosts is not solved.
+  (**Changed by the review, below:** "reads the wall clock once" did not keep two shards of one
+  host together — a shard keeps measuring and slewing.)
 - **Handoff** (the three-phase exchange and its message layouts stay): the commit's state carries
   the tick it was read at, as a private component beside the owner token. The receiver sets the
   input floor to **that** tick and, installing at a later local tick, brings the entity forward by
@@ -445,7 +447,8 @@ measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-proc
   the ship.
 - **Cluster clock** (`space-server/src/clock.rs`): `ShardWelcome` ends with `tick_origin_us`
   (`OrchestratorConfig::tick_origin_us`, `--tick-origin`), every shard runs `clock::run` on
-  `TickClock::new(origin)`: tick `n` is due at `origin + n / 30 s`, the wall clock is read once,
+  `TickClock::new(origin)`: tick `n` is due at `origin + n / 30 s`, the wall clock is read once
+  (no longer: see the review's status block below),
   late ticks are made up (8 at most), a longer stall is jumped over (`Shard::skip_to`,
   `ShardStats::skipped`, three log lines a minute). **Deviations:** (a) the default origin is a
   **fixed instant** (`SceneClock::DEFAULT_ORIGIN_US`, 2026-01-01T00:00:00Z) for the orchestrator
@@ -454,8 +457,8 @@ measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-proc
   timeline. Tick numbers are therefore large (8.5e8 today); nothing casts one to `f32`. (b) It is
   **not a second clock beside `SceneClock`**: the cluster clock *is* the scene clock a shard tells
   its clients (`SceneClock::cluster(origin)`), set once and never re-anchored. `main`'s
-  wall-clock re-anchoring (`Shard::sync_scene_clock`, 30 ms tolerance) is called by neither
-  binary any more; it is left for a shard driven by a loop of its own. (c) "Says so in its load
+  wall-clock re-anchoring (`Shard::sync_scene_clock`, 30 ms tolerance) was called by neither
+  binary any more and by nothing else; it and its test were removed in the review. (c) "Says so in its load
   report" is not built: no shard sends a load report yet (section 3). Measured: three shards
   started 1.3 s and 0.9 s apart are never more than one tick apart when looked at together
   (`tests/crossing.rs`); on a live four-shard stack every shard's log names the same tick.
@@ -471,6 +474,9 @@ measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-proc
   sunk by it), no contacts, and a ship in fast travel only coasts; at most 15 ticks, beyond which
   the two clocks are taken not to agree and the old rule applies (accept tick + lead) — as it
   does between shards stepped by hand, which is why the 41 acceptance tests pass unchanged.
+  (As built in phase 3 the 15 ticks were checked only when the commit arrived; an entity
+  installed after its shard had stalled was brought forward by the whole stall. Fixed in the
+  review: the bound holds at the install.)
   `ShardStats::caught_up` counts the ticks made up: 0 in every flight of the client tests but the
   fast one over the demo area (11 ticks in all, among some hundred transfers, most of them
   bodies; which entities they were was not looked at). Checked tick for tick against a ship that
@@ -546,7 +552,143 @@ measured. Numbers are from `crates/space-client/tests/seamless.rs` (four in-proc
   replicas, not a crossing. Fast travel's velocity kinks are the flight
   model's, not a border's. Noticed while reading, not verified: `ShipView::apply` treats every
   chunk of a snapshot as the whole interest set, so a snapshot too large for one frame would
-  lose its earlier chunks on the client (the demo area's fits one).
+  lose its earlier chunks on the client (the demo area's fits one). (Verified and fixed in the
+  review: `Snapshot::more`.)
+
+**Status: reviewed (phase 3b).** An independent review of the phase-3 commit found the following;
+each was checked against the code as it stood after phase 4, fixed where it held, and given a
+test that fails without the fix. Numbers from a live stack are from `dev.ps1 -ServersOnly
+-PortOffset 300` (four shards, release build, two headless clients on the harness, 2026-11-24;
+logs and samples in `target/phase3b/` and `target/dev/shots/phase3b/`).
+
+- **The catch-up was bounded when a commit arrived, not when it was installed.** A commit read
+  within 15 ticks of the present and installed after its shard had stalled and jumped was brought
+  forward by the whole stall: seconds of flight without a contact. Now the bound holds at the
+  install (`PendingCommit::catch_up_at`), for ships and bodies: past it the state is installed
+  as it is — the entity stood still for the stall like everything else on that shard.
+  (`a_commit_installed_after_a_stall_is_not_brought_forward_by_the_stall`: a 90-tick stall with
+  the commit in hand; without the bound the ship is 36 m on.)
+- **A jump restarted scene time and dropped every input.** `Shard::skip_to` used the prediction
+  mirror's `reset_clock`: after a jump the orbiting bodies moved by the whole stall and what
+  they carry by one tick — a ship standing on the Moon was left 19 000 km behind it — and
+  inputs filed for ticks *after* the jump were thrown away with the rest. `SimWorld::skip_to`
+  keeps where scene time stood (the next step carries by all of it) and drops only the inputs
+  of the ticks jumped over. So "the world stands still across a jump" is now exact about what
+  it means: nothing flies, falls or collides for the skipped ticks; the sky moves on and takes
+  what it holds along.
+- **The clocks of two shards of one host could differ for good.** Each read the wall clock
+  once and counted on the monotonic clock: whatever the two drifted apart by between two
+  shards' starts — an NTP step, a suspended host, hours of drift before a replacement — stayed
+  as a constant offset between them, and nothing measured it. Now every shard compares its tick
+  clock with the wall clock once a second, says what it found (`ShardStats::clock_offset_us`,
+  the census line: `... N ticks jumped, M caught up; clock offset +0.3 ms`) and corrects it: up
+  to 2 ms is left alone, more is slewed away at 0.5 % at most (never backwards, a tick 0.17 ms
+  longer or shorter), more than half a second **behind** is stepped over at once and handled as
+  the stall it is. The clocks are read through `clock::TimeSource`, so tests set the time
+  (`ManualTime`) instead of sleeping, and the loop without its sleep is `clock::Pacer`.
+  **What is still not solved:** hosts whose wall clocks differ; the time a slew takes — 7 s per
+  tick of offset, during which a crossing between the two shards is a commit that many ticks
+  early or late (waited for, or caught up), so "a replacement started later counts the same
+  ticks" is true to a few milliseconds once it has slewed, not by construction; and a wall
+  clock stepped *back*, which is only slewed (200 s per second of step) and said in the log.
+  On the live stack every shard's line read `clock offset +0.0 ms` for the half hour it ran,
+  the replacement's included.
+- **A tick origin in the future** made `tick_at` saturate at 0: the shard slept until the
+  origin came while it admitted players. Both binaries now refuse such a `--tick-origin`, and a
+  shard refuses a welcome that names one (`SceneClock::origin_refusal`), with a sentence that
+  says by how much.
+- **Inputs could be lost when the commit followed the client's connect within the input
+  lead.** The client tags inputs three ticks ahead and sent each once: the ones it had sent
+  just before its second connection existed reached only the old shard, and a shard dropped
+  whatever a player sent before that player's status had arrived (datagrams are not ordered
+  with the stream). Two ends: the link says the inputs for ticks still to come again the moment
+  the connection is up (`link::resend_tail`), and the accepting shard keeps what the owner of a
+  staged ship sends, status or not. With a connection that comes up as the lead runs out, a
+  ship now flies bit for bit as on one shard, and each shard's record of the ticks it applied
+  an input on (`SimWorld::applied_inputs`) names every tick once.
+  (`inputs_sent_before_a_late_connection_are_said_again_and_kept`,
+  `the_inputs_sent_just_before_a_handoff_connection_are_said_again_on_it`.) "Inputs are never
+  lost" is narrower than it read: no input that reaches a shard in time is lost *to the
+  handoff*; a datagram that is dropped or late is lost as on any tick, and nobody applies the
+  inputs of ticks a stalled shard jumped over.
+- **A snapshot in several chunks lost all but its last on the client** (seen while reading in
+  phase 3, confirmed): each chunk was taken for the whole interest set. `Snapshot` ends with
+  `more` (protocol 7): the client collects the names of every chunk and drops what none of them
+  named when the chunk that says `more: false` arrives; a shard ends a snapshot whose rest
+  despawned with an empty last chunk. (`a_join_snapshot_in_several_chunks_arrives_whole`: nine
+  crates and a ship at 600 B a frame.)
+- **`drain_inputs` on a ghost: refuted.** A ghost is imported without `ShipControls` and
+  without an `Owner`, and every write of `drain_inputs` goes through one of the two: an input
+  filed for a ship that has since been handed away does nothing. Pinned
+  (`a_ghost_takes_no_input_that_was_filed_for_the_ship_it_replaces`); no code changed.
+- **Two players in contact across a border.** Measured first
+  (`two_players_pushing_each_other_across_a_border`, against the same on one shard): each ship
+  met the other's ghost — a kinematic body at the other's velocity, which pushes and cannot be
+  pushed — and was thrown back at the *other's* speed. Two players pushing at each other across
+  `x = -6` bounced apart to 2.3 m and back for as long as they pushed (the gap changing by
+  0.41 m a tick); on one shard they stand, hull to hull. Fixed in `space-sim/src/rigid.rs`
+  (`meeting_velocities`): a **ship's** ghost that is about to touch one ship of this world is
+  presented to the solver at the velocity the two share after an inelastic meeting of equal
+  masses; the other shard does the same from the same two velocities, so no word between the
+  shards is needed. Now: pressed together they stand 0.59 m apart (0.60 on one shard), the gap
+  moving 1.6 mm a tick; one pushing the other moves off with it at 17.6 m/s after eight seconds
+  where one shard gives 19.7 (they are on two shards, a tick behind each other, until the
+  pusher is a metre across). Nothing changes for ghosts of bodies, or for a ghost about to
+  touch several ships. On the live stack, two clients steering at each other from a gentle
+  contact for six seconds: across the border the gap stayed 0.54-0.63 m in every one of 234
+  samples (largest change between two samples 7 cm) while the pair drifted 7.7 m west and the
+  pusher was handed over; the same two on one shard: 0.50-1.15 m (they are frictionless
+  capsules and slide round each other). Corrections up to 1 cm for both players.
+- **The tests were timed against themselves.** `seamless.rs` held whole-flight maxima over
+  thousands of frames to limits taken against the test's own `Instant::now()` (5 cm at 15 m/s is
+  3.3 ms of scheduling). Its bounds are now taken on the app's own frame instants
+  (`DrawnShip::at`) and drawn ticks, with what a long frame explains taken off, **around each
+  change of shard** (1.5 s before to 0.7 s after), and pass under a floor that is the size of
+  defect each is there to catch or within three times the 99.5th percentile of the same flight
+  away from any switch (module docs of the file). The latency test's two ticks of slack are
+  now four on a median — a coarse net — and the exact check is the shards' record of applied
+  inputs: every tick once, through the real send path, at every switch of every crossing test.
+  The three-shard clock tests set the time instead of reading it. The file runs in 2 min 40 s
+  instead of six to seven (one loop instead of two, two standers at once, two players in the
+  border test, turn-rounds without a full stop); the target of under two minutes was not
+  reached: the handoff's second and the three-second settle rule are most of what is left.
+  Pinned to two logical CPUs each, two copies at once, with a release build and a live stack
+  running beside them: 10 runs of `seamless.rs`, one failure — a premise of the test itself
+  (a climb timed by the wall clock ended 20 cm above its upper bound; it now climbs by height)
+  — then 10 of 10 for that test; `handoff.rs` 9 of 10 (a look that read the link twice could
+  miss a handoff between the two; fixed), then 10 of 10; `crossing.rs` and `orchestrated.rs`
+  10 of 10 each.
+- **On the live stack** (clients at 30 frames a second this time, `/state` sampled 50-140
+  times a second). 20 crossings at 8-16 m/s: the drawn ship was off from where the sample
+  before puts it by 3.8 mm at the 99.5th percentile of the samples around a switch (5.5 mm
+  away from one), corrections 0, 1.07-1.15 s from a metre past the border (median 1.11) —
+  phase 3 measured 4.0 mm, 0 and 1.00-1.30 s. (The largest single step, 0.19 m, was the ship
+  running into a floating crate of the zero-g corner 1.5 s before a switch: the shard's word
+  changed by 9 m/s in one tick, and the prediction had it to 0.03 mm.) 10 crossings in fast
+  travel (20-364 m/s): 0.36 m at the 99.5th percentile around a switch, 0.34 m away from one,
+  the largest 0.44 m against 1.19 m elsewhere; corrections 0; 1.09-1.15 s. One shard killed by
+  pid and replaced (new id, next port, scene re-issued): 10 crossings to and from the
+  replacement, 6.5 mm at the 99.5th percentile (5.5 mm away from a switch), corrections 0,
+  1.09-1.13 s. A shard stalled for three seconds in the middle of a handoff into it
+  (`SPACE_DEBUG_STALL_DIR`, a hook for exactly this): the old shard committed on time, the
+  picture stood still for two seconds, and the ship went on from **where its commit put it** —
+  4.7 m behind where the client's prediction had run to, not 30 m ahead of it; the shard logged
+  `could not keep up: it was 91 ticks behind ... jumped` and `90 ticks jumped, 0 caught up`.
+  At the start of the cluster three body transfers were called off by an epoch change (the
+  third and fourth shard were still joining); none after, and none of a player's.
+- **The 16 cm correction of phase 4** is what running into a body costs: the client predicts
+  its ship against *kinematic copies* of the bodies near it, so the first ticks of a collision
+  are predicted against a body that does not give way. Ramming the zero-g corner's crates at
+  2-4 m/s: four corrections over 3 cm (7-13 cm), each with a crate 0.4-0.6 m from the ship,
+  none in free flight. By design; a dynamic copy would be the fix, and is not planned here.
+- **The dev profile's optimised physics** (`rapier3d-f64`, `parry3d-f64` at 3, `space-sim` at
+  2) is what the CI's tests use too — the `test` profile inherits `dev`, package overrides
+  included. A clean build of `space-sim` with its dependencies: 36 s with them, 23 s with all
+  three at 0, on this machine (32 threads, busy with two test runs at the time).
+- **Not verified here.** `.config/nextest.toml`'s new `timing` group was not run: nextest is
+  not installed on this machine (the `cargo test` fallback ran). The Linux job's second pass
+  with `SPACE_SKIP_TIMING=1` was not run either. No wall was put in a stalled ship's way on
+  the live stack: that nothing is brought forward through one rests on the test.
 
 ## 6. Far replicas and level of detail
 
@@ -709,7 +851,8 @@ by body and tick by tick. Numbers below are from it (debug build) unless a live 
   live stack *before* the last of the three rules was written (a ball offered towards a ship
   that was on its way back), not since. The harness clients' prediction was 16 cm off the
   shard's word once in the five minutes of ramming things (`correction_max_m`); where was not
-  looked at.
+  looked at. (Looked at in the review of phase 3, section 5: a ship that runs into a body is
+  corrected, by design — the client predicts against a kinematic copy of the body.)
 
 ## 8. Docker launcher and compose
 
@@ -730,7 +873,8 @@ by body and tick by tick. Numbers below are from it (debug build) unless a live 
 ## 9. The wire (PROTOCOL_VERSION 6 -> 7)
 
 `ShardRegion` + client endpoint. `LoadReport` + entity count, hot cell. `ShardHello` + secret.
-`ShardWelcome` + tick origin. Peer hellos carry the peer token in the existing token field.
+`ShardWelcome` + tick origin. `Snapshot` + `more` (added by the review of phase 3: a snapshot in
+several chunks). Peer hellos carry the peer token in the existing token field.
 Appended variants: `JoinRedirect`, `FarInterest`, `FarUpdate` (`VARIANT_COUNT` 32). The handoff
 messages, the epoch messages and `Hello` keep their layouts.
 
@@ -739,8 +883,9 @@ protocol 6 of its own - the merged demo area: `SceneClock` (tag 28), `PlayerInpu
 `ShipControls` - and that 6 stands as released. Everything of this branch is therefore
 **protocol 7**, on top of it: built so far are `ShardHello` + optional client endpoint + secret,
 `ShardRegion` + client endpoint, `RejectReason::Starting`, the peer token in a shard's hello and
-`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30), and since phase 3 `ShardWelcome` + tick origin
-(`tick_origin_us`, its last field). `FarInterest`/`FarUpdate` (30, 31) and the load report's new
+`JoinRedirect` at tag 29 (`VARIANT_COUNT` 30), since phase 3 `ShardWelcome` + tick origin
+(`tick_origin_us`, its last field), and since its review `Snapshot` + `more` (its last field:
+"further chunks of this snapshot follow"). `FarInterest`/`FarUpdate` (30, 31) and the load report's new
 fields are still to come and stay inside 7 as long as 7 has not been pushed to `main`; once it
 has, the next layout change is 8. (The handoff state's private components are not wire layout:
 the scene-time component got a ninth byte in phase 3.)

@@ -25,7 +25,10 @@
 //! hand at different times count the same ticks without being told anything
 //! — which is what lets one hand a ship to the other without a step. Give
 //! `--peer` shards the same origin if you give one at all. An orchestrated
-//! shard takes none: its welcome names the cluster's.
+//! shard takes none: its welcome names the cluster's. An origin that lies in
+//! the future of this host's clock is refused, here and in a welcome: there
+//! is no tick to run yet, and a shard that waited for one would let players
+//! into a world that does not move.
 //!
 //! # Orchestrated
 //!
@@ -418,6 +421,12 @@ async fn run(options: Options) -> Result<(), String> {
         return run_orchestrated(options, orch_addr).await;
     }
 
+    // Where this shard is on its tick timeline — or the reason it cannot be
+    // on it (an origin that has not come yet), before anything is bound and
+    // any player let in.
+    let clock = space_server::clock::TickClock::new(options.tick_origin_us)
+        .map_err(|why| format!("--tick-origin: {why}"))?;
+
     let net =
         Arc::new(ShardNet::bind(options.bind).map_err(|e| format!("bind {}: {e}", options.bind))?);
     let bound = net.local_addr().map_err(|e| e.to_string())?;
@@ -467,11 +476,7 @@ async fn run(options: Options) -> Result<(), String> {
     // everything the step queued goes out. Standalone shards started at
     // different times — the two of a handoff setup — therefore count the same
     // ticks, as the shards of an orchestrator's cluster do.
-    let ticking = tokio::spawn(space_server::clock::run(
-        shard,
-        net,
-        space_server::clock::TickClock::new(options.tick_origin_us),
-    ));
+    let ticking = tokio::spawn(space_server::clock::run(shard, net, clock));
 
     // `serve` returns only when the endpoint is closed, so in practice the
     // process runs until it is killed. The tick loop is watched too: if it ever

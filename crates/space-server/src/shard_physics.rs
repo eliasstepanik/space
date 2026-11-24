@@ -448,15 +448,29 @@ impl Shard {
             return;
         }
         let mut now = self.stats();
+        // What the line is written for is a change in the counts; the tick
+        // and the clock's offset (never the same twice) ride along.
+        let offset_us = now.clock_offset_us;
         now.tick = 0;
         now.clients = 0;
+        now.clock_offset_us = 0;
         if self.census == Some(now) {
             return;
         }
         self.census = Some(now);
         println!(
-            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts; handoffs {} out, {} in, {} aborted",
-            self.config.shard, now.ships, now.bodies, now.ghosts, now.handed_off, now.received, now.aborted
+            "space-server: {} at tick {tick}: {} ships, {} bodies, {} ghosts; handoffs {} out, \
+             {} in, {} aborted; {} ticks jumped, {} caught up; clock offset {:+.1} ms",
+            self.config.shard,
+            now.ships,
+            now.bodies,
+            now.ghosts,
+            now.handed_off,
+            now.received,
+            now.aborted,
+            now.skipped,
+            now.caught_up,
+            offset_us as f64 / 1e3
         );
     }
 
@@ -1117,10 +1131,9 @@ impl Shard {
         }
         self.drop_ghost(guid, false);
         // What it has done since the state was taken, if the commit came
-        // late: on along its velocity (guarantee 4).
-        let late = pending
-            .state_tick
-            .map_or(0, |at| self.sim.tick().saturating_sub(at));
+        // late: on along its velocity (guarantee 4) — a few ticks at most,
+        // never the seconds of a stall (`PendingCommit::catch_up_at`).
+        let late = pending.catch_up_at(self.sim.tick());
         self.stats.caught_up += late;
         let components = advanced_components(pending.components, late);
         let components = carried_components(&self.sim, components, pending.scene_time);

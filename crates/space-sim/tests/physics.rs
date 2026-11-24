@@ -1003,6 +1003,70 @@ fn export_import_round_trip_and_hostile_lists() {
     }
 }
 
+/// Inputs that were filed for a ship while this world simulated it are not
+/// applied once the ship has been handed away and is a ghost here: the ghost
+/// keeps the controls and the velocity its owner reports.
+///
+/// This holds because a ghost is given neither `ShipControls` nor an
+/// `Owner` when it is imported, and every write of `drain_inputs` goes
+/// through one of the two.
+///
+/// Mutation this catches: a ghost that is imported like a ship, with
+/// controls and an owner (the old player's input then leaves fast travel
+/// for it and clamps its velocity to the normal top speed — the ship a
+/// neighbour is flying at 300 m/s is shown, and collided with, at 120 — and
+/// the old session's `input_ack` runs on for inputs nobody applied).
+#[test]
+fn a_ghost_takes_no_input_that_was_filed_for_the_ship_it_replaces() {
+    let o = WorldPos::ZERO;
+    let mut here = SimWorld::new(ShardId(1));
+    let mut state = ShipState::at_rest(at(o, [0.0, 50.0, 0.0]));
+    state.vel = [300.0, 0.0, 0.0];
+    let entity = here.spawn_ship(guid(7), 5, state);
+    here.world_mut()
+        .get_mut::<space_sim::ShipControls>(entity)
+        .expect("a ship has controls")
+        .fast = true;
+    // The player's inputs for the next three ticks: fast travel off.
+    let now = here.tick();
+    let inputs: Vec<PlayerInput> = (1..=3)
+        .map(|i| PlayerInput {
+            entity: guid(7),
+            thrust: [0.0, 0.0, 1.0],
+            torque: [0.0; 3],
+            tick: now + i,
+            fast: false,
+        })
+        .collect();
+    here.apply_inputs(now, &inputs);
+    assert_eq!(here.buffered_input_count(), 3);
+    // The ship is handed away: it leaves, and its ghost takes its place.
+    let components = here.export_entity(guid(7)).expect("exports");
+    here.despawn(guid(7));
+    here.insert_ghost(guid(7), &components).expect("a ghost");
+    let before = here.export_entity(guid(7)).expect("the ghost exports");
+    for _ in 0..3 {
+        here.step();
+    }
+    assert_eq!(here.buffered_input_count(), 0);
+    assert_eq!(
+        here.state_of(guid(7)).expect("the ghost").vel,
+        [300.0, 0.0, 0.0],
+        "the ghost's velocity is its owner's word"
+    );
+    assert_eq!(
+        here.export_entity(guid(7)).expect("the ghost exports"),
+        before,
+        "no component of the ghost was touched"
+    );
+    assert_eq!(
+        here.input_ack(5),
+        0,
+        "nothing was applied for the old session"
+    );
+    assert_eq!(here.input_ack(0), 0, "nor for nobody's");
+}
+
 /// A ghost driven from outside pushes a dynamic body of this world and is
 /// never integrated here; a spring owned by a ghost pulls on this world's end.
 #[test]

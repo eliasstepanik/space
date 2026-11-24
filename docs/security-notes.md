@@ -307,6 +307,23 @@ by default.
 * **Never drive a client with OS-level input** (SendKeys, xdotool, clipboard):
   that is not a harness, it types into whatever has focus. See `AGENT.md`.
 
+## The shard's stall hook (`SPACE_DEBUG_STALL_DIR`)
+
+`space-server` has one debugging hook in its tick loop (`space-server/src/clock.rs`,
+`debug_stall`): when the environment variable `SPACE_DEBUG_STALL_DIR` names a directory, a file
+`stall-<shard id>` in it holding a number of milliseconds (60 000 at most) makes that shard's loop
+stand still that long, once; the file is removed first. It exists to look at what a suspended
+shard does (`skills/space-visual-test/SKILL.md`).
+
+* **Off unless the variable is set**, and nothing sets it: not the compose files, not the dev
+  scripts. The orchestrator's `process` launcher passes its own environment on to the shards it
+  starts (minus its secrets), so a variable set for the orchestrator reaches them — set it only
+  for such a test.
+* **It is not a network surface.** Nothing a peer or a player sends reaches it; it reads a file
+  name it builds itself from the shard's own id, in a directory the operator named. Whoever can
+  write into that directory can stall the shard — as they could stop it. It gives nothing else:
+  the file's content is parsed as a number and used for nothing but a sleep.
+
 ## Known limitations (Phase 3 close-out)
 
 * The H13 frame-gap test relies on lockstepped harness ticks; production continuity rests on the separately-tested commit-gate machinery.

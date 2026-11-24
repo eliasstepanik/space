@@ -294,7 +294,13 @@ Check what your change touches, and one step either side of it.
   1.6 s from a metre past the border is a defect, and so is a client log
   line `does not take this client`, a shard log line `the handoff of the
   player's ship ... was called off`, or one `could not keep up` (a shard
-  that fell behind the cluster clock). A second client that only looks on
+  that fell behind the cluster clock). Every shard's census line (every
+  5 s when its counts change) ends with `N ticks jumped, M caught up; clock
+  offset +0.3 ms`: how far its tick clock was from the wall clock when it
+  last looked. More than a few milliseconds for longer than it takes to
+  slew (7 s per tick of offset) is a defect; a line `was ... s behind the
+  wall clock` or `is ... s ahead of the wall clock` says a host's clock was
+  stepped or the host suspended. A second client that only looks on
   keeps its `shard`, `session` and `handoffs` while the first crosses, also
   when the first flies right past it: a player's ship is handed over for
   where it is, not for who is near (`space-server/src/border.rs`, "Players'
@@ -357,6 +363,18 @@ Check what your change touches, and one step either side of it.
   where a player was is not kept). While the root's shard is being replaced
   the player port answers "the cluster is starting"; afterwards
   `player_port.sends_to_shard` names the replacement.
+- **A stalled shard** (a suspended host, a debugger): start the stack with
+  `SPACE_DEBUG_STALL_DIR` set to a directory (the orchestrator hands its
+  environment to the shards it starts). A file `stall-<shard id>` in it
+  holding a number of milliseconds makes that shard stand still that long,
+  once, the next time its loop turns (the file is removed; the shard logs
+  `stalls for N ms`), and then find itself behind: it logs `could not keep
+  up ... jumped` and its census line counts the ticks. Cross into it while
+  it stands: the client keeps playing on the shard it was on, the handoff
+  completes when the stalled shard is back, and the ship is **where its
+  commit put it** — not brought forward by the seconds of the stall
+  (`caught up` stays 0 for a stall over half a second). The variable is
+  for this test only; unset, the hook is one environment lookup a tick.
 - **Handoff:** `--topology two-shards`, fly across (the border is at HUD
   `pos` x = 512); the picture must not jump and the scene must stay where it
   was. Players and bodies within 64 m (plus 3 s of their motion) of a border

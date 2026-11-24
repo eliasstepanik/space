@@ -240,6 +240,11 @@ pub struct AppConfig {
 /// The own ship as a frame drew it ([`App::drawn_ship`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawnShip {
+    /// The instant the frame was drawn for: the one reading of the monotonic
+    /// clock the frame's draw clock and prediction were advanced to. The time
+    /// between two frames' is exactly the time the app let pass between
+    /// them, whenever whoever drives it gets to look.
+    pub at: Instant,
     /// The fractional tick of the shard's clock it was drawn at.
     pub tick: f64,
     /// Where, metres from the scene's spawn point (what the HUD's `pos`
@@ -271,12 +276,15 @@ struct Session {
     own: Option<OwnShip>,
     /// The own ship as drawn this frame.
     shown: Option<Shown>,
+    /// The instant this frame was advanced to ([`DrawnShip::at`]).
+    shown_at: Option<Instant>,
 }
 
 impl Session {
     /// The frame's bookkeeping: the clock, and the own ship's prediction
     /// (rebuilt for a new ship, shard, scene or anchor).
     fn advance(&mut self, scene: space_protocol::Scene, now: Instant) {
+        self.shown_at = Some(now);
         self.clock.update(&self.replica, now);
         let sent = self.link.take_sent();
         let stale = self
@@ -711,6 +719,7 @@ impl App {
             clock: Clock::new(),
             own: None,
             shown: None,
+            shown_at: None,
         }));
     }
 
@@ -907,6 +916,7 @@ impl App {
         };
         let (shown, anchor) = (session.shown?, session.replica.anchor()?);
         Some(DrawnShip {
+            at: session.shown_at?,
             tick: shown.tick,
             position: WorldPos::delta(anchor, shown.state.pos),
             velocity: shown.state.vel,

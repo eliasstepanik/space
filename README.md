@@ -248,7 +248,8 @@ commit, and the HUD changes to `shard 2  handoffs 1` without the view jumping.
 
 The shards of a cluster count the same ticks — from the cluster's tick
 origin, which the orchestrator hands every shard it welcomes and a standalone
-shard takes from `--tick-origin` (both default to one fixed instant) — so a
+shard takes from `--tick-origin` (both default to one fixed instant; one that
+lies in the future is refused) — so a
 tick number names the same instant on every shard. The accepting shard
 installs the ship on the tick its committed state describes, with the inputs
 the client has been sending to both shards since it was redirected, and the

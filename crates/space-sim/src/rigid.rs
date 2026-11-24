@@ -394,6 +394,9 @@ struct Entry {
     entity: Entity,
     ghost: bool,
     ship: bool,
+    /// A ghost of a **ship** (its owner flies it with `ShipControls`): see
+    /// [`meeting_velocities`].
+    ship_ghost: bool,
     parts: Vec<PartPhys>,
     joints: Vec<JointDef>,
     bubble: Option<BubbleId>,
@@ -471,6 +474,78 @@ struct Work {
     pushed_v: Vec<Vector>,
     pushed_w: Vec<Vector>,
     pushed_com: Vec<Vector>,
+}
+
+/// The velocity each **ship's ghost** of a bubble is presented to the solver
+/// at this tick, where that is not the velocity its owner reported.
+///
+/// A ghost is a kinematic body: it pushes with the velocity it is given and
+/// cannot be pushed. That is right for what rests on it, and wrong for two
+/// **ships** that run into each other across a shard border — each shard
+/// simulates its own and holds the other as a ghost, so each ship met an
+/// immovable object coming at it and was thrown back at the *other's* speed:
+/// the two exchanged velocities (a perfectly elastic collision) where on one
+/// shard they stop against each other, and two players pushing at each other
+/// across a border bounced metres apart, again and again.
+///
+/// So a ship's ghost that is closing in on **one** ship of this world and
+/// will touch it within the tick is presented with the velocity the two
+/// share after an inelastic meeting of equal masses — the mean of the two,
+/// along the line between them (every ship has the same mass). The other
+/// shard does the same with the roles swapped, from the same two velocities,
+/// so both ships come out at that shared velocity without a word between the
+/// shards: pushed against each other they stand, and one pushing the other
+/// moves off with it at half the thrust's acceleration, as on one shard.
+/// Nothing is changed for a ghost that is not a ship's, that is moving away,
+/// or that is about to touch several ships at once.
+fn meeting_velocities(
+    members: &BTreeSet<EntityGuid>,
+    index: &BTreeMap<EntityGuid, usize>,
+    work: &[Work],
+    entries: &BTreeMap<EntityGuid, Entry>,
+) -> BTreeMap<EntityGuid, [f64; 3]> {
+    let reach = |e: &Entry| {
+        e.parts
+            .first()
+            .map_or(0.0, |p| p.shape.compute_local_bounding_sphere().radius())
+    };
+    let mut out = BTreeMap::new();
+    for g in members {
+        let e = &entries[g];
+        let wg = &work[index[g]];
+        if !e.ship_ghost || !wg.alive || wg.states.is_empty() {
+            continue;
+        }
+        let ghost = wg.states[0];
+        let v_ghost = f64s(ghost.vel);
+        let mut met: Option<[f64; 3]> = None;
+        let mut ships = 0;
+        for o in members {
+            let eo = &entries[o];
+            let wo = &work[index[o]];
+            if !eo.ship || !wo.alive || wo.next.is_empty() {
+                continue;
+            }
+            // From the ghost to the ship, and how fast the gap closes.
+            let d = WorldPos::delta(ghost.pos, wo.states[0].pos);
+            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if dist < 1e-9 {
+                continue;
+            }
+            let n = d.map(|c| c / dist);
+            let v_ship = f64s(wo.next[0].vel);
+            let closing: f64 = (0..3).map(|k| (v_ghost[k] - v_ship[k]) * n[k]).sum();
+            if closing <= 0.0 || dist > reach(e) + reach(eo) + closing * f64::from(DT) {
+                continue;
+            }
+            ships += 1;
+            met = Some([0, 1, 2].map(|k| v_ghost[k] - 0.5 * closing * n[k]));
+        }
+        if let (1, Some(shared)) = (ships, met) {
+            out.insert(*g, shared);
+        }
+    }
+    out
 }
 
 /// The rigid-body world of a [`crate::SimWorld`]. See the [module docs](self).
@@ -1109,6 +1184,7 @@ impl Physics {
                 entity,
                 ghost,
                 ship: ship && !ghost,
+                ship_ghost: false,
                 parts,
                 joints,
                 bubble: None,
@@ -1122,6 +1198,14 @@ impl Physics {
             },
         );
         Ok(())
+    }
+
+    /// Say whether the ghost `guid` is a ghost of a ship (a ghost has no
+    /// `ShipControls` of its own to tell by).
+    pub(crate) fn mark_ship_ghost(&mut self, guid: EntityGuid, ship_ghost: bool) {
+        if let Some(e) = self.entries.get_mut(&guid) {
+            e.ship_ghost = e.ghost && ship_ghost;
+        }
     }
 
     /// Remove an entity from the physics (its ECS entity is the caller's).
@@ -1462,6 +1546,7 @@ impl Physics {
             if !needs {
                 continue;
             }
+            let meeting = meeting_velocities(&b.members, &index, &work, &self.entries);
             for g in &b.members {
                 let k = index[g];
                 let e = &self.entries[g];
@@ -1485,7 +1570,13 @@ impl Physics {
                     let lin = v3(f64s(n.vel));
                     let ang = v3(rotate(s.quat, f64s(n.ang_vel)));
                     if e.ghost || !part.dynamic {
-                        rb.set_linvel(v3(f64s(s.vel)), false);
+                        // (A ship's ghost about to meet a ship of this world
+                        // is presented at the velocity the two will share.)
+                        let vel = match meeting.get(g) {
+                            Some(shared) if p == 0 => *shared,
+                            _ => f64s(s.vel),
+                        };
+                        rb.set_linvel(v3(vel), false);
                         rb.set_angvel(v3(rotate(s.quat, f64s(s.ang_vel))), false);
                         continue;
                     }

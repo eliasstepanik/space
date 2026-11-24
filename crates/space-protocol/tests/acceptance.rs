@@ -136,6 +136,7 @@ fn all_messages() -> Vec<Message> {
             epoch: 7,
             entities: (0..5).map(|i| entity(1, i, 3)).collect(),
             input_ack: 98,
+            more: false,
         }),
         Message::Delta(Delta {
             tick: 100,
@@ -416,6 +417,7 @@ fn oversized_rejected() {
         epoch: 1,
         entities: (0..200_000u64).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     });
     let err = try_encode_frame(&huge).expect_err("must not encode an oversized frame");
     assert!(matches!(err, CodecError::Oversized { .. }), "{err:?}");
@@ -430,6 +432,7 @@ fn truncated_rejected() {
         epoch: 1,
         entities: (0..4).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     }));
 
     // Shorter than the header.
@@ -618,6 +621,7 @@ fn guid_stable_across_handoff() {
         epoch: 7,
         entities: vec![entity(1, original.serial, 2)],
         input_ack: 0,
+        more: false,
     });
     let Message::Snapshot(back) = decode_frame(&encode_frame(&snap)).expect("snapshot decodes")
     else {
@@ -931,6 +935,7 @@ impl Rng {
                 epoch: self.next_u64(),
                 entities: self.entities(),
                 input_ack: self.next_u64(),
+                more: false,
             }),
             5 => Message::Delta(Delta {
                 tick: self.next_u64(),
@@ -1153,15 +1158,17 @@ fn delta_size_sanity() {
     assert!(frame.len() < 20 * 1024 + FRAME_HEADER_LEN);
 
     // The same corpus as a Snapshot costs less: a `Delta` additionally carries
-    // `base_tick` (8 B) and the `removed` length prefix (8 B when empty).
+    // `base_tick` (8 B) and the `removed` length prefix (8 B when empty); a
+    // `Snapshot` carries `more` (1 B: "further chunks follow", protocol 7).
     let snap = Message::Snapshot(Snapshot {
         tick: 1_000,
         shard: shard(1),
         epoch: 7,
         entities: (0..100u64).map(|i| entity(1, i, 3)).collect(),
         input_ack: 0,
+        more: false,
     });
-    assert_eq!(encode_frame(&snap).len() + 16, frame.len());
+    assert_eq!(encode_frame(&snap).len() + 15, frame.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,6 +1198,7 @@ fn remediation_fields_roundtrip() {
         epoch: 2,
         entities: Vec::new(),
         input_ack: 9,
+        more: false,
     });
     let Message::Snapshot(back) = decode_frame(&encode_frame(&m)).unwrap() else {
         unreachable!()

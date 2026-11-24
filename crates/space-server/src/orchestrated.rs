@@ -350,6 +350,22 @@ pub async fn start_orchestrated(
     options: OrchestratedOptions,
     orch_addr: SocketAddr,
 ) -> Result<RunningShard, String> {
+    let time = Arc::new(crate::clock::SystemTime::new());
+    start_orchestrated_on(options, orch_addr, time).await
+}
+
+/// [`start_orchestrated`] on the clocks `time` instead of the host's: for a
+/// test that decides what time it is ([`crate::clock::ManualTime`]).
+///
+/// # Errors
+///
+/// As [`start_orchestrated`]; and the welcome names a tick origin that lies
+/// in the future of `time`'s wall clock.
+pub async fn start_orchestrated_on(
+    options: OrchestratedOptions,
+    orch_addr: SocketAddr,
+    time: Arc<dyn crate::clock::TimeSource>,
+) -> Result<RunningShard, String> {
     // Bind first (whatever `options.bind` says; the binary defaults it to the
     // fixed `127.0.0.1:7777`): without `advertise` the endpoint we
     // report is the one we listen on. With it, we report that address instead,
@@ -365,6 +381,19 @@ pub async fn start_orchestrated(
         Err(why) => {
             net.close();
             return Err(format!("orchestrator handshake: {why}"));
+        }
+    };
+
+    // The cluster's clock: this shard counts the ticks every other shard of
+    // the cluster counts, from the origin the welcome names — whenever it
+    // was started, a replacement included (`crate::clock`). An origin this
+    // host's clock has not reached yet cannot be run on: refuse, before
+    // anything is served (the orchestrator sees the link close and says so).
+    let clock = match crate::clock::TickClock::on(welcome.tick_origin_us, time) {
+        Ok(clock) => clock,
+        Err(why) => {
+            net.close();
+            return Err(format!("the orchestrator's welcome: {why}"));
         }
     };
 
@@ -409,14 +438,7 @@ pub async fn start_orchestrated(
         tokio::spawn(async move { net.serve(shard).await })
     };
     let state = Arc::clone(&shard);
-    // The cluster's clock: this shard counts the ticks every other shard of
-    // the cluster counts, from the origin the welcome names — whenever it
-    // was started, a replacement included (`crate::clock`).
-    let ticking = tokio::spawn(crate::clock::run(
-        shard,
-        Arc::clone(&net),
-        crate::clock::TickClock::new(welcome.tick_origin_us),
-    ));
+    let ticking = tokio::spawn(crate::clock::run(shard, Arc::clone(&net), clock));
     // No orchestrator, no shard: stop serving and ticking the moment the
     // link is lost, whoever is (or is not) waiting on `RunningShard::wait`.
     let watchdog = {

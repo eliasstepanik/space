@@ -66,12 +66,15 @@ impl Running {
 /// the tick clock a standalone `space-server` runs on (`clock::run` with the
 /// default tick origin): both shards count the same ticks.
 fn start(id: u32, region: NodeRef) -> Running {
+    start_with(id, region, |_| {})
+}
+
+/// [`start`], with the shard's configuration changed by `tune` first.
+fn start_with(id: u32, region: NodeRef, tune: impl FnOnce(&mut ShardConfig)) -> Running {
     let net = Arc::new(ShardNet::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind"));
-    let shard = Arc::new(AsyncMutex::new(Shard::new(ShardConfig::new(
-        ShardId::new(id),
-        net.local_addr().expect("addr"),
-        region,
-    ))));
+    let mut config = ShardConfig::new(ShardId::new(id), net.local_addr().expect("addr"), region);
+    tune(&mut config);
+    let shard = Arc::new(AsyncMutex::new(Shard::new(config)));
     let serve = tokio::spawn({
         let (net, shard) = (Arc::clone(&net), Arc::clone(&shard));
         async move {
@@ -81,7 +84,8 @@ fn start(id: u32, region: NodeRef) -> Running {
     let ticker = tokio::spawn(space_server::clock::run(
         Arc::clone(&shard),
         Arc::clone(&net),
-        space_server::clock::TickClock::new(space_protocol::SceneClock::DEFAULT_ORIGIN_US),
+        space_server::clock::TickClock::new(space_protocol::SceneClock::DEFAULT_ORIGIN_US)
+            .expect("the default origin is in the past"),
     ));
     Running {
         net,
@@ -291,7 +295,10 @@ impl<'a> Flight<'a> {
         self.link.set_thrust([thrust_x, 0.0, 0.0]);
         for _ in 0..3_000 {
             self.look();
-            if self.link.replica().handoffs >= handoffs {
+            // (What the look saw, not a second reading of the link: a
+            // handoff that completes between the two would end the flight
+            // without ever having been looked at.)
+            if self.handoffs >= handoffs {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -810,6 +817,7 @@ async fn a_handoff_connection_the_accepting_shard_ended_is_not_reused() {
         epoch: 1,
         entities: vec![ship(ours, 7), ship(theirs, 8)],
         input_ack: 0,
+        more: false,
     }))
     .await
     .expect("the snapshot");
@@ -877,6 +885,7 @@ async fn a_handoff_connection_the_accepting_shard_ended_is_not_reused() {
             epoch: 1,
             entities: vec![ship(placeholder, 42)],
             input_ack: 0,
+            more: false,
         }))
         .await
         .expect("a frame");
@@ -948,4 +957,172 @@ async fn the_client_learns_the_scene_on_join_and_follows_a_change() {
 
     link.close();
     shard.stop();
+}
+
+/// A join snapshot that needs several frames arrives whole: a shard whose
+/// frames carry two or three entities each has nine crates floating around
+/// the spawn point, so the snapshot a new player is sent goes out in at
+/// least three chunks, a tick apart — and the client holds all ten entities
+/// afterwards, and still a second later.
+///
+/// Mutation this catches (client): taking each `Snapshot` message for the
+/// whole interest set — only the last chunk's entities are left, and the
+/// shard never sends the others again (they rest, and it counts them as
+/// known). Mutation (shard): chunks that do not say that more follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_snapshot_in_several_chunks_arrives_whole() {
+    use space_sim::body::Body;
+    use space_sim::shape::ShapeRef;
+    use space_sim::{BodySpawn, ShipState};
+
+    let region = NodeRef::new(64, [0, 0, 0]);
+    // 600 B a frame: two or three entities (a ship is about 160 B).
+    let a = start_with(1, region, |config| config.frame_budget = 600);
+    let spawn = space_client::link::map_anchor(&ShardMap::new(
+        1,
+        vec![ShardRegion::new(region, ShardId::new(1), a.addr())],
+    ))
+    .expect("an anchor");
+    let mut crates = Vec::new();
+    {
+        let mut shard = a.shard.lock().await;
+        for i in 0..9 {
+            let at =
+                WorldPos::from_f64_metres_around(spawn, [20.0 + 3.0 * f64::from(i), 2.0, 10.0]);
+            let body = Body::dynamic(ShapeRef::cuboid([0.3; 3]));
+            crates.push(
+                shard
+                    .spawn_body(BodySpawn::new(ShipState::at_rest(at), body))
+                    .expect("a crate"),
+            );
+        }
+    }
+    let link = ServerLink::connect(a.addr()).await.expect("joined");
+    let whole = eventually(10, || {
+        let replica = link.replica();
+        replica.ship.is_some() && crates.iter().all(|g| replica.entity(*g).is_some())
+    })
+    .await;
+    let replica = link.replica();
+    assert!(
+        whole,
+        "the client holds {} of the 9 crates",
+        crates
+            .iter()
+            .filter(|g| replica.entity(**g).is_some())
+            .count()
+    );
+    // And keeps them: nothing a later chunk or delta says takes one away.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let replica = link.replica();
+    assert_eq!(
+        replica.tracked().count(),
+        10,
+        "nine crates and the own ship"
+    );
+    assert!(crates.iter().all(|g| replica.entity(*g).is_some()));
+    link.close();
+    a.stop();
+}
+
+/// The ticks of the inputs `conn` receives as datagrams within `within`.
+async fn input_ticks(conn: &space_net::Conn, within: Duration) -> Vec<u64> {
+    let mut ticks = Vec::new();
+    let end = tokio::time::Instant::now() + within;
+    while let Ok(Ok(Some(message))) = tokio::time::timeout_at(end, conn.recv_datagram()).await {
+        if let Message::InputTick(batch) = message {
+            ticks.extend(batch.inputs.iter().map(|input| input.tick));
+        }
+    }
+    ticks
+}
+
+/// The link tags its inputs a few ticks ahead and sends each once. When it
+/// follows a redirect, the inputs it sent **just before** the second
+/// connection existed are for ticks the accepting shard may be the one to
+/// simulate (a commit that follows the connection at once): the link says
+/// them again on the new connection, through the path every input takes.
+///
+/// Mutation this catches: opening the connection and only sending what comes
+/// after (the accepting shard never hears the last few ticks sent before:
+/// the ship coasts through them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inputs_sent_just_before_a_handoff_connection_are_said_again_on_it() {
+    use space_protocol::{EntityGuid, EntitySnapshot, Redirect, Snapshot};
+    let (id_a, id_b) = (ShardId::new(1), ShardId::new(2));
+    let mut shard_a = StandIn::start(id_a, 7);
+    let mut shard_b = StandIn::start(id_b, 40);
+    let map = ShardMap::new(
+        1,
+        vec![
+            ShardRegion::new(NodeRef::new(64, [0, 0, 0]), id_a, shard_a.addr),
+            ShardRegion::new(NodeRef::new(64, [1, 0, 0]), id_b, shard_b.addr),
+        ],
+    );
+    *shard_a.map.lock().expect("map") = map.clone();
+    *shard_b.map.lock().expect("map") = map.clone();
+    let link = ServerLink::join(shard_a.addr).await.expect("join A");
+    let (on_a, _) = shard_a
+        .arrival(Duration::from_secs(5))
+        .await
+        .expect("the link's connection");
+    let ours = EntityGuid::new(id_a, 1);
+    let spawn = space_scene::scene_anchor(&map).expect("an anchor");
+    let frame = |tick: u64| {
+        Message::Snapshot(Snapshot {
+            tick,
+            shard: id_a,
+            epoch: 1,
+            entities: vec![EntitySnapshot::new(
+                ours,
+                vec![
+                    (
+                        <space_sim::Owner as space_ecs::ComponentDef>::ID,
+                        space_protocol::codec::encode_raw(&7u64),
+                    ),
+                    (
+                        <space_sim::ShipState as space_ecs::ComponentDef>::ID,
+                        space_sim::wire::encode_ship_state(&space_sim::ShipState::at_rest(spawn)),
+                    ),
+                ],
+            )],
+            input_ack: 0,
+            more: false,
+        })
+    };
+    // A's frames, a tick apart, for a third of a second: the link flies.
+    for tick in 200..210u64 {
+        on_a.send(&frame(tick)).await.expect("a frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(eventually(5, || link.replica().ship == Some(ours)).await);
+    // What A has been sent so far: inputs up to a few ticks past its frames.
+    let sent_to_a = input_ticks(&on_a, Duration::from_millis(60)).await;
+    let newest = *sent_to_a.iter().max().expect("the link sends inputs");
+    assert!(newest > 209, "tagged ahead of the newest frame: {newest}");
+    // The handoff: the link dials B.
+    on_a.send(&Message::Redirect(Redirect {
+        entity: ours,
+        new_shard: id_b,
+        shard_map: map.clone(),
+        activation_tick: 300,
+    }))
+    .await
+    .expect("a redirect");
+    let (on_b, _) = shard_b
+        .arrival(Duration::from_secs(5))
+        .await
+        .expect("the link follows the redirect");
+    let said_to_b = input_ticks(&on_b, Duration::from_millis(400)).await;
+    // Every tick after A's newest frame that the link had already sent an
+    // input for: B hears them too.
+    let missing: Vec<u64> = (210..=newest).filter(|t| !said_to_b.contains(t)).collect();
+    assert!(
+        missing.is_empty(),
+        "B was never told the inputs for ticks {missing:?} (sent to A up to {newest}; B heard \
+         {said_to_b:?})"
+    );
+    link.close();
+    shard_a.task.abort();
+    shard_b.task.abort();
 }

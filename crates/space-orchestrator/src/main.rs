@@ -89,11 +89,14 @@
 //! `--tick-origin <unix microseconds>` is the instant of the cluster's tick
 //! 0. Every shard is handed it in its welcome and counts its ticks from it
 //! (tick `n` is due `n / 30 s` after it), so a tick number names the same
-//! instant on every shard — whenever each was started, a replacement
-//! included — and a player's ship can be handed from one to the next without
-//! a step (`space_server::clock`). The default is a fixed instant
-//! (2026-01-01T00:00:00Z, the one a standalone shard uses too); there is
-//! rarely a reason to give another.
+//! instant on every shard — whenever each was started: each keeps its tick
+//! clock on the host's wall clock (`space_server::clock`), so a replacement
+//! started later is on the same ticks to within milliseconds — and a
+//! player's ship can be handed from one to the next without a step. The
+//! default is a fixed instant (2026-01-01T00:00:00Z, the one a standalone
+//! shard uses too); there is rarely a reason to give another. One that lies
+//! in the future of this host's clock is refused: there is no tick to run
+//! yet.
 //!
 //! # Shards
 //!
@@ -625,6 +628,14 @@ async fn run(options: Options, started: Instant) -> Result<(), String> {
         webui,
     } = options;
     let webui = webui.map(|webui| webui.with_started(started));
+    // A tick origin that has not come yet: every shard would refuse its
+    // welcome (there is no tick to run). Say so here, once, instead.
+    if let Some(why) = space_protocol::SceneClock::origin_refusal(
+        config.tick_origin_us,
+        space_server::config::wall_clock_us(),
+    ) {
+        return Err(format!("--tick-origin: {why}"));
+    }
     // The peer token shards present to each other: the one given, else one
     // made now (from the web UI form token's source). Never printed.
     let peer_token = peer_token

@@ -12,23 +12,24 @@
 //! |---|---|
 //! | [`a_ship_handed_over_flies_as_if_it_never_changed_shard`] | H2, H4, H5 on the cluster clock: one simulator at every tick, no tick lost, no input lost or applied twice |
 //! | [`a_late_commit_is_caught_up_with_the_inputs_of_the_ticks_it_missed`] | the catch-up, and the inputs a player sends to both shards |
+//! | [`inputs_sent_before_a_late_connection_are_said_again_and_kept`] | a connection that comes up within the input lead of the commit loses no input |
 //! | [`a_commit_that_arrives_early_waits_for_its_tick`] | no double step |
 //! | [`a_standing_players_ship_is_not_handed_over_when_another_flies_past`] | a player's ship moves for where it is, not with an island |
 //! | [`a_players_handoff_is_not_called_off_by_bodies_going_the_other_way`] | the crossing rule and a refused body never cost a player its handoff |
 //! | [`a_refused_body_does_not_call_off_the_ship_it_travels_with`] | the bodies of a player's island travel with the ship; the ship waits for none of them |
-//! | [`shards_started_seconds_apart_count_the_same_ticks`] | the cluster clock, with real tick loops |
+//! | [`a_commit_installed_after_a_stall_is_not_brought_forward_by_the_stall`] | the catch-up is bounded when the entity is installed, not only when its commit arrives |
+//! | [`two_players_pushing_each_other_across_a_border`] | two ships in contact across a border behave as on one shard: no bounce, no pass-through |
+//! | [`shards_started_seconds_apart_count_the_same_ticks`] | the cluster clock, with the binary's tick loop on a clock the test sets |
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use space_protocol::{
     EntityGuid, InputTick, Message, NeighbourStatus, PlayerInput, SceneClock, ShardId, ShardMap,
     ShardRegion,
 };
-use space_server::clock::TickClock;
-use space_server::handoff::HANDOFF_LEAD;
+use space_server::clock::{ManualTime, Pacer, TickClock, MAX_TICK_BURST};
+use space_server::handoff::{HANDOFF_LEAD, MAX_CATCH_UP};
 use space_server::shard::{Destination, Shard};
 use space_server::ShardConfig;
 use space_sim::body::{Body, MassSpec};
@@ -200,6 +201,16 @@ struct Pilot {
     /// The first frame of each shard after the first, by shard: `(tick,
     /// input_ack)`.
     first_frames: HashMap<ShardId, (u64, u64)>,
+    /// How many turns the pilot takes to get through to the shard a
+    /// redirect names (a slow connect); 0 = within the turn.
+    connect_takes: u64,
+    /// A redirect being followed: the shard, and the turns left.
+    dialing: Option<(ShardId, u64)>,
+    /// Whether a shard that has just been connected to is told the inputs
+    /// already sent for ticks to come (`space_client::link::resend_tail`).
+    resends: bool,
+    /// The inputs sent last, oldest first.
+    recent: Vec<PlayerInput>,
 }
 
 impl Pilot {
@@ -218,6 +229,10 @@ impl Pilot {
             next: None,
             redirects: 0,
             first_frames: HashMap::new(),
+            connect_takes: 0,
+            dialing: None,
+            resends: true,
+            recent: Vec::new(),
         }
     }
 
@@ -227,23 +242,56 @@ impl Pilot {
     fn act(&mut self, c: &mut Cluster, thrust: [f32; 3]) {
         for m in c.frames_for(self.on, self.session) {
             let Message::Redirect(r) = m else { continue };
-            if r.entity != self.ship || self.next.is_some() {
+            if r.entity != self.ship || self.next.is_some() || self.dialing.is_some() {
                 continue;
             }
             self.redirects += 1;
-            let welcome = c
-                .shard_mut(r.new_shard)
-                .join(&space_net::hello(&self.token))
-                .expect("the accepting shard admits the ship's player");
-            c.shard_mut(r.new_shard).client_status(
-                welcome.session,
-                NeighbourStatus {
-                    entity: self.ship,
-                    shard: r.new_shard,
-                    connected: true,
-                },
-            );
-            self.next = Some((r.new_shard, welcome.session));
+            self.dialing = Some((r.new_shard, self.connect_takes));
+        }
+        // The connection to the shard the redirect names is up (now, or some
+        // turns after the redirect): hello, the inputs already sent for
+        // ticks to come, then the status that opens the commit's gate.
+        if let Some((to, left)) = self.dialing {
+            if left > 0 {
+                self.dialing = Some((to, left - 1));
+            } else {
+                self.dialing = None;
+                let welcome = c
+                    .shard_mut(to)
+                    .join(&space_net::hello(&self.token))
+                    .expect("the accepting shard admits the ship's player");
+                let newest = c.shard(self.on).sim().tick();
+                let tail: Vec<PlayerInput> = self
+                    .recent
+                    .iter()
+                    .filter(|input| input.tick > newest)
+                    .copied()
+                    .collect();
+                if self.resends && !tail.is_empty() {
+                    let batch = InputTick {
+                        tick: tail[tail.len() - 1].tick,
+                        seq: 0,
+                        inputs: tail,
+                        ack_tick: 0,
+                    };
+                    c.shard_mut(to).apply_input(welcome.session, &batch);
+                }
+                c.shard_mut(to).client_status(
+                    welcome.session,
+                    NeighbourStatus {
+                        entity: self.ship,
+                        shard: to,
+                        connected: true,
+                    },
+                );
+                self.next = Some((to, welcome.session));
+                // A slow connect is modelled with everything behind it fast:
+                // the status is mirrored to the offering shard at once, so
+                // its very next tick commits.
+                if self.connect_takes > 0 {
+                    c.deliver();
+                }
+            }
         }
         if let Some((to, session)) = self.next {
             // The switch: the first frame from the new shard.
@@ -275,6 +323,9 @@ impl Pilot {
             }],
             ack_tick: 0,
         };
+        self.recent.extend(batch.inputs.iter().copied());
+        let keep = self.recent.len().saturating_sub(12);
+        self.recent.drain(..keep);
         c.shard_mut(self.on).apply_input(self.session, &batch);
         if let Some((to, session)) = self.next {
             c.shard_mut(to).apply_input(session, &batch);
@@ -403,6 +454,84 @@ fn a_ship_handed_over_flies_as_if_it_never_changed_shard() {
     assert_eq!((stats.0.handed_off, stats.1.received), (1, 1));
     assert_eq!(stats.1.caught_up, 0, "on time: nothing to catch up");
     assert_eq!(stats.0.aborted + stats.1.aborted, 0);
+}
+
+/// A player whose connection to the accepting shard comes up late — the
+/// lead's second is all but over — so that the commit follows it within the
+/// ticks its inputs are tagged ahead: the inputs it had sent before, for
+/// ticks after the commit, went to the old shard only. It says them again to
+/// the new shard the moment it is through (before the status that opens the
+/// gate), and the ship flies as if it had never changed shard, bit for bit.
+///
+/// Mutation this catches: a client that does not say them again (the ticks
+/// right after the commit fly without their thrust: the ship is off the
+/// reference from the switch on), a shard that drops what a player sends
+/// for the ship staged for it before the player's status has arrived.
+#[test]
+fn inputs_sent_before_a_late_connection_are_said_again_and_kept() {
+    let ticks = 160;
+    let alone = reference(ticks);
+    // Through just before the lead runs out, as it does, and a little after
+    // (the gate then opens on a commit that is already due).
+    let mut lost_unsaid = Vec::new();
+    for takes in HANDOFF_LEAD - 2..=HANDOFF_LEAD + 3 {
+        for resends in [true, false] {
+            let mut c = Cluster::pair();
+            let mut pilot = Pilot::join(&mut c, "pilot");
+            pilot.connect_takes = takes;
+            pilot.resends = resends;
+            let flight = fly(&mut c, &mut pilot, ticks, |c, _| c.tick());
+            assert_eq!(pilot.redirects, 1, "one handoff (connect takes {takes})");
+            let switched = switch_tick(&flight);
+            if !resends {
+                // The premise is collected: does this delay cost an input?
+                let same = flight
+                    .iter()
+                    .zip(&alone)
+                    .filter(|((_, _, sims), _)| !sims.is_empty())
+                    .all(|((_, state, _), (_, ref_state, _))| state == ref_state);
+                if !same {
+                    lost_unsaid.push(takes);
+                }
+                continue;
+            }
+            for ((tick, state, sims), (_, ref_state, _)) in flight.iter().zip(&alone) {
+                assert!(sims.len() <= 1, "tick {tick}: simulated by {sims:?}");
+                if !sims.is_empty() {
+                    assert_eq!(
+                        state, ref_state,
+                        "connect takes {takes}: tick {tick} (the switch was at {switched})"
+                    );
+                }
+            }
+            // Every tick's input was applied once, by one of the two shards.
+            let mut applied: Vec<SimTick> = c
+                .shards
+                .iter()
+                .flat_map(|s| s.sim().applied_inputs())
+                .filter(|(_, guid)| *guid == pilot.ship)
+                .map(|(tick, _)| tick)
+                .collect();
+            applied.sort_unstable();
+            let (first, last) = (applied[0], applied[applied.len() - 1]);
+            assert_eq!(
+                applied,
+                (first..=last).collect::<Vec<_>>(),
+                "connect takes {takes}: every tick once, none missing, none twice"
+            );
+            assert!(first <= START + INPUT_LEAD + 1 && last >= START + ticks);
+        }
+    }
+    // The premise: among these delays are ones that cost inputs when they
+    // are not said again (the commit followed the connection within the
+    // input lead).
+    assert!(
+        !lost_unsaid.is_empty(),
+        "no delay made the commit follow the connection within the input lead"
+    );
+    eprintln!(
+        "a connection this many ticks after the redirect loses inputs unsaid: {lost_unsaid:?}"
+    );
 }
 
 /// A commit that arrives late — the accepting shard has stepped one, two,
@@ -753,80 +882,358 @@ fn a_refused_body_does_not_call_off_the_ship_it_travels_with() {
     }
 }
 
-/// Three shards with real tick loops (`clock::run`, the binary's), the
-/// second started 1.3 s after the first and the third — a replacement, say —
-/// another 0.9 s later, all on one tick origin: looked at in the same
-/// instant their ticks differ by **at most one** (each steps a tick when it
-/// is due; one of them may just have), each is at the tick that is due by
-/// the wall clock or just behind it, and none is ever ahead of it. (The
-/// tolerance is for a machine that runs other tests at the same time: nine
-/// looks in ten must be within one tick, every look within four — a shard
-/// whose task was kept waiting is late for a moment and makes the ticks up.)
+/// A handoff's commit is in the accepting shard's hands, a tick before its
+/// install, when the host stands still for three seconds (a suspended
+/// machine: both shards find ninety ticks gone and jump). The entity — a
+/// player's ship, and a drifting crate — is then installed **where its
+/// commit says it is**: it stood still for the stall like everything else.
+///
+/// Mutation this catches: bounding the catch-up only when the commit arrives
+/// (`local_tick_of`: the state's tick was then within `MAX_CATCH_UP` of the
+/// present) and not at the install — the ship is brought forward by the 89
+/// ticks of the stall, 36 m of flight without a single contact, through
+/// whatever stands there; `caught_up` counts them.
+#[test]
+fn a_commit_installed_after_a_stall_is_not_brought_forward_by_the_stall() {
+    const STALL: SimTick = 90;
+    for body in [true, false] {
+        let mut c = Cluster::pair();
+        let mut pilot = Pilot::join(&mut c, "pilot");
+        let mut start = ShipState::at_rest(at_border([-25.0, 0.0, 0.0]));
+        start.vel = [12.0, 0.0, 0.0];
+        let guid = if body {
+            c.shard_mut(ShardId::new(1))
+                .spawn_body(BodySpawn::new(start, crate_body()))
+                .expect("a crate")
+        } else {
+            assert!(c.shard_mut(ShardId::new(1)).set_state(pilot.ship, start));
+            pilot.ship
+        };
+        let mut committed: Option<ShipState> = None;
+        let mut installed: Option<ShipState> = None;
+        for _ in 0..400 {
+            if !body {
+                pilot.act(&mut c, [0.0; 3]);
+            }
+            if committed.is_some() {
+                c.tick();
+                if installed.is_none() {
+                    installed = c.shards[1].sim().ship_state(guid);
+                }
+                continue;
+            }
+            // Shard 1 ticks first and its messages are delivered: a commit
+            // it sends is in shard 2's hands while shard 2 is a tick behind.
+            let sent = c.shards[0].stats().handed_off;
+            c.shards[0].tick();
+            c.round += 1;
+            c.deliver();
+            if c.shards[0].stats().handed_off == sent {
+                c.shards[1].tick();
+                c.deliver();
+                continue;
+            }
+            // The commit is there. (What it says: shard 1's ghost of it.)
+            committed = c.shards[0].sim().state_of(guid);
+            assert!(c.shards[1].sim().ship_state(guid).is_none());
+            // Three seconds pass for nobody; then both find them gone.
+            let due = c.shards[0].sim().tick() + STALL;
+            assert!(c.shards[0].run_to(due).skipped > 0);
+            let paced = c.shards[1].run_to(due);
+            assert_eq!(paced.skipped, STALL, "shard 2 jumped");
+            c.round += 1;
+            c.deliver();
+            installed = c.shards[1].sim().ship_state(guid);
+        }
+        let (committed, installed) = (
+            committed.expect("the entity was committed"),
+            installed.expect("and installed on shard 2"),
+        );
+        // One tick of flight (the step after the install), not ninety.
+        let flown = WorldPos::distance(committed.pos, installed.pos);
+        assert!(
+            flown < 1.0,
+            "body: {body}; the entity was brought forward {flown} m by a stall"
+        );
+        assert_eq!(
+            c.shards[1].stats().caught_up,
+            0,
+            "body: {body}; {STALL} ticks is past the catch-up's {MAX_CATCH_UP}"
+        );
+        assert_eq!(c.simulators(guid), vec![ShardId::new(2)]);
+        assert_eq!(c.shards[1].stats().received, 1);
+    }
+}
+
+/// What two players' ships do to each other, tick by tick: `a` starts
+/// `apart / 2` west of the border and `b` as far east of it, and for `ticks`
+/// ticks each holds the thrust given (along x). Returns, per tick, the two
+/// ships' positions along x (metres from the border) and velocities.
+fn push(
+    c: &mut Cluster,
+    apart: f64,
+    thrust: [f32; 2],
+    ticks: SimTick,
+) -> Vec<([f64; 2], [f32; 2])> {
+    let mut a = Pilot::join(c, "a");
+    let mut b = Pilot::join(c, "b");
+    let at = |x: f64| ShipState::at_rest(at_border([x, 0.0, 0.0]));
+    assert!(c
+        .shard_mut(ShardId::new(1))
+        .set_state(a.ship, at(-apart / 2.0)));
+    assert!(c
+        .shard_mut(ShardId::new(1))
+        .set_state(b.ship, at(apart / 2.0)));
+    // `b` stands on the ground east of the border: where there is a second
+    // shard it is handed over to it before anything else happens.
+    for _ in 0..150 {
+        a.act(c, [0.0; 3]);
+        b.act(c, [0.0; 3]);
+        c.tick();
+    }
+    let east = c.shards.len().min(2) as u32;
+    assert_eq!(c.simulators(b.ship), vec![ShardId::new(east)]);
+    assert_eq!(c.simulators(a.ship), vec![ShardId::new(1)]);
+    let mut out = Vec::new();
+    for _ in 0..ticks {
+        a.act(c, [thrust[0], 0.0, 0.0]);
+        b.act(c, [thrust[1], 0.0, 0.0]);
+        c.tick();
+        // A ship that is changing shard is on neither for one look: its
+        // last word then.
+        let (sa, sb) = (c.state(a.ship), c.state(b.ship));
+        let last = out.last().copied().unwrap_or(([0.0; 2], [0.0; 2]));
+        out.push((
+            [
+                sa.map_or(last.0[0], |s| border_x(s.pos)),
+                sb.map_or(last.0[1], |s| border_x(s.pos)),
+            ],
+            [
+                sa.map_or(last.1[0], |s| s.vel[0]),
+                sb.map_or(last.1[1], |s| s.vel[0]),
+            ],
+        ));
+    }
+    out
+}
+
+/// Two players in contact across a border, measured against the same two
+/// on one shard (`docs/plan-sharding.md` §5, "Two players in contact").
+/// Each shard simulates its own player's ship and holds the other as a
+/// **ghost** — a kinematic copy, moved to where its owner said it was a
+/// tick ago. A player's ship is never handed over for an island
+/// (`border.rs`, "Players' ships"), so the two stay on two shards for as
+/// long as each stays on its own ground.
+///
+/// * **Pushing against each other** (both thrust at the other): on one shard
+///   they meet and stand, pressed together, hull to hull (0.6 m between
+///   their centres). Across the border the same: they stand within a
+///   centimetre or two of that, the gap moves by millimetres a tick, and
+///   neither creeps.
+/// * **One pushes the other** (one thrusts, the other does not): on one
+///   shard the two move off together, sharing the thrust. Across the border
+///   too — a little slower while they are on two shards (each hears of the
+///   other a tick late) — and once the pusher is a metre across the border
+///   it changes shard and the two are on one.
+///
+/// Mutation this catches: a ship's ghost presented to the solver at its
+/// owner's velocity alone (`rigid.rs`, `meeting_velocities`: each ship is
+/// then thrown back at the other's speed — measured: the two bounce apart
+/// to 2.3 m and back for as long as they push, the gap changing by 0.41 m
+/// a tick); ghosts of players' ships that do not collide (the ships pass
+/// through each other); a pusher that cannot move what it pushes.
+#[test]
+fn two_players_pushing_each_other_across_a_border() {
+    let ticks = 240;
+    for (name, thrust) in [
+        ("against each other", [1.0f32, -1.0]),
+        ("one pushes", [1.0, 0.0]),
+    ] {
+        let mut one = Cluster::single();
+        let alone = push(&mut one, 4.0, thrust, ticks);
+        let mut two = Cluster::pair();
+        let split = push(&mut two, 4.0, thrust, ticks);
+        let gap = |run: &[([f64; 2], [f32; 2])]| -> Vec<f64> {
+            run.iter().map(|(x, _)| x[1] - x[0]).collect()
+        };
+        let (gap_alone, gap_split) = (gap(&alone), gap(&split));
+        let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        // In contact: the smallest gap on one shard is the two hulls touching.
+        let touching = min(&gap_alone);
+        let deepest = touching - min(&gap_split);
+        // Momentum (equal masses): the sum of the two velocities.
+        let sum = |run: &[([f64; 2], [f32; 2])], i: usize| f64::from(run[i].1[0] + run[i].1[1]);
+        let end = ticks as usize - 1;
+        // Jitter: the largest change of the gap from one tick to the next
+        // over the last two seconds, when the two are in contact.
+        let jitter = |g: &[f64]| {
+            g[end - 60..=end]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0, f64::max)
+        };
+        eprintln!(
+            "[{name}] one shard: gap at contact {touching:.3} m, at the end {:.3} m; a at {:.2} m, \
+             b at {:.2} m; velocities {:.2?}; gap jitter {:.4} m/tick",
+            gap_alone[end], alone[end].0[0], alone[end].0[1], alone[end].1, jitter(&gap_alone)
+        );
+        eprintln!(
+            "[{name}] two shards: {deepest:.3} m deeper inside each other, gap at the end {:.3} m; \
+             a at {:.2} m, b at {:.2} m; velocities {:.2?}; gap jitter {:.4} m/tick; momentum \
+             {:.2} against {:.2} m/s; handoffs {:?}, aborted {:?}",
+            gap_split[end],
+            split[end].0[0],
+            split[end].0[1],
+            split[end].1,
+            jitter(&gap_split),
+            sum(&split, end),
+            sum(&alone, end),
+            two.shards.iter().map(|s| s.stats().handed_off).collect::<Vec<_>>(),
+            two.shards.iter().map(|s| s.stats().aborted).collect::<Vec<_>>(),
+        );
+        // The hulls touch at 0.6 m between the centres (one shard, at rest).
+        let hull = gap_alone[end];
+        assert!((hull - 0.6).abs() < 0.01, "[{name}] the premise: {hull}");
+        // Never through each other: no deeper than the impact on one shard
+        // goes, and a decimetre.
+        assert!(
+            deepest < 0.1 && min(&gap_split) > 0.3,
+            "[{name}] the ships went into each other: {deepest} m deeper than on one shard"
+        );
+        // In contact for the last two seconds, hull to hull, without a bounce.
+        for g in &gap_split[end - 60..=end] {
+            assert!(
+                (g - hull).abs() < 0.05,
+                "[{name}] in contact the centres are {g:.3} m apart, {hull:.3} m on one shard"
+            );
+        }
+        assert!(
+            jitter(&gap_split) < 0.01,
+            "[{name}] the gap jitters by {} m a tick",
+            jitter(&gap_split)
+        );
+        assert_eq!(
+            two.shards.iter().map(|s| s.stats().aborted).sum::<usize>(),
+            0
+        );
+        if thrust[1] != 0.0 {
+            // Pressed together they stand where they met, as on one shard.
+            for k in 0..2 {
+                assert!(
+                    (split[end].0[k] - alone[end].0[k]).abs() < 0.1,
+                    "[{name}] they crept: {:?} against {:?}",
+                    split[end].0,
+                    alone[end].0
+                );
+            }
+            assert!(sum(&split, end).abs() < 0.05, "momentum is still none");
+        } else {
+            // The pushed ship is pushed: together, and at no less than four
+            // fifths of the speed two ships on one shard reach.
+            let (v, v_alone) = (split[end].1, alone[end].1);
+            assert!((v[0] - v[1]).abs() < 0.05, "[{name}] together: {v:?}");
+            assert!(
+                v[1] > 0.8 * v_alone[1] && v[1] <= v_alone[1] + 0.05,
+                "[{name}] pushed to {} m/s, {} on one shard",
+                v[1],
+                v_alone[1]
+            );
+        }
+    }
+}
+
+/// Three shards on the binary's tick loop (`clock::Pacer`: what `clock::run`
+/// does between two sleeps), the second started 1.3 s after the first and the
+/// third — a replacement, say — another 0.9 s later, all on one tick origin
+/// and one host (one `ManualTime`: the test decides what time it is, so
+/// nothing here depends on how busy the machine is). After **every** turn of
+/// the loops every shard is at exactly the tick that is due — whether the
+/// turn came on time, three ticks late (made up) or three seconds late
+/// (jumped) — and so at the same tick as the others.
 ///
 /// Mutation this catches: counting from the shard's own start (39 and 66
-/// ticks apart), an interval that skips a late tick for good (a shard that
+/// ticks apart), a loop that skips a late tick for good (a shard that
 /// stalled once is behind for ever), a replacement placed on the timeline by
 /// anything but the origin.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shards_started_seconds_apart_count_the_same_ticks() {
-    let origin = space_server::config::wall_clock_us() - 77_000_000;
-    let start = |id: u32| {
-        let net = Arc::new(
-            space_server::net::ShardNet::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind"),
-        );
-        let shard = Arc::new(tokio::sync::Mutex::new(Shard::new(ShardConfig::new(
+#[test]
+fn shards_started_seconds_apart_count_the_same_ticks() {
+    let time = ManualTime::at(ORIGIN + 77_000_000);
+    let cluster = SceneClock::cluster(ORIGIN);
+    let mut running: Vec<(Shard, Pacer)> = Vec::new();
+    let start = |id: u32, running: &mut Vec<(Shard, Pacer)>| {
+        let mut shard = Shard::new(ShardConfig::new(
             ShardId::new(id),
-            net.local_addr().expect("addr"),
+            listening(id as u16),
             NodeRef::new(64, [i64::from(id), 0, 0]),
-        ))));
-        let clock = TickClock::new(origin);
-        let task = tokio::spawn(space_server::clock::run(
-            Arc::clone(&shard),
-            Arc::clone(&net),
-            clock,
         ));
-        (shard, net, task, clock)
+        let mut pacer = Pacer::new(TickClock::on(ORIGIN, time.clone()).expect("a clock"));
+        pacer.start(&mut shard);
+        running.push((shard, pacer));
     };
-    let a = start(1);
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
-    let b = start(2);
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let c = start(3);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let looks = 60;
-    let (mut apart, mut behind) = (Vec::new(), Vec::new());
-    for _ in 0..looks {
-        // Looked at together: all three locked, then read.
-        let (ga, gb, gc) = (a.0.lock().await, b.0.lock().await, c.0.lock().await);
-        let now = Instant::now();
-        let ticks = [ga.sim().tick(), gb.sim().tick(), gc.sim().tick()];
-        let due = [a.3.tick_at(now), b.3.tick_at(now), c.3.tick_at(now)];
-        drop((ga, gb, gc));
-        assert_eq!(due[0], due[1]);
-        assert_eq!(due[1], due[2], "one timeline: the same tick is due on all");
-        let (lo, hi) = (*ticks.iter().min().unwrap(), *ticks.iter().max().unwrap());
-        apart.push(hi - lo);
-        behind.push(due[0].saturating_sub(lo));
-        assert!(
-            hi <= due[0],
-            "a shard ahead of the clock: {ticks:?} at {due:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(17)).await;
+    // How long the loops sleep between turns, µs: on time, early, a few
+    // ticks late — never more than the burst.
+    let naps = [
+        33_333i64, 7_000, 12_500, 41_000, 3_000, 29_000, 100_000, 16_667, 250_000,
+    ];
+    let run = |us: i64, running: &mut Vec<(Shard, Pacer)>| {
+        let mut passed = 0;
+        let mut turn = 0;
+        while passed < us {
+            let nap = naps[turn % naps.len()];
+            turn += 1;
+            passed += nap;
+            time.advance(nap);
+            let due = cluster.tick_at(ORIGIN + 77_000_000 + elapsed(&time));
+            for (shard, pacer) in running.iter_mut() {
+                let paced = pacer.turn(shard);
+                assert_eq!(paced.skipped, 0, "late by at most the burst: made up");
+                assert_eq!(
+                    shard.sim().tick(),
+                    due,
+                    "{} after a {nap} µs nap",
+                    shard.shard()
+                );
+                assert_eq!(shard.scene_clock(), cluster);
+                assert_eq!(shard.sim().scene_time(), cluster.time_us_at(due));
+            }
+        }
+    };
+    fn elapsed(time: &ManualTime) -> i64 {
+        use space_server::clock::TimeSource;
+        time.mono_us()
     }
-    // 77 s after the origin, at 30 Hz.
-    let tick = a.0.lock().await.sim().tick();
-    assert!((2_300..2_700).contains(&tick), "tick {tick}");
-    let within = |values: &[u64], limit: u64| values.iter().filter(|v| **v <= limit).count();
-    assert!(
-        within(&apart, 1) >= looks * 9 / 10 && within(&apart, 4) == looks,
-        "the shards' ticks, apart: {apart:?}"
-    );
-    assert!(
-        within(&behind, 1) >= looks * 9 / 10 && within(&behind, 4) == looks,
-        "behind the clock: {behind:?}"
-    );
-    for (_, net, task, _) in [a, b, c] {
-        task.abort();
-        net.close();
+    start(1, &mut running);
+    assert_eq!(running[0].0.sim().tick(), 77 * 30, "77 s after the origin");
+    run(1_300_000, &mut running);
+    start(2, &mut running);
+    run(900_000, &mut running);
+    start(3, &mut running);
+    run(2_000_000, &mut running);
+    let ticks: Vec<SimTick> = running.iter().map(|(s, _)| s.sim().tick()).collect();
+    assert!(ticks.iter().all(|t| *t == ticks[0]), "{ticks:?}");
+    assert!(ticks[0] > 77 * 30 + 120, "four seconds on: {ticks:?}");
+    // Shard 2 stands still for three seconds while the others run; then it
+    // jumps, and is on the cluster's tick again at once.
+    for _ in 0..90 {
+        time.advance(33_334);
+        for (shard, pacer) in running.iter_mut().filter(|(s, _)| s.shard().0 != 2) {
+            assert_eq!(pacer.turn(shard).stepped, 1);
+        }
+    }
+    let behind = running[0].0.sim().tick() - running[1].0.sim().tick();
+    assert_eq!(behind, 90);
+    let paced = {
+        let (shard, pacer) = &mut running[1];
+        pacer.turn(shard)
+    };
+    assert_eq!((paced.stepped, paced.skipped), (1, 89));
+    assert!(behind > MAX_TICK_BURST);
+    run(500_000, &mut running);
+    for (shard, _) in &running {
+        assert_eq!(
+            shard.stats().skipped,
+            if shard.shard().0 == 2 { 89 } else { 0 }
+        );
+        assert_eq!(shard.stats().clock_offset_us, 0, "one host, one clock");
     }
 }

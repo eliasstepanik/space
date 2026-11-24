@@ -378,6 +378,11 @@ pub struct ClientReplica {
     pub owed_removals: Vec<EntityGuid>,
     /// The remaining entities of a snapshot that did not fit in one frame.
     pub pending_snapshot: VecDeque<EntityGuid>,
+    /// A chunk of a snapshot went out saying "more follow"
+    /// ([`Snapshot::more`]) and the chunk that says "that was all" has not:
+    /// the client is collecting, and has to be told the end even if nothing
+    /// is left to send (the rest despawned).
+    pub snapshot_open: bool,
     /// Frames sent and not yet settled by an acknowledgement, oldest first.
     pub in_flight: VecDeque<SentFrame>,
     /// Lower bound on the `input_ack` this client is told, set by an inbound
@@ -399,6 +404,7 @@ impl ClientReplica {
             owed: Vec::new(),
             owed_removals: Vec::new(),
             pending_snapshot: VecDeque::new(),
+            snapshot_open: false,
             in_flight: VecDeque::new(),
             input_ack_floor: 0,
         }
@@ -736,7 +742,7 @@ pub fn build_frame(
         // this is where the change scan resumes once the snapshot is complete.
         replica.change_base = tick;
     }
-    if !replica.pending_snapshot.is_empty() {
+    if !replica.pending_snapshot.is_empty() || replica.snapshot_open {
         let mut builder = SnapshotBuilder::with_budget(cx.budget, tick, cx.shard, cx.epoch);
         let mut sent = Vec::new();
         while let Some(&guid) = replica.pending_snapshot.front() {
@@ -751,14 +757,20 @@ pub fn build_frame(
             replica.pending_snapshot.pop_front();
             sent.push(guid);
         }
-        if !builder.is_empty() {
+        // Every chunk but the last says that more follow: the client takes
+        // "what the snapshot does not name is gone" from the whole of it.
+        // A snapshot whose last entities despawned before their chunk still
+        // ends with a chunk that says so — an empty one.
+        if !builder.is_empty() || replica.snapshot_open {
+            let more = !replica.pending_snapshot.is_empty();
+            replica.snapshot_open = more;
             replica.known.extend(sent.iter().copied());
             replica.ack_tick = tick;
             replica.remember(tick, sent, Vec::new());
-            return Frame::Snapshot(builder.finish_snapshot(input_ack));
+            return Frame::Snapshot(builder.finish_snapshot_chunk(input_ack, more));
         }
-        // Everything that was planned has despawned: there is nothing to dump,
-        // so this tick is an ordinary delta.
+        // Everything that was planned has despawned before a first chunk went
+        // out: there is nothing to dump, so this tick is an ordinary delta.
     }
 
     // Removals: everything the client holds that is no longer visible. The
@@ -1024,7 +1036,10 @@ mod tests {
 
         sim.step();
         let first = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
-        assert!(matches!(first, Frame::Snapshot(_)));
+        assert!(
+            matches!(&first, Frame::Snapshot(s) if s.more),
+            "more follow"
+        );
         assert_eq!(guids_in(&first), vec![all[0], all[1]], "chunk 1");
 
         // The ship that went out in chunk 1 jumps, once, and is parked again.
@@ -1036,11 +1051,14 @@ mod tests {
 
         sim.step();
         let second = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
-        assert!(matches!(second, Frame::Snapshot(_)));
+        assert!(
+            matches!(&second, Frame::Snapshot(s) if s.more),
+            "more follow"
+        );
         assert_eq!(guids_in(&second), vec![all[2], all[3]], "chunk 2");
         sim.step();
         let third = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
-        assert!(matches!(third, Frame::Snapshot(_)));
+        assert!(matches!(&third, Frame::Snapshot(s) if !s.more), "the last");
         assert_eq!(guids_in(&third), vec![all[4], all[5]], "chunk 3");
 
         // The snapshot is complete. Nothing has changed since chunk 2 — but the
@@ -1066,6 +1084,41 @@ mod tests {
         }
         let carried = carried.expect("the change made during the snapshot must be sent");
         assert_eq!(carried.pos, moved_to);
+    }
+
+    /// A snapshot whose last entities despawn before their chunk went out
+    /// still ends: the client is sent a chunk that says "that was all".
+    ///
+    /// Mutation this catches: ending the snapshot only with a chunk that
+    /// carries something (the client would wait for the end for ever, and
+    /// never drop what the snapshot did not name).
+    #[test]
+    fn a_snapshot_whose_rest_despawned_still_ends() {
+        const BUDGET: usize = 400;
+        let (mut sim, mut guids, all) = parked_fleet(4);
+        let mut replica = ClientReplica::new(all[0]);
+        let mut log = ComponentLog::new();
+        sim.step();
+        let first = frame_for(&mut sim, &guids, &mut log, &mut replica, &all, BUDGET);
+        assert!(matches!(&first, Frame::Snapshot(s) if s.more));
+        assert!(replica.snapshot_open);
+        // The two that were still to come are gone (as a shard removes an
+        // entity: from the world, its index and what it tells clients).
+        for guid in &all[2..] {
+            sim.despawn(*guid);
+            guids.remove(*guid);
+            log.forget(*guid);
+        }
+        sim.step();
+        let second = frame_for(&mut sim, &guids, &mut log, &mut replica, &all[..2], BUDGET);
+        let Frame::Snapshot(last) = second else {
+            panic!("the snapshot has to be ended: {second:?}");
+        };
+        assert!(!last.more && last.entities.is_empty(), "{last:?}");
+        assert!(!replica.snapshot_open);
+        sim.step();
+        let third = frame_for(&mut sim, &guids, &mut log, &mut replica, &all[..2], BUDGET);
+        assert!(matches!(third, Frame::Delta(_)), "then deltas: {third:?}");
     }
 
     /// The interest index follows a ship that moves and is not disturbed by one

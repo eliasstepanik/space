@@ -162,6 +162,10 @@ pub struct ShardStats {
     /// Ticks handed-over entities were brought forward at their install
     /// because the commit arrived late (see [`crate::handoff`], guarantee 4).
     pub caught_up: SimTick,
+    /// Wall clock minus this shard's tick clock as last measured, µs:
+    /// positive when the shard is behind (see [`crate::clock`], "Keeping to
+    /// the wall clock"). 0 for a shard that is not run by [`crate::clock`].
+    pub clock_offset_us: i64,
 }
 
 /// One transfer that was called off, as [`Shard::recent_aborts`] lists it
@@ -237,6 +241,21 @@ struct PendingCommit {
     scene_time: Option<i64>,
 }
 
+impl PendingCommit {
+    /// The ticks to bring the entity forward by when it is installed at
+    /// `tick`: the ticks since the one its state describes — or **none** if
+    /// that is more than [`MAX_CATCH_UP`] (or the clocks do not agree). The
+    /// catch-up is flight without contacts; it is good for the few ticks a
+    /// commit takes to arrive, never for the seconds of a shard that stood
+    /// still ([`Shard::install_pending_commits`]).
+    pub(crate) fn catch_up_at(&self, tick: SimTick) -> SimTick {
+        self.state_tick
+            .map(|at| tick.saturating_sub(at))
+            .filter(|late| *late <= MAX_CATCH_UP)
+            .unwrap_or(0)
+    }
+}
+
 /// One shard: its region, its simulation, its clients and its handoff ledger.
 #[derive(Debug)]
 pub struct Shard {
@@ -303,7 +322,8 @@ pub struct Shard {
     /// The scene clients are told to draw, and the revision it was set at (see
     /// [`Shard::set_scene`]).
     scene: SceneState,
-    /// Whether the scene clock was set ([`Shard::sync_scene_clock`]).
+    /// Whether the scene clock was set ([`Shard::set_scene_clock`]): this
+    /// shard counts scene time on a shared clock, not from its own zero.
     scene_clock_set: bool,
     stats: ShardStats,
 }
@@ -358,35 +378,12 @@ impl Shard {
         self.sim.scene_clock()
     }
 
-    /// Use `clock` from now on and tell every client (tests, and
-    /// [`Shard::sync_scene_clock`]).
+    /// Use `clock` from now on and tell every client
+    /// ([`Shard::start_clock`], tests).
     pub fn set_scene_clock(&mut self, clock: SceneClock) {
         self.sim.set_scene_clock(clock);
         self.scene_clock_set = true;
         self.send_to_all(Message::SceneClock(clock));
-    }
-
-    /// Keep the scene clock on the wall clock: `now_us` is the wall clock's
-    /// time (µs since the Unix epoch, [`crate::config::wall_clock_us`]) of the
-    /// tick just produced. The first call anchors the clock there; later
-    /// calls re-anchor it only when it has drifted more than
-    /// [`crate::config::SCENE_CLOCK_TOLERANCE_US`] from the wall clock (a
-    /// skipped tick), and tell every client. Returns whether it re-anchored.
-    ///
-    /// For a shard driven by a loop of its own that counts its ticks from
-    /// its own start and may skip one. The binaries' shards do not use it:
-    /// they run on the cluster's clock ([`crate::clock`],
-    /// [`Shard::start_clock`]), whose scene time is exact by construction
-    /// and never re-anchored. A shard neither is called on counts scene time
-    /// from 0 at tick 0 (deterministic, for tests).
-    pub fn sync_scene_clock(&mut self, now_us: i64) -> bool {
-        let tick = self.sim.tick();
-        let drift = now_us - self.sim.scene_clock().time_us_at(tick);
-        if self.scene_clock_set && drift.abs() <= crate::config::SCENE_CLOCK_TOLERANCE_US {
-            return false;
-        }
-        self.set_scene_clock(SceneClock::new(tick, now_us));
-        true
     }
 
     /// Start counting at `tick` ([`Shard::start_clock`]).
@@ -396,16 +393,29 @@ impl Shard {
 
     /// Jump forward to `tick` without simulating the ticks in between: what
     /// a shard does that is too far behind the cluster clock to make them up
-    /// ([`crate::clock`]). The world stands still across the jump (and inputs
-    /// filed for the skipped ticks are dropped); every timeout simply finds
-    /// that much time gone. A `tick` at or before the present does nothing.
+    /// ([`crate::clock`]). Nothing moves by itself across the jump — no
+    /// body flies on, falls or collides for the ticks that are skipped —
+    /// with one exception: scene time does not stop, so the next step moves
+    /// the orbiting large bodies by the whole of it **and carries what is
+    /// near them along** ([`space_sim::SimWorld::skip_to`]): a ship standing
+    /// on the Moon is still standing on it. Inputs filed for the skipped
+    /// ticks are dropped, the ones for later ticks are kept; every timeout
+    /// simply finds that much time gone. A `tick` at or before the present
+    /// does nothing.
     pub fn skip_to(&mut self, tick: SimTick) {
         let at = self.sim.tick();
         if tick <= at {
             return;
         }
         self.stats.skipped += tick - at;
-        self.sim.reset_clock(tick);
+        self.sim.skip_to(tick);
+    }
+
+    /// Record what the tick clock last measured against the wall clock
+    /// ([`ShardStats::clock_offset_us`]; the loop in [`crate::clock`] calls
+    /// this every turn).
+    pub fn set_clock_offset(&mut self, offset_us: i64) {
+        self.stats.clock_offset_us = offset_us;
     }
 
     /// This shard's id.
@@ -955,9 +965,28 @@ impl Shard {
         client.replica.acknowledge(ack);
         // Rewrite every input to this session's ship. This is the `entity_of`
         // trust boundary: the guid that reaches the simulation is ours, whatever
-        // the client sent. An awaiting-adopt client has no ship yet, so its
-        // inputs are dropped — the old shard is still simulating its entity.
+        // the client sent.
+        //
+        // An awaiting-adopt client has no ship yet — the old shard is still
+        // simulating its entity. If a ship is **staged for it** (the transfer
+        // whose owner token is this client's: the test `client_status` makes
+        // too), its inputs are kept for that ship like those of a client that
+        // has reported in (guarantee 5): a client says its inputs for the
+        // ticks to come the moment it has connected, and its datagrams are
+        // not ordered with the status it sends on the stream. Anybody else's
+        // are dropped.
         let Some(ship) = client.ship else {
+            let now = self.sim.tick();
+            let staged = self
+                .ledger
+                .incoming()
+                .iter()
+                .find(|(_, staged)| staged.is_owned_by(&client.player_token))
+                .map(|(guid, _)| *guid);
+            if let Some(ship) = staged {
+                let kept = self.staged_inputs.entry(ship).or_default();
+                keep_staged(kept, batch.inputs.iter().copied(), ship, now);
+            }
             return;
         };
         // Bounded: only one input per tick can ever be applied to the one ship
@@ -1569,16 +1598,7 @@ impl Shard {
                 || self.pending_commits.iter().any(|p| p.guid == ship)
             {
                 let kept = self.staged_inputs.entry(ship).or_default();
-                for input in inputs {
-                    let wanted = input.tick.saturating_add(MAX_CATCH_UP) > now
-                        && input.tick <= now.saturating_add(space_sim::sim_world::MAX_INPUT_LEAD);
-                    if wanted {
-                        kept.insert(input.tick, input);
-                    }
-                }
-                while kept.len() > MAX_STAGED_INPUTS {
-                    kept.pop_first();
-                }
+                keep_staged(kept, inputs, ship, now);
             }
         }
         // (A transfer that was called off leaves nothing behind.)
@@ -1677,6 +1697,15 @@ impl Shard {
     /// applied, by the old shard or by the catch-up (guarantee 5). Between
     /// shards whose clocks do not agree the gate is the accept tick plus the
     /// lead and the floor the commit's `activation_tick`, as it always was.
+    ///
+    /// **The catch-up is bounded here, not only when the commit arrives**
+    /// ([`PendingCommit::catch_up_at`]): a commit that was within
+    /// [`MAX_CATCH_UP`] ticks of the present when it was read may be
+    /// installed much later — this shard stalled in between and then jumped
+    /// ([`Shard::skip_to`]) — and bringing an entity forward by seconds of
+    /// contact-free flight would put it through walls. Past the bound the
+    /// state is installed as it is: the entity stood still for the stall,
+    /// like everything else on this shard.
     fn install_pending_commits(&mut self, tick: SimTick) {
         let due: Vec<PendingCommit> = self
             .pending_commits
@@ -1710,7 +1739,7 @@ impl Shard {
             let inputs = self.staged_inputs.remove(&pending.guid).unwrap_or_default();
             // What the ship has done since its state was taken, if the commit
             // came late: flown on, under the inputs its player sent us.
-            let late = pending.state_tick.map_or(0, |at| tick.saturating_sub(at));
+            let late = pending.catch_up_at(tick);
             let (mut state, fast) = catch_up_ship(
                 pending.state,
                 pending.fast,
@@ -1720,6 +1749,12 @@ impl Shard {
                 late,
             );
             self.stats.caught_up += late;
+            // (The record of what was applied: the catch-up's ticks too.)
+            if late > 0 {
+                for at in inputs.range(tick - late + 1..=tick).map(|(at, _)| *at) {
+                    self.sim.note_applied(at, pending.guid);
+                }
+            }
             // Where it was relative to the planet it is near, by our clock.
             if let Some(sent) = pending.scene_time {
                 let c = self.sim.carry(state.pos, sent, self.sim.scene_time());
@@ -2228,6 +2263,30 @@ fn decode_ship_controls(snapshot: &space_protocol::EntitySnapshot) -> Option<Shi
         .map(|(controls, _)| controls)
 }
 
+/// Keep `inputs` for the ship `ship` that is on its way here, by tick: the
+/// ones for ticks the install may still have to replay or file (not older
+/// than the catch-up reaches, not further ahead than the simulation takes
+/// one), one per tick, [`MAX_STAGED_INPUTS`] at most (the oldest go first).
+/// Every input is rewritten to `ship`, whatever the client named.
+fn keep_staged(
+    kept: &mut BTreeMap<SimTick, PlayerInput>,
+    inputs: impl IntoIterator<Item = PlayerInput>,
+    ship: EntityGuid,
+    now: SimTick,
+) {
+    for mut input in inputs {
+        let wanted = input.tick.saturating_add(MAX_CATCH_UP) > now
+            && input.tick <= now.saturating_add(space_sim::sim_world::MAX_INPUT_LEAD);
+        if wanted {
+            input.entity = ship;
+            kept.insert(input.tick, input);
+        }
+    }
+    while kept.len() > MAX_STAGED_INPUTS {
+        kept.pop_first();
+    }
+}
+
 /// Bring a handed-over ship forward by the `late` ticks after `from`: the
 /// ticks between the one its committed state describes and the one it is
 /// installed on (see [`Shard::install_pending_commits`]). Returns the state
@@ -2447,46 +2506,6 @@ mod tests {
     // ------------------------------------------------------------- the scene
 
     use space_protocol::Scene;
-
-    /// Two shards that booted at different times (different ticks) agree on
-    /// the scene time once both follow the wall clock; a shard re-anchors
-    /// only when it has drifted past the tolerance, and tells its clients.
-    #[test]
-    fn shards_agree_on_the_scene_clock_and_re_anchor_only_on_drift() {
-        let (mut a, mut b) = (shard(), shard());
-        a.tick_n(7);
-        b.tick_n(300);
-        let now = 1_763_900_000_000_000;
-        assert!(
-            a.sync_scene_clock(now) && b.sync_scene_clock(now),
-            "the first sync anchors"
-        );
-        assert_eq!(a.scene_clock().time_us_at(7), now);
-        assert_eq!(b.scene_clock().time_us_at(300), now);
-        // A second later both are a second on, on their own ticks.
-        a.tick_n(30);
-        b.tick_n(30);
-        let later = now + 1_000_000;
-        assert!(!a.sync_scene_clock(later) && !b.sync_scene_clock(later + 20_000));
-        assert_eq!(a.sim().scene_time(), later);
-        assert_eq!(b.sim().scene_time(), later);
-        // A stall: shard b skipped three ticks (100 ms). It re-anchors, and
-        // tells its client.
-        let session = join(&mut b, "p");
-        let _ = b.take_outbox();
-        b.tick();
-        assert!(b.sync_scene_clock(later + 33_333 + 100_000));
-        assert_eq!(b.scene_clock().time_us_at(b.sim().tick()), later + 133_333);
-        let told: Vec<SceneClock> = b
-            .take_outbox()
-            .into_iter()
-            .filter_map(|o| match (o.dest, o.message) {
-                (Destination::Client(s), Message::SceneClock(c)) if s == session => Some(c),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(told, vec![b.scene_clock()]);
-    }
 
     fn shard() -> Shard {
         Shard::new(ShardConfig::new(

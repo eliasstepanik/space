@@ -108,6 +108,11 @@ jobs:
       # rendered nothing (which is what this step used to report): the job stays
       # green, but the step is red until the runner has Mesa >= 24.1 or a real
       # GPU. Once it has, drop `continue-on-error` so the GPU tests gate.
+      #
+      # SPACE_SKIP_TIMING=1: this pass is for what renders. The crossing
+      # tests of space-client (tests/seamless.rs: a real client flown through
+      # four shards in real time, minutes of it, nothing rendered) have run
+      # in the xtask step above and are not run a second time here.
       - name: GPU tests (lavapipe + validation layer)
         continue-on-error: true
         env:
@@ -115,6 +120,7 @@ jobs:
           VK_LAYER_PATH: /usr/share/vulkan/explicit_layer.d
           SPACE_RENDER_VALIDATION: "1"
           SPACE_REQUIRE_GPU: "1"
+          SPACE_SKIP_TIMING: "1"
         run: cargo test -p space-render -p space-client -- --test-threads=1
       # The `naga < 30` guard lives in `crates/space-render/build.rs`
       # (`assert_naga_at_least_30`), which runs on every build of the renderer

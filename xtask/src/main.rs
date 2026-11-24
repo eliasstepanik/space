@@ -143,7 +143,8 @@ fn test_target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) 
 /// must not run in parallel (skills/space-dev/SKILL.md): on CI they skip, but
 /// on a machine with a real GPU a parallel run would start many devices at
 /// once. `.config/nextest.toml` puts the same packages in a `max-threads = 1`
-/// test group for the nextest path.
+/// test group for the nextest path. (The wall-clock-sensitive tests among
+/// them have a group of their own there: `TIMING_TESTS` in the tests below.)
 const GPU_PACKAGES: [&str; 3] = ["space-render", "space-client", "space-mcp-client"];
 
 fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -901,27 +902,105 @@ mod tests {
         }
     }
 
+    /// The wall-clock-sensitive tests: `(package, test target)`. They fly a real
+    /// client through real shard loops in real time, so they are run one at a
+    /// time and with the machine to themselves as far as that can be had:
+    /// `.config/nextest.toml` puts them in a `timing` group of their own
+    /// (`max-threads = 1`, four test slots each), and the `cargo test` fallback
+    /// runs their package — a GPU package — after everything else with one test
+    /// thread (`cargo_test_commands`). The CI's second, renderer-only pass over
+    /// the package skips `seamless` (`SPACE_SKIP_TIMING=1`,
+    /// `.github/workflows/ci.yml`).
+    const TIMING_TESTS: [(&str, &str); 2] =
+        [("space-client", "seamless"), ("space-client", "handoff")];
+
+    /// The overrides of `.config/nextest.toml`, in order: each one's
+    /// `filter`, `test-group` and whether it asks for several test slots.
+    fn nextest_overrides() -> Vec<(String, String, bool)> {
+        let config = include_str!("../../.config/nextest.toml");
+        let value = |block: &str, key: &str| {
+            block
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_once('='))
+                .map(|(_, v)| v.trim().trim_matches('\'').to_owned())
+        };
+        config
+            .split("[[profile.default.overrides]]")
+            .skip(1)
+            .map(|block| {
+                (
+                    value(block, "filter").expect("an override has a filter"),
+                    value(block, "test-group").expect("an override has a test group"),
+                    value(block, "threads-required").is_some(),
+                )
+            })
+            .collect()
+    }
+
     /// The nextest path serialises the same packages through a test group;
     /// the list there and `GPU_PACKAGES` here must not drift apart.
     #[test]
     fn nextest_config_serialises_the_same_gpu_packages() {
         let config = include_str!("../../.config/nextest.toml");
-        let setting = |key: &str| {
-            config
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.starts_with('#') && line.starts_with(key))
-                .unwrap_or_else(|| panic!("no `{key}` line in .config/nextest.toml"))
-        };
-        assert!(setting("gpu").contains("max-threads = 1"));
-        assert!(setting("test-group").contains("'gpu'"));
-        let filter = setting("filter");
+        assert!(config
+            .lines()
+            .any(|line| line.trim() == "gpu = { max-threads = 1 }"));
+        let overrides = nextest_overrides();
+        let (filter, _, _) = overrides
+            .iter()
+            .find(|(_, group, _)| group == "gpu")
+            .expect("an override for the gpu group");
         assert_eq!(filter.matches("package(").count(), GPU_PACKAGES.len());
         for package in GPU_PACKAGES {
             assert!(filter.contains(&format!("package({package})")), "{filter}");
             let manifest = checkout().join("crates").join(package).join("Cargo.toml");
             assert!(manifest.is_file(), "{package} is not a workspace crate");
         }
+    }
+
+    /// The wall-clock-sensitive tests have a serial group of their own that
+    /// is decided **before** the gpu group (the first matching override
+    /// wins, and their package is a GPU package), ask for more than one
+    /// test slot, exist, and — for the `cargo test` fallback — belong to a
+    /// package that is run with one test thread after everything else.
+    #[test]
+    fn nextest_config_runs_the_timing_tests_alone() {
+        let config = include_str!("../../.config/nextest.toml");
+        assert!(config
+            .lines()
+            .any(|line| line.trim() == "timing = { max-threads = 1 }"));
+        let overrides = nextest_overrides();
+        let timing = overrides
+            .iter()
+            .position(|(_, group, _)| group == "timing")
+            .expect("an override for the timing group");
+        let gpu = overrides
+            .iter()
+            .position(|(_, group, _)| group == "gpu")
+            .expect("an override for the gpu group");
+        assert!(timing < gpu, "the first matching override decides");
+        let (filter, _, several_slots) = &overrides[timing];
+        assert!(several_slots, "the timing tests ask for several test slots");
+        assert_eq!(filter.matches("binary(").count(), TIMING_TESTS.len());
+        for (package, test) in TIMING_TESTS {
+            assert!(filter.contains(&format!("package({package})")), "{filter}");
+            assert!(filter.contains(&format!("binary({test})")), "{filter}");
+            let file = checkout()
+                .join("crates")
+                .join(package)
+                .join("tests")
+                .join(format!("{test}.rs"));
+            assert!(file.is_file(), "{} does not exist", file.display());
+            assert!(
+                GPU_PACKAGES.contains(&package),
+                "{package} is not run single-threaded by the cargo test fallback"
+            );
+        }
+        // The CI's second pass over the package leaves the crossing tests out.
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        assert!(ci.contains("SPACE_SKIP_TIMING: \"1\""), "ci.yml");
     }
 
     #[test]

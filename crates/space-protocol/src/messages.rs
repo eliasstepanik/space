@@ -148,6 +148,18 @@ pub struct Snapshot {
     /// sent inputs 10..=14 and gets `input_ack = 12` keeps exactly 13 and 14,
     /// whatever order the server received them in.
     pub input_ack: u64,
+    /// More chunks of this snapshot follow (protocol 7).
+    ///
+    /// An interest set that does not fit one frame goes out as several
+    /// `Snapshot` messages, one per tick, on the reliable ordered stream:
+    /// every chunk but the last says `true`. "What a snapshot does not name
+    /// is gone" is a statement about the **whole** snapshot: the recipient
+    /// collects the entities of every chunk and drops what none of them
+    /// named when the chunk that says `false` arrives — never per chunk (it
+    /// used to, and kept only the last chunk's entities, while the shard
+    /// counted all of them as known). A snapshot that fits one frame is one
+    /// message that says `false`.
+    pub more: bool,
 }
 
 /// A delta: the entities whose components changed since the recipient's last
