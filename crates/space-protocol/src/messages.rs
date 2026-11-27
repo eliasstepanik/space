@@ -168,9 +168,12 @@ pub struct Snapshot {
 /// A delta: the entities whose components changed since the recipient's last
 /// acknowledged tick.
 ///
-/// Same shape as [`Snapshot`] plus the base tick it applies to: the recipient
-/// applies it only if `base_tick` matches what it holds, otherwise it asks for a
-/// fresh snapshot. This is the network half of `space-ecs`'s change-tick model
+/// Same shape as [`Snapshot`] plus a `base_tick`. The client applies every
+/// delta directly (merges it into its state) and does not gate on `base_tick`;
+/// the field is informational. Loss recovery is server-side: the server tracks
+/// which frames each client has acknowledged (`InputTick::ack_tick`) and
+/// re-sends the content of frames presumed lost (see `space-server`'s
+/// `replicate` module). This is the network half of `space-ecs`'s change-tick model
 /// (`World::tick` + `Query::changed_since`): the server's replication pass
 /// collects exactly the rows whose change tick moved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

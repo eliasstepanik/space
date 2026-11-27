@@ -61,6 +61,7 @@ You are expected to *use* the game while you build it.
 | run it on one shard, or on more | the same with `-MinShards N` / `--min-shards N` (1 to 8; 1 = no borders anywhere). The client's address stays the player port |
 | watch the cluster scale | the dev scripts with `SPACE_ORCHESTRATOR_SHARD_CAPACITY=2`, `SPACE_ORCHESTRATOR_SCALE_OUT_AFTER=5`, `SPACE_ORCHESTRATOR_SCALE_IN_AFTER=15`, `SPACE_ORCHESTRATOR_SCALE_COOLDOWN=10` in the environment and two clients: a loaded shard's hot cell is carved for a new shard, an idle shard is merged away, drains and stops (`.warren/skills/space-visual-test/SKILL.md`, "Scaling") |
 | run it in containers | `deploy/docker-compose.yaml`: **the orchestrator alone**, which starts its shard containers through the Docker socket (`--launcher docker`, Linux engine only). The dev scripts do not need Docker: they keep `--launcher process` |
+| check the container stack end to end | `cargo run -p xtask -- e2e` (needs Docker): builds the images, starts the compose stack as project `space-e2e` on its own ports, flies one player across a shard border, takes the stack down; `--dry-run` prints the commands |
 | drive a client without a human | the harness: `space-client --headless --harness 127.0.0.1:8098`, then `GET /state`, `GET /frame.png`, `POST /input`, `POST /script` |
 | script a user | Lua: `space-client --headless --script scripts/harness/smoke.lua` — the exit code is the script's result |
 | watch and play in a browser | `space-client --stream 127.0.0.1:8099` + `cargo run -p xtask -- viewer` → `http://127.0.0.1:8097/` |

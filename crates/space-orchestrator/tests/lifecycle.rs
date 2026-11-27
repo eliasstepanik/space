@@ -35,20 +35,10 @@ use space_protocol::control::LoadReport;
 use space_protocol::shard::EpochAck;
 use space_protocol::{Message, Reject, RejectReason, SceneAck, SceneState, ShardHello, ShardId};
 use space_server::orchestrated::{start_orchestrated, OrchestratedOptions};
-
-fn loopback0() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
-}
+use space_test_support::loopback0;
 
 fn temp_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "space-orch-lifecycle-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ))
+    space_test_support::temp_path("space-orch-lifecycle", tag)
 }
 
 /// A running orchestrator: its loop in a task, and the handle its web UI
@@ -533,10 +523,20 @@ async fn a_shard_without_the_cluster_secret_is_refused_for_good() {
         .await
         .expect("a refusal is not waited out")
         .expect_err("no secret, no region");
-        assert!(
-            err.contains("rejected") && err.contains("cluster secret"),
-            "{wrong:?}: {err}"
-        );
+        if wrong.is_empty() {
+            // No secret: nothing to verify with; the orchestrator refuses the hello.
+            assert!(
+                err.contains("rejected") && err.contains("cluster secret"),
+                "{wrong:?}: {err}"
+            );
+        } else {
+            // A wrong secret: the shard sees the orchestrator's certificate is
+            // not of its secret's CA and never sends the hello.
+            assert!(
+                err.contains("did not prove it holds") && err.contains("cluster secret"),
+                "{wrong:?}: {err}"
+            );
+        }
         assert!(!err.contains(SECRET), "the secret is never said: {err}");
         assert!(started.elapsed() < Duration::from_secs(5), "final, at once");
     }

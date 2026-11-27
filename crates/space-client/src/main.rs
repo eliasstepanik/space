@@ -40,6 +40,7 @@ use space_client::input::KEY_HELP;
 use space_harness::http::{self, HttpConfig};
 use space_harness::script::{run_script, ScriptConfig, StopHandle};
 use space_harness::{Control, Hub, ScriptReport};
+use space_net::ClusterPin;
 use space_render::{ContextOptions, QualityPreset, RenderContext, MAX_FRAME_DIMENSION};
 use space_stream::StreamServer;
 
@@ -107,6 +108,8 @@ struct Config {
     script_timeout: Option<Duration>,
     /// `--out-dir DIR`: where scripts write screenshots.
     out_dir: PathBuf,
+    /// `--pin HEX`: the cluster pin every server must present (skips TOFU).
+    pin: Option<ClusterPin>,
 }
 
 impl Default for Config {
@@ -125,6 +128,7 @@ impl Default for Config {
             script: None,
             script_timeout: None,
             out_dir: PathBuf::from("harness-out"),
+            pin: None,
         }
     }
 }
@@ -151,6 +155,8 @@ impl Config {
 enum Command {
     Run(Box<Config>),
     Help,
+    /// `--reset-pins`: delete the pin file and exit.
+    ResetPins,
 }
 
 /// Parse a `WxH` frame size; both sides must be in `1..=MAX_FRAME_DIMENSION`.
@@ -166,6 +172,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     let mut config = Config::default();
     let mut headless = false;
     let mut stream = None;
+    let mut reset_pins = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = |what: &str| args.next().ok_or(format!("{arg} needs {what}"));
@@ -230,6 +237,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 );
             }
             "--out-dir" => config.out_dir = PathBuf::from(value("a directory")?),
+            "--reset-pins" => reset_pins = true,
+            "--pin" => {
+                config.pin = Some(
+                    value("a cluster pin (64 hex characters)")?
+                        .parse()
+                        .map_err(|e| format!("--pin: {e}"))?,
+                );
+            }
             // The scene flags of the offline client. Ignored with a warning,
             // not refused: a deployment that still passes one (the proxy
             // compose did, as `CLIENT_ARGS=--galaxy`) must not lose its client
@@ -248,6 +263,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
+    }
+    if reset_pins {
+        return Ok(Command::ResetPins);
     }
     config.front_end = match stream {
         Some(addr) => FrontEnd::Stream(addr),
@@ -269,7 +287,7 @@ fn usage() -> String {
         \x20                   [--size WxH] [--quality high|medium|low|ci] [--no-vsync]\n\
         \x20                   [--frames N] [--fps N] [--glb FILE [--glb-scale S]]\n\
         \x20                   [--harness ADDR] [--script FILE [--script-timeout S]]\n\
-        \x20                   [--out-dir DIR]\n\
+        \x20                   [--out-dir DIR] [--pin HEX] [--reset-pins]\n\
         \n\
         The client always plays on a shard. With no arguments a window opens on\n\
         the connect screen: type the server's address (host, host:port or\n\
@@ -324,7 +342,19 @@ fn usage() -> String {
         \x20                and exit with its result: 0 passed, 1 failed (the\n\
         \x20                message goes to stderr)\n\
         \x20 --script-timeout S  stop the script after S seconds (default 60)\n\
-        \x20 --out-dir DIR  where scripts write screenshots (default harness-out)"
+        \x20 --out-dir DIR  where scripts write screenshots (default harness-out)\n\
+        \n\
+        Server identity (trust on first use): the first time this client dials\n\
+        a host:port of a cluster it trusts the cluster pin (the cluster CA's\n\
+        public key) the server presents, logs it - compare it with the pin the\n\
+        orchestrator prints, out of band - and stores it in pins.json under\n\
+        your config directory ($SPACE_PIN_FILE overrides the path). Later\n\
+        dials of that host:port must present the same pin, or are refused. A\n\
+        server without a cluster secret presents none: nothing is stored.\n\
+        \x20 --pin HEX      hold every server of this run to this pin (64 hex\n\
+        \x20                characters) instead of the stored ones; a mismatch\n\
+        \x20                is refused\n\
+        \x20 --reset-pins   delete the stored pins and exit"
     )
 }
 
@@ -628,11 +658,31 @@ fn main() -> ExitCode {
             println!("{}", usage());
             return ExitCode::SUCCESS;
         }
+        Ok(Command::ResetPins) => {
+            return match space_client::tofu::reset_pins() {
+                Ok((path, true)) => {
+                    println!("space-client: deleted the pin file {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Ok((path, false)) => {
+                    println!(
+                        "space-client: no pin file at {}; nothing to delete",
+                        path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    eprintln!("space-client: --reset-pins: {message}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         Err(message) => {
             eprintln!("space-client: {message}\n\n{}", usage());
             return ExitCode::from(2);
         }
     };
+    space_client::tofu::set_pin(config.pin);
     match run(&config) {
         Ok(code) => ExitCode::from(code),
         Err(fatal) => {
@@ -650,7 +700,24 @@ mod tests {
         match parse_args(args.iter().map(|arg| (*arg).to_owned()))? {
             Command::Run(config) => Ok(*config),
             Command::Help => Err("help".into()),
+            Command::ResetPins => Err("reset-pins".into()),
         }
+    }
+
+    #[test]
+    fn pins_are_given_and_reset_on_the_command_line() {
+        let pin = "ab".repeat(32);
+        assert_eq!(
+            parse(&["--pin", &pin]).unwrap().pin,
+            Some(pin.parse().unwrap())
+        );
+        assert!(parse(&["--pin", "abc"]).unwrap_err().contains("--pin"));
+        assert!(parse(&["--pin"]).is_err());
+        assert_eq!(
+            parse_args(["--reset-pins".to_owned()]),
+            Ok(Command::ResetPins)
+        );
+        assert!(usage().contains("--reset-pins") && usage().contains("--pin HEX"));
     }
 
     #[test]

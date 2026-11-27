@@ -1,0 +1,10 @@
+[package]
+name = "space-test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Helpers shared by the workspace's tests: a seeded PRNG, temp paths, loopback address. Depends on no workspace crate; used as a dev-dependency only"
+
+[lints]
+workspace = true

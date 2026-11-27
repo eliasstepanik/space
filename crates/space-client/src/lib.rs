@@ -38,4 +38,5 @@ pub mod link;
 pub mod meshes;
 pub mod predict;
 pub mod scenes;
+pub mod tofu;
 pub mod ui;

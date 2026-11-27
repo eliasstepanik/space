@@ -67,7 +67,10 @@ pub struct SpawnSpec {
     /// The host UDP port this shard listens on, from the config's port range
     /// (0: any port — the in-process launcher binds an ephemeral one).
     pub host_port: u16,
-    /// The cluster secret the shard presents in its hello (empty: none). A
+    /// The cluster secret the shard presents in its hello (empty: none). It is
+    /// the cluster secret only when a hello needs one
+    /// ([`crate::control::ControlPlane::secret_required`]); a generated secret
+    /// is not handed over otherwise. A
     /// launcher hands it over **through the environment or in memory, never on
     /// a command line**, and never logs it.
     pub secret: String,

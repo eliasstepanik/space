@@ -1052,6 +1052,15 @@ async fn serve<L: Launcher + 'static>(
     println!("{}", scene_line(&orchestrator.control.scene, &config));
     println!("{}", shards_line(&config));
     println!("{}", players_line(&config));
+    match orchestrator.control.cluster_trust() {
+        Some(trust) => println!(
+            "space-orchestrator: cluster links are pinned to the cluster secret; cluster pin {}",
+            trust.pin()
+        ),
+        None => println!(
+            "space-orchestrator: cluster links are not pinned (loopback control port, no cluster secret configured)"
+        ),
+    }
     // The web UI runs in its own task and holds only a handle: it reads the
     // snapshots the loop publishes and offers commands to the loop's queue, so
     // nothing it does (or a client does to it) can hold the loop up. An address

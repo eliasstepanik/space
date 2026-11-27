@@ -26,7 +26,7 @@
 - Phase 2 — headless multiplayer + H1–H8
   - Scale targets: ~100 players/shard, ~1k entities in interest range (U9).
 - Phase 3 — orchestrator + H9–H15
-  - Status: **complete** — `space-orchestrator` (epoch-versioned shard map, split/merge autoscaler, monotonic persisted ShardId counter) and shard handoff H9–H15. The `bollard`-backed `--launcher docker` is deferred (`--launcher local` only); see `docs/plan-phase3.md`.
+  - Status: **complete** — `space-orchestrator` (epoch-versioned shard map, split/merge autoscaler, monotonic persisted ShardId counter) and shard handoff H9–H15. `--launcher docker` is implemented (hand-rolled HTTP/1.1 over the Docker socket, no `bollard`) alongside `--launcher local`; see `docs/plan-phase3.md`.
   - Load metric `max(players/100, tick p95/33.3 ms)`; split at ≥0.8 for 10 s, merge at ≤0.35 for 60 s (U12).
   - ShardId allocation: ids are **monotonic and never reused** (FIX 9). Guid
     uniqueness `(shard, serial)` requires it — a recycled id would alias two
@@ -48,4 +48,4 @@
 - Phase 7 — MCP
   - Status: **complete** — `space-mcp` (hand-rolled JSON-RPC, stdio + Streamable HTTP), `space-mcp-server` (drive a shard) and `space-mcp-client` (play and capture frames).
 - Phase 8 — packaging + skill
-  - Status: **complete** — `Dockerfile.client` + compose `stream` profile, top-level CI build `Dockerfile`, wasm and Docker-build CI jobs, the `space-dev` agent skill (`.warren/skills/space-dev/SKILL.md`), workspace version 0.1.0. The Dockerfiles are correct-by-inspection only (`deploy/README.md`).
+  - Status: **complete** — `Dockerfile.client` + compose `stream` profile, top-level CI build `Dockerfile`, wasm and Docker-build CI jobs, the `space-dev` agent skill (`.warren/skills/space-dev/SKILL.md`), workspace version 0.1.0. The Dockerfiles are built (but not run) in CI (`deploy/README.md`).

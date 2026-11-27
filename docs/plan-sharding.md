@@ -1675,7 +1675,7 @@ made untrue brought up to date.
 1. **Map and lifecycle.** Carve and ancestor merge, depth 64, all-shard recipients (first, as a
    pure test: carve three cells, merge one); the anchor rule and spawn points; regions at hello;
    `min/max-shards`, the reconciler, the `process` launcher, supervision, secrets; load reports.
-   The dev scripts get the four-shard topology as an option, not yet the default.
+   The dev scripts default to the four-shard topology (`scripts/dev.sh` sets `min_shards=4`).
 2. **One address.** Player port, `JoinRedirect`, client endpoints, the address a shard is seen at.
 3. **Seamless crossing.** Tick origin, the handoff state's tick and the catch-up, the client's
    clock, prediction and histories across a switch, ship hysteresis.

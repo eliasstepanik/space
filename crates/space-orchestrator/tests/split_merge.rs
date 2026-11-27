@@ -10,9 +10,12 @@
 //! The full client-visible H9–H15 suite (players crossing a split boundary with
 //! no tick gap) is slice 4; the Docker launcher is slice 5.
 
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use common::RecordingLauncher;
 use space_orchestrator::autoscale::{SPLIT_DWELL_TICKS, SPLIT_THRESHOLD};
 use space_orchestrator::config::OrchestratorConfig;
 use space_orchestrator::control::ControlPlane;
@@ -32,41 +35,6 @@ fn addr(n: u16) -> SocketAddr {
 
 fn shard(n: u32) -> ShardId {
     ShardId::new(n)
-}
-
-/// A launcher that records spawns/kills and never touches a process.
-#[derive(Debug, Default)]
-struct RecordingLauncher {
-    spawned: std::sync::Mutex<Vec<LaunchId>>,
-    killed: std::sync::Mutex<Vec<LaunchId>>,
-}
-
-impl Launcher for RecordingLauncher {
-    async fn spawn(
-        &self,
-        spec: SpawnSpec,
-    ) -> Result<ShardHandle, space_orchestrator::launcher::LaunchError> {
-        self.spawned.lock().unwrap().push(spec.launch);
-        Ok(ShardHandle {
-            launch: spec.launch,
-            shard: None,
-            endpoint: launched_at(spec.launch),
-            process: "rec".into(),
-        })
-    }
-    async fn kill(
-        &self,
-        launch: LaunchId,
-    ) -> Result<(), space_orchestrator::launcher::LaunchError> {
-        self.killed.lock().unwrap().push(launch);
-        Ok(())
-    }
-    async fn poll(
-        &self,
-        _launch: LaunchId,
-    ) -> Result<Poll, space_orchestrator::launcher::LaunchError> {
-        Ok(Poll::Alive)
-    }
 }
 
 /// Where the shard of `launch` listens in these tests.
@@ -105,7 +73,14 @@ fn register(orch: &mut Orchestrator<RecordingLauncher>, spec: &SpawnSpec) -> Sha
 /// control link (a map change is only made when every one of them can
 /// acknowledge it).
 fn orchestrator(plane: ControlPlane) -> Orchestrator<RecordingLauncher> {
-    let mut orch = Orchestrator::new(plane, Arc::new(RecordingLauncher::default()));
+    let mut orch = Orchestrator::new(
+        plane,
+        Arc::new(RecordingLauncher::new(
+            "rec",
+            |spec| launched_at(spec.launch),
+            false,
+        )),
+    );
     let owners: Vec<ShardId> = orch.map().regions.iter().map(|r| r.shard).collect();
     orch.note_connected(owners);
     orch

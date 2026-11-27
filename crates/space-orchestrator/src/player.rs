@@ -145,7 +145,24 @@ impl PlayerServer {
     ///
     /// [`io::Error`] when the socket cannot be bound.
     pub fn bind(bind: SocketAddr) -> io::Result<Self> {
-        let (config, _cert) = space_net::crypto::make_server_config();
+        Self::bind_trusted(bind, None)
+    }
+
+    /// Bind the player port on `bind`, presenting certificates issued by the
+    /// cluster CA of `trust`; `None` presents a throwaway self-signed one
+    /// ([`Self::bind`]).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the socket cannot be bound.
+    pub fn bind_trusted(
+        bind: SocketAddr,
+        trust: Option<&space_net::ClusterTrust>,
+    ) -> io::Result<Self> {
+        let config = match trust {
+            Some(trust) => trust.server_config(),
+            None => space_net::crypto::make_server_config().0,
+        };
         let endpoint = space_net::server_endpoint(bind, config)?;
         let (answer, _) = watch::channel(PlayerAnswer::Starting);
         Ok(Self {
@@ -339,13 +356,10 @@ mod tests {
     use super::*;
     use space_net::{Joined, NetError};
     use space_protocol::{Hello, ShardId, ShardMap, ShardRegion, PROTOCOL_VERSION};
+    use space_test_support::loopback0;
     use std::time::Instant;
 
     const SERVER_NAME: &str = crate::control::SERVER_NAME;
-
-    fn loopback0() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
-    }
 
     /// A player port serving on loopback, and its address.
     fn serving(hello_timeout: Duration) -> (Arc<PlayerServer>, SocketAddr) {
@@ -358,6 +372,34 @@ mod tests {
         // (Detached: it ends with the endpoint, when the server is dropped.)
         drop(Arc::clone(&server).spawn_accept());
         (server, addr)
+    }
+
+    /// A pinned client trusts a player port bound with the cluster trust and
+    /// is told `Untrusted` by a plain one.
+    #[tokio::test]
+    async fn a_pinned_client_trusts_a_player_port_bound_with_the_cluster_trust() {
+        let trust = space_net::ClusterTrust::from_secret("the-cluster-secret-0123").expect("trust");
+        let pin = trust.pin();
+        let trusted =
+            Arc::new(PlayerServer::bind_trusted(loopback0(), Some(&trust)).expect("bind"));
+        let plain = Arc::new(PlayerServer::bind(loopback0()).expect("bind"));
+        let t_addr = trusted.local_addr().expect("bound");
+        let p_addr = plain.local_addr().expect("bound");
+        drop(Arc::clone(&trusted).spawn_accept());
+        drop(Arc::clone(&plain).spawn_accept());
+
+        let hello = space_net::hello("player");
+        let endpoint = space_net::client_endpoint_pinned(t_addr, Some(&pin)).expect("endpoint");
+        // The handshake completed: the port answered "starting".
+        let told = space_net::join(&endpoint, t_addr, SERVER_NAME, &hello)
+            .await
+            .expect_err("nothing published yet");
+        assert_eq!(told, NetError::Rejected(RejectReason::Starting));
+        let endpoint = space_net::client_endpoint_pinned(p_addr, Some(&pin)).expect("endpoint");
+        let err = space_net::join(&endpoint, p_addr, SERVER_NAME, &hello)
+            .await
+            .expect_err("a plain port is not the cluster's");
+        assert!(matches!(err, NetError::Untrusted(_)), "{err:?}");
     }
 
     fn redirect_to(shard: u32) -> JoinRedirect {

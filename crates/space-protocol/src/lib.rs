@@ -11,7 +11,7 @@
 //! [`bincode`] 2.x through its `serde` bridge, behind one function pair,
 //! [`encode_frame`] / [`decode_frame`]. It is pure Rust like the rest of the
 //! workspace (no C code), reuses the `serde` derive the messages already carry,
-//! and is compact (varint integers). A hand-rolled codec would be a second
+//! and is compact (fixed-width integers, chosen on purpose: see `codec.rs`). A hand-rolled codec would be a second
 //! format to test and to keep bug-compatible across four consumers, and
 //! bincode 2.0.1 is the released 2.x, so there is no alpha/beta churn. The
 //! bincode `Config` is pinned here ([`codec`]), which makes the byte layout a

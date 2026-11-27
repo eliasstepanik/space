@@ -23,6 +23,11 @@
 //!   fails with the reason and the process exits.
 //! * An orchestrator that cannot be reached at all is tried again for
 //!   [`ORCHESTRATOR_PATIENCE`], then the boot fails.
+//! * An orchestrator that does not prove it holds the shard's cluster secret
+//!   (its certificate is not issued from the CA the secret makes) is **final**
+//!   too, never retried: the shard has not sent anything, and in particular not
+//!   its secret. A shard with a secret verifies the orchestrator before the
+//!   `ShardHello`, and verifies every peer shard before its hello.
 //!
 //! # A shard does not run without its orchestrator
 //!
@@ -40,7 +45,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use space_net::NetError;
+use space_net::{ClusterPin, ClusterTrust, NetError};
 use space_protocol::{RejectReason, ShardHello, ShardId, ShardRegion, ShardWelcome};
 use space_world::NodeRef;
 use tokio::sync::Mutex;
@@ -95,7 +100,10 @@ pub struct OrchestratedOptions {
     pub cluster: String,
     /// The cluster secret presented in `ShardHello` (empty: none). Needed when
     /// the orchestrator's control port is not on loopback, or when it was
-    /// given a secret explicitly.
+    /// given a secret explicitly. With a secret the shard presents a cluster
+    /// certificate itself and refuses to send anything (the secret included)
+    /// to an orchestrator or peer shard whose certificate was not issued from
+    /// the CA this secret makes; without one it behaves as it always did.
     pub secret: String,
 }
 
@@ -169,6 +177,14 @@ pub fn classify(err: &NetError) -> HelloFailure {
             "{err}: shard and orchestrator must be built from the same commit"
         )),
         NetError::Protocol(_) => HelloFailure::Final(err.to_string()),
+        // Never retried, and the secret was not sent: the orchestrator's
+        // certificate does not chain to the CA this shard's secret makes.
+        NetError::Untrusted(_) => HelloFailure::Final(format!(
+            "the orchestrator at that address did not prove it holds this shard's cluster \
+             secret (its certificate was not issued from it): the secret differs from the \
+             orchestrator's (check {ENV_CLUSTER_SECRET} / {ENV_CLUSTER_SECRET_FILE} on both), \
+             the orchestrator runs without one, or something else answers there"
+        )),
         NetError::Handshake(_) | NetError::Io(_) => HelloFailure::Unreachable(err.to_string()),
     }
 }
@@ -204,6 +220,19 @@ pub async fn register_within(
     orch_addr: SocketAddr,
     patience: Duration,
 ) -> Result<(ShardWelcome, space_net::Conn), String> {
+    let pin = ClusterTrust::from_secret(&options.secret).map(|t| t.pin());
+    register_pinned(options, advertised, orch_addr, patience, pin).await
+}
+
+/// The loop of [`register_within`], with the orchestrator verified against
+/// `pin` (derived from the secret by the callers; `None` only without one).
+async fn register_pinned(
+    options: &OrchestratedOptions,
+    advertised: SocketAddr,
+    orch_addr: SocketAddr,
+    patience: Duration,
+    pin: Option<ClusterPin>,
+) -> Result<(ShardWelcome, space_net::Conn), String> {
     // `ShardId::NONE` and no region is the normal hello: the orchestrator
     // allocates the id and assigns the region.
     let claim = options
@@ -221,7 +250,7 @@ pub async fn register_within(
             client_endpoint: options.client_endpoint,
             secret: options.secret.clone(),
         };
-        let err = match OrchestratorLink::handshake(orch_addr, hello).await {
+        let err = match OrchestratorLink::handshake_pinned(orch_addr, hello, pin.as_ref()).await {
             Ok(answer) => return Ok(answer),
             Err(err) => err,
         };
@@ -385,19 +414,24 @@ pub async fn start_orchestrated_on(
     // fixed `127.0.0.1:7777`): without `advertise` the endpoint we
     // report is the one we listen on. With it, we report that address instead,
     // so a peer or client on another host/container can dial us.
-    let net = Arc::new(ShardNet::bind(options.bind).map_err(|e| format!("bind: {e}"))?);
+    let trust = ClusterTrust::from_secret(&options.secret);
+    let net = Arc::new(
+        ShardNet::bind_trusted(options.bind, trust.clone()).map_err(|e| format!("bind: {e}"))?,
+    );
     let listening = net.local_addr().map_err(|e| e.to_string())?;
     let advertised = options.advertised(listening);
 
     // Ask the orchestrator for an id + region + map, for as long as it says
     // "not yet". Nothing is served and nothing ticks before the welcome.
-    let (welcome, conn) = match register(&options, advertised, orch_addr).await {
-        Ok(answer) => answer,
-        Err(why) => {
-            net.close();
-            return Err(format!("orchestrator handshake: {why}"));
-        }
-    };
+    let pin = trust.as_ref().map(ClusterTrust::pin);
+    let (welcome, conn) =
+        match register_pinned(&options, advertised, orch_addr, ORCHESTRATOR_PATIENCE, pin).await {
+            Ok(answer) => answer,
+            Err(why) => {
+                net.close();
+                return Err(format!("orchestrator handshake: {why}"));
+            }
+        };
 
     // The cluster's clock: this shard counts the ticks every other shard of
     // the cluster counts, from the origin the welcome names — whenever it
@@ -584,6 +618,11 @@ mod tests {
         });
         assert!(why.contains("same commit"), "{why}");
         last_word(NetError::Protocol("expected ShardWelcome".into()));
+        let why = last_word(NetError::Untrusted("bad certificate".into()));
+        assert!(
+            why.contains(ENV_CLUSTER_SECRET) && why.contains(ENV_CLUSTER_SECRET_FILE),
+            "{why}"
+        );
     }
 
     /// The secret comes from the variable, else from a file (the flag's, else

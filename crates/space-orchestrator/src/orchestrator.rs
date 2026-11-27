@@ -2260,7 +2260,12 @@ impl<L: Launcher> Orchestrator<L> {
             cluster: config.cluster.clone(),
             control_addr: config.control_addr(),
             host_port,
-            secret: self.control.cluster_secret().expose().to_owned(),
+            // Handed over only when a hello needs it.
+            secret: if self.control.secret_required() {
+                self.control.cluster_secret().expose().to_owned()
+            } else {
+                String::new()
+            },
         });
         true
     }
@@ -4381,8 +4386,9 @@ impl<L: Launcher> Orchestrator<L> {
     ///
     /// [`std::io::Error`] if the control endpoint cannot be bound.
     pub fn bind(&self) -> Result<Arc<crate::control::ControlServer>, std::io::Error> {
-        Ok(Arc::new(crate::control::ControlServer::bind(
+        Ok(Arc::new(crate::control::ControlServer::bind_trusted(
             self.control.config.bind,
+            self.control.cluster_trust(),
         )?))
     }
 
@@ -4396,10 +4402,11 @@ impl<L: Launcher> Orchestrator<L> {
     ///
     /// [`std::io::Error`] if the player port cannot be bound.
     pub fn bind_player(&self) -> Result<Option<Arc<PlayerServer>>, std::io::Error> {
+        let trust = self.control.cluster_trust();
         self.control
             .config
             .player_bind
-            .map(|bind| PlayerServer::bind(bind).map(Arc::new))
+            .map(|bind| PlayerServer::bind_trusted(bind, trust).map(Arc::new))
             .transpose()
     }
 
@@ -9773,6 +9780,54 @@ mod tests {
         );
     }
 
+    /// A launched shard is handed the cluster secret only when a hello needs
+    /// it.
+    #[test]
+    fn a_launch_carries_the_cluster_secret_only_when_it_is_required() {
+        let mut open = fresh_cluster(OrchestratorConfig {
+            min_shards: 1,
+            launcher: LauncherKind::Process,
+            ..OrchestratorConfig::default()
+        });
+        // A generated secret is not handed over on a loopback control port.
+        open.control
+            .set_generated_secret(crate::config::Secret::new("generated-for-the-shards"));
+        open.tick();
+        assert_eq!(open.take_pending_spawn().pop().expect("launch").secret, "");
+
+        // Off loopback a hello needs the secret, so a generated one is handed over.
+        let mut managed = fresh_cluster(OrchestratorConfig {
+            bind: "0.0.0.0:7000".parse().expect("addr"),
+            min_shards: 1,
+            launcher: LauncherKind::Process,
+            ..OrchestratorConfig::default()
+        });
+        managed
+            .control
+            .set_generated_secret(crate::config::Secret::new("generated-for-the-shards"));
+        managed.tick();
+        assert_eq!(
+            managed.take_pending_spawn().pop().expect("launch").secret,
+            "generated-for-the-shards"
+        );
+
+        let mut configured = fresh_cluster(OrchestratorConfig {
+            min_shards: 1,
+            launcher: LauncherKind::Process,
+            cluster_secret: Some(crate::config::Secret::new("the-cluster-secret-0123")),
+            ..OrchestratorConfig::default()
+        });
+        configured.tick();
+        assert_eq!(
+            configured
+                .take_pending_spawn()
+                .pop()
+                .expect("launch")
+                .secret,
+            "the-cluster-secret-0123"
+        );
+    }
+
     /// What the launcher is asked for: one launch per missing shard, each with
     /// a host port of the range (round robin: the port of a shard that just
     /// went is not the next one used) and the cluster secret; a launch that
@@ -9794,7 +9849,10 @@ mod tests {
         assert_eq!(first.launch, LaunchId(1));
         assert_eq!(first.cluster, orch.config().cluster);
         assert_eq!(first.control_addr, orch.config().control_addr());
-        assert_eq!(first.secret, "generated-for-the-shards");
+        assert_eq!(
+            first.secret, "",
+            "loopback, nothing configured: no hello needs a secret, so none is handed over"
+        );
 
         // The launcher could not start it.
         orch.note_launch_result(first.launch, Err("spawn failed: no such file".into()));

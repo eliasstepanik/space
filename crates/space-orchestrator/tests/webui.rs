@@ -41,15 +41,12 @@ use space_orchestrator::orchestrator::Orchestrator;
 use space_orchestrator::webui::{Limits, WebUi, WebUiConfig};
 use space_protocol::{Message, Scene, SceneState, ShardId};
 use space_server::orchestrated::{start_orchestrated, OrchestratedOptions, RunningShard};
+use space_test_support::loopback0;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 const TOKEN: &str = "integration-test-token-0123456789";
-
-fn loopback0() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
-}
 
 /// The default limits without the pause between operator actions: most tests
 /// here post several actions back to back (the pause has a test of its own).

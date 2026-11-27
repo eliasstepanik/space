@@ -33,20 +33,10 @@ use space_protocol::shard::EpochAck;
 use space_protocol::{JoinRedirect, Message, RejectReason, SceneAck, ShardHello, ShardId};
 use space_server::net::SERVER_NAME;
 use space_server::orchestrated::{start_orchestrated, OrchestratedOptions, RunningShard};
-
-fn loopback0() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
-}
+use space_test_support::loopback0;
 
 fn temp_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "space-orch-player-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ))
+    space_test_support::temp_path("space-orch-player", tag)
 }
 
 /// A running orchestrator with a player port: its loop in a task, the two

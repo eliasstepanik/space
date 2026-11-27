@@ -29,15 +29,18 @@
 //! between two shards over real QUIC, the shard-side epoch participant -- is
 //! production code.
 
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use common::RecordingLauncher;
 use space_orchestrator::config::OrchestratorConfig;
 use space_orchestrator::control::ControlPlane;
 use space_orchestrator::epoch::EpochPublisher;
 use space_orchestrator::ids::{MemoryCounterSink, PersistentShardIdAllocator};
-use space_orchestrator::launcher::{LaunchError, LaunchId, Launcher, Poll, ShardHandle, SpawnSpec};
+use space_orchestrator::launcher::{LaunchId, Launcher, ShardHandle, SpawnSpec};
 use space_orchestrator::orchestrator::Orchestrator;
 use space_protocol::control::LoadReport;
 use space_protocol::shard::{ShardId, ShardMap, ShardRegion};
@@ -71,48 +74,6 @@ fn shard(n: u32) -> ShardId {
 /// The root region of a test cluster.
 fn root() -> NodeRef {
     NodeRef::new(ROOT_DEPTH, [0, 0, 0])
-}
-
-/// A launcher that records the orchestrator's launch decisions and never starts
-/// a process: the harness starts members itself so it can wire their peer
-/// endpoints. Recording is what lets a test assert what a launch spec carries.
-#[derive(Debug, Default)]
-struct RecordingLauncher {
-    spawned: StdMutex<Vec<SpawnSpec>>,
-    killed: StdMutex<Vec<LaunchId>>,
-}
-
-impl RecordingLauncher {
-    fn spawned(&self) -> Vec<SpawnSpec> {
-        self.spawned.lock().unwrap().clone()
-    }
-
-    fn killed(&self) -> Vec<LaunchId> {
-        self.killed.lock().unwrap().clone()
-    }
-}
-
-impl Launcher for RecordingLauncher {
-    async fn spawn(&self, spec: SpawnSpec) -> Result<ShardHandle, LaunchError> {
-        self.spawned.lock().unwrap().push(spec.clone());
-        Ok(ShardHandle {
-            launch: spec.launch,
-            shard: None,
-            endpoint: spec.control_addr,
-            process: "harness".into(),
-        })
-    }
-    async fn kill(&self, launch: LaunchId) -> Result<(), LaunchError> {
-        self.killed.lock().unwrap().push(launch);
-        Ok(())
-    }
-    async fn poll(&self, launch: LaunchId) -> Result<Poll, LaunchError> {
-        Ok(if self.killed.lock().unwrap().contains(&launch) {
-            Poll::Dead
-        } else {
-            Poll::Alive
-        })
-    }
 }
 
 /// A control plane whose root is owned by `root_owner`, epoch 1.
@@ -210,7 +171,14 @@ impl Cluster {
         let plane = plane_with_root(shard(1), ids);
         let (ack_tx, ack_rx) = mpsc::channel(1024);
         Self {
-            orch: Orchestrator::new(plane, Arc::new(RecordingLauncher::default())),
+            orch: Orchestrator::new(
+                plane,
+                Arc::new(RecordingLauncher::new(
+                    "harness",
+                    |spec| spec.control_addr,
+                    true,
+                )),
+            ),
             members: Vec::new(),
             ack_rx: Arc::new(Mutex::new(ack_rx)),
             ack_tx,

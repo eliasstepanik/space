@@ -4,6 +4,7 @@ use std::process::{exit, Command, Stdio};
 
 use clap::{Parser, Subcommand};
 
+mod e2e;
 mod viewer;
 
 #[derive(Parser)]
@@ -33,8 +34,8 @@ enum Task {
         #[arg(long)]
         dry_run: bool,
     },
-    /// End-to-end tests (implemented in a later phase)
-    E2e,
+    /// Docker end-to-end check: the compose stack, one player, one change of shard
+    E2e(e2e::E2eArgs),
     /// Load benchmarks (implemented in a later phase)
     Load,
     /// Cross-platform parity checks (implemented in a later phase)
@@ -89,7 +90,8 @@ fn main() {
             gpu_setup(&prefix, force, print_env)
         }
         Task::Viewer(args) => viewer::run(args, &invoked_from),
-        Task::E2e | Task::Load | Task::Parity | Task::WebSmoke | Task::Accept => stub(),
+        Task::E2e(args) => e2e::run(args, &invoked_from),
+        Task::Load | Task::Parity | Task::WebSmoke | Task::Accept => stub(),
     }
 }
 

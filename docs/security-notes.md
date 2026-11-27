@@ -77,6 +77,69 @@ describes current behaviour, not intent.
   file), and anything that formats `Secret::expose()` or the fields of a wire
   message by hand.
 
+## Cluster certificate pinning
+
+**Threat model.** A man-in-the-middle who can intercept traffic between a
+shard and the orchestrator, or between two shards, could impersonate either
+side, steal the cluster secret or inject commands. Without pinning, the
+accept-anything TLS of `space_net::crypto` cannot tell them apart from the
+real peer.
+
+**Mechanism.** The cluster secret seeds a deterministic Ed25519 CA
+(PBKDF2-HMAC-SHA256, 100,000 iterations, salt `space-cluster-ca-v1`; see
+`space_net::trust`). The CA signs a per-endpoint leaf certificate, with a fresh
+key each time; the CA key never leaves the process. The **pin** is the
+hex-encoded CA public key (`ClusterPin`). A dialer verifies the server's
+certificate against a trust store that holds only that CA, and rejects any
+certificate the CA did not issue.
+
+**Pin properties.** The pin is deterministic: the same secret always gives the
+same pin, and rotating the secret changes the pin. It is a public key and safe
+to publish.
+
+**How to verify.** The orchestrator prints the pin at startup; an operator
+compares it out-of-band with the pin they expect. Shards that hold the secret
+verify the orchestrator's certificate automatically, before they send
+`ShardHello`, and verify a peer shard's certificate before the hello that
+carries the peer token. The orchestrator presents the cluster certificate on
+its control and player ports whenever a secret is required. A shard with an
+empty secret behaves as before (no pinning).
+
+**Current scope.** Implemented: orchestrator certificate and shard-to-shard
+verification by shards, and **client-side trust on first use**. A cluster
+server presents the CA's self-signed certificate behind its leaf
+(`ClusterTrust::ca_certificate`, an intermediate in the TLS chain; no wire
+message changed). The client (`space_client::tofu`, which every client dial goes
+through: the entry address and every shard a redirect or handoff names) reads
+the pin off that certificate, checks that the leaf was issued by that CA, and
+the first time it sees a `host:port` stores the pin and logs it at info level
+(`trusting <host:port> pin <hex> for the first time; verify it out of band` -
+compare it with the pin the orchestrator printed). Every later dial of that
+`host:port` must present the same pin; a mismatch is refused with an error
+naming the host:port, the expected and the received pin, and `--reset-pins`.
+A server without a cluster secret presents no CA: the client connects unpinned
+(as before) and stores nothing; a server that has a stored pin and later
+presents none is refused.
+
+The store is a JSON object `{"host:port": "<64 hex>"}` at
+`<config dir>/space/pins.json` (`$XDG_CONFIG_HOME` or `$HOME/.config`; on
+Windows `%APPDATA%`; the environment variable `SPACE_PIN_FILE` overrides the
+path). An unreadable file is treated as empty, with a warning. A corrupt one
+is first renamed to `pins.json.corrupt` (so the pins in it are not lost), then
+treated as empty with a warning; pins are written through a temporary file and
+a rename, so a crash does not leave half a file.
+`space-client --reset-pins` deletes it and exits 0; `space-client --pin <hex>`
+holds every server of that run to the given pin (TOFU skipped, store neither
+read nor written, a mismatch fails hard). Limits, stated: TOFU protects against
+a man in the middle only from the second connection on (verify the first pin
+out of band); the key is the address as dialed, so the same server under a new
+address is a first use; two client processes are not locked against each other
+when they write the file.
+
+**What an attacker can do.** One who holds the cluster secret can do nothing
+new: they already control the cluster. One who does not hold it cannot
+impersonate the orchestrator or a shard to a verifying shard.
+
 ## Deferred items
 
 1. **The peer token is one secret for the whole cluster.** It says "a shard of

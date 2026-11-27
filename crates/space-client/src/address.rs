@@ -274,6 +274,7 @@ pub fn explain(addr: SocketAddr, error: &NetError) -> String {
             format!("no answer from {addr} (is a shard running there?)")
         }
         NetError::Handshake(why) => format!("cannot connect to {addr}: {why}"),
+        NetError::Untrusted(why) => format!("cannot connect to {addr}: {why}"),
         NetError::Protocol(why) => format!("{addr} is not a space shard: {why}"),
         NetError::Io(why) => format!("cannot reach {addr}: {why}"),
     }

@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use space_world::hash::splitmix64;
+use space_test_support::Rng;
 use space_world::octree::{self, NodeRef, MAX_DEPTH};
 use space_world::{
     CellCoord, Galaxy, InterestGrid, LodSelector, StarSystem, WorldPos, CELL_HALF, MAX_SELECTED,
@@ -21,26 +21,6 @@ fn far_pos() -> WorldPos {
     WorldPos {
         cell: [FAR_CELL, 0, 0],
         local: [0.0; 3],
-    }
-}
-
-/// SplitMix64-driven test RNG: deterministic, no external crates.
-struct Rng(u64);
-
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(1);
-        splitmix64(self.0)
-    }
-
-    /// Uniform in `[0, 1)`.
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// Uniform in `[-1, 1)`.
-    fn next_sym(&mut self) -> f64 {
-        self.next_f64() * 2.0 - 1.0
     }
 }
 
@@ -70,7 +50,7 @@ fn position_precision() {
     // Random far origins and arbitrary deltas: the cell term is exact, so the
     // only error is the f32 quantisation of the local part (~3e-5 m for
     // |local| <= 512). Absolute error therefore stays below 1 mm.
-    let mut rng = Rng(0x9E37_79B9);
+    let mut rng = Rng::new(0x9E37_79B9);
     // Spread over ~4.7e23 mm (4.7e20 m) so origins reach 50 000 ly.
     let wide = |rng: &mut Rng| -> i128 {
         let hi = (rng.next_u64() % 256_000) as i128;
@@ -132,7 +112,7 @@ fn cell_normalization() {
 
 #[test]
 fn octree_roundtrip() {
-    let mut rng = Rng(0xCAFE);
+    let mut rng = Rng::new(0xCAFE);
     for _ in 0..200 {
         let pos = WorldPos::from_metres([
             rng.next_u64() as i64 as i128,
@@ -210,7 +190,7 @@ fn lod_monotonic() {
     let sel = LodSelector::new(54, 58, 32.0);
     let fov = std::f32::consts::FRAC_PI_3;
     let dir = [1.0f32, 0.0, 0.0];
-    let mut rng = Rng(0xB0_00_00_00_00_00_00_01);
+    let mut rng = Rng::new(0xB0_00_00_00_00_00_00_01);
     for i in 0..1000 {
         let cam = random_camera(&mut rng);
         // Halve the distance to the region centre: strictly closer.
@@ -246,7 +226,7 @@ fn lod_monotonic() {
 fn lod_bounded() {
     let sel = LodSelector::new(54, 58, 32.0);
     let fov = std::f32::consts::FRAC_PI_3;
-    let mut rng = Rng(0x1234_5678);
+    let mut rng = Rng::new(0x1234_5678);
     for _ in 0..200 {
         let cam = random_camera(&mut rng);
         for dir in [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.3, 0.6, -0.7]] {
@@ -295,11 +275,11 @@ fn galaxy_deterministic() {
     let b = Galaxy::new(0xDEAD_BEEF_CAFE_1234);
     let c = Galaxy::new(0xDEAD_BEEF_CAFE_1235);
 
-    let va = sample_galaxy(&a, &mut Rng(7));
-    let vb = sample_galaxy(&b, &mut Rng(7));
+    let va = sample_galaxy(&a, &mut Rng::new(7));
+    let vb = sample_galaxy(&b, &mut Rng::new(7));
     assert_eq!(va, vb, "same seed must produce identical output");
 
-    let vc = sample_galaxy(&c, &mut Rng(7));
+    let vc = sample_galaxy(&c, &mut Rng::new(7));
     assert_ne!(va, vc, "different seed must differ");
 
     // The generator actually produces stars, and they cluster towards the core.
@@ -408,7 +388,7 @@ fn system_orbits() {
 #[test]
 fn interest_cap() {
     let mut grid = InterestGrid::new();
-    let mut rng = Rng(0xC0FFEE);
+    let mut rng = Rng::new(0xC0FFEE);
     // 5000 entities in a 20 km box around the origin.
     for id in 0..5000u64 {
         let pos = WorldPos::from_f64_metres_around(
@@ -480,7 +460,7 @@ const BENCH_BUDGET_S: f64 = 10.0;
 /// Spread `n` entities over a 100 km cube (about 1000 per 1 km cell).
 fn populate(n: u64) -> InterestGrid {
     let mut grid = InterestGrid::new();
-    let mut rng = Rng(0xBEEF_0000);
+    let mut rng = Rng::new(0xBEEF_0000);
     for id in 0..n {
         let pos = WorldPos::from_f64_metres_around(
             WorldPos::ZERO,
@@ -514,7 +494,7 @@ fn bench_interest_insert() {
 #[test]
 fn bench_interest_query() {
     let grid = populate(1_000_000);
-    let mut rng = Rng(0x1234);
+    let mut rng = Rng::new(0x1234);
     let t = Instant::now();
     let mut total = 0usize;
     for _ in 0..1000 {

@@ -13,5 +13,8 @@ space-protocol = { workspace = true }
 serde = { workspace = true }
 rapier3d-f64 = { workspace = true }
 
+[dev-dependencies]
+space-test-support = { workspace = true }
+
 [lints]
 workspace = true

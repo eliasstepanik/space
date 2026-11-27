@@ -104,6 +104,12 @@ this binary against a daemon — either a compose job
 exists, treat every claim in "What CI (with a daemon) will run" below as
 **unproven**.
 
+**Since then:** the spike was ported to `crates/space-orchestrator/src/launcher/docker.rs`,
+and the CI home is the `docker-e2e` job of `.github/workflows/ci.yml`
+(`cargo run -p xtask -- e2e`): it runs the production launcher through
+`deploy/docker-compose.yaml` — create, list, remove on shutdown — not this binary,
+which still has never been run against a daemon.
+
 ## What a daemon host would run (not yet executed anywhere)
 
 On a host with a Docker daemon, the same binary runs the full cycle and prints

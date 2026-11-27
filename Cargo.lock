@@ -543,6 +543,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2029,6 +2035,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2136,6 +2158,15 @@ name = "rand_pcg"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb95882a1e14462c69aea9984bb261293ccfe6022ef8de0eda18bd5afb0052df"
+dependencies = [
+ "rand_core",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
  "rand_core",
 ]
@@ -2591,7 +2622,10 @@ dependencies = [
  "env_logger",
  "futures-util",
  "log",
+ "quinn",
  "raw-window-handle",
+ "rustls",
+ "serde_json",
  "space-ecs",
  "space-harness",
  "space-net",
@@ -2668,6 +2702,7 @@ dependencies = [
  "bytes",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "space-ecs",
  "space-protocol",
@@ -2687,6 +2722,7 @@ dependencies = [
  "space-scene",
  "space-server",
  "space-sim",
+ "space-test-support",
  "space-world",
  "tokio",
 ]
@@ -2696,8 +2732,10 @@ name = "space-protocol"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "proptest",
  "serde",
  "space-ecs",
+ "space-test-support",
  "space-world",
 ]
 
@@ -2733,6 +2771,7 @@ dependencies = [
 name = "space-server"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "quinn",
  "serde",
  "space-ecs",
@@ -2752,6 +2791,7 @@ dependencies = [
  "serde",
  "space-ecs",
  "space-protocol",
+ "space-test-support",
  "space-world",
 ]
 
@@ -2767,6 +2807,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "space-test-support"
+version = "0.1.0"
+
+[[package]]
 name = "space-viewer"
 version = "0.1.0"
 dependencies = [
@@ -2779,6 +2823,9 @@ dependencies = [
 [[package]]
 name = "space-world"
 version = "0.1.0"
+dependencies = [
+ "space-test-support",
+]
 
 [[package]]
 name = "spade"
@@ -3102,6 +3149,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicode-ident"

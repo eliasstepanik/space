@@ -4,6 +4,12 @@
 //! `version_mismatch_rejected`, `oversized_rejected`, `truncated_rejected`,
 //! `unknown_tag_rejected`, `shard_map_lookup`, `guid_stable_across_handoff`,
 //! `snapshot_budget`, `property_random_messages` and `delta_size_sanity`.
+//!
+//! Property tests over hostile bytes (proptest, fixed seed, no regression files;
+//! `PROPTEST_CASES` overrides the 256 cases): `arbitrary_bytes_never_panic_the_decoder`,
+//! `a_valid_header_over_arbitrary_bytes_never_panics`,
+//! `a_mutated_valid_frame_never_panics` and
+//! `a_hostile_length_prefix_never_panics_the_decoder`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -835,19 +841,18 @@ fn removed_list_is_charged_to_the_budget() {
 // Property: 1000 random messages roundtrip
 // ---------------------------------------------------------------------------
 
-/// Tiny deterministic RNG (the same mixer `space-world` uses for generation).
-struct Rng(u64);
+/// The protocol's message generators, over the workspace's shared test PRNG.
+struct Rng(space_test_support::Rng);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(seed)
+        Self(space_test_support::Rng::new(seed))
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        space_world::splitmix64(self.0)
+        self.0.next_u64()
     }
     fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n
+        self.0.below(n)
     }
     fn u32_below(&mut self, n: u32) -> u32 {
         self.below(u64::from(n)) as u32
@@ -1830,4 +1835,111 @@ fn message_tags_are_dense_and_covered() {
     for (i, tag) in tags.iter().enumerate() {
         assert_eq!(*tag as usize, i, "tags must be dense");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Property: the decoder survives hostile bytes
+// ---------------------------------------------------------------------------
+
+use proptest::collection::vec;
+use proptest::prelude::{any, Strategy};
+use proptest::sample::Index;
+use proptest::test_runner::TestCaseError;
+
+/// Runs a property with a fixed seed, no regression files and `cases` cases
+/// (`PROPTEST_CASES` wins when set), so a failure is the same on every run.
+fn check<S>(cases: u32, strategy: &S, test: impl Fn(S::Value) -> Result<(), TestCaseError>)
+where
+    S: Strategy,
+    S::Value: std::fmt::Debug,
+{
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    let mut config = Config::default();
+    if std::env::var_os("PROPTEST_CASES").is_none() {
+        config.cases = cases;
+    }
+    config.failure_persistence = None;
+    let mut runner =
+        TestRunner::new_with_rng(config, TestRng::deterministic_rng(RngAlgorithm::ChaCha));
+    if let Err(failure) = runner.run(strategy, test) {
+        panic!("{failure}");
+    }
+}
+
+/// The decoder either refuses `frame` or yields a message that re-encodes to
+/// bytes that decode and re-encode to the same bytes (bytes, not messages: a
+/// decoded float may be NaN).
+fn survives(frame: &[u8]) -> Result<(), TestCaseError> {
+    let Ok(message) = decode_frame(frame) else {
+        return Ok(());
+    };
+    let bytes = try_encode_frame(&message).map_err(|e| {
+        TestCaseError::fail(format!("decoded {message:?} but cannot encode it: {e}"))
+    })?;
+    let again = decode_frame(&bytes)
+        .map_err(|e| TestCaseError::fail(format!("re-encoded {message:?} does not decode: {e}")))?;
+    let bytes_again = try_encode_frame(&again)
+        .map_err(|e| TestCaseError::fail(format!("decoded {again:?} but cannot encode it: {e}")))?;
+    if bytes_again != bytes {
+        return Err(TestCaseError::fail(format!(
+            "re-encoding is not stable for {message:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// A frame: payload length, protocol version (both big-endian), payload.
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn arbitrary_bytes_never_panic_the_decoder() {
+    check(256, &vec(any::<u8>(), 0..=2048), |bytes| survives(&bytes));
+}
+
+#[test]
+fn a_valid_header_over_arbitrary_bytes_never_panics() {
+    let strategy = (0..Message::VARIANT_COUNT, vec(any::<u8>(), 0..=2048));
+    check(256, &strategy, |(tag, bytes)| {
+        let mut payload = tag.to_be_bytes().to_vec();
+        payload.extend_from_slice(&bytes);
+        survives(&framed(&payload))
+    });
+}
+
+#[test]
+fn a_mutated_valid_frame_never_panics() {
+    let strategy = (any::<u64>(), vec((any::<Index>(), any::<u8>()), 1..=8));
+    check(256, &strategy, |(seed, edits)| {
+        let mut frame = encode_frame(&Rng::new(seed).message());
+        let payload_len = frame.len() - FRAME_HEADER_LEN;
+        if payload_len == 0 {
+            return survives(&frame);
+        }
+        for (index, byte) in edits {
+            frame[FRAME_HEADER_LEN + index.index(payload_len)] = byte;
+        }
+        survives(&frame)
+    });
+}
+
+#[test]
+fn a_hostile_length_prefix_never_panics_the_decoder() {
+    let strategy = (any::<u64>(), any::<Index>(), (1u64 << 32)..=u64::MAX);
+    check(256, &strategy, |(seed, index, hostile)| {
+        let mut frame = encode_frame(&Rng::new(seed).message());
+        let payload_len = frame.len() - FRAME_HEADER_LEN;
+        if payload_len < 12 {
+            return Ok(());
+        }
+        let offset = 4 + index.index(payload_len - 8 - 4 + 1);
+        let at = FRAME_HEADER_LEN + offset;
+        frame[at..at + 8].copy_from_slice(&hostile.to_be_bytes());
+        survives(&frame)
+    });
 }

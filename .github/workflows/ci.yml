@@ -1,7 +1,7 @@
 name: CI
 
 # Where the jobs run:
-#   * Linux jobs (lint, linux, wasm, docker) run BARE on SELF-HOSTED runners
+#   * Linux jobs (lint, supply-chain, linux, wasm, docker, docker-e2e) run BARE on SELF-HOSTED runners
 #     labelled `space-ci` (Linux, x64, dind over TCP) on the maintainer's
 #     `proxy` host. They install Rust via rustup (no job containers), because
 #     the runner's docker-in-docker sidecar cannot mount the runner's tool dirs
@@ -30,6 +30,33 @@ jobs:
         run: python3 -m pip install --user pyyaml || pip3 install --user pyyaml || (apt-get update && apt-get install -y python3-yaml)
       - name: Parse .github/workflows and deploy YAML
         run: python3 .github/scripts/check_yaml.py
+      # Picks up .github/actionlint.yaml (custom runner label).
+      - name: actionlint
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+  # Supply chain: RustSec advisories (cargo-audit) and licenses / bans /
+  # sources (cargo-deny).
+  supply-chain:
+    name: Supply chain
+    runs-on: [self-hosted, linux, x64, space-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rustup, idempotent)
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny check
+        run: cargo deny check
 
   linux:
     name: Linux
@@ -165,7 +192,7 @@ jobs:
         run: cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer
 
   # Build every image to prove the Dockerfiles parse and compile; nothing is
-  # pushed or run. (The container *runtime* behaviour is not exercised here.)
+  # pushed or run. (The container *runtime* behaviour is exercised by `docker-e2e` below.)
   docker:
     name: Docker build (${{ matrix.file }})
     # Directly on the runner (no container): it needs the host's docker/buildx.
@@ -183,3 +210,50 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: docker buildx build (no push)
         run: docker buildx build --file ${{ matrix.file }} --tag space-ci/test:latest .
+
+  # The local compose stack, run for real: `xtask e2e` builds the shard image,
+  # starts deploy/docker-compose.yaml as the compose project `space-e2e` on its
+  # own ports, waits for four shard containers, flies one player (no renderer:
+  # crates/space-client/tests/live_stack.rs) across a shard border and takes
+  # the stack down again. The daemon is the runner's dind over TCP, so the
+  # player port is dialed on the DOCKER_HOST's host, which xtask reads itself.
+  # One run at a time: the project name and the ports are fixed. (A newer
+  # waiting run replaces an older waiting one; a running one is never cancelled.)
+  docker-e2e:
+    name: Docker E2E (compose stack, one handoff)
+    runs-on: [self-hosted, linux, x64, space-ci]
+    timeout-minutes: 90
+    concurrency:
+      group: docker-e2e
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rustup, idempotent)
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      # `xtask e2e` exits 2 without the compose plugin; the runner image may not have it.
+      - name: docker compose (install the plugin if the runner has none)
+        run: |
+          if ! docker compose version >/dev/null 2>&1; then
+            mkdir -p "$HOME/.docker/cli-plugins"
+            curl -sSfL -o "$HOME/.docker/cli-plugins/docker-compose" \
+              https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64
+            chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+          fi
+          docker compose version
+      - name: cargo run -p xtask -- e2e
+        run: cargo run -p xtask -- e2e

@@ -10,7 +10,8 @@
 //! loopback does not start without one a shard could present
 //! ([`OrchestratorConfig::check_secret`]), and when the operator configured
 //! none, one is generated for the shards the orchestrator starts itself (it is
-//! handed to them by the launcher and never printed).
+//! handed to them by the launcher only when a hello needs it, and never
+//! printed).
 //!
 //! It also opens the scene file next to the counter ([`crate::scene`]): the
 //! scene an operator chose before a restart is restored, otherwise the
@@ -82,14 +83,7 @@ mod tests {
     use super::*;
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "space-orch-boot-unit-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ))
+        space_test_support::temp_path("space-orch-boot-unit", tag)
     }
 
     /// Mutation this catches: the `expect` that used to sit on the counter

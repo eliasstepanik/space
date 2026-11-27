@@ -19,41 +19,11 @@ use space_sim::physics::step_ship;
 use space_sim::prediction::PredictedShip;
 use space_sim::tick::{dt, seconds_of, SimTick};
 use space_sim::{orbits, ShipState, SimWorld};
+use space_test_support::Rng;
 use space_world::{StarSystem, WorldPos};
 
 /// Seed for every seeded pseudo-random script in this file.
 const SEED: u64 = 0x5EA1_2345_6789_ABCD;
-
-/// SplitMix64 (same mixer `space-world` uses): integer-only, so the generated
-/// input scripts are bit-identical on every platform.
-fn splitmix64(mut x: u64) -> (u64, u64) {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    (x, z ^ (z >> 31))
-}
-
-/// A deterministic pseudo-random generator over `u64`.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let (state, out) = splitmix64(self.0);
-        self.0 = state;
-        out
-    }
-
-    /// A float in `[-1, 1]` with 1e-6 resolution, derived from integers only.
-    fn next_signed(&mut self) -> f32 {
-        let u = self.next_u64() % 2_000_001;
-        (u as f64 / 1_000_000.0 - 1.0) as f32
-    }
-}
 
 /// The ships used by the multi-entity tests.
 const SHIPS: u64 = 8;

@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use space_net::Conn;
+use space_net::{ClusterTrust, Conn};
 use space_protocol::{
     Message, Reject, RejectReason, ShardHello, ShardId, ShardMap, ShardRegion, ShardWelcome,
     Welcome,
@@ -69,7 +69,31 @@ struct Seen {
 /// An orchestrator that answers the hellos it gets from `script`, in order
 /// (the last answer is repeated). Returns its address and what it has seen.
 fn scripted_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>>) {
-    let (config, _cert) = space_net::crypto::make_server_config();
+    scripted_orchestrator_of(script, "the-cluster-secret")
+}
+
+/// [`scripted_orchestrator`] that presents a certificate issued from the CA of
+/// `secret` (an empty one: a plain self-signed certificate).
+fn scripted_orchestrator_of(
+    script: Vec<Answer>,
+    secret: &str,
+) -> (SocketAddr, Arc<StdMutex<Seen>>) {
+    let config = match ClusterTrust::from_secret(secret) {
+        Some(trust) => trust.server_config(),
+        None => space_net::crypto::make_server_config().0,
+    };
+    scripted_orchestrator_with(script, config)
+}
+
+/// [`scripted_orchestrator`] with a plain self-signed certificate.
+fn self_signed_orchestrator(script: Vec<Answer>) -> (SocketAddr, Arc<StdMutex<Seen>>) {
+    scripted_orchestrator_of(script, "")
+}
+
+fn scripted_orchestrator_with(
+    script: Vec<Answer>,
+    config: quinn::ServerConfig,
+) -> (SocketAddr, Arc<StdMutex<Seen>>) {
     let endpoint = space_net::server_endpoint(loopback0(), config).expect("bind the control port");
     let addr = endpoint.local_addr().expect("bound");
     let seen = Arc::new(StdMutex::new(Seen::default()));
@@ -577,5 +601,50 @@ async fn an_orchestrated_shard_requires_the_peer_token_of_its_welcome() {
         "a running shard prints its peer token: {printed}"
     );
     assert!(printed.contains("<redacted>"), "{printed}");
+    shard.abort();
+}
+
+/// A shard that holds a cluster secret verifies the orchestrator before it
+/// sends its `ShardHello`, which carries the secret: an orchestrator whose
+/// certificate is self-signed, or issued from another secret, never sees one.
+///
+/// Mutation this catches: dialling with no verification (the audit finding:
+/// the secret went to whoever answered at the address).
+#[tokio::test]
+async fn a_shard_does_not_give_its_secret_to_an_orchestrator_it_cannot_verify() {
+    let (self_signed, seen_self) = self_signed_orchestrator(vec![Answer::Welcome(7)]);
+    let (other, seen_other) = scripted_orchestrator_of(vec![Answer::Welcome(7)], "another-secret");
+    for (what, orch, seen) in [
+        ("self-signed", self_signed, seen_self),
+        ("another secret", other, seen_other),
+    ] {
+        let started = Instant::now();
+        let err =
+            tokio::time::timeout(Duration::from_secs(10), start_orchestrated(options(), orch))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: refused at once, not waited out"))
+                .expect_err("an orchestrator that cannot be verified");
+        assert!(err.contains("cluster secret"), "{what}: {err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+        assert!(
+            seen.lock().expect("seen").hellos.is_empty(),
+            "{what}: no ShardHello may arrive"
+        );
+    }
+}
+
+/// A shard without a secret verifies nothing and registers with a self-signed
+/// orchestrator, as on a loopback dev cluster.
+#[tokio::test]
+async fn a_shard_without_a_secret_registers_with_a_self_signed_orchestrator() {
+    let (orch, seen) = self_signed_orchestrator(vec![Answer::Welcome(7)]);
+    let mut open = options();
+    open.secret = String::new();
+    let shard = tokio::time::timeout(Duration::from_secs(10), start_orchestrated(open, orch))
+        .await
+        .expect("registered in time")
+        .expect("registered");
+    assert_eq!(shard.shard, ShardId(7));
+    assert_eq!(seen.lock().expect("seen").hellos.len(), 1);
     shard.abort();
 }

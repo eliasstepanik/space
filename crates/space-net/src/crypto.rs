@@ -1,13 +1,17 @@
-//! TLS material: a self-signed certificate and the rustls configs.
+//! TLS material and the rustls configs.
 //!
-//! `space` runs its own trust domain: shards and clients have no CA, so every
-//! endpoint presents a **self-signed** certificate generated at start-up with
-//! [`rcgen`], and the client accepts the peer's certificate without a CA chain
-//! ([`SkipAllVerifier`]). That is deliberate for Phase 2: QUIC still gets an
-//! authenticated, encrypted, integrity-protected channel, and the identity check
-//! the game actually needs (the player token in [`space_protocol::Hello`])
-//! happens one layer up, in [`crate::accept_connection`]. Pinning real
-//! certificates is an orchestrator (Phase 3) concern.
+//! This module is the **no-trust** half of `space`'s TLS: an endpoint *without*
+//! a cluster secret or cluster pin (a loopback dev cluster, a standalone shard,
+//! a player that was given no pin) presents a **self-signed** certificate
+//! generated at start-up with [`rcgen`], and its dialer accepts the peer's
+//! certificate without a CA chain ([`SkipAllVerifier`]). QUIC still gives an
+//! encrypted, integrity-protected channel, and the identity check the game needs
+//! (the player token in [`space_protocol::Hello`]) happens one layer up, in
+//! [`crate::accept_connection`]. Everything that has a cluster secret or pin uses
+//! [`crate::trust`] instead: a CA derived from the secret, leaf certificates
+//! signed by it and a client that verifies against it. The cluster CA
+//! derivation (secret to Ed25519 CA) lives in [`crate::trust`] and builds on
+//! the config helpers of this module.
 //!
 //! What "pure Rust" means here, precisely: the whole `space` dependency graph is
 //! pure Rust **except for one deliberate exception** — the TLS/QUIC cryptographic
@@ -51,13 +55,18 @@ pub struct CertPair {
     /// The DER-encoded certificate (presented on connect).
     pub cert: CertificateDer<'static>,
     key_pkcs8: Vec<u8>,
+    /// Certificates presented behind `cert` (a cluster leaf's CA); empty for a
+    /// self-signed one.
+    intermediates: Vec<CertificateDer<'static>>,
 }
 
 impl CertPair {
-    /// Generate a fresh self-signed certificate.
+    /// Generate a fresh self-signed certificate, for an endpoint without a
+    /// cluster secret (see the [module docs](self); with one, use
+    /// [`crate::trust::ClusterTrust::issue`]).
     ///
     /// `dns_names` become the subject alternative names; [`SkipAllVerifier`]
-    /// ignores them, but a real deployment would pin them.
+    /// ignores them.
     #[must_use]
     pub fn generate(dns_names: &[&str]) -> Self {
         let names: Vec<String> = dns_names.iter().map(|s| (*s).to_string()).collect();
@@ -66,6 +75,21 @@ impl CertPair {
         Self {
             cert: cert.der().clone(),
             key_pkcs8: signing_key.serialize_der(),
+            intermediates: Vec::new(),
+        }
+    }
+
+    /// A pair from an already issued certificate, its PKCS#8 key and the
+    /// certificates to present behind it.
+    pub(crate) fn from_parts(
+        cert: CertificateDer<'static>,
+        key_pkcs8: Vec<u8>,
+        intermediates: Vec<CertificateDer<'static>>,
+    ) -> Self {
+        Self {
+            cert,
+            key_pkcs8,
+            intermediates,
         }
     }
 
@@ -85,7 +109,9 @@ impl std::fmt::Debug for CertPair {
 }
 
 /// A [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier) that
-/// accepts any certificate (see the [module docs](self) for why).
+/// accepts any certificate. It is what an endpoint **without** a cluster secret
+/// or pin dials with (see the [module docs](self)); a dialer that has a
+/// [`ClusterPin`](crate::trust::ClusterPin) never uses it.
 #[derive(Debug)]
 pub struct SkipAllVerifier;
 
@@ -132,7 +158,7 @@ impl ServerCertVerifier for SkipAllVerifier {
 }
 
 /// The TLS versions a `space` endpoint speaks (QUIC requires TLS 1.3).
-const VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+pub(crate) const VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Build the rustls **server** config from `cert`.
 ///
@@ -150,14 +176,20 @@ pub fn make_tls_server_config(cert: &CertPair) -> Arc<rustls::ServerConfig> {
         .with_protocol_versions(VERSIONS)
         .expect("ring supports TLS 1.3")
         .with_no_client_auth()
-        .with_single_cert(vec![cert.cert.clone()], cert.key_der())
+        .with_single_cert(
+            std::iter::once(cert.cert.clone())
+                .chain(cert.intermediates.iter().cloned())
+                .collect(),
+            cert.key_der(),
+        )
         .expect("the rcgen key must be supported by the ring provider");
     config.alpn_protocols = vec![ALPN.to_vec()];
     Arc::new(config)
 }
 
-/// Build the rustls **client** config (any server certificate accepted, see
-/// [`SkipAllVerifier`]).
+/// Build the rustls **client** config for an endpoint without a cluster pin:
+/// any server certificate is accepted, see [`SkipAllVerifier`]. With a pin use
+/// [`crate::trust::ClusterPin::tls_client_config`].
 ///
 /// # Panics
 ///
@@ -176,7 +208,9 @@ pub fn make_tls_client_config() -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-/// Build a [`quinn::ServerConfig`] from a fresh self-signed certificate.
+/// Build a [`quinn::ServerConfig`] from a fresh **self-signed** certificate, for
+/// an endpoint without a cluster secret (with one, use
+/// [`crate::trust::ClusterTrust::server_config`]).
 ///
 /// Returns the config and the certificate it presents (handy for tests and for
 /// logging the fingerprint). The ALPN from [`make_tls_server_config`] survives,
@@ -188,12 +222,19 @@ pub fn make_tls_client_config() -> Arc<ClientConfig> {
 #[must_use]
 pub fn make_server_config() -> (quinn::ServerConfig, CertPair) {
     let cert = CertPair::generate(&["space.local"]);
-    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(make_tls_server_config(&cert))
-        .expect("the ring provider supplies the QUIC initial cipher suite");
-    (quinn::ServerConfig::with_crypto(Arc::new(quic)), cert)
+    (quic_server_config(&cert), cert)
 }
 
-/// Build a [`quinn::ClientConfig`] that accepts any server certificate.
+/// Wrap the rustls server config for `cert` as a [`quinn::ServerConfig`].
+pub(crate) fn quic_server_config(cert: &CertPair) -> quinn::ServerConfig {
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(make_tls_server_config(cert))
+        .expect("the ring provider supplies the QUIC initial cipher suite");
+    quinn::ServerConfig::with_crypto(Arc::new(quic))
+}
+
+/// Build a [`quinn::ClientConfig`] that accepts any server certificate, for an
+/// endpoint without a cluster pin (with one, use
+/// [`crate::trust::ClusterPin::client_config`]).
 ///
 /// # Panics
 ///

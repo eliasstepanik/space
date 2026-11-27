@@ -838,6 +838,96 @@ async fn a_bystander_keeps_its_one_session_when_somebody_elses_ship_crosses() {
     b.stop();
 }
 
+/// The player disconnects while its handoff is in flight: the link has
+/// followed the redirect and reported in on the accepting shard A, and the
+/// commit has not happened yet (the shards give it a lead of a second). Closing
+/// the link drops **both** connections at once. Neither shard may keep the
+/// player: no session, no ship, no staged transfer left over to be installed
+/// later for nobody. A player who joins afterwards gets exactly one ship.
+///
+/// Not covered here: dropping only the second connection while the first stays
+/// (the old shard keeping the feed). `ServerLink` has no way to drop just its
+/// pending connection from outside, so that needs a hook in the link (or a
+/// stand-in shard that ends the connection, which is the server dropping, not
+/// the client).
+///
+/// Mutation this catches: a shard that keeps the ship of a session whose
+/// connection is gone (`leave` not aborting the staged transfer or not
+/// dropping the pending commit): a ship owned by nobody, stranded on a shard
+/// that no longer has a player.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_disconnects_mid_handoff_leaves_nothing_behind() {
+    let (a, b) = neighbours().await;
+    let link = join_through_a(&a, &b).await;
+    let ship = link.replica().ship.expect("a ship");
+
+    // Fly towards A until A has the player's second connection (it has a
+    // session there) while the link still plays on B.
+    link.set_thrust([-1.0, 0.0, 0.0]);
+    let mut mid_handoff = false;
+    for _ in 0..6_000 {
+        let on_a = a
+            .shard
+            .try_lock()
+            .is_ok_and(|a_shard| a_shard.stats().clients > 0);
+        if on_a {
+            mid_handoff = link.replica().handoffs == 0;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    link.set_thrust([0.0; 3]);
+    assert!(
+        mid_handoff,
+        "never caught the link between its report on A and the commit: {:?}",
+        link.replica()
+    );
+
+    // The client goes away, both connections with it.
+    link.close();
+    drop(link);
+
+    assert!(
+        eventually(10, || {
+            let (Ok(a), Ok(b)) = (a.shard.try_lock(), b.shard.try_lock()) else {
+                return false;
+            };
+            let (sa, sb) = (a.stats(), b.stats());
+            (sa.clients, sa.ships, sb.clients, sb.ships) == (0, 0, 0, 0)
+        })
+        .await,
+        "state left behind by the disconnected player: A {:?}, B {:?}",
+        a.shard.lock().await.stats(),
+        b.shard.lock().await.stats()
+    );
+    // Not even later, when a commit that crossed the disconnect would be
+    // installed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let (a_shard, b_shard) = (a.shard.lock().await, b.shard.lock().await);
+        for shard in [&a_shard, &b_shard] {
+            assert_eq!(shard.stats().ships, 0, "a stranded ship");
+            assert_eq!(shard.stats().clients, 0);
+            assert!(shard.sim().ship_state(ship).is_none());
+            assert_eq!(shard.session_of(ship), None);
+        }
+    }
+
+    // A fresh player is welcomed normally: one session, one ship, in all.
+    let again = join_through_a(&a, &b).await;
+    assert_eq!(again.replica().handoffs, 0);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    {
+        let (a_shard, b_shard) = (a.shard.lock().await, b.shard.lock().await);
+        assert_eq!(a_shard.stats().clients + b_shard.stats().clients, 1);
+        assert_eq!(a_shard.stats().ships + b_shard.stats().ships, 1);
+    }
+
+    again.close();
+    a.stop();
+    b.stop();
+}
+
 /// A second player, joined through A like the first: it starts beside the
 /// first one, on the spawn point's shard.
 async fn join_through_a_beside(a: &Running) -> ServerLink {

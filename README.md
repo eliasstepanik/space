@@ -14,6 +14,7 @@ shows — the *scene* — is chosen on the server side, for everyone at once.
 | `space-net`, `space-server`, `space-orchestrator` | QUIC transport, the shard, the shard map / autoscaler / scene owner with its built-in web UI |
 | `space-render`, `space-client` | ash/Vulkan renderer (ray-traced shadows, textures, GLB models, 2D overlay), the client (window, headless, pixel stream) |
 | `space-harness` | drive a client without a human: HTTP API for state, frames and input, sandboxed Lua test scripts |
+| `space-test-support` | helpers shared by the tests (seeded PRNG, temp paths, loopback address); depends on no workspace crate, dev-dependency only |
 | `space-stream`, `space-viewer` | JPEG-over-WebSocket streaming and the wasm browser viewer (a local development tool) |
 | `space-mcp*`, `xtask` | MCP servers for agentic testing; CI driver and `xtask viewer` |
 
@@ -239,8 +240,16 @@ space-client [--server ADDR] [--headless | --stream ADDR] [--size WxH]
              [--quality high|medium|low|ci] [--no-vsync] [--frames N] [--fps N]
              [--glb FILE [--glb-scale S]]
              [--harness ADDR] [--script FILE [--script-timeout S]] [--out-dir DIR]
+             [--pin HEX] [--reset-pins]
 ```
 
+- **Server identity (trust on first use).** The first time the client dials a
+  `host:port` of a cluster it trusts and stores the cluster pin the server
+  presents (logged; compare it with the pin the orchestrator prints) in
+  `<config dir>/space/pins.json` (`SPACE_PIN_FILE` overrides the path); later
+  dials must match or are refused. `--pin HEX` holds the run's servers to a pin
+  you give instead; `--reset-pins` deletes the file and exits. A server without
+  a cluster secret is dialed unpinned. See `docs/security-notes.md`.
 - **window** (default), **`--headless`** (no window, renders offscreen) or
   **`--stream ADDR`** (headless, and streams the picture to the browser viewer).
 - `--server ADDR` connects at once and keeps reconnecting **to that address**

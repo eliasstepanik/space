@@ -75,8 +75,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use space_net::{
-    accept_incoming, client_endpoint_for, connect, connect_within, hello, server_endpoint, Conn,
-    LogBudget, Secret,
+    accept_incoming, connect, connect_within, hello, server_endpoint, Conn, LogBudget, Secret,
 };
 use space_protocol::{Message, ShardHello, ShardId, ShardWelcome};
 use tokio::sync::{mpsc, Mutex};
@@ -192,6 +191,9 @@ pub struct ShardNet {
     /// How many of those refusals may be written to the log (see
     /// [`PEER_REFUSAL_LINES`]): the count above is exact, the log is not.
     refusal_lines: LogBudget,
+    /// The cluster CA this shard holds (a cluster with a secret): its
+    /// certificate is issued from it and peers are verified against its pin.
+    trust: Option<space_net::ClusterTrust>,
 }
 
 /// How many refused peer hellos a shard writes to its log per
@@ -214,10 +216,29 @@ impl ShardNet {
     ///
     /// [`io::Error`] when the socket cannot be bound.
     pub fn bind(bind: SocketAddr) -> io::Result<Self> {
-        let (config, _cert) = space_net::crypto::make_server_config();
+        Self::bind_trusted(bind, None)
+    }
+
+    /// [`ShardNet::bind`] for a shard of a cluster that has a secret: with
+    /// `trust` the endpoint presents a certificate issued from the cluster CA
+    /// and every peer this shard dials is verified against that CA's pin;
+    /// without it, a self-signed certificate and unverified peers, as before.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the socket cannot be bound.
+    pub fn bind_trusted(
+        bind: SocketAddr,
+        trust: Option<space_net::ClusterTrust>,
+    ) -> io::Result<Self> {
+        let config = match &trust {
+            Some(trust) => trust.server_config(),
+            None => space_net::crypto::make_server_config().0,
+        };
         let endpoint = server_endpoint(bind, config)?;
         Ok(Self {
             endpoint,
+            trust,
             shard_endpoints: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -620,8 +641,9 @@ impl ShardNet {
         let failures = Arc::clone(&self.peer_send_failures);
         let task_dead = Arc::clone(&dead);
         let hello = peer_hello_with(local, self.peer_token().expose());
+        let pin = self.trust.as_ref().map(space_net::ClusterTrust::pin);
         tokio::spawn(async move {
-            run_peer_sender(rx, addr, shard_id, hello, task_dead, failures).await;
+            run_peer_sender(rx, addr, shard_id, hello, pin, task_dead, failures).await;
         });
         let sender = PeerSender {
             tx,
@@ -694,13 +716,15 @@ async fn run_peer_sender(
     addr: SocketAddr,
     peer: ShardId,
     hello: space_protocol::Hello,
+    pin: Option<space_net::ClusterPin>,
     dead: Arc<AtomicBool>,
     failures: Arc<AtomicU64>,
 ) {
     // One client endpoint for the life of the sender: a quinn `Endpoint` drives
     // its connections, so it must outlive them. It is bound in the address
-    // family of the peer it dials.
-    let endpoint = match client_endpoint_for(addr) {
+    // family of the peer it dials. With a `pin` the peer must present a
+    // certificate of the cluster CA before the hello (and its token) is sent.
+    let endpoint = match space_net::client_endpoint_pinned(addr, pin.as_ref()) {
         Ok(endpoint) => endpoint,
         Err(e) => {
             failures.fetch_add(1, Ordering::SeqCst);
@@ -816,12 +840,41 @@ impl OrchestratorLink {
     /// [`space_net::NetError::Rejected`] with the orchestrator's reason when it
     /// refused the hello ([`space_protocol::RejectReason::Draining`]: not yet,
     /// ask again; anything else is final).
+    ///
+    /// Invariant: a non-empty cluster secret is only ever written to a
+    /// connection whose certificate chains to the CA of that secret. The
+    /// orchestrator is verified against the pin derived from `hello.secret`.
     pub async fn handshake(
         addr: SocketAddr,
         hello: ShardHello,
     ) -> Result<(ShardWelcome, Conn), space_net::NetError> {
-        let endpoint =
-            client_endpoint_for(addr).map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
+        let pin = space_net::ClusterTrust::from_secret(&hello.secret).map(|t| t.pin());
+        Self::handshake_pinned(addr, hello, pin.as_ref()).await
+    }
+
+    /// [`OrchestratorLink::handshake`] with the pin to verify the orchestrator
+    /// against (`None`: no verification, only allowed without a secret).
+    ///
+    /// Invariant: a non-empty cluster secret is only ever written to a
+    /// connection whose certificate chains to the CA of that secret.
+    ///
+    /// # Errors
+    ///
+    /// As [`OrchestratorLink::handshake`]; [`space_net::NetError::Untrusted`]
+    /// when the orchestrator's certificate does not chain to `pin`, or at once
+    /// (nothing dialled) when `hello` carries a secret and `pin` is `None`.
+    pub async fn handshake_pinned(
+        addr: SocketAddr,
+        hello: ShardHello,
+        pin: Option<&space_net::ClusterPin>,
+    ) -> Result<(ShardWelcome, Conn), space_net::NetError> {
+        if !hello.secret.is_empty() && pin.is_none() {
+            return Err(space_net::NetError::Untrusted(
+                "refusing to send the cluster secret over an unverified connection".into(),
+            ));
+        }
+        let endpoint = space_net::client_endpoint_pinned(addr, pin)
+            .map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
         let (conn, _welcome) =
             connect(&endpoint, addr, SERVER_NAME, &peer_hello(hello.shard)).await?;
         // The orchestrator answered the transport handshake with a placeholder;
@@ -1045,6 +1098,7 @@ fn scene_switch_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space_net::client_endpoint_for;
 
     /// The token a shard dials its peers with must parse back to its own id, or
     /// the accepting shard mistakes the peer for a client (and every handoff
@@ -1242,6 +1296,102 @@ mod tests {
         assert_eq!(net.peers_refused(), 5);
         serve.abort();
         net.close();
+    }
+
+    /// [`served_shard`] on a [`ShardNet::bind_trusted`] endpoint.
+    async fn served_trusted_shard(
+        trust: Option<space_net::ClusterTrust>,
+    ) -> (Arc<ShardNet>, JoinHandle<()>) {
+        let net = Arc::new(ShardNet::bind_trusted(loopback(), trust).expect("bind"));
+        let shard = Arc::new(Mutex::new(Shard::new(crate::ShardConfig::new(
+            ShardId::new(1),
+            net.local_addr().expect("addr"),
+            space_world::NodeRef::new(64, [0, 0, 0]),
+        ))));
+        let serve = tokio::spawn({
+            let net = Arc::clone(&net);
+            async move { net.serve(shard).await }
+        });
+        (net, serve)
+    }
+
+    /// Send one peer message from `from` to `to` and wait for the dial to
+    /// settle: `true` when it was delivered (no failure counted, nothing refused).
+    async fn peer_message_arrives(from: &ShardNet, to: &ShardNet) -> bool {
+        let addr = to.local_addr().expect("addr");
+        from.send_to_peer(ShardId::new(7), ShardId::new(1), Some(addr), probe())
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while from.peer_send_failures() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        from.peer_send_failures() == 0 && to.peers_refused() == 0
+    }
+
+    /// Two shards that hold the cluster's trust verify each other and
+    /// exchange a peer message; a shard with trust does not dial a peer that
+    /// only has a self-signed certificate (nothing is sent, a failure is
+    /// counted); two plain shards still exchange one.
+    ///
+    /// Mutation this catches: `peer_sender` dialling without the pin — the
+    /// peer token would go to a peer that never proved it holds the secret.
+    #[tokio::test]
+    async fn shards_with_trust_verify_each_other_and_plain_shards_still_talk() {
+        let trust = || space_net::ClusterTrust::from_secret("cluster-secret");
+
+        let (a, serve_a) = served_trusted_shard(trust()).await;
+        let (b, serve_b) = served_trusted_shard(trust()).await;
+        assert!(peer_message_arrives(&a, &b).await, "trusted -> trusted");
+        a.close();
+        b.close();
+        serve_a.abort();
+        serve_b.abort();
+
+        let (a, serve_a) = served_trusted_shard(trust()).await;
+        let (plain, serve_plain) = served_trusted_shard(None).await;
+        assert!(
+            !peer_message_arrives(&a, &plain).await,
+            "a shard with trust must not dial a self-signed peer"
+        );
+        assert!(a.peer_send_failures() > 0);
+        assert_eq!(plain.peers_refused(), 0, "no hello arrived at all");
+        a.close();
+        plain.close();
+        serve_a.abort();
+        serve_plain.abort();
+
+        let (a, serve_a) = served_trusted_shard(None).await;
+        let (b, serve_b) = served_trusted_shard(None).await;
+        assert!(peer_message_arrives(&a, &b).await, "plain -> plain");
+        a.close();
+        b.close();
+        serve_a.abort();
+        serve_b.abort();
+    }
+
+    /// A hello with a secret and no pin is refused before anything is dialled.
+    ///
+    /// Mutation this catches: dropping the guard — the secret would be
+    /// written to a connection nobody verified.
+    #[tokio::test]
+    async fn the_secret_is_not_sent_without_a_pin() {
+        // Nobody listens here: a dial would take the handshake timeout.
+        let nobody = std::net::UdpSocket::bind(loopback()).expect("bind");
+        let addr = nobody.local_addr().expect("addr");
+        let hello = ShardHello {
+            cluster: "c".into(),
+            shard: ShardId::NONE,
+            endpoint: addr,
+            region: None,
+            client_endpoint: None,
+            secret: "a-secret".into(),
+        };
+        let started = std::time::Instant::now();
+        let err = OrchestratorLink::handshake_pinned(addr, hello, None)
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, space_net::NetError::Untrusted(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     fn probe() -> Message {

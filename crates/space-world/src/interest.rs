@@ -16,7 +16,7 @@
 //! `tests/acceptance.rs` run the same workloads with a 10 s budget each: a
 //! guard against algorithmic regressions that survives a busy CI runner.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::pos::WorldPos;
@@ -109,10 +109,31 @@ pub struct InterestGrid {
     cells: FastMap<[i64; 3], Vec<Entry>>,
     /// entity -> cell key it is currently stored in.
     locations: FastMap<u64, [i64; 3]>,
+    /// Multiset of stored radii (order-preserving bit key -> count), so the
+    /// maximum can be recomputed when the largest entity is removed.
+    radii: BTreeMap<u32, usize>,
     /// Largest radius of any stored entity (0 when empty); used to bound the
-    /// cell scan of a query. Only ever grows — a removal may leave it larger
-    /// than necessary, which costs scan time but never correctness.
+    /// cell scan of a query. Kept exact from `radii`: it shrinks on removal.
     max_radius: f32,
+}
+
+/// Map an `f32` (not NaN) to a `u32` that sorts like the float.
+fn radius_key(r: f32) -> u32 {
+    let bits = r.to_bits();
+    if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+/// Inverse of [`radius_key`].
+fn radius_from_key(k: u32) -> f32 {
+    if k >> 31 == 1 {
+        f32::from_bits(k & 0x7FFF_FFFF)
+    } else {
+        f32::from_bits(!k)
+    }
 }
 
 impl InterestGrid {
@@ -145,9 +166,6 @@ impl InterestGrid {
     /// when the entity is alone in it.
     pub fn insert(&mut self, entity: u64, pos: WorldPos, radius: f32) {
         let key = pos.cell_key();
-        if radius > self.max_radius {
-            self.max_radius = radius;
-        }
         match self.locations.get(&entity).copied() {
             Some(old) if old == key => {
                 let slot = self
@@ -155,8 +173,11 @@ impl InterestGrid {
                     .get_mut(&key)
                     .and_then(|cell| cell.iter_mut().find(|e| e.id == entity));
                 if let Some(entry) = slot {
+                    let old_radius = entry.radius;
                     entry.pos = pos;
                     entry.radius = radius;
+                    self.untrack_radius(old_radius);
+                    self.track_radius(radius);
                     return;
                 }
                 // The two maps always agree, so this is not reached; falling
@@ -173,6 +194,41 @@ impl InterestGrid {
             radius,
         });
         self.locations.insert(entity, key);
+        self.track_radius(radius);
+    }
+
+    /// Count `radius` in the radius multiset and refresh `max_radius`.
+    fn track_radius(&mut self, radius: f32) {
+        if radius.is_nan() {
+            return; // never widens a query (it compares false against everything)
+        }
+        *self.radii.entry(radius_key(radius)).or_insert(0) += 1;
+        self.refresh_max_radius();
+    }
+
+    /// Remove one occurrence of `radius` from the multiset and refresh
+    /// `max_radius`, so it shrinks when the largest entity leaves.
+    fn untrack_radius(&mut self, radius: f32) {
+        if radius.is_nan() {
+            return;
+        }
+        let key = radius_key(radius);
+        if let Some(count) = self.radii.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.radii.remove(&key);
+            }
+        }
+        self.refresh_max_radius();
+    }
+
+    fn refresh_max_radius(&mut self) {
+        let largest = self
+            .radii
+            .keys()
+            .next_back()
+            .map_or(0.0, |&k| radius_from_key(k));
+        self.max_radius = largest.max(0.0);
     }
 
     /// Remove `entity`; returns whether it was present.
@@ -184,11 +240,15 @@ impl InterestGrid {
             // The order of a cell's entries is never observable (query results
             // are sorted by distance, then id), so the hole is filled with the
             // last entry instead of shifting the tail down.
-            if let Some(i) = cell.iter().position(|e| e.id == entity) {
-                cell.swap_remove(i);
-            }
+            let removed = cell
+                .iter()
+                .position(|e| e.id == entity)
+                .map(|i| cell.swap_remove(i));
             if cell.is_empty() {
                 self.cells.remove(&key);
+            }
+            if let Some(entry) = removed {
+                self.untrack_radius(entry.radius);
             }
         }
         true
@@ -553,6 +613,27 @@ mod tests {
         assert!(!grid.remove(1));
         let hits = grid.query_sphere(at([0.0; 3]), 1_000.0, 10);
         assert_eq!(ids(&hits), vec![3, 2]);
+    }
+
+    /// Removing the largest entity shrinks the scan reach again.
+    #[test]
+    fn max_radius_shrinks_when_the_largest_is_removed() {
+        let at = |m: [f64; 3]| WorldPos::from_f64_metres_around(WorldPos::ZERO, m);
+        let mut grid = InterestGrid::new();
+        grid.insert(1, at([0.0; 3]), 10.0);
+        grid.insert(2, at([5_000.0, 0.0, 0.0]), 1.0e6);
+        grid.insert(3, at([0.0, 5_000.0, 0.0]), 1.0e6);
+        assert_eq!(grid.max_radius, 1.0e6);
+        assert!(grid.remove(2));
+        assert_eq!(grid.max_radius, 1.0e6, "another entity still has it");
+        // Shrinking in place by refresh also counts.
+        grid.insert(3, at([0.0, 5_000.0, 0.0]), 20.0);
+        assert_eq!(grid.max_radius, 20.0);
+        assert!(grid.remove(3));
+        assert_eq!(grid.max_radius, 10.0);
+        assert!(grid.remove(1));
+        assert_eq!(grid.max_radius, 0.0);
+        assert!(grid.radii.is_empty());
     }
 
     /// A query that straddles the `i64` wrap of the cell space finds its

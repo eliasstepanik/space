@@ -44,7 +44,7 @@
 //! * [`autoscale`] — the load metric and the split/merge decision
 //! * [`launcher`] — the [`launcher::Launcher`] seam, [`launcher::local::LocalLauncher`]
 //!   (shards inside this process) and [`launcher::process::ProcessLauncher`]
-//!   (one `space-server` process per shard); `launcher::docker` is a later slice
+//!   (one `space-server` process per shard); [`launcher::docker`] runs each shard in a container
 //! * [`scene`] — the cluster's scene, its revision and its persistence (not an
 //!   epoch: see below)
 //! * [`control`] — the control-plane message handlers and the control port's
@@ -85,7 +85,7 @@
 //!
 //! # What this crate is not yet
 //!
-//! The Docker launcher (`launcher/docker.rs`) is a stub. Load reports are
+//! Load reports are
 //! received and acted on, but no shard sends one yet, so the autoscaler only
 //! acts in tests and a merge needs its report said on the shard's behalf
 //! (`docs/plan-sharding.md` §3).

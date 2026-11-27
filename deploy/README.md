@@ -18,6 +18,7 @@ export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"              # required: n
 docker compose -f deploy/docker-compose.yaml up --build            # the orchestrator; it starts four shards
 docker compose -f deploy/docker-compose.yaml --profile stream up --build   # + client
 space-client --server 127.0.0.1:7777                               # a client on the host: the player port
+cargo run -p xtask -- e2e                                          # all of it as one check, on its own ports (see below)
 ```
 
 `up --build` builds the orchestrator image only. The shard image has to exist
@@ -81,6 +82,22 @@ ran): it is pulled once more, then the shard is created. The orchestrator
 never removes an image; `proxy/README.md` has the command that removes old
 shard images on the production host.
 
+## The end-to-end check (`xtask e2e`)
+
+`cargo run -p xtask -- e2e` needs a Docker daemon and the compose plugin (without them
+it exits 2 and says that nothing was checked). It builds `space/shard:e2e`, starts this
+compose file as the project `space-e2e` — player port `7877/udp`, shard ports
+`7970-7999/udp`, web UI `127.0.0.1:7981`, a generated throwaway `SPACE_CLUSTER_SECRET`,
+`DOCKER_GID` read from the socket as the daemon sees it (or taken from the environment)
+— waits for four running shard containers, and runs the ignored test of
+`crates/space-client/tests/live_stack.rs`: a player without a renderer joins through
+the player port, flies across the border at x = -6, is handed to the next shard
+container and parks there. Then `compose down`; a shard container left behind fails
+the run. A stack on the default ports is not touched. With a remote daemon
+(`DOCKER_HOST=tcp://host:port`) the player port is dialed on that host;
+`--server-host HOST` names another, `--dry-run` prints the commands. CI runs it as the
+`docker-e2e` job of `ci.yml`.
+
 ## Publishing pipeline
 
 Both pipelines run on **every push to `main`**, whatever the commit touched, so
@@ -99,7 +116,7 @@ several commits pushed together, the head is the one that is built.
   `:latest` only moves while the commit is still the head of `main`, so a
   slow build of an older push cannot put it back. The repo owner must make a
   package public after its first push. `ci.yml`'s `docker` job still only
-  builds.
+  builds; its `docker-e2e` job runs the local compose stack (`xtask e2e`, above).
 - **Release**: `.github/workflows/release.yml` takes the next patch version
   after the highest `vX.Y.Z` tag, tags the pushed commit with it, builds
   `space-client` (`--release --locked`) on Linux and Windows plus the wasm
@@ -332,6 +349,10 @@ Desktop 28.5.1 (Linux engine in WSL2), 2026-11-24
   `DOCKER_GID`.
 
 **Not run**
+- `cargo run -p xtask -- e2e` against a daemon, and the `docker-e2e` CI job: checked
+  without a daemon only — the command lines by `--dry-run` and unit tests, the
+  player's flight against an in-process four-shard cluster
+  (`crates/space-client/tests/live_stack.rs`). Move this line up once the job has run green.
 - Anything on a Linux host: a socket group other than 0, a firewall, real
   published ports to another machine.
 - The pull of an image that was removed while the orchestrator ran (the

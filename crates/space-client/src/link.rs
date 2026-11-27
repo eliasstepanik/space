@@ -1,7 +1,8 @@
 //! The multiplayer seam: a normal `space-net` player connection.
 //!
 //! [`ServerLink::join`] is the same client path a native client uses:
-//! [`space_net::client_endpoint_for`] + [`space_net::join`] with a
+//! [`crate::tofu::join`] (a [`space_net::join`] over a trust-on-first-use
+//! endpoint: every dial is pinned) with a
 //! [`space_net::hello`] (so the `PROTOCOL_VERSION` gate is the transport's, not
 //! reimplemented here). No server protocol is added: the link sends
 //! [`Message::InputTick`] batches (datagrams) and reads the replicated
@@ -180,7 +181,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use space_ecs::{ComponentDef, ComponentId};
-use space_net::{client_endpoint_for, hello, join, Conn, Joined, NetError};
+use space_net::{hello, Conn, Joined, NetError};
 use space_protocol::{
     far, resolve_client_endpoint, EntityGuid, EntitySnapshot, InputTick, Message, NeighbourStatus,
     Origin, OriginKind, PlayerInput, Redirect, SceneClock, SceneState, ShardId, ShardMap, Welcome,
@@ -565,6 +566,9 @@ pub struct OtherShip {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ShipView {
     ships: Vec<Tracked>,
+    /// Position in `ships` by guid; rebuilt whenever entities are removed,
+    /// extended on every push.
+    index: std::collections::HashMap<EntityGuid, usize>,
     /// A snapshot that is arriving in several chunks
     /// ([`space_protocol::Snapshot::more`]): the tick of its first chunk and
     /// every entity its chunks have named so far. `None` between snapshots.
@@ -753,9 +757,17 @@ impl ShipView {
             }),
             _ => {}
         }
+        if self.index.len() != self.ships.len() {
+            self.index = self
+                .ships
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.ship.guid, i))
+                .collect();
+        }
         let full = matches!(message, Message::Snapshot(_));
         for entry in entities {
-            let held = self.ships.iter().position(|s| s.ship.guid == entry.guid);
+            let held = self.index.get(&entry.guid).copied();
             if held.is_some_and(|i| tick < self.ships[i].tick) {
                 // Older than what is held: it can only rewind.
                 continue;
@@ -819,6 +831,7 @@ impl ShipView {
                     };
                     seen.record(sample_of(&entity, state, at, parts));
                     seen.components = Arc::new(entity.components);
+                    self.index.insert(seen.ship.guid, self.ships.len());
                     self.ships.push(seen);
                 }
             }
@@ -1424,8 +1437,8 @@ impl Drop for ServerLink {
 
 /// Say hello at `addr` as the player `player_token`.
 async fn hello_at(addr: SocketAddr, player_token: &str) -> Result<Joined, NetError> {
-    let endpoint = client_endpoint_for(addr).map_err(|e| NetError::Handshake(e.to_string()))?;
-    join(&endpoint, addr, SERVER_NAME, &hello(player_token)).await
+    // The one place the client dials: pinned by trust on first use (`tofu`).
+    crate::tofu::join(addr, SERVER_NAME, &hello(player_token)).await
 }
 
 /// Where a player dials `shard` according to `map`, when it entered through

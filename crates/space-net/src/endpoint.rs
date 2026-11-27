@@ -42,6 +42,8 @@ use crate::framed::{
     frame_version_mismatch, read_frame, read_frame_capped, recv_datagram, recv_stream_message,
     send_message, send_on_stream, MAX_HELLO_PAYLOAD,
 };
+use crate::tofu::TofuProbe;
+use crate::trust::ClusterPin;
 
 /// Application close code used when a [`Hello`] is refused.
 pub const REJECT_CLOSE_CODE: u32 = 0x20;
@@ -108,11 +110,16 @@ pub enum NetError {
     Protocol(String),
     /// A transport error.
     Io(String),
+    /// The server's certificate was not issued by the cluster this endpoint pins.
+    Untrusted(String),
 }
 
 impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            NetError::Untrusted(why) => {
+                write!(f, "the server's certificate is not this cluster's: {why}")
+            }
             NetError::VersionMismatch { seen, expected } => write!(
                 f,
                 "peer speaks protocol version {seen}, this build requires {expected}"
@@ -188,7 +195,7 @@ pub fn server_endpoint(bind: SocketAddr, server_config: ServerConfig) -> io::Res
 /// refuses it with `InvalidRemoteAddress`) and requires a working IPv6 stack
 /// everywhere else, even to reach `127.0.0.1`. Binding the family of the
 /// address actually being dialled has neither problem, so this is the one to
-/// use whenever the destination is known.
+/// use whenever the destination is known. It accepts any server certificate.
 ///
 /// # Errors
 ///
@@ -205,6 +212,7 @@ pub fn client_endpoint_for(addr: SocketAddr) -> io::Result<Endpoint> {
 ///
 /// Prefer [`client_endpoint_for`] when the destination is known: this one
 /// cannot know which address family will be dialled and guesses by platform.
+/// It accepts any server certificate.
 ///
 /// # Errors
 ///
@@ -218,17 +226,83 @@ pub fn client_endpoint() -> io::Result<Endpoint> {
     client_endpoint_on(bind)
 }
 
-/// A client endpoint bound to a specific local address.
+/// A client endpoint bound to a specific local address. It accepts any server
+/// certificate.
 ///
 /// # Errors
 ///
 /// [`io::Error`] when the socket cannot be bound.
 pub fn client_endpoint_on(bind: SocketAddr) -> io::Result<Endpoint> {
-    let mut config = make_client_config();
+    client_endpoint_with(bind, make_client_config())
+}
+
+/// A client endpoint that can dial `addr` and trusts only the cluster `pin`
+/// names; with `None` it is exactly [`client_endpoint_for`] (any certificate).
+///
+/// A server whose certificate the cluster did not issue makes the dial fail
+/// with [`NetError::Untrusted`].
+///
+/// # Errors
+///
+/// [`io::Error`] when the socket cannot be bound.
+pub fn client_endpoint_pinned(addr: SocketAddr, pin: Option<&ClusterPin>) -> io::Result<Endpoint> {
+    let Some(pin) = pin else {
+        return client_endpoint_for(addr);
+    };
+    let wildcard = match addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    client_endpoint_with(SocketAddr::new(wildcard, 0), pin.client_config())
+}
+
+/// A client endpoint for a **trust-on-first-use** dial of `addr` (see
+/// [`crate::tofu`]): with `expected` `None` it learns the pin of the cluster CA
+/// the server presents; with `Some(pin)` it accepts only a server of that CA.
+/// A server without a cluster secret (no CA) is accepted unpinned when nothing
+/// is expected and refused when a pin is.
+///
+/// The returned [`TofuProbe`] reports, after the dial, which pin the server
+/// presented ([`TofuProbe::presented_pin`]). A refused certificate is
+/// [`NetError::Untrusted`] from [`join`] / [`connect`].
+///
+/// # Errors
+///
+/// [`io::Error`] when the socket cannot be bound.
+pub fn client_endpoint_tofu(
+    addr: SocketAddr,
+    expected: Option<ClusterPin>,
+) -> io::Result<(Endpoint, TofuProbe)> {
+    let wildcard = match addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let (config, probe) = crate::tofu::client_config(expected);
+    let endpoint = client_endpoint_with(SocketAddr::new(wildcard, 0), config)?;
+    Ok((endpoint, probe))
+}
+
+/// The endpoint construction shared by the client endpoints.
+fn client_endpoint_with(bind: SocketAddr, mut config: quinn::ClientConfig) -> io::Result<Endpoint> {
     config.transport_config(transport_config());
     let mut endpoint = Endpoint::client(bind).map_err(io::Error::other)?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
+}
+
+/// Map the error of a finished dial: a TLS alert for a rejected certificate or
+/// signature is [`NetError::Untrusted`], anything else a [`NetError::Handshake`].
+fn dial_error(e: quinn::ConnectionError) -> NetError {
+    if let quinn::ConnectionError::TransportError(t) = &e {
+        let rejected = [42u8, 43, 44, 45, 46, 48, 49, 51];
+        if rejected
+            .iter()
+            .any(|n| t.code == quinn::TransportErrorCode::crypto(*n))
+        {
+            return NetError::Untrusted(e.to_string());
+        }
+    }
+    NetError::Handshake(e.to_string())
 }
 
 /// A connected `space` peer: the quinn connection plus its control stream.
@@ -543,9 +617,7 @@ async fn join_unbounded(
     let connecting = endpoint
         .connect(addr, server_name)
         .map_err(|e| NetError::Handshake(e.to_string()))?;
-    let conn = connecting
-        .await
-        .map_err(|e| NetError::Handshake(e.to_string()))?;
+    let conn = connecting.await.map_err(dial_error)?;
     // The control stream is the first bi stream the client opens; the server
     // reads the hello from it and answers on its own control stream.
     let (mut send, mut recv) = conn

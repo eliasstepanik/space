@@ -74,7 +74,8 @@
 //! `an_unanswered_body_offer_times_out_and_nothing_moved`,
 //! `a_refused_body_offer_leaves_the_body_where_it_was`, the island tests)
 //! and `tests/four_cells.rs` (bodies on the demo area's four shard areas,
-//! against the same thing on one shard).
+//! against the same thing on one shard) and `tests/handoff_props.rs`
+//! (generated interleavings: 1, 2, 6, 7 and, for the offering shard, 8 as invariants).
 //!
 //! # What a handed-over body keeps, and what it does not
 //!

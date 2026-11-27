@@ -22,10 +22,7 @@ use space_orchestrator::launcher::local::LocalLauncher;
 use space_orchestrator::orchestrator::Orchestrator;
 use space_protocol::{Hello, Message, ShardId};
 use space_server::orchestrated::{start_orchestrated, OrchestratedOptions};
-
-fn loopback0() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
-}
+use space_test_support::loopback0;
 
 /// Boot an orchestrator through the binary's own path; returns the cluster
 /// name, the control address, its task and the temp state file.

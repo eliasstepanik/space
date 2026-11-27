@@ -62,9 +62,13 @@ pub struct ControlPlane {
     pub peer_token: Secret,
     /// The cluster secret: what a `ShardHello` must carry when
     /// [`Self::secret_required`], and what the orchestrator hands the shards it
-    /// starts itself. The configured one, or one [`crate::boot::boot`]
-    /// generated; empty when there is neither.
+    /// starts itself **only when** a hello needs it (otherwise they are handed
+    /// none). The configured one, or one [`crate::boot::boot`] generated;
+    /// empty when there is neither.
     cluster_secret: Secret,
+    /// The cluster's certificate authority, derived from the cluster secret;
+    /// see [`Self::cluster_trust`]. Its `Debug` shows the pin only.
+    trust: Option<space_net::ClusterTrust>,
     /// Whether a hello without the right cluster secret is refused
     /// ([`OrchestratorConfig::secret_required`]).
     secret_required: bool,
@@ -88,17 +92,42 @@ impl ControlPlane {
         publisher: EpochPublisher,
         peer_token: String,
     ) -> Self {
-        Self {
+        let mut plane = Self {
             scene: SceneStore::in_memory(config.initial_scene),
             cluster_secret: config.cluster_secret.clone().unwrap_or_default(),
             secret_required: config.secret_required(),
+            trust: None,
             autoscaler: Autoscaler::with_config(config.scale),
             config,
             ids,
             publisher,
             peer_token: Secret::new(peer_token),
             unclaimed_root_owner: None,
+        };
+        plane.trust = plane.derive_trust();
+        plane
+    }
+
+    /// The one rule for [`Self::cluster_trust`]: a trust when a secret is
+    /// required and there is one, none otherwise.
+    fn derive_trust(&self) -> Option<space_net::ClusterTrust> {
+        if self.secret_required {
+            space_net::ClusterTrust::from_secret(self.cluster_secret.expose())
+        } else {
+            None
         }
+    }
+
+    /// The cluster's certificate authority: what the control port and the
+    /// player port present certificates from, and whose pin the operator is
+    /// told ([`space_net::ClusterTrust::pin`]).
+    ///
+    /// `Some` exactly when [`Self::secret_required`] and the cluster secret is
+    /// not empty; `None` on a loopback control port with nothing configured,
+    /// where the links are not pinned.
+    #[must_use]
+    pub fn cluster_trust(&self) -> Option<&space_net::ClusterTrust> {
+        self.trust.as_ref()
     }
 
     /// The cluster secret (see the field docs); empty when there is none.
@@ -115,12 +144,14 @@ impl ControlPlane {
 
     /// Use `secret` as the cluster secret when none was configured: what
     /// [`crate::boot::boot`] does with the one it generates, so that the
-    /// shards the orchestrator starts have one to present. A configured secret
-    /// is never replaced.
+    /// shards the orchestrator starts have one to present when a hello needs
+    /// it (it is not handed to them otherwise). A configured secret is never
+    /// replaced. The cluster trust is derived again.
     pub fn set_generated_secret(&mut self, secret: Secret) {
         if self.config.cluster_secret.is_none() {
             self.cluster_secret = secret;
         }
+        self.trust = self.derive_trust();
     }
 
     /// The way in for every `ShardHello`: when a secret is required it must
@@ -618,7 +649,24 @@ impl ControlServer {
     ///
     /// [`io::Error`] when the socket cannot be bound.
     pub fn bind(bind: SocketAddr) -> io::Result<Self> {
-        let (config, _cert) = space_net::crypto::make_server_config();
+        Self::bind_trusted(bind, None)
+    }
+
+    /// Bind the control endpoint on `bind`, presenting certificates issued by
+    /// the cluster CA of `trust`; `None` presents a throwaway self-signed one
+    /// ([`Self::bind`]).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the socket cannot be bound.
+    pub fn bind_trusted(
+        bind: SocketAddr,
+        trust: Option<&space_net::ClusterTrust>,
+    ) -> io::Result<Self> {
+        let config = match trust {
+            Some(trust) => trust.server_config(),
+            None => space_net::crypto::make_server_config().0,
+        };
         let endpoint = space_net::server_endpoint(bind, config)?;
         let (tx, rx) = mpsc::channel::<Inbound>(OUT_QUEUE);
         Ok(Self {
@@ -1327,6 +1375,7 @@ mod tests {
         assert_eq!(open.check_credentials(&hello("space-local", "")), Ok(()));
         open.set_generated_secret(Secret::new("generated-secret-456"));
         assert_eq!(open.cluster_secret().expose(), "generated-secret-456");
+        assert!(open.cluster_trust().is_none(), "nothing requires a secret");
         assert_eq!(open.check_credentials(&hello("space-local", "")), Ok(()));
         assert_eq!(
             open.check_credentials(&hello("space-local", "anything")),
@@ -1355,6 +1404,10 @@ mod tests {
             // A configured secret is never replaced by a generated one.
             plane.set_generated_secret(Secret::new("generated-secret-456"));
             assert_eq!(plane.cluster_secret().expose(), SECRET);
+            assert_eq!(
+                plane.cluster_trust().map(space_net::ClusterTrust::pin),
+                space_net::ClusterTrust::from_secret(SECRET).map(|t| t.pin()),
+            );
             assert_eq!(
                 plane.check_credentials(&hello("space-local", SECRET)),
                 Ok(())
@@ -1448,6 +1501,62 @@ mod tests {
         let printed = format!("{plane:?}");
         assert!(!printed.contains("do-not-print"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    /// A generated secret makes a trust only where a hello needs a secret.
+    #[test]
+    fn a_generated_secret_gives_a_trust_off_loopback_only() {
+        let mut plane = ControlPlane::new(
+            OrchestratorConfig {
+                bind: "0.0.0.0:7000".parse().expect("addr"),
+                ..OrchestratorConfig::default()
+            },
+            PersistentShardIdAllocator::with_sink(1, Box::new(MemoryCounterSink::default())),
+            EpochPublisher::new(ShardMap::new(
+                1,
+                vec![ShardRegion::new(
+                    OrchestratorConfig::default().root_node(),
+                    ShardId::new(1),
+                    addr(7_001),
+                )],
+            )),
+            "peer".into(),
+        );
+        assert!(plane.secret_required());
+        assert!(plane.cluster_trust().is_none(), "no secret yet");
+        plane.set_generated_secret(Secret::new("generated-secret-456"));
+        let want = space_net::ClusterTrust::from_secret("generated-secret-456").map(|t| t.pin());
+        assert!(want.is_some());
+        assert_eq!(plane.cluster_trust().map(|t| t.pin()), want);
+        assert!(!format!("{plane:?}").contains("generated-secret-456"));
+    }
+
+    /// A pinned client completes the handshake with a trusted control port and
+    /// is told `Untrusted` by a plain one.
+    #[tokio::test]
+    async fn a_pinned_client_trusts_a_control_port_bound_with_the_cluster_trust() {
+        let trust = space_net::ClusterTrust::from_secret("the-cluster-secret-0123").expect("trust");
+        let pin = trust.pin();
+        let trusted = Arc::new(ControlServer::bind_trusted(addr(0), Some(&trust)).expect("bind"));
+        let plain = Arc::new(ControlServer::bind(addr(0)).expect("bind"));
+        let t_addr = trusted.local_addr().expect("addr");
+        let p_addr = plain.local_addr().expect("addr");
+        let t_accept = Arc::clone(&trusted).spawn_accept();
+        let p_accept = Arc::clone(&plain).spawn_accept();
+
+        let endpoint = space_net::client_endpoint_pinned(t_addr, Some(&pin)).expect("endpoint");
+        space_net::connect(&endpoint, t_addr, SERVER_NAME, &space_net::hello("shard:1"))
+            .await
+            .expect("pinned client trusts the trusted server");
+        let endpoint = space_net::client_endpoint_pinned(p_addr, Some(&pin)).expect("endpoint");
+        let err = space_net::connect(&endpoint, p_addr, SERVER_NAME, &space_net::hello("shard:1"))
+            .await
+            .expect_err("a plain server is not the cluster's");
+        assert!(matches!(err, space_net::NetError::Untrusted(_)), "{err:?}");
+        t_accept.abort();
+        p_accept.abort();
+        trusted.close();
+        plain.close();
     }
 
     /// How each refusal goes on the wire, and which one a shard may ask again
