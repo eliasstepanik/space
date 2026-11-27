@@ -1971,22 +1971,44 @@ fn run_client(args: &[&str], env_remove: &[&str]) -> Finished {
         command.env_remove(name);
     }
     let mut child = command.spawn().expect("start space-client");
+    // The pipes are drained while the child runs, so a child that writes more
+    // than a pipe holds can never be stuck on its own output.
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
+    let mut timed_out = false;
+    let status = loop {
         match child.try_wait().expect("wait for space-client") {
-            Some(_) => break,
+            Some(status) => break status,
             None if Instant::now() >= deadline => {
+                timed_out = true;
                 let _ = child.kill();
-                break;
+                break child.wait().expect("reap space-client");
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
+    };
+    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    if timed_out {
+        // Name the invocation that hung, so a CI log says which one it was.
+        stderr = format!("space-client {args:?} did not exit within 120 s; stderr:\n{stderr}");
     }
-    let output = child.wait_with_output().expect("collect the output");
     Finished {
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: status.code(),
+        stdout,
+        stderr,
     }
 }
 

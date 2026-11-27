@@ -447,7 +447,12 @@ fn e2e_without_docker_exits_2_and_says_it_is_not_a_pass() {
         .arg("e2e")
         .current_dir(workspace_root())
         .env("PATH", &empty)
-        .env_remove("DOCKER_HOST")
+        // Windows also looks for `docker.exe` outside PATH (system directories, the
+        // application directory), so a runner with Docker installed may still find
+        // it. Point it at a daemon address nothing listens on: found or not, there
+        // is no working daemon.
+        .env("DOCKER_HOST", "tcp://127.0.0.1:1")
+        .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_GID")
         .output()
         .expect("spawn xtask");
