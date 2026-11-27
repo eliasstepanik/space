@@ -6,7 +6,14 @@ all-features = true
 
 [advisories]
 # Advisory database is the RustSec one; ignores live in .cargo/audit.toml too.
-ignore = []
+ignore = [
+    # bincode 2.0.1: unmaintained, but functional. No fixed version exists (the
+    # advisory's remedy is migrating to another crate); tracked for a future
+    # migration. Direct dependent is space-protocol (the wire codec), so it
+    # reaches space-net, space-sim, space-scene, space-server, space-orchestrator,
+    # space-client and the MCP crates (`cargo tree -i bincode`).
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 allow = [
@@ -24,6 +31,10 @@ allow = [
     "CC0-1.0",
     "0BSD",
     "BSL-1.0",
+    # IJG: the JPEG Group's reference-implementation license, unavoidable for
+    # JPEG encoders. Needed by jpeg-encoder 0.7.1 ((MIT OR Apache-2.0) AND IJG),
+    # pulled in via space-stream (the pixel-stream client).
+    "IJG",
 ]
 confidence-threshold = 0.8
 
