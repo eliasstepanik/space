@@ -27,6 +27,7 @@ const SHARD_NAME_PREFIX: &str = "space-e2e-shard-";
 const MIN_SHARDS: usize = 4;
 const LIVE_TEST: &str = "a_player_on_the_running_stack_is_handed_to_the_next_shard";
 const SERVER_ENV: &str = "SPACE_E2E_SERVER";
+const PIN_FILE_ENV: &str = "SPACE_PIN_FILE";
 const SOCKET: &str = "/var/run/docker.sock";
 /// One poll every two seconds: 180 s in all.
 const READY_POLLS: u32 = 90;
@@ -112,9 +113,27 @@ fn compose_env(secret: &str, docker_gid: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The test binary reads one variable; the cluster secret is not for it.
-fn test_run_env(server: &str) -> [(&'static str, String); 1] {
-    [(SERVER_ENV, server.to_owned())]
+/// What the test binary gets: the server, and a pin file of its own. The cluster
+/// secret is not for it.
+///
+/// The stack runs on a throwaway cluster secret, so its cluster pin (the CA key
+/// derived from the secret) is new on every run, while the client remembers
+/// pins per `host:port` (trust on first use) in a file in the user's config
+/// directory. A pin left there by an earlier run for the same address would
+/// refuse the new stack. The pin is not known in advance here (xtask has no
+/// key-derivation code), so the run trusts the stack on its first dial, but
+/// against a store that starts empty: `SPACE_PIN_FILE` names a file that is
+/// this run's own and is deleted before and after it (see [`run`]).
+fn test_run_env(server: &str, pin_file: &Path) -> [(&'static str, String); 2] {
+    [
+        (SERVER_ENV, server.to_owned()),
+        (PIN_FILE_ENV, pin_file.display().to_string()),
+    ]
+}
+
+/// This run's pin store: in the temp directory, named by the process id.
+fn e2e_pin_file() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("space-e2e-pins-{}.json", std::process::id()))
 }
 
 /// The output of `stat -c %g`.
@@ -384,12 +403,14 @@ pub fn run(args: E2eArgs, invoked_from: &Path) -> ! {
     }
 
     // 9-11.
+    let pin_file = e2e_pin_file();
     let mut ok = true;
     let up = compose_args(&["up", "--build", "--detach"]);
     if shell.status("docker", &up, &env).is_some() || !wait_for_shards(shell, &env) {
         ok = false;
     } else {
-        let test_env = test_run_env(&server);
+        let _ = std::fs::remove_file(&pin_file);
+        let test_env = test_run_env(&server, &pin_file);
         if shell
             .status("cargo", &test_run_args(&test_dir), &test_env)
             .is_some()
@@ -402,6 +423,8 @@ pub fn run(args: E2eArgs, invoked_from: &Path) -> ! {
     if !ok {
         show_why(shell, &env);
     }
+
+    let _ = std::fs::remove_file(&pin_file);
 
     // 13. Teardown.
     if shell.status("docker", &down, &env).is_some() {
@@ -566,9 +589,16 @@ mod tests {
     }
 
     #[test]
-    fn the_test_run_gets_only_the_server_address() {
-        let env = test_run_env("dind:7877");
-        assert_eq!(env, [("SPACE_E2E_SERVER", "dind:7877".to_owned())]);
+    fn the_test_run_gets_the_server_and_its_own_pin_file() {
+        let pins = Path::new("pins.json");
+        let env = test_run_env("dind:7877", pins);
+        assert_eq!(
+            env,
+            [
+                ("SPACE_E2E_SERVER", "dind:7877".to_owned()),
+                ("SPACE_PIN_FILE", "pins.json".to_owned())
+            ]
+        );
         assert!(env.iter().all(|(key, _)| *key != "SPACE_CLUSTER_SECRET"));
     }
 
