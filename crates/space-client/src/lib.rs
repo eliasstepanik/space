@@ -26,6 +26,7 @@
 
 #![warn(missing_docs)]
 
+pub mod adaptive;
 pub mod address;
 pub mod app;
 pub mod bodies;

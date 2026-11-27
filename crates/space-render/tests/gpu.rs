@@ -2703,6 +2703,86 @@ fn the_overlay_draws_text_and_rectangles_over_the_finished_frame() {
     );
 }
 
+/// A model behind the camera is neither drawn nor traced, and the picture is
+/// byte-for-byte the one without it.
+#[test]
+fn a_model_behind_the_camera_is_not_drawn_and_changes_no_pixel() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128;
+    let cube = Arc::new(MeshData::cuboid([1.0; 3], 1.0, matte([0.8; 3])));
+    let a = shadow_scene(vec![placed(&cube, [0.0, -2.5, -8.0])], Vec::new());
+    let b = shadow_scene(
+        vec![
+            placed(&cube, [0.0, -2.5, -8.0]),
+            placed(&cube, [0.0, 0.0, 20.0]),
+        ],
+        Vec::new(),
+    );
+    let out_a = render_clear(&mut ctx, &a, size, QualityPreset::Ci);
+    let out_b = render_clear(&mut ctx, &b, size, QualityPreset::Ci);
+    assert_eq!(out_a.models_drawn, 1);
+    assert!(
+        out_a.pixels == out_b.pixels,
+        "a model behind the camera changed the picture"
+    );
+    assert_eq!(out_b.models_drawn, 1, "only the cube in view is drawn");
+    assert_eq!(out_b.models_traced, 0);
+}
+
+/// A cube wholly outside the frustum, between the light and an on-screen floor
+/// point, still shadows it: it is not drawn but it stays in the TLAS.
+#[test]
+fn a_model_outside_the_view_still_casts_its_shadow() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let cube = Arc::new(MeshData::cuboid([0.5; 3], 1.0, matte([0.8; 3])));
+    // Looking 60 degrees down; the light at (0, 3, -8) is above the view, the
+    // floor point (0, -4, -3) (pixel ~(64, 51)) is in it, and the cube sits
+    // half way along the ray between them.
+    let at = [0.0, -0.5, -5.5];
+    let make = |models: Vec<ModelInstance>| {
+        let mut scene = shadow_scene(models, Vec::new());
+        scene.camera = camera_looking(0.0, -60.0);
+        scene
+    };
+    let scene = make(vec![placed(&cube, at)]);
+    let c = cube.center();
+    assert!(
+        !scene
+            .camera
+            .sees_sphere([at[0] + c[0], at[1] + c[1], at[2] + c[2]], cube.radius()),
+        "the cube must be outside the frustum"
+    );
+    let point = (64, 51);
+    let out = render_clear(&mut ctx, &scene, size, QualityPreset::High);
+    assert_eq!(out.models_drawn, 0);
+    assert_eq!(out.models_traced, 1);
+    let p = rgb(&out, point.0, point.1);
+    assert!(is_dark(p), "the floor point is in the cube's shadow: {p:?}");
+
+    let bare = render_clear(&mut ctx, &make(Vec::new()), size, QualityPreset::High);
+    let p = rgb(&bare, point.0, point.1);
+    assert!(
+        is_bright(p),
+        "without the cube the floor point is lit: {p:?}"
+    );
+}
+
+/// A 10 cm cube 10 km away is far under a pixel: neither drawn nor traced.
+#[test]
+fn a_model_too_small_to_see_is_skipped() {
+    let Some(mut ctx) = context() else { return };
+    let cube = Arc::new(MeshData::cuboid([0.05; 3], 1.0, matte([0.8; 3])));
+    let scene = shadow_scene(vec![placed(&cube, [0.0, 0.0, -10_000.0])], Vec::new());
+    let out = render_clear(&mut ctx, &scene, 128, QualityPreset::High);
+    assert_eq!(out.models_drawn, 0);
+    assert_eq!(out.models_traced, 0);
+}
+
 // ---- cameras that are not looking down -Z, glass up close, the environment -----
 
 use space_render::Environment;
@@ -4465,5 +4545,339 @@ fn the_skys_shadow_under_a_ball_is_smooth_and_steady() {
         );
         assert!(step <= 5, "{preset}: neighbouring pixels differ by {step}");
         assert!(out.pixels == render_clear(&mut ctx, &scene, size, preset).pixels);
+    }
+}
+
+/// A frame reports how long the GPU took for it: the same figure from the
+/// frame's output and from the context.
+///
+/// Mutation: with the end timestamp not written the time is 0 (or garbage).
+#[test]
+fn a_frame_reports_its_gpu_time() {
+    let Some(mut ctx) = context() else { return };
+    assert_eq!(ctx.last_gpu_time(), None, "nothing has been rendered yet");
+    let out = ctx
+        .render_frame(&sphere_scene(64, 64), 64, 64, &ci_options())
+        .expect("render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    let time = out.gpu_time.expect("the device times its frames");
+    eprintln!("gpu time of a 64x64 frame: {time:?}");
+    assert!(time > std::time::Duration::ZERO, "{time:?}");
+    assert!(time < std::time::Duration::from_secs(60), "{time:?}");
+    assert_eq!(ctx.last_gpu_time(), Some(time));
+}
+
+/// The default ray budget is `Full`, and `Full` changes no pixel: leaving the
+/// field at its default and setting `Full` explicitly give the same picture.
+///
+/// This is not the guard against a `Full` that halves the rays: that is
+/// `the_ray_budget_table` in quality.rs.
+#[test]
+fn the_default_ray_budget_changes_no_pixel() {
+    let Some(mut ctx) = context() else { return };
+    let size = 96;
+    let scene = Scene::from_instances(
+        camera_looking(0.0, -30.0),
+        vec![
+            shadow_matte([0.0, -101.5, 0.0, 100.0], space_render::SHAPE_BOX),
+            shadow_matte([0.0, -0.8, -2.6, 0.5], space_render::SHAPE_SPHERE),
+        ],
+    )
+    .with_environment(Environment::gradient([1.0; 3], [1.0; 3], [1.0; 3]));
+    let base = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset: QualityPreset::High,
+        fog_scale: 0.0,
+        ..Default::default()
+    };
+    let default = ctx.render_frame(&scene, size, size, &base).expect("render");
+    let full = RenderOptions {
+        ray_budget: space_render::RayBudget::Full,
+        ..base
+    };
+    let explicit = ctx.render_frame(&scene, size, size, &full).expect("render");
+    assert_eq!(
+        default.validation_messages + explicit.validation_messages,
+        0
+    );
+    assert!(default.pixels == explicit.pixels);
+}
+
+/// Dynamic resolution: a scene rendered at half size keeps the frame's size
+/// and an overlay that is as sharp as at full size (it is drawn after the
+/// scale-up), and shows about the same picture.
+#[test]
+fn a_scaled_frame_keeps_its_size_and_a_sharp_overlay() {
+    let Some(mut ctx) = context() else { return };
+    let size = 128u32;
+    let camera = space_render::CameraPose {
+        aspect: 1.0,
+        ..post_camera()
+    };
+    let mut scene = Scene::from_instances(
+        camera,
+        vec![emissive_sphere([0.0, 0.0, -3.0], 1.0, [4.0; 3])],
+    );
+    // Opaque rectangles (their pixels do not depend on what is under them):
+    // one over the sphere's edge, one over the background, one at the frame's
+    // corner; and text.
+    let rects = [
+        (50u32, 30u32, 20u32, 15u32, [0.0, 1.0, 0.0, 1.0]),
+        (90, 90, 13, 9, [1.0, 0.0, 1.0, 1.0]),
+        (0, 110, 18, 18, [0.0, 0.0, 1.0, 1.0]),
+    ];
+    for (x, y, w, h, color) in rects {
+        scene
+            .overlay
+            .rect(x as f32, y as f32, w as f32, h as f32, color);
+    }
+    scene.overlay.text(4.0, 3.0, 2, [1.0, 1.0, 0.0, 1.0], "Ab1");
+    let render = |ctx: &mut RenderContext, render_scale: f32| {
+        let out = ctx
+            .render_frame(
+                &scene,
+                size,
+                size,
+                &RenderOptions {
+                    render_scale,
+                    ..ci_options()
+                },
+            )
+            .expect("render");
+        assert_eq!(out.validation_messages, 0, "validation messages seen");
+        assert_eq!((out.width, out.height), (size, size));
+        assert_eq!(out.pixels.len(), (size * size * 4) as usize);
+        out
+    };
+    let full = render(&mut ctx, 1.0);
+    let half = render(&mut ctx, 0.5);
+    let mut compared = 0;
+    for (rx, ry, w, h, _) in rects {
+        for y in ry..ry + h {
+            for x in rx..rx + w {
+                assert_eq!(
+                    pixel(&full, x, y),
+                    pixel(&half, x, y),
+                    "overlay pixel ({x}, {y}) differs"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 300);
+    let (a, b) = (coverage(&full), coverage(&half));
+    eprintln!("coverage: full {a:.4}, half {b:.4}");
+    assert!(b > 0.0 && (a - b).abs() <= 0.1 * a, "{a} vs {b}");
+    assert!(full.pixels != half.pixels, "the scale changed something");
+}
+
+/// A `render_scale` of 1.0 is the default: no pixel changes.
+///
+/// Both renders use the same value (the default *is* 1.0), so this cannot
+/// catch a broken scale-1.0 path: that is guarded by the pixel-exact tests of
+/// every other scene, which all render at the default scale. This only pins
+/// that spelling the default out changes nothing.
+#[test]
+fn scale_one_changes_no_pixel() {
+    let Some(mut ctx) = context() else { return };
+    let size = 96;
+    let scene = sphere_scene(size, size);
+    let base = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset: QualityPreset::High,
+        ..Default::default()
+    };
+    let default = ctx.render_frame(&scene, size, size, &base).expect("render");
+    let explicit = ctx
+        .render_frame(
+            &scene,
+            size,
+            size,
+            &RenderOptions {
+                render_scale: 1.0,
+                ..base
+            },
+        )
+        .expect("render");
+    assert_eq!(
+        default.validation_messages + explicit.validation_messages,
+        0
+    );
+    assert!(default.pixels == explicit.pixels);
+}
+
+/// Shadows and reflections still work at half resolution: the scene of
+/// `a_model_casts_a_shadow_on_the_floor_and_receives_one`, with its floor
+/// points (the output is still 128 px).
+#[test]
+fn a_scaled_frame_still_has_shadows_and_reflections() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let cube = Arc::new(MeshData::cuboid([1.0; 3], 1.0, matte([0.8; 3])));
+    let scene = shadow_scene(vec![placed(&cube, [0.0, -2.5, -8.0])], Vec::new());
+    let (in_shadow, lit_floor) = ((64, 124), (16, 124));
+    let options = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset: QualityPreset::High,
+        fog_scale: 0.0,
+        render_scale: 0.5,
+        ..Default::default()
+    };
+    let out = ctx
+        .render_frame(&scene, size, size, &options)
+        .expect("render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    assert_eq!((out.width, out.height), (size, size));
+    let shadow = rgb(&out, in_shadow.0, in_shadow.1);
+    assert!(is_dark(shadow), "the floor under the cube is {shadow:?}");
+    let lit = rgb(&out, lit_floor.0, lit_floor.1);
+    assert!(is_bright(lit), "the open floor is {lit:?}");
+
+    // The post pass (SSR) at half size: the red sphere's reflection is where
+    // the mirror geometry predicts, as in
+    // `ssr_reflects_a_bright_object_where_mirror_geometry_predicts`.
+    let mirror = mirror_scene(0.1);
+    let options = RenderOptions {
+        gi_enabled: false,
+        quality: Quality::CI,
+        preset: QualityPreset::High,
+        render_scale: 0.5,
+        ..Default::default()
+    };
+    let out = ctx
+        .render_frame(&mirror, size, size, &options)
+        .expect("render");
+    assert_eq!(out.validation_messages, 0, "validation messages seen");
+    assert_eq!((out.width, out.height), (size, size));
+    let (n, cx, cy) = centroid(&out, 83..size, is_red)
+        .expect("no reflection of the red sphere in the half-scale frame");
+    eprintln!("half scale: reflection n={n} centroid=({cx:.1},{cy:.1})");
+    assert!(n >= 40, "reflection too small ({n} px)");
+    assert!(
+        (cx - 64.0).abs() <= 2.5 && (cy - 93.6).abs() <= 4.0,
+        "reflection centroid ({cx:.1},{cy:.1}) vs mirror prediction (64, 93.6)"
+    );
+}
+
+/// The scale may change from frame to frame on one context: every frame is
+/// clean, and the same scale gives the same picture again.
+#[test]
+fn changing_the_scale_between_frames_is_clean() {
+    let Some(mut ctx) = context() else { return };
+    let size = 96;
+    let scene = sphere_scene(size, size);
+    let mut frames = Vec::new();
+    for render_scale in [0.5, 1.0, 0.7, 0.5] {
+        let out = ctx
+            .render_frame(
+                &scene,
+                size,
+                size,
+                &RenderOptions {
+                    gi_enabled: false,
+                    quality: Quality::CI,
+                    preset: QualityPreset::High,
+                    render_scale,
+                    ..Default::default()
+                },
+            )
+            .expect("render");
+        assert_eq!(
+            out.validation_messages, 0,
+            "validation messages at scale {render_scale}"
+        );
+        assert_eq!((out.width, out.height), (size, size));
+        frames.push(out);
+    }
+    assert!(
+        frames[0].pixels == frames[3].pixels,
+        "the 0.5 frames differ"
+    );
+}
+
+fn shadow_matte(center: [f32; 4], shape: u32) -> GpuInstance {
+    GpuInstance {
+        center,
+        albedo: [0.8, 0.8, 0.8, 0.0],
+        emissive: [0.0; 4],
+        roughness: 1.0,
+        shape,
+        transmission: 0.0,
+        _pad1: 0.0,
+    }
+}
+
+/// Fewer rays keep the sky's shadow: with the scene of
+/// `the_skys_shadow_under_a_ball_is_smooth_and_steady` on High, the floor under
+/// the ball stays darker than the open floor at every budget, and its
+/// brightness moves by less than 20 (of 255) from Full to Half and Quarter.
+///
+/// Mutation: a budget that drops the sky rays altogether lights the floor
+/// under the ball like the open floor.
+#[test]
+fn a_smaller_ray_budget_keeps_the_skys_shadow() {
+    let Some(mut ctx) = context() else { return };
+    if !ctx.ray_query_support().complete() {
+        eprintln!("SKIP: device has no ray query");
+        return;
+    }
+    let size = 128;
+    let scene = Scene::from_instances(
+        camera_looking(0.0, -30.0),
+        vec![
+            shadow_matte([0.0, -101.5, 0.0, 100.0], space_render::SHAPE_BOX),
+            shadow_matte([0.0, -0.8, -2.6, 0.5], space_render::SHAPE_SPHERE),
+        ],
+    )
+    .with_environment(Environment::gradient([1.0; 3], [1.0; 3], [1.0; 3]));
+    let mean = |out: &space_render::FrameOutput, xs: std::ops::Range<u32>| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for y in 68..73 {
+            for x in xs.clone() {
+                sum += f64::from(luma(rgb(out, x, y)));
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let mut under_means = Vec::new();
+    for budget in [
+        space_render::RayBudget::Full,
+        space_render::RayBudget::Half,
+        space_render::RayBudget::Quarter,
+    ] {
+        let opts = RenderOptions {
+            gi_enabled: false,
+            quality: Quality::CI,
+            preset: QualityPreset::High,
+            fog_scale: 0.0,
+            ray_budget: budget,
+            ..Default::default()
+        };
+        let out = ctx.render_frame(&scene, size, size, &opts).expect("render");
+        assert_eq!(
+            out.validation_messages, 0,
+            "{budget:?}: validation messages"
+        );
+        let (under, open) = (mean(&out, 58..70), mean(&out, 4..16));
+        eprintln!("{budget:?}: under the ball {under:.1}, open floor {open:.1}");
+        assert!(under < open, "{budget:?}: {under} vs {open}");
+        under_means.push(under);
+    }
+    for (i, name) in [(1, "Half"), (2, "Quarter")] {
+        assert!(
+            (under_means[i] - under_means[0]).abs() < 20.0,
+            "{name}: {} vs Full's {}",
+            under_means[i],
+            under_means[0]
+        );
     }
 }

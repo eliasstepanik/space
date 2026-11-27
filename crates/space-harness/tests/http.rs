@@ -253,6 +253,8 @@ fn state_is_the_clients_snapshot_as_json() {
         "retry_in_s",
         "frame",
         "fps",
+        "gpu_ms",
+        "render_level",
         "gravity",
         "landed",
         "bodies",

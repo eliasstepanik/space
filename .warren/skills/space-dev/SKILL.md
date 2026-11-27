@@ -519,7 +519,7 @@ Mesa 25 works, verified in WSL; jammy's 23.x does not).
 ## Phase map
 0 risk-gate spikes (`spikes/`); 1 world/ecs/protocol/sim; 2 QUIC netcode, headless multiplayer, handoff H1-H8;
 3 orchestrator + autoscaler + H9-H15 (`--launcher docker` deferred then; built in the sharding work's phase 6, `docs/plan-sharding.md` §8); 4 ash renderer core (headless, GPU tests);
-5 ray-query GI/SSR/fog/refraction + quality presets (`--quality high|medium|low|ci`);
+5 ray-query GI/SSR/fog/refraction + quality presets (`--quality high|medium|low|ci`; `--adaptive auto|off|0-6` steers the render level from the GPU time: `space-client/src/adaptive.rs`, acting through `RenderOptions::{ray_budget, render_scale}`);
 6 pixel streaming: `space-stream`, `space-client --stream`, wasm `space-viewer` (JPEG only);
 7 MCP servers; 8 packaging: Docker images, compose `stream` profile, CI wasm + docker jobs, this skill, v0.1.0.
 After v0.1: playable window + GLB + shard transitions; then the online-only rework: connect screen,

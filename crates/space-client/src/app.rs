@@ -88,6 +88,7 @@ use space_world::WorldPos;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::adaptive::{Adaptive, AdaptiveMode};
 use crate::address::{dial, ServerAddress, DEFAULT_ADDRESS};
 use crate::bodies::{draw_time, pose_at, BodyRenderer, Drawn, When, INTERPOLATION_DELAY};
 use crate::connect::Prompt;
@@ -449,6 +450,8 @@ pub struct App {
     drawn_others: Vec<(EntityGuid, WorldPos)>,
     /// What each of `drawn_others` is, in the same order.
     others_about: Vec<OtherAbout>,
+    /// Ray budget and render scale that follow the measured GPU time.
+    adaptive: Adaptive,
 }
 
 impl std::fmt::Debug for App {
@@ -494,6 +497,7 @@ impl App {
             drawn_bodies: Vec::new(),
             drawn_others: Vec::new(),
             others_about: Vec::new(),
+            adaptive: Adaptive::new(AdaptiveMode::default(), Duration::from_secs_f64(1.0 / 60.0)),
         };
         if config.server.is_some() {
             app.connect();
@@ -845,9 +849,36 @@ impl App {
     #[must_use]
     pub fn render_options(&self) -> RenderOptions {
         match self.net {
-            Net::Online(_) => self.world.options(self.quality),
+            Net::Online(_) => self.adaptive.apply(self.world.options(self.quality)),
             _ => World::default().options(QualityPreset::Ci),
         }
+    }
+
+    /// Chooses how the ray budget and render scale are steered
+    /// ([`AdaptiveMode`]) and the frame time the GPU's share is taken of.
+    pub fn set_adaptive(&mut self, mode: AdaptiveMode, frame_target: Duration) {
+        self.adaptive = Adaptive::new(mode, frame_target);
+    }
+
+    /// Takes the GPU time of the frame just rendered, when the device
+    /// measured one. Only a real GPU playing online steers the level.
+    pub fn observe_gpu_time(&mut self, time: Option<Duration>) {
+        if let Some(t) = time {
+            let adapt = matches!(self.net, Net::Online(_)) && self.detail != Detail::Software;
+            self.adaptive.observe(t, adapt);
+        }
+    }
+
+    /// The current adaptive level, 0 (as chosen) to 6 (cheapest).
+    #[must_use]
+    pub fn render_level(&self) -> usize {
+        self.adaptive.level()
+    }
+
+    /// The last GPU time observed.
+    #[must_use]
+    pub fn gpu_time(&self) -> Option<Duration> {
+        self.adaptive.gpu_time()
     }
 
     /// Whether somebody is waiting for a picture ([`Hub::frame_wanted`]): a
@@ -1157,8 +1188,16 @@ impl App {
             .shard
             .map_or_else(|| "?".to_owned(), |shard| shard.0.to_string());
         let players = 1 + replica.other_ships().filter(|t| t.is_player()).count();
+        let first = match self.adaptive.gpu_time() {
+            Some(gpu) => format!(
+                "{fps:.0} fps  {ms:.1} ms  gpu {:.1} ms  level {}",
+                gpu.as_secs_f64() * 1000.0,
+                self.adaptive.level()
+            ),
+            None => format!("{fps:.0} fps  {ms:.1} ms"),
+        };
         let mut lines = vec![
-            format!("{fps:.0} fps  {ms:.1} ms"),
+            first,
             format!(
                 "shard {shard}  handoffs {}  players {players}",
                 replica.handoffs
@@ -1277,6 +1316,8 @@ impl App {
             fps: self.fps.fps,
             ..ClientState::default()
         };
+        state.gpu_ms = self.gpu_time().map(|t| t.as_secs_f32() * 1000.0);
+        state.render_level = u32::try_from(self.render_level()).unwrap_or(u32::MAX);
         match &self.net {
             Net::Idle => {
                 state.error = self.controls.prompt.error().map(str::to_owned);

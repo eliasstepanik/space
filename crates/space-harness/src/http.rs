@@ -99,6 +99,8 @@ GET  /state            the client's state as JSON: screen (connect|connecting|on
                        velocity, speed,
                        yaw_deg, pitch_deg, handoffs, scene, scene_revision, retry_in_s,
                        frame, width, height, fps,
+                       gpu_ms (GPU time of the last frame, null if unknown),
+                       render_level (adaptive level 0-6),
                        gravity, landed, bodies (nearest first: guid, visual, visual_id,
                        position, distance, speed, parts, in_view, source
                        (local|ghost|far), step, sample_age_s), bodies_in_view,

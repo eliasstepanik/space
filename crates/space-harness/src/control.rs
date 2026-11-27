@@ -111,6 +111,13 @@ pub struct ClientState {
     pub height: u32,
     /// Frames per second, as the client measures it.
     pub fps: f32,
+    /// GPU execution time of the last frame, milliseconds (`null` until
+    /// one is known, or on a device without timestamp queries).
+    #[serde(default)]
+    pub gpu_ms: Option<f32>,
+    /// The adaptive render level in force: 0 (full quality) to 6.
+    #[serde(default)]
+    pub render_level: u32,
     /// The strength of the gravity at the ship, m/s² (0 in weightless
     /// space): what the client's prediction of the scene's physics finds
     /// there (the demo area's gravity room pulls with 9.81).
@@ -727,6 +734,8 @@ mod tests {
         }];
         state.bodies_in_view = 1;
         state.far_drawn = 1;
+        state.gpu_ms = Some(7.5);
+        state.render_level = 3;
         state.others = vec![OtherState {
             guid: "2:1".into(),
             player: true,
@@ -755,6 +764,8 @@ mod tests {
         assert_eq!(json["bodies"][0]["source"], "far");
         assert_eq!(json["bodies"][0]["step"], 2);
         assert_eq!(json["far_drawn"], 1);
+        assert_eq!(json["gpu_ms"], 7.5);
+        assert_eq!(json["render_level"], 3);
         assert_eq!(json["others"][0]["source"], "far");
         assert_eq!(json["others"][0]["player"], true);
         assert_eq!(json["correction_m"], 0.002);
@@ -812,6 +823,8 @@ mod tests {
             "others_drawn",
             "others",
             "far_drawn",
+            "gpu_ms",
+            "render_level",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }

@@ -850,6 +850,9 @@ impl BodyRenderer {
             // long: the showcase's springs (1.5 m at rest) at the size they
             // always had, the far content's 16 m one ten times that.
             let scale = (spring.rest_length / COIL_REST).max(1.0);
+            if !coil_kept(camera, a, b, (COIL_RADIUS + COIL_WIRE) * scale) {
+                continue;
+            }
             scene.instances.extend(coil(
                 a,
                 b,
@@ -859,6 +862,21 @@ impl BodyRenderer {
             ));
         }
     }
+}
+
+/// Whether a coil between camera-relative `a` and `b` (`reach` = its radius
+/// plus its wire) can matter: it is in view, or near/large enough to still
+/// shadow or light what is.
+fn coil_kept(camera: &CameraPose, a: [f32; 3], b: [f32; 3], reach: f32) -> bool {
+    let c = [0, 1, 2].map(|k| (a[k] + b[k]) * 0.5);
+    let r = [0, 1, 2]
+        .map(|k| (b[k] - a[k]).powi(2))
+        .iter()
+        .sum::<f32>()
+        .sqrt()
+        / 2.0
+        + reach;
+    camera.sees_sphere(c, r) || space_render::occludes_off_screen(c, r)
 }
 
 fn mul3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
@@ -1128,6 +1146,17 @@ mod tests {
         // Without an own ship there is nothing to measure from.
         let history: VecDeque<Sample> = [sample(0, 500.0, 0.0)].into_iter().collect();
         assert_eq!(draw_time(&history, 7.0, None), 7.0);
+    }
+
+    #[test]
+    fn a_coil_far_outside_the_view_is_not_built() {
+        let camera = CameraPose::default();
+        let reach = COIL_RADIUS + COIL_WIRE;
+        let at = |z: f32| coil_kept(&camera, [0.0, 0.0, z], [0.0, -1.5, z], reach);
+        assert!(at(-10.0), "ahead");
+        assert!(at(10.0), "behind, near");
+        assert!(!at(2000.0), "2 km behind");
+        assert!(at(-2000.0), "2 km ahead");
     }
 
     #[test]

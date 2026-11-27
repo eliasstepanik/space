@@ -237,7 +237,8 @@ address, and refuses to start on any other address without a token. See
 
 ```
 space-client [--server ADDR] [--headless | --stream ADDR] [--size WxH]
-             [--quality high|medium|low|ci] [--no-vsync] [--frames N] [--fps N]
+             [--quality high|medium|low|ci] [--adaptive auto|off|0-6] [--no-vsync]
+             [--frames N] [--fps N]
              [--glb FILE [--glb-scale S]]
              [--harness ADDR] [--script FILE [--script-timeout S]] [--out-dir DIR]
              [--pin HEX] [--reset-pins]
@@ -250,6 +251,7 @@ space-client [--server ADDR] [--headless | --stream ADDR] [--size WxH]
   dials must match or are refused. `--pin HEX` holds the run's servers to a pin
   you give instead; `--reset-pins` deletes the file and exits. A server without
   a cluster secret is dialed unpinned. See `docs/security-notes.md`.
+- `--adaptive auto|off|0-6` (default `auto`) picks the adaptive render level: `auto` steers it from the GPU time, `off` is level 0 (full quality), a number fixes it. It lives in `crates/space-client/src/adaptive.rs` and acts through `RenderOptions::{ray_budget, render_scale}`; `/state` shows `gpu_ms` and `render_level`.
 - **window** (default), **`--headless`** (no window, renders offscreen) or
   **`--stream ADDR`** (headless, and streams the picture to the browser viewer).
 - `--server ADDR` connects at once and keeps reconnecting **to that address**

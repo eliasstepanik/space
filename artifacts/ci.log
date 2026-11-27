@@ -1,0 +1,2100 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/xtask ci`
+xtask: workspace root: /workspace
+xtask: running `cargo fmt --check`
+xtask: running `cargo clippy --workspace --all-targets --locked -- -D warnings`
+   Compiling ring v0.17.14
+   Compiling space-render v0.1.0 (/workspace/crates/space-render)
+warning: space-render@0.1.0: naga version: 30.0.2
+warning: space-render@0.1.0: rq_triangle: 2321 SPIR-V words
+warning: space-render@0.1.0: gi_probe: 4773 SPIR-V words
+warning: space-render@0.1.0: tonemap: 883 SPIR-V words
+warning: space-render@0.1.0: forward_vs: 4314 SPIR-V words
+warning: space-render@0.1.0: forward_fs: 5400 SPIR-V words
+warning: space-render@0.1.0: forward_fs_shadow: 7795 SPIR-V words
+warning: space-render@0.1.0: forward_glass_vs: 4315 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs: 5371 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs_shadow: 7766 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_vs: 4026 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs: 5687 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs_shadow: 8082 SPIR-V words
+warning: space-render@0.1.0: forward_sky_vs: 3501 SPIR-V words
+warning: space-render@0.1.0: forward_sky_fs: 3658 SPIR-V words
+warning: space-render@0.1.0: post: 6714 SPIR-V words
+warning: space-render@0.1.0: post_rq: 10082 SPIR-V words
+warning: space-render@0.1.0: overlay_vs: 556 SPIR-V words
+warning: space-render@0.1.0: overlay_fs: 354 SPIR-V words
+   Compiling rustls v0.23.46
+    Checking rustls-webpki v0.103.17
+    Checking rcgen v0.14.10
+    Checking quinn-proto v0.11.19
+    Checking quinn v0.11.12
+    Checking space-net v0.1.0 (/workspace/crates/space-net)
+    Checking space-server v0.1.0 (/workspace/crates/space-server)
+    Checking space-client v0.1.0 (/workspace/crates/space-client)
+    Checking space-orchestrator v0.1.0 (/workspace/crates/space-orchestrator)
+    Checking space-mcp-server v0.1.0 (/workspace/crates/space-mcp-server)
+    Checking space-mcp-client v0.1.0 (/workspace/crates/space-mcp-client)
+    Checking space-scene v0.1.0 (/workspace/crates/space-scene)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.35s
+xtask: cargo-nextest not found, falling back to `cargo test`
+xtask: running `cargo test --workspace --exclude space-render --exclude space-client --exclude space-mcp-client --locked --no-fail-fast --target-dir target/xtask-test`
+   Compiling quinn-proto v0.11.19
+   Compiling space-render v0.1.0 (/workspace/crates/space-render)
+warning: space-render@0.1.0: naga version: 30.0.2
+warning: space-render@0.1.0: rq_triangle: 2321 SPIR-V words
+warning: space-render@0.1.0: gi_probe: 4773 SPIR-V words
+warning: space-render@0.1.0: tonemap: 883 SPIR-V words
+warning: space-render@0.1.0: forward_vs: 4314 SPIR-V words
+warning: space-render@0.1.0: forward_fs: 5400 SPIR-V words
+warning: space-render@0.1.0: forward_fs_shadow: 7795 SPIR-V words
+warning: space-render@0.1.0: forward_glass_vs: 4315 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs: 5371 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs_shadow: 7766 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_vs: 4026 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs: 5687 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs_shadow: 8082 SPIR-V words
+warning: space-render@0.1.0: forward_sky_vs: 3501 SPIR-V words
+warning: space-render@0.1.0: forward_sky_fs: 3658 SPIR-V words
+warning: space-render@0.1.0: post: 6714 SPIR-V words
+warning: space-render@0.1.0: post_rq: 10082 SPIR-V words
+warning: space-render@0.1.0: overlay_vs: 556 SPIR-V words
+warning: space-render@0.1.0: overlay_fs: 354 SPIR-V words
+   Compiling quinn v0.11.12
+   Compiling space-net v0.1.0 (/workspace/crates/space-net)
+   Compiling space-server v0.1.0 (/workspace/crates/space-server)
+   Compiling space-client v0.1.0 (/workspace/crates/space-client)
+   Compiling space-orchestrator v0.1.0 (/workspace/crates/space-orchestrator)
+   Compiling space-mcp-server v0.1.0 (/workspace/crates/space-mcp-server)
+   Compiling space-scene v0.1.0 (/workspace/crates/space-scene)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.35s
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-ecs/a11d042be586d0de/out/space_ecs-a11d042be586d0de)
+
+running 2 tests
+test query::tests::get_many_mut_rejects_duplicates_and_out_of_range ... ok
+test query::tests::get_many_mut_keeps_the_requested_order ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/acceptance.rs (target/xtask-test/debug/build/space-ecs/7d4cd4136f15e8c1/out/acceptance-7d4cd4136f15e8c1)
+
+running 16 tests
+test change_tick_is_per_row_not_per_component ... ok
+test command_buffer ... ok
+test change_ticks ... ok
+test archetype_migration ... ok
+test component_info_get_rejects_out_of_range_id ... ok
+test registry_table ... ok
+test query_correctness ... ok
+test roundtrip_mutation_no_false_positive ... ok
+test get_mut_panics_on_mismatch - should panic ... ok
+test roundtrip_mutation_panics_on_mismatch - should panic ... ok
+test spawn_rejects_duplicate_component_ids_and_leaves_the_world_intact ... ok
+test staged_scheduler ... ok
+test tick_is_u64_and_no_wrap ... ok
+test with_entity_and_row_tick ... ok
+test with_entity_pairs_each_row_with_its_own_entity ... ok
+test spawn_despawn_roundtrip ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/no_alloc.rs (target/xtask-test/debug/build/space-ecs/23e9fa1cb03be358/out/no_alloc-23e9fa1cb03be358)
+
+running 1 test
+test query_iteration_does_not_allocate_per_row ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-harness/e77d0aa52d1cbf2a/out/space_harness-e77d0aa52d1cbf2a)
+
+running 49 tests
+test control::tests::a_frame_checks_its_size_and_finds_its_pixels ... ok
+test control::tests::every_key_has_names_that_find_it_again ... ok
+test control::tests::the_trait_is_object_safe_and_shareable ... ok
+test control::tests::turns_are_given_in_degrees_and_sent_in_radians ... ok
+test control::tests::untypeable_text_is_refused_whole ... ok
+test control::tests::typing_sends_characters_and_turns_newline_and_tab_into_keys ... ok
+test control::tests::the_state_is_a_flat_json_object_with_stable_names ... ok
+test fake::tests::quit_ends_the_client_and_closes_its_hub ... ok
+test fake::tests::the_picture_is_a_pure_function_of_screen_and_frame_number ... ok
+test fake::tests::an_unknown_server_ends_on_the_error_screen_which_enter_dismisses ... ok
+test fake::tests::typing_an_address_and_enter_connects ... ok
+test http::tests::a_body_split_across_reads_is_reassembled_and_expect_is_answered ... ok
+test fake::tests::a_frozen_client_times_out_instead_of_hanging_its_callers ... ok
+test http::tests::a_token_must_be_usable_and_long_enough_off_loopback ... ok
+test http::tests::bodies_are_read_exactly_and_capped_before_being_read ... ok
+test http::tests::content_length_is_validated ... ok
+test http::tests::input_events_are_parsed ... ok
+test http::tests::malformed_heads_are_rejected ... ok
+test http::tests::malformed_input_events_are_refused_with_a_reason ... ok
+test http::tests::only_address_hosts_and_localhost_are_allowed ... ok
+test http::tests::only_the_servers_own_origin_is_same_origin ... ok
+test http::tests::request_lines_headers_and_queries_are_parsed ... ok
+test http::tests::responses_are_framed_with_length_and_close ... ok
+test http::tests::tokens_are_compared_whole_and_parsed_from_bearer_headers ... ok
+test hub::tests::a_frame_that_is_already_there_is_returned_at_once ... ok
+test hub::tests::a_stale_frame_is_not_the_current_picture ... ok
+test hub::tests::a_stalled_loop_makes_input_busy_instead_of_growing_the_queue ... ok
+test hub::tests::closing_wakes_waiters_and_refuses_requests ... ok
+test hub::tests::impossible_addresses_are_refused_before_they_reach_the_loop ... ok
+test hub::tests::many_waiters_are_all_woken_by_one_frame ... ok
+test hub::tests::requests_reach_the_loop_in_order_and_once ... ok
+test hub::tests::the_state_is_the_last_one_published ... ok
+test fake::tests::frames_come_on_demand_and_show_which_frame_they_are ... ok
+test image::tests::a_one_pixel_png_is_exactly_these_bytes ... ok
+test image::tests::checksums_match_their_reference_values ... ok
+test image::tests::formats_are_told_by_the_extension ... ok
+test image::tests::jpeg_is_a_valid_jfif_of_the_right_size ... ok
+test image::tests::mismatched_buffers_are_refused ... ok
+test http::tests::a_response_nobody_reads_is_given_up_on ... ok
+test image::tests::png_decodes_back_to_the_same_pixels ... ok
+test image::tests::the_test_decoder_notices_corruption ... ok
+test script::tests::chunk_names_are_kept_only_when_plain ... ok
+test script::tests::escaping_and_odd_screenshot_names_are_refused ... ok
+test script::tests::positions_are_read_out_of_messages ... ok
+test script::tests::screenshot_names_stay_below_the_output_directory ... ok
+test script::tests::the_report_is_plain_json_and_gives_an_exit_code ... ok
+test image::tests::stored_blocks_split_at_exactly_65535_bytes ... ok
+test hub::tests::waiting_for_a_frame_is_bounded_and_asks_the_loop_for_one ... ok
+test fake::tests::thrust_moves_the_ship_and_flying_far_enough_changes_shard ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/http.rs (target/xtask-test/debug/build/space-harness/1ed43c388a495aa7/out/http-1ed43c388a495aa7)
+
+running 21 tests
+test a_configured_token_is_required_on_every_request ... ok
+test a_host_that_is_not_an_address_is_refused ... ok
+test a_non_loopback_address_is_refused_without_an_adequate_token ... ok
+test a_failing_script_is_reported_with_message_and_line ... ok
+test a_second_script_is_a_409_and_the_running_one_can_be_stopped ... ok
+test bad_input_is_a_400_and_nothing_of_it_is_applied ... ok
+test connections_are_capped ... ok
+test connect_disconnect_and_quit ... ok
+test frames_come_as_jpeg_too ... ok
+test cross_origin_requests_are_refused ... ok
+test frames_come_as_png_with_the_exact_pixels ... ok
+test a_script_runs_and_its_report_comes_back ... ok
+test input_types_presses_holds_and_turns ... ok
+test serve_refuses_a_listener_on_every_interface_without_a_token ... ok
+test state_is_the_clients_snapshot_as_json ... ok
+test the_api_serves_any_control_behind_an_arc ... ok
+test the_root_lists_the_routes ... ok
+test unknown_routes_and_wrong_methods ... ok
+test oversized_and_malformed_requests_get_their_statuses ... ok
+test script_timeouts_come_from_the_request_and_are_capped_by_the_server ... ok
+test a_frame_that_never_comes_is_a_bounded_504 ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+     Running tests/lua.rs (target/xtask-test/debug/build/space-harness/1ff5c1c500a39b52/out/lua-1ff5c1c500a39b52)
+
+running 20 tests
+test a_failing_assert_is_an_error_with_its_message_and_line ... ok
+test a_script_sees_the_bodies_and_pushes_one ... ok
+test a_script_that_does_not_compile_is_a_compile_error_with_its_line ... ok
+test an_interpreter_error_has_no_line_but_the_report_says_where_the_script_was ... ok
+test calls_after_the_client_quit_fail_cleanly ... ok
+test a_script_plays_a_whole_session ... ok
+test keys_a_script_left_down_are_released_when_it_ends ... ok
+test keys_presses_holds_turns_and_the_pointer ... ok
+test output_is_capped_and_every_run_starts_clean ... ok
+test pcall_catches_errors_and_the_script_goes_on ... ok
+test screenshots_cannot_escape_the_output_directory ... ok
+test state_connect_and_disconnect_as_a_script_sees_them ... ok
+test the_number_of_screenshots_is_capped ... ok
+test the_sandbox_has_no_way_out ... ok
+test a_running_script_can_be_stopped_from_outside ... ok
+test resource_exhaustion_ends_the_script_not_the_host ... ok
+test wrong_arguments_are_located_errors ... ok
+test waiting_frames_time_pixels_and_output ... ok
+test a_frozen_client_fails_the_script_instead_of_hanging_it ... ok
+test the_timeout_stops_runaway_scripts ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.53s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-mcp/0082f0a73b021cb6/out/space_mcp-0082f0a73b021cb6)
+
+running 42 tests
+test base64::tests::rfc4648_vectors ... ok
+test base64::tests::all_byte_values_round_trip_and_garbage_is_rejected ... ok
+test http::tests::a_malformed_bracketed_origin_is_refused_not_a_panic ... ok
+test http::tests::a_content_length_body_is_read_exactly ... ok
+test http::tests::a_body_split_across_reads_is_reassembled ... ok
+test http::tests::a_request_with_a_malformed_origin_gets_a_403 ... ok
+test http::tests::a_stale_session_from_before_a_restart_is_404_for_every_kind_of_message ... ok
+test http::tests::accept_negotiation_and_origin_rules ... ok
+test http::tests::content_length_is_validated ... ok
+test http::tests::delete_ends_a_session ... ok
+test http::tests::expect_continue_is_answered ... ok
+test http::tests::initialize_assigns_a_session_that_later_requests_need ... ok
+test http::tests::json_responses_carry_content_length ... ok
+test http::tests::malformed_heads_are_rejected ... ok
+test http::tests::notifications_are_202_and_need_a_session_too ... ok
+test http::tests::http_level_rejections ... ok
+test http::tests::oversized_bodies_are_rejected_before_being_read ... ok
+test http::tests::request_line_and_headers_are_parsed ... ok
+test http::tests::sse_framing_is_exact ... ok
+test http::tests::sse_is_chosen_when_asked_for_and_the_session_header_still_rides ... ok
+test http::tests::other_malformed_requests_get_proper_statuses ... ok
+test http::tests::the_socket_path_serves_and_rejects ... ok
+test jsonrpc::tests::a_client_response_is_recognised ... ok
+test jsonrpc::tests::a_request_parses_with_its_id_and_params ... ok
+test jsonrpc::tests::a_notification_has_no_id ... ok
+test jsonrpc::tests::bad_json_is_a_parse_error_with_a_null_id ... ok
+test jsonrpc::tests::responses_serialise_to_one_line ... ok
+test jsonrpc::tests::non_requests_are_invalid_requests ... ok
+test server::tests::a_failing_tool_is_is_error_true_not_a_protocol_error ... ok
+test server::tests::initialize_reports_version_capabilities_and_identity ... ok
+test server::tests::initialize_without_params_is_invalid_params ... ok
+test server::tests::initialized_notification_gets_no_response ... ok
+test server::tests::ping_is_an_empty_result ... ok
+test server::tests::tools_call_rejects_bad_params ... ok
+test server::tests::tools_call_returns_text_content ... ok
+test server::tests::tools_list_names_descriptions_and_schemas ... ok
+test server::tests::unknown_method_is_32601_and_bad_json_is_32700 ... ok
+test tests::bad_transport_flags_are_errors ... ok
+test stdio::tests::newline_json_rpc_round_trips ... ok
+test tests::stdio_is_the_default_and_other_flags_pass_through ... ok
+test http::tests::a_full_session_table_evicts_the_least_recently_used_session ... ok
+test http::tests::a_response_nobody_reads_is_given_up_on ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-mcp-server/5ad0f167345a1228/out/space_mcp_server-5ad0f167345a1228)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/space-mcp-server/00a7813dd454c323/out/space_mcp_server-00a7813dd454c323)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mcp_loopback.rs (target/xtask-test/debug/build/space-mcp-server/188ebdd7051eb87e/out/mcp_loopback-188ebdd7051eb87e)
+
+running 3 tests
+test the_stdio_shim_round_trips_newline_json_rpc ... ok
+test advance_ticks_delivers_each_tick_instead_of_hoarding_frames ... ok
+test mcp_over_streamable_http_drives_a_real_shard ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-net/2fa9c887d2af9a67/out/space_net-2fa9c887d2af9a67)
+
+running 12 tests
+test secret::tests::an_empty_secret_matches_nothing ... ok
+test secret::tests::only_the_secret_itself_matches ... ok
+test secret::tests::a_secret_is_never_printed ... ok
+test log_budget::tests::a_few_lines_per_window_and_the_rest_are_counted ... ok
+test tofu::tests::the_pin_is_read_off_the_ca_certificate ... ok
+test trust::tests::debug_leaves_the_secret_and_key_out ... ok
+test tofu::tests::a_leaf_or_garbage_gives_no_other_pin ... ok
+test trust::tests::pin_text_round_trips ... ok
+test trust::tests::the_hand_built_anchor_matches_rustls ... ok
+test tofu::tests::the_ca_certificate_is_the_same_every_time ... ok
+test trust::tests::the_pin_of_a_known_secret_is_fixed ... ok
+test trust::tests::pins_follow_the_secret ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/pinning.rs (target/xtask-test/debug/build/space-net/d3d56acad935f72d/out/pinning-d3d56acad935f72d)
+
+running 9 tests
+test a_pinned_client_refuses_a_self_signed_server ... ok
+test a_pinned_client_connects_to_a_server_of_its_cluster ... ok
+test a_pin_parsed_from_its_text_verifies ... ok
+test a_pinned_client_refuses_another_clusters_server ... ok
+test an_unpinned_client_still_connects_to_a_cluster_server ... ok
+test tofu_learns_the_pin_of_a_cluster_server ... ok
+test tofu_holds_a_server_to_the_expected_pin ... ok
+test tofu_takes_a_server_without_a_ca_unpinned_only_when_nothing_is_expected ... ok
+test tofu_refuses_a_copied_ca_in_front_of_a_foreign_leaf ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/transport.rs (target/xtask-test/debug/build/space-net/aa8db77fdc171070/out/transport-aa8db77fdc171070)
+
+running 26 tests
+test a_peer_built_for_another_protocol_version_is_refused_at_the_hello ... ok
+test a_policy_reject_reaches_the_client_with_its_reason ... ok
+test a_first_frame_larger_than_a_hello_is_refused_from_its_header ... ok
+test a_server_speaking_another_version_is_a_version_mismatch_to_the_client ... ok
+test an_ipv6_server_is_diallable_through_client_endpoint_for ... ok
+test client_endpoint_for_binds_the_family_it_dials ... ok
+test accept_gives_up_on_a_client_that_never_sends_a_hello ... ok
+test connect_reports_a_redirect_as_an_error_that_says_what_the_address_is ... ok
+test connect_gives_up_when_the_server_never_answers_the_hello ... ok
+test control_stream_round_trips ... ok
+test datagram_message_round_trips ... ok
+test disconnect_is_observed ... ok
+test first_frame_must_be_hello ... ok
+test hello_handshake_round_trip ... ok
+test join_still_takes_a_welcome_and_a_version_mismatch_is_still_readable ... ok
+test join_returns_the_redirect_a_server_turned_it_away_with ... ok
+test keep_alive_fits_inside_the_idle_timeout ... ok
+test oversized_frame_rejected_before_alloc ... ok
+test reject_reason_survives_the_wire ... ok
+test shard_map_fixture_resolves_the_origin ... ok
+test snapshot_stream_round_trips ... ok
+test oversized_delta_promoted_to_stream ... ok
+test the_largest_legitimate_hello_fits_and_a_larger_one_is_refused_by_the_sender ... ok
+test version_mismatch_is_rejected ... ok
+test a_peer_that_grants_no_receive_window_cannot_hold_the_last_word ... ok
+test a_quiet_connection_outlives_the_idle_timeout ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.51s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-orchestrator/433b0befdae0331c/out/space_orchestrator-433b0befdae0331c)
+
+running 329 tests
+test autoscale::tests::a_loaded_shard_is_relieved_at_its_hot_cell ... ok
+test autoscale::tests::a_sustained_hot_shard_splits_after_the_dwell ... ok
+test autoscale::tests::an_action_is_followed_by_a_cooldown_whatever_the_load_does ... ok
+test autoscale::tests::after_an_action_the_shard_is_on_cooldown_and_the_cluster_is_busy ... ok
+test autoscale::tests::oscillation_around_the_threshold_never_accumulates_dwell ... ok
+test autoscale::tests::settings_without_a_band_are_refused ... ok
+test autoscale::tests::the_choice_is_deterministic_lowest_id_first ... ok
+test autoscale::tests::the_hysteresis_band_resets_both_dwell_timers ... ok
+test autoscale::tests::the_metric_follows_the_capacity_and_a_pair_adds_up ... ok
+test autoscale::tests::the_decision_table ... ok
+test autoscale::tests::a_forgotten_shard_is_never_chosen_on_its_old_dwell ... ok
+test autoscale::tests::the_metric_is_the_max_of_both_signals ... ok
+test autoscale::tests::the_spawn_cell_is_carved_only_while_that_relieves_somebody ... ok
+test autoscale::tests::a_sustained_cold_shard_merges_after_the_longer_dwell ... ok
+test boot::tests::an_unwritable_state_path_is_a_boot_error_naming_the_path ... ok
+test config::tests::a_depth_64_root_would_never_split ... ok
+test config::tests::a_non_loopback_control_port_needs_a_secret_a_shard_can_present ... ok
+test config::tests::a_secret_is_never_printed ... ok
+test config::tests::control_addr_defaults_to_bind_and_can_be_overridden ... ok
+test config::tests::min_shards_must_fit_the_limits_and_the_layout ... ok
+test config::tests::the_default_root_has_split_headroom ... ok
+test control::tests::a_claim_of_an_already_issued_id_on_a_free_node_is_refused ... ok
+test control::tests::a_claim_of_an_implausible_id_is_refused_and_does_not_poison_the_counter ... ok
+test control::tests::a_claim_with_an_issued_id_on_a_node_outside_the_map_is_refused_too ... ok
+test boot::tests::boot_reserves_the_root_owner_and_persists_the_counter ... ok
+test boot::tests::boot_restores_a_saved_scene_and_survives_a_corrupt_scene_file ... ok
+test control::tests::a_hello_claiming_an_owned_region_is_refused ... ok
+test control::tests::a_hello_is_refused_not_panicked_when_the_counter_cannot_be_persisted ... ok
+test control::tests::a_hello_is_stale_once_its_shard_has_given_up_or_is_about_to ... ok
+test control::tests::a_hello_naming_another_cluster_is_refused ... ok
+test control::tests::a_connection_that_never_sends_its_hello_is_closed ... ok
+test control::tests::a_hello_with_no_id_gets_a_fresh_allocation_and_the_current_map ... ok
+test control::tests::a_load_report_feeds_the_autoscaler ... ok
+test control::tests::a_no_region_hello_claiming_a_non_root_id_is_refused_when_the_root_is_owned ... ok
+test control::tests::a_none_re_hello_for_an_owned_root_is_not_handed_the_owners_id ... ok
+test control::tests::a_none_re_hello_with_a_different_endpoint_on_an_owned_node_is_refused ... ok
+test control::tests::a_generated_secret_gives_a_trust_off_loopback_only ... ok
+test control::tests::a_second_region_less_hello_for_the_root_is_refused ... ok
+test control::tests::a_shard_claiming_the_next_to_issue_id_does_not_cause_a_collision ... ok
+test control::tests::admin_status_lists_the_published_regions ... ok
+test control::tests::an_anonymous_claim_for_a_node_outside_the_published_map_is_refused ... ok
+test control::tests::confirming_a_known_id_reserves_it_in_the_allocator ... ok
+test control::tests::only_a_wait_is_not_final_and_it_travels_as_draining ... ok
+test control::tests::send_to_never_waits_on_a_full_queue_or_holds_the_registry ... ok
+test control::tests::spawn_bots_is_refused_not_panicked ... ok
+test control::tests::a_pinned_client_trusts_a_control_port_bound_with_the_cluster_trust ... ok
+test epoch::tests::a_deep_carve_reaches_every_shard_in_the_map ... ok
+test epoch::tests::a_recipient_is_listed_once ... ok
+test epoch::tests::activation_uses_the_max_observer_tick_plus_the_lead ... ok
+test epoch::tests::an_ack_for_a_different_epoch_cannot_commit_the_staged_epoch ... ok
+test epoch::tests::an_unacked_prepare_aborts_and_the_published_map_is_byte_identical ... ok
+test epoch::tests::commits_are_spaced_by_the_minimum_epoch_interval ... ok
+test epoch::tests::epochs_are_monotonic_and_the_map_is_versioned ... ok
+test epoch::tests::every_shard_that_must_switch_is_a_prepare_recipient ... ok
+test epoch::tests::set_endpoints_fills_addresses_without_touching_ownership_or_epoch ... ok
+test epoch::tests::the_outstanding_prepare_is_available_to_a_recipient_that_has_not_acked ... ok
+test events::tests::a_back_to_back_repeat_is_counted_not_added ... ok
+test events::tests::a_long_text_is_cut_on_a_character_boundary ... ok
+test events::tests::a_zero_capacity_log_still_holds_one_entry ... ok
+test events::tests::entries_a_peer_can_cause_never_push_the_others_out ... ok
+test events::tests::entries_are_numbered_from_one_and_listed_newest_first ... ok
+test events::tests::the_log_is_a_ring_the_oldest_entry_leaves_first ... ok
+test ids::tests::a_corrupt_counter_file_is_an_error_not_a_silent_reset ... ok
+test ids::tests::a_counter_in_a_missing_directory_is_an_error_not_a_panic ... ok
+test ids::tests::a_failed_persist_withholds_the_id_and_it_is_never_handed_out_later ... ok
+test ids::tests::a_lone_tmp_file_is_resumed_from_not_reset_to_first ... ok
+test ids::tests::a_missing_counter_file_falls_back_to_first ... ok
+test ids::tests::a_restart_resumes_strictly_above_the_last_allocated_id ... ok
+test ids::tests::ids_are_monotonic_and_never_reused ... ok
+test ids::tests::persist_replaces_the_counter_file_and_leaves_no_temp_file ... ok
+test ids::tests::reserve_bumps_past_the_id_ignores_none_and_surfaces_persist_failure ... ok
+test ids::tests::the_counter_is_persisted_before_the_id_is_returned ... ok
+test ids::tests::the_directory_of_a_bare_file_name_is_the_current_directory ... ok
+test ids::tests::the_reserved_none_id_is_never_handed_out ... ok
+test control::tests::the_control_plane_never_prints_a_secret ... ok
+test launcher::docker::tests::a_chunked_body_is_put_together_across_chunks_and_reads ... ok
+test launcher::docker::tests::a_container_that_does_not_start_is_removed ... ok
+test launcher::docker::tests::a_launch_is_found_at_the_containers_address_and_port ... ok
+test launcher::docker::tests::a_launch_pulls_an_image_that_was_removed_while_the_orchestrator_ran ... ok
+test launcher::docker::tests::a_launch_stopped_while_it_is_created_leaves_no_container ... ok
+test launcher::docker::tests::a_name_held_by_a_strangers_container_is_left_alone ... ok
+test launcher::docker::tests::a_name_held_by_our_own_leftover_is_freed_and_tried_again ... ok
+test launcher::docker::tests::a_secret_that_lies_across_the_cut_is_taken_out_whole ... ok
+test launcher::docker::tests::a_shard_container_is_created_from_exactly_this ... ok
+test launcher::docker::tests::a_call_that_is_never_answered_times_out ... ok
+test boot::tests::boot_settles_the_cluster_secret ... ok
+test launcher::docker::tests::names_are_encoded_and_image_references_split ... ok
+test launcher::docker::tests::kill_removes_with_force_and_a_missing_container_is_removed ... ok
+test launcher::docker::tests::an_answer_over_the_limits_is_refused ... ok
+test launcher::docker::tests::prepare_does_not_guess_a_network ... ok
+test launcher::docker::tests::poll_tells_running_from_exited_from_no_answer ... ok
+test launcher::docker::tests::prepare_removes_only_labelled_leftovers_and_pulls_nothing_that_is_there ... ok
+test launcher::docker::tests::prepare_pulls_a_missing_image_and_a_failed_pull_is_an_error ... ok
+test launcher::docker::tests::the_default_options ... ok
+test launcher::docker::tests::the_orchestrator_finds_itself_by_name_before_its_host_name ... ok
+test launcher::local::tests::a_kill_ends_a_launch_that_is_still_trying_to_register ... ok
+test launcher::local::tests::a_spawned_shard_answers_a_real_client_connection ... ok
+test launcher::local::tests::kill_makes_poll_report_dead ... ok
+test launcher::local::tests::killing_a_shard_that_is_not_running_is_a_noop ... ok
+test launcher::local::tests::poll_on_an_unknown_launch_is_dead ... ok
+test launcher::local::tests::poll_reports_dead_when_a_registered_shards_tick_loop_stops ... ok
+test launcher::local::tests::spawn_returns_a_reachable_endpoint_and_poll_reports_alive ... ok
+test launcher::process::tests::a_child_is_not_handed_the_orchestrators_own_settings ... ok
+test launcher::docker::tests::no_error_and_no_debug_prints_the_secret ... ok
+test launcher::process::tests::a_launched_shard_sends_its_players_to_the_host_they_dialed ... ok
+test launcher::process::tests::a_missing_executable_is_an_error_naming_the_path ... ok
+test launcher::process::tests::launched_shards_bind_the_control_ports_ip_or_loopback ... ok
+test launcher::process::tests::the_executable_is_an_absolute_path_and_exactly_that_is_started ... ok
+test launcher::process::tests::a_child_is_started_logged_noted_and_seen_to_exit ... ok
+test launcher::process::tests::the_shard_executable_lies_next_to_the_running_one ... ok
+test launcher::tests::a_spawn_spec_never_prints_the_secret ... ok
+test launcher::tests::a_wildcard_control_address_is_dialled_on_loopback ... ok
+test ops::tests::a_command_reads_as_what_it_does ... ok
+test orchestrator::tests::a_carve_nobody_acks_aborts_and_its_shard_is_stopped ... ok
+test orchestrator::tests::a_carve_that_cannot_happen_changes_nothing_and_says_why ... ok
+test orchestrator::tests::a_cell_is_carved_for_a_new_shard_through_the_epoch_protocol_and_merged_back ... ok
+test orchestrator::tests::a_commit_is_followed_by_a_map_push_carrying_every_real_endpoint ... ok
+test launcher::process::tests::the_pid_file_lists_exactly_the_children_that_are_running ... ok
+test orchestrator::tests::a_crowd_on_the_spawn_point_grows_the_cluster_only_when_that_relieves_somebody ... ok
+test orchestrator::tests::a_dead_launch_whose_shard_is_gone_or_already_dead_is_just_removed ... ok
+test orchestrator::tests::a_dead_shard_is_replaced_under_a_new_id_and_the_scene_revision_rises_once ... ok
+test orchestrator::tests::a_drain_that_does_not_end_is_cut_short ... ok
+test orchestrator::tests::a_drain_whose_target_dies_is_ended_at_once_and_the_replacement_is_not_held_up ... ok
+test orchestrator::tests::a_draining_shard_that_is_declared_dead_is_not_left_draining ... ok
+test orchestrator::tests::a_hand_started_shard_restarting_in_place_does_not_cause_a_launch ... ok
+test orchestrator::tests::a_hello_at_a_live_shards_address_waits_while_another_shard_could_not_ack ... ok
+test orchestrator::tests::a_hello_naming_a_live_shards_address_from_elsewhere_harms_nobody ... ok
+test orchestrator::tests::a_drain_that_ends_with_bodies_builds_the_scene_afresh ... ok
+test orchestrator::tests::a_join_that_keeps_missing_its_deadline_backs_off_and_the_silent_shard_is_replaced ... ok
+test orchestrator::tests::a_launch_whose_purpose_a_hand_started_shard_took_is_stopped_not_given_a_cell ... ok
+test orchestrator::tests::a_launched_shard_that_says_hello_twice_keeps_its_process ... ok
+test orchestrator::tests::a_loaded_shard_is_not_relieved_beyond_max_shards ... ok
+test orchestrator::tests::a_lost_control_link_is_logged_once_and_makes_the_shard_dead ... ok
+test orchestrator::tests::a_map_push_carries_every_client_endpoint ... ok
+test orchestrator::tests::a_merge_needs_the_targets_report_and_room_for_the_players ... ok
+test orchestrator::tests::a_merge_that_aborts_kills_nobody_and_is_forgotten ... ok
+test orchestrator::tests::a_merge_that_would_go_below_min_shards_is_refused ... ok
+test orchestrator::tests::a_merged_shard_drains_and_is_told_to_stop_only_when_it_is_empty ... ok
+test orchestrator::tests::a_paused_autoscaler_takes_no_action_and_needs_a_fresh_dwell_afterwards ... ok
+test orchestrator::tests::a_refused_operator_request_changes_nothing_at_all ... ok
+test orchestrator::tests::a_region_can_be_split_again_and_each_split_carves_a_new_octant ... ok
+test orchestrator::tests::a_registration_and_a_refused_hello_are_logged ... ok
+test orchestrator::tests::a_replacement_on_the_port_of_the_shard_it_replaces_is_supervised_like_any_other ... ok
+test orchestrator::tests::a_report_from_a_shard_outside_the_map_is_ignored ... ok
+test orchestrator::tests::a_report_or_an_ack_is_only_taken_from_the_shard_it_names ... ok
+test orchestrator::tests::a_scene_ack_is_believed_only_about_a_known_shard_and_only_forwards ... ok
+test orchestrator::tests::a_scene_change_and_an_epoch_change_do_not_wait_for_each_other ... ok
+test orchestrator::tests::a_scene_raise_that_fails_after_a_replacement_is_tried_again_until_it_succeeds ... ok
+test orchestrator::tests::a_scene_that_cannot_be_saved_is_refused_and_nothing_is_sent ... ok
+test orchestrator::tests::a_shard_is_merged_on_its_report_and_a_pair_only_when_cold_together ... ok
+test orchestrator::tests::a_shard_killed_by_the_admin_verb_is_replaced ... ok
+test orchestrator::tests::a_shard_started_by_hand_on_a_port_of_the_range_is_not_taken_for_a_launch ... ok
+test launcher::docker::tests::shutdown_removes_everything_within_one_bound ... ok
+test orchestrator::tests::a_shard_that_comes_back_at_its_address_replaces_itself_once_it_can_be_served ... ok
+test orchestrator::tests::a_shard_that_comes_back_has_to_confirm_again ... ok
+test orchestrator::tests::a_shard_that_has_not_confirmed_is_reminded_once_a_second_until_it_does ... ok
+test orchestrator::tests::a_shard_that_is_being_stopped_is_not_welcomed_again_and_keeps_its_port ... ok
+test orchestrator::tests::a_shard_without_an_ip_of_its_own_is_listed_at_the_address_it_is_seen_from ... ok
+test orchestrator::tests::a_shard_that_answers_again_is_not_taken_for_dead ... ok
+test orchestrator::tests::a_split_at_the_region_limit_is_refused_whoever_asks ... ok
+test orchestrator::tests::a_split_that_aborts_stages_the_kill_of_its_child ... ok
+test orchestrator::tests::a_split_that_cannot_happen_burns_no_id_and_says_why ... ok
+test orchestrator::tests::a_split_whose_shard_never_registers_is_given_up ... ok
+test orchestrator::tests::a_split_with_an_unwritable_counter_is_not_carried_out_not_a_panic ... ok
+test orchestrator::tests::a_stale_report_expires_and_never_completes_a_dwell ... ok
+test orchestrator::tests::a_stop_the_launcher_never_confirms_gives_its_port_back_after_a_while ... ok
+test orchestrator::tests::a_surplus_in_process_launch_is_stopped_but_never_one_whose_shard_just_registered ... ok
+test orchestrator::tests::a_wait_that_will_not_pass_by_itself_is_logged_once ... ok
+test orchestrator::tests::an_ack_naming_an_unknown_shard_is_not_remembered ... ok
+test orchestrator::tests::an_attached_front_end_reads_the_snapshot_that_was_published ... ok
+test orchestrator::tests::an_autoscaler_split_carves_the_centre_octant_first ... ok
+test orchestrator::tests::an_operator_can_still_split_while_the_autoscaler_is_paused ... ok
+test orchestrator::tests::an_operator_change_right_after_a_commit_waits_for_the_minimum_interval ... ok
+test orchestrator::tests::an_operator_merge_needs_a_report_and_the_shard_drains_after_the_commit ... ok
+test orchestrator::tests::an_operator_request_while_a_change_is_under_way_is_refused_not_queued ... ok
+test orchestrator::tests::an_operator_scene_change_reaches_every_shard_and_each_confirmation_is_tracked ... ok
+test orchestrator::tests::an_operator_split_carves_the_octant_asked_for_through_the_epoch_protocol ... ok
+test orchestrator::tests::an_operator_split_with_no_octant_starts_at_the_centre_like_the_autoscaler ... ok
+test orchestrator::tests::an_operators_scene_survives_an_orchestrator_restart ... ok
+test orchestrator::tests::an_orchestrator_that_lost_its_scene_file_gets_back_above_a_shard_that_kept_running ... ok
+test orchestrator::tests::every_shard_is_welcomed_with_the_clusters_tick_origin ... ok
+test orchestrator::tests::hellos_while_a_change_is_in_flight_are_told_to_wait_and_served_in_turn ... ok
+test orchestrator::tests::launches_get_a_host_port_each_and_a_failed_launch_is_followed_by_a_pause ... ok
+test orchestrator::tests::max_shards_refuses_a_further_shard_for_good ... ok
+test orchestrator::tests::min_shards_4_ends_with_four_regions_owned_by_four_live_shards ... ok
+test orchestrator::tests::no_change_is_proposed_while_a_recipient_is_not_connected ... ok
+test orchestrator::tests::a_snapshot_of_a_full_map_plans_nothing_and_is_quick ... ok
+test orchestrator::tests::no_map_change_is_made_while_a_shard_drains ... ok
+test orchestrator::tests::re_sending_the_map_queues_the_committed_map_for_every_owner ... ok
+test orchestrator::tests::re_sending_the_map_many_times_between_two_beats_sends_it_once ... ok
+test orchestrator::tests::scene_changes_between_two_beats_cost_one_message_per_shard ... ok
+test orchestrator::tests::refused_hellos_cannot_flush_the_event_log_or_flood_standard_output ... ok
+test orchestrator::tests::the_autoscaler_merges_away_only_shards_the_orchestrator_launched ... ok
+test orchestrator::tests::the_autoscaler_never_goes_below_the_minimum ... ok
+test orchestrator::tests::the_autoscaler_keeps_the_layout_cells_of_min_shards ... ok
+test orchestrator::tests::the_cluster_grows_at_the_hot_cell_and_shrinks_again_by_draining ... ok
+test orchestrator::tests::the_mock_launcher_satisfies_the_trait ... ok
+test orchestrator::tests::the_only_shard_of_a_cluster_is_replaced_by_the_next_one_that_registers ... ok
+test orchestrator::tests::the_orchestrator_gets_above_a_reported_revision_once_a_second_and_within_reason ... ok
+test orchestrator::tests::the_orchestrator_is_constructible_without_a_runtime ... ok
+test orchestrator::tests::the_launcher_is_asked_and_told_but_never_waited_for ... ok
+test orchestrator::tests::the_pause_between_failing_launches_grows_whoever_else_is_healthy ... ok
+test orchestrator::tests::the_player_port_follows_the_owner_of_the_spawn_point ... ok
+test orchestrator::tests::the_snapshot_says_what_is_known_and_nothing_that_is_not ... ok
+test orchestrator::tests::the_snapshot_shows_the_player_port_and_every_client_endpoint ... ok
+test player::tests::a_client_of_another_version_is_told_so_by_the_player_port ... ok
+test player::tests::a_first_packet_is_retried_and_a_real_client_still_gets_its_answer ... ok
+test orchestrator::tests::a_launch_carries_the_cluster_secret_only_when_it_is_required ... ok
+test orchestrator::tests::the_orchestrator_never_prints_a_secret ... ok
+test player::tests::a_shards_hello_on_the_player_port_is_told_what_it_dialed ... ok
+test player::tests::a_pinned_client_trusts_a_player_port_bound_with_the_cluster_trust ... ok
+test player::tests::every_hello_is_answered_with_what_was_last_published ... ok
+test scene::tests::a_chosen_scene_and_its_revision_survive_a_restart ... ok
+test control::tests::a_hello_needs_the_cluster_secret_when_one_is_required ... ok
+test scene::tests::a_fresh_state_directory_starts_at_the_initial_scene_and_writes_nothing ... ok
+test scene::tests::a_lone_temp_file_is_read_like_the_scene_file ... ok
+test scene::tests::a_retired_scene_loads_as_the_default_and_keeps_the_revision_rising ... ok
+test scene::tests::a_scene_that_cannot_be_saved_is_not_adopted ... ok
+test scene::tests::an_unknown_scene_name_keeps_the_revision_rising ... ok
+test scene::tests::raising_above_a_seen_revision_keeps_the_scene_and_saves_the_number ... ok
+test scene::tests::the_memory_store_counts_revisions_from_one ... ok
+test scene::tests::the_scene_file_sits_next_to_the_state_file_and_collides_with_nothing ... ok
+test snapshot::tests::a_confirmed_scene_is_compared_with_the_current_one ... ok
+test snapshot::tests::a_node_reads_as_depth_and_index ... ok
+test snapshot::tests::the_octant_of_a_child_is_its_position_among_its_siblings ... ok
+test snapshot::tests::the_progress_of_a_scene_reads_as_one_sentence ... ok
+test snapshot::tests::the_signs_follow_the_octant_bits ... ok
+test topology::tests::a_carve_needs_a_node_inside_a_region_that_is_not_one_already ... ok
+test topology::tests::a_merge_is_the_exact_inverse_of_the_split ... ok
+test topology::tests::a_split_carves_exactly_one_octant ... ok
+test topology::tests::a_split_changes_ownership_only_inside_the_child ... ok
+test topology::tests::a_split_is_the_carve_of_one_child_octant ... ok
+test topology::tests::carves_nest_and_a_merge_falls_back_to_the_nearest_enclosing_region ... ok
+test topology::tests::children_composed_from_the_root_stay_valid_down_to_one_cell ... ok
+test topology::tests::layout_cells_are_handed_out_in_a_fixed_order_around_the_spawn_cell ... ok
+test topology::tests::merging_a_root_region_is_refused ... ok
+test topology::tests::no_two_regions_at_equal_depth_overlap_in_any_produced_map ... ok
+test topology::tests::splitting_a_too_small_region_is_refused ... ok
+test topology::tests::the_centre_of_a_region_lies_in_its_last_octant ... ok
+test topology::tests::the_cheap_view_checks_agree_with_the_planners ... ok
+test topology::tests::the_depth_size_math_matches_the_plan ... ok
+test topology::tests::the_picked_octant_skips_the_ones_already_carved_and_starts_where_told ... ok
+test topology::tests::the_split_gate_is_depth_54_and_a_region_may_be_one_cell ... ok
+test topology::tests::three_cells_carved_out_of_a_depth_40_root_and_one_merged_back ... ok
+test webui::auth::tests::a_host_is_an_ip_literal_localhost_or_a_listed_name ... ok
+test webui::auth::tests::a_listed_name_can_pin_its_port ... ok
+test webui::auth::tests::a_proxy_gives_itself_away_by_its_headers ... ok
+test webui::auth::tests::an_origin_must_be_this_server ... ok
+test webui::auth::tests::base64_round_trips_the_standard_alphabet ... ok
+test webui::auth::tests::equal_secrets_compare_equal_and_nothing_else_does ... ok
+test webui::auth::tests::only_a_same_origin_fetch_site_passes ... ok
+test webui::auth::tests::random_tokens_are_long_hex_and_never_repeat ... ok
+test scene::tests::a_corrupt_scene_file_falls_back_to_the_initial_scene_with_a_warning ... ok
+test webui::auth::tests::the_password_of_basic_credentials_is_the_token ... ok
+test webui::auth::tests::without_a_token_only_a_loopback_host_is_this_server ... ok
+test webui::auth::tests::wrong_missing_and_malformed_credentials_are_told_apart ... ok
+test webui::http::tests::a_body_is_read_to_exactly_its_declared_length ... ok
+test webui::auth::tests::random_tokens_have_no_stuck_or_copied_bits ... ok
+test webui::http::tests::a_head_response_keeps_the_length_and_drops_the_body ... ok
+test webui::http::tests::a_header_value_cannot_split_the_response ... ok
+test webui::http::tests::a_page_allows_exactly_its_own_stylesheet ... ok
+test webui::http::tests::a_repeated_header_that_must_be_unique_is_refused ... ok
+test webui::http::tests::a_request_line_and_its_headers_are_parsed ... ok
+test webui::http::tests::a_request_trickled_byte_by_byte_is_reassembled ... ok
+test webui::http::tests::an_oversized_body_is_refused_before_it_is_read ... ok
+test webui::http::tests::an_oversized_or_unterminated_head_is_refused ... ok
+test webui::http::tests::a_response_nobody_reads_is_given_up_on ... ok
+test webui::http::tests::content_length_is_validated ... ok
+test webui::http::tests::every_response_carries_the_security_headers_and_closes ... ok
+test webui::http::tests::expect_continue_is_answered ... ok
+test webui::http::tests::expect_continue_is_not_answered_to_an_http_1_0_client ... ok
+test webui::http::tests::form_encoding_is_decoded ... ok
+test webui::http::tests::malformed_heads_are_refused ... ok
+test webui::http::tests::other_broken_requests_get_their_status ... ok
+test webui::http::tests::the_number_of_form_fields_is_bounded ... ok
+test webui::http::tests::the_target_and_the_header_count_are_bounded ... ok
+test webui::json::tests::a_number_that_json_cannot_express_becomes_null ... ok
+test webui::json::tests::an_object_places_its_commas ... ok
+test webui::json::tests::strings_are_escaped ... ok
+test webui::json::tests::the_checker_itself_tells_json_from_not_json ... ok
+test webui::page::tests::a_unix_time_becomes_a_utc_date ... ok
+test webui::page::tests::distances_pick_a_readable_unit ... ok
+test webui::page::tests::everything_formatted_into_the_page_is_escaped ... ok
+test webui::page::tests::spans_read_like_a_person_would_say_them ... ok
+test webui::page::tests::the_five_significant_characters_are_escaped ... ok
+test webui::tests::a_carved_cell_is_listed_under_its_region_and_merged_from_the_page ... ok
+test webui::tests::a_client_that_never_finishes_its_request_is_timed_out ... ok
+test webui::http::tests::an_unfinished_head_runs_out_of_time_before_a_body_does ... ok
+test webui::tests::a_cross_origin_post_is_refused_and_nothing_happens ... ok
+test webui::tests::a_non_loopback_bind_without_a_token_is_refused ... ok
+test webui::tests::a_malformed_action_is_refused_before_it_reaches_the_run_loop ... ok
+test webui::tests::a_public_name_needs_a_token_even_on_a_loopback_bind ... ok
+test webui::tests::a_request_for_another_host_name_is_refused ... ok
+test webui::tests::a_request_that_repeats_a_fresh_switch_is_sent_to_the_switchs_banner ... ok
+test webui::tests::a_scene_banner_cannot_be_conjured_by_a_link ... ok
+test webui::tests::a_post_without_the_form_token_is_refused ... ok
+test webui::tests::a_scene_posted_by_the_page_switches_and_an_unknown_name_is_refused ... ok
+test webui::tests::a_script_with_the_token_and_no_origin_is_served ... ok
+test webui::tests::a_shard_without_a_report_has_no_report_not_a_report_of_zero ... ok
+test webui::tests::a_split_posted_by_the_page_is_carried_out_and_redirects_back ... ok
+test webui::tests::a_stopped_run_loop_is_a_503_not_a_hang ... ok
+test webui::tests::a_scene_request_that_races_its_twin_is_answered_once_the_twin_is_done ... ok
+test webui::tests::a_switch_with_no_shard_connected_says_that_nobody_was_told ... ok
+test webui::tests::a_token_protected_ui_refuses_requests_without_the_token ... ok
+test webui::tests::allowed_hosts_are_bare_names_and_the_token_stays_out_of_debug ... ok
+test webui::tests::an_action_needs_the_token_too_and_is_not_carried_out_without_it ... ok
+test webui::tests::an_action_that_arrives_while_one_is_in_flight_is_refused ... ok
+test webui::tests::an_address_gives_its_slot_back_when_its_connection_ends ... ok
+test webui::tests::an_already_running_banner_does_not_outlive_its_revision ... ok
+test webui::tests::an_idle_connection_is_given_up_on_at_the_head_deadline ... ok
+test webui::tests::an_ipv6_client_is_counted_by_its_slash_64 ... ok
+test player::tests::a_silent_peer_is_dropped_and_no_connection_is_held_open ... ok
+test webui::tests::a_switch_a_shard_has_not_confirmed_names_it_and_the_page_reloads_until_it_has ... ok
+test webui::tests::hostile_strings_are_escaped_in_the_page_and_in_the_json ... ok
+test webui::tests::no_control_on_the_page_holds_a_choice_a_reload_could_reset ... ok
+test player::tests::a_peer_that_grants_no_receive_window_does_not_keep_a_slot ... ok
+test webui::tests::the_dashboard_shows_the_cluster_the_map_and_the_shard ... ok
+test webui::tests::the_default_limits_give_an_idle_connection_less_time_than_a_request ... ok
+test webui::tests::the_page_and_the_json_show_the_player_port_and_each_client_endpoint ... ok
+test webui::tests::the_page_marks_a_shard_whose_scene_is_behind ... ok
+test webui::tests::the_refresh_can_be_paused_and_is_clamped ... ok
+test webui::tests::the_socket_path_serves_pages_and_refuses_garbage ... ok
+test webui::tests::asking_for_the_scene_that_is_running_says_nothing_to_do_and_is_never_refused ... ok
+test webui::tests::unknown_paths_and_wrong_methods_are_refused ... ok
+test webui::tests::the_state_is_served_as_well_formed_json ... ok
+test webui::tests::connections_beyond_the_cap_are_closed_and_slots_come_back ... ok
+test webui::tests::without_a_token_a_request_that_came_through_a_proxy_is_refused ... ok
+test webui::tests::without_a_token_only_a_loopback_host_is_served ... ok
+test webui::tests::operator_actions_are_taken_one_at_a_time_a_moment_apart ... ok
+
+test result: ok. 329 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/space-orchestrator/9553ae22c3a3698b/out/space_orchestrator-9553ae22c3a3698b)
+
+running 22 tests
+test tests::a_min_shards_that_cannot_be_kept_is_refused_at_startup ... ok
+test tests::a_non_loopback_web_ui_does_not_start_without_a_token ... ok
+test tests::a_bad_command_line_is_an_error_not_a_panic ... ok
+test tests::defaults_match_the_config ... ok
+test tests::flags_override_the_config ... ok
+test tests::control_addr_is_parsed_and_distinct_from_bind ... ok
+test tests::a_public_host_name_does_not_start_without_a_token ... ok
+test tests::the_autoscaler_is_configured_by_flags_or_variables ... ok
+test tests::the_docker_launcher_is_configured_by_flags_or_variables ... ok
+test tests::the_docker_launcher_is_told_its_own_name_its_instance_and_the_memory_limit ... ok
+test tests::the_initial_scene_comes_from_the_flag_then_the_environment_then_the_default ... ok
+test tests::the_player_port_is_off_unless_asked_for_and_needs_no_token ... ok
+test tests::the_cluster_secret_is_configured_and_required_off_loopback ... ok
+test tests::a_configured_peer_token_is_a_secret_or_an_error ... ok
+test tests::the_region_limit_has_a_default_and_a_flag ... ok
+test tests::the_process_launcher_without_its_executable_is_a_startup_error ... ok
+test tests::the_shard_flags_come_from_the_flag_then_the_environment_then_the_default ... ok
+test tests::the_startup_line_says_who_starts_the_shards_and_never_a_secret ... ok
+test tests::the_web_ui_is_on_only_when_given_an_address ... ok
+test tests::the_token_can_come_from_a_file_and_hosts_from_a_list ... ok
+test tests::the_docker_instance_is_made_once_and_kept_with_the_state ... ok
+test tests::the_startup_line_says_which_scene_and_where_it_came_from ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/boot_loopback.rs (target/xtask-test/debug/build/space-orchestrator/532ebc210c547b0b/out/boot_loopback-532ebc210c547b0b)
+
+running 5 tests
+test a_restarting_shard_at_the_same_endpoint_replaces_itself_under_a_new_id ... ok
+test a_second_region_less_shard_is_given_the_next_layout_cell ... ok
+test a_split_commits_through_the_real_run_loop_and_the_local_launcher ... ok
+test an_anonymous_claim_for_a_node_outside_the_map_is_rejected_and_burns_no_id ... ok
+test a_booted_cluster_serves_frames_and_never_redirects_to_the_control_port ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+
+     Running tests/lifecycle.rs (target/xtask-test/debug/build/space-orchestrator/5e17356b5c96f5c6/out/lifecycle-5e17356b5c96f5c6)
+
+running 8 tests
+test a_hello_whose_shard_has_given_up_on_it_is_not_served ... ok
+test a_connection_speaks_only_for_the_shard_it_was_admitted_as ... ok
+test a_shard_without_the_cluster_secret_is_refused_for_good ... ok
+test a_shard_that_dies_is_replaced_under_a_new_id_and_the_scene_is_built_afresh ... ok
+   Compiling ring v0.17.14
+test a_launcher_that_never_answers_does_not_stop_the_clock ... ok
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.17
+   Compiling rcgen v0.14.10
+test min_shards_4_through_the_real_loop_ends_with_four_live_shards_in_four_quadrants ... ok
+test a_refused_hello_is_closed_and_nothing_else_it_says_is_heard ... ok
+   Compiling quinn-proto v0.11.19
+   Compiling quinn v0.11.12
+   Compiling space-net v0.1.0 (/workspace/crates/space-net)
+   Compiling space-server v0.1.0 (/workspace/crates/space-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.34s
+test the_process_launcher_starts_real_shards_and_replaces_one_that_is_killed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.39s
+
+     Running tests/pinning.rs (target/xtask-test/debug/build/space-orchestrator/570305593ec67e57/out/pinning-570305593ec67e57)
+
+running 2 tests
+test without_a_secret_launched_and_hand_started_shards_all_register ... ok
+test a_cluster_with_a_secret_is_dialled_only_by_clients_that_hold_its_pin ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running tests/player_port.rs (target/xtask-test/debug/build/space-orchestrator/3896cc3cd7e994cc/out/player_port-3896cc3cd7e994cc)
+
+running 5 tests
+test a_player_who_dials_the_control_port_is_told_what_it_is ... ok
+test a_shard_that_registers_without_an_ip_is_listed_with_the_one_it_is_seen_from ... ok
+test after_the_roots_shard_is_replaced_the_player_port_names_the_new_owner ... ok
+test the_player_port_sends_a_player_to_the_spawn_points_owner_and_says_starting_until_there_is_one ... ok
+test nothing_said_on_the_player_port_reaches_the_orchestrator ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+
+     Running tests/rebalance.rs (target/xtask-test/debug/build/space-orchestrator/7696e2e59d3e74ea/out/rebalance-7696e2e59d3e74ea)
+
+running 11 tests
+test a_flapping_load_does_not_flap_the_topology ... ok
+test a_killed_shard_is_removed_and_the_world_stays_owned ... ok
+test a_shard_that_never_acks_gets_an_abort_and_the_world_keeps_the_old_map ... ok
+test a_split_gets_a_strictly_greater_id_than_its_parent ... ok
+test after_an_orchestrator_restart_the_next_id_exceeds_every_id_ever_issued ... ok
+test a_split_publishes_prepare_then_acks_then_commit_in_that_order ... ok
+test the_autoscaler_splits_a_hot_shard_end_to_end ... ok
+test the_orchestrator_allocates_ids_and_no_launch_spec_carries_one ... ok
+test a_client_sees_a_frame_every_tick_across_a_rebalance ... ok
+test a_split_rebalances_a_player_into_the_child_without_the_client_noticing ... ok
+test lookup_agrees_with_the_serving_shard_after_every_topology_change ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.19s
+
+     Running tests/split_merge.rs (target/xtask-test/debug/build/space-orchestrator/3f492986db2df32d/out/split_merge-3f492986db2df32d)
+
+running 8 tests
+test a_hot_shard_splits_the_epoch_and_a_shard_is_launched_for_the_child ... ok
+test a_cold_carved_cell_merges_back_into_the_roots_owner ... ok
+test a_split_stages_a_spawn_and_the_commit_publishes_the_child_region ... ok
+test a_cold_child_merges_the_epoch_and_stages_a_kill ... ok
+test a_shard_registers_over_loopback_and_gets_its_id_and_map ... ok
+test an_unacked_prepare_aborts_and_the_map_is_unchanged ... ok
+test the_local_launcher_spawns_a_reachable_child_over_loopback ... ok
+test a_cell_is_carved_with_the_local_launcher_committed_and_merged_back ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.91s
+
+     Running tests/webui.rs (target/xtask-test/debug/build/space-orchestrator/adcb4d8e70797d49/out/webui-adcb4d8e70797d49)
+
+running 7 tests
+test a_token_protected_web_ui_refuses_everything_without_the_token ... ok
+test a_switch_reaches_a_shard_that_holds_a_higher_revision_than_the_orchestrator ... ok
+test a_shard_that_restarts_is_handed_the_scene_that_is_current_now ... ok
+test a_tokenless_ui_refuses_proxied_requests_and_hurried_actions ... ok
+test a_scene_switch_posted_to_the_web_ui_reaches_every_shard_and_its_players ... ok
+test the_web_ui_shows_the_cluster_and_a_split_posted_to_it_commits ... ok
+test idle_http_clients_do_not_hold_up_the_control_plane ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.24s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-protocol/4f3051e768795fd3/out/space_protocol-4f3051e768795fd3)
+
+running 14 tests
+test far::tests::an_origin_round_trips ... ok
+test far::tests::the_steps_follow_the_distance_with_hysteresis ... ok
+test far::tests::a_far_player_is_validated ... ok
+test scene::tests::an_unknown_name_is_refused_and_the_refusal_lists_the_catalogue ... ok
+test far::tests::the_wire_len_of_an_update_is_exact ... ok
+test scene::tests::an_unknown_id_is_not_known_and_falls_back_to_the_default ... ok
+test scene::tests::ids_and_names_are_unique_and_round_trip ... ok
+test scene::tests::only_a_strictly_newer_revision_supersedes ... ok
+test scene::tests::the_retired_solar_id_resolves_to_the_default ... ok
+test scene::tests::the_catalogue_ids_and_names_are_pinned ... ok
+test snapshot::tests::message_overhead_is_exact ... ok
+test scene::tests::the_scene_clock_maps_ticks_to_microseconds_exactly ... ok
+test snapshot::tests::entity_snapshot_encoded_len_is_exact ... ok
+test far::tests::the_draw_delay_is_continuous_and_covers_the_step_in_use ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/acceptance.rs (target/xtask-test/debug/build/space-protocol/5c4d25660abe3cce/out/acceptance-5c4d25660abe3cce)
+
+running 30 tests
+test a_join_redirect_round_trips_at_tag_29 ... ok
+test a_hello_never_prints_its_token ... ok
+test a_region_carries_a_client_endpoint_beside_its_endpoint ... ok
+test a_shard_hello_ends_with_the_cluster_secret_and_never_prints_it ... ok
+test a_shard_hello_may_ask_for_a_client_endpoint ... ok
+test an_unknown_scene_id_decodes_and_the_receiver_can_fall_back ... ok
+test an_unspecified_client_endpoint_means_the_host_the_player_dialed ... ok
+test a_hostile_length_prefix_never_panics_the_decoder ... ok
+test builder_overhead_is_max_of_snapshot_and_delta ... ok
+test check_hello_gates_the_handshake ... ok
+test delta_size_sanity ... ok
+test guid_stable_across_handoff ... ok
+test header_is_length_then_version ... ok
+test message_tags_are_dense_and_covered ... ok
+test octree_nodes_validated_on_decode ... ok
+test a_mutated_valid_frame_never_panics ... ok
+test property_random_messages_roundtrip ... ok
+test remediation_fields_roundtrip ... ok
+test removed_list_is_charged_to_the_budget ... ok
+test roundtrip_all ... ok
+test scene_messages_have_a_pinned_wire_layout ... ok
+test shard_map_lookup ... ok
+test arbitrary_bytes_never_panic_the_decoder ... ok
+test snapshot_budget ... ok
+test truncated_rejected ... ok
+test unknown_tag_rejected ... ok
+test version_mismatch_rejected ... ok
+test a_valid_header_over_arbitrary_bytes_never_panics ... ok
+test snapshot_budget_edge_cases ... ok
+test oversized_rejected ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-scene/1da8e8a526964ec6/out/space_scene-1da8e8a526964ec6)
+
+running 2 tests
+test glb::tests::reads_a_tiny_glb_and_applies_the_node_transform ... ok
+test glb::tests::malformed_input_is_an_error_not_a_panic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/perf.rs (target/xtask-test/debug/build/space-scene/3957237dfdecba51/out/perf-3957237dfdecba51)
+
+running 1 test
+test demo_area_with_200_bodies_and_32_ships ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/scene.rs (target/xtask-test/debug/build/space-scene/c1bc3f609e1cee22/out/scene-c1bc3f609e1cee22)
+
+running 12 tests
+test no_showcase_object_starts_intersecting_another ... ok
+test the_anchor_lies_beside_and_above_the_corner_where_the_roots_cells_meet ... ok
+test the_anchor_rule_is_the_clients ... ok
+test a_player_lands_on_the_far_rocks_and_lifts_off ... ok
+test every_scene_builds_and_steps_anywhere ... ok
+test the_kestrel_collider_is_its_glb ... ok
+test a_ship_fast_travels_to_the_moon_and_lands ... ok
+test the_demo_statics_match_what_the_client_draws ... ok
+test the_sky_moves_on_its_orbits_and_leaves_the_demo_area_alone ... ok
+test the_showcase_works ... ok
+test the_planetoid_holds_its_crates_and_moons_and_lets_a_player_land ... ok
+test the_far_content_keeps_to_its_cells_and_steps ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-server/67f56ffffedf9d35/out/space_server-67f56ffffedf9d35)
+
+running 66 tests
+test alloc::tests::a_poisoned_counter_is_an_error_not_a_panic ... ok
+test alloc::tests::the_reserved_none_id_is_never_handed_out ... ok
+test alloc::tests::allocation_resumes_from_a_persisted_counter ... ok
+test border::tests::scene_guids_carry_their_revision_and_never_meet_counter_guids ... ok
+test alloc::tests::ids_are_monotonic_and_never_reused ... ok
+test border::tests::border_geometry_is_exact_far_from_the_origin ... ok
+test border::tests::territory_distance_and_home_follow_the_map ... ok
+test border::tests::near_a_corner_of_four_cells_the_distance_is_to_the_shards_own_ground ... ok
+test clock::tests::a_tick_origin_in_the_future_is_refused ... ok
+test clock::tests::shards_started_seconds_apart_agree_on_the_tick_of_an_instant ... ok
+test epoch::tests::a_change_for_a_known_owner_copies_that_owners_endpoint ... ok
+test clock::tests::a_clock_that_drifted_from_the_wall_clock_is_slewed_onto_it ... ok
+test epoch::tests::a_change_for_a_new_owner_gets_the_unresolved_sentinel_endpoint ... ok
+test epoch::tests::a_change_for_a_node_the_map_already_names_replaces_its_owner ... ok
+test epoch::tests::a_commit_for_an_unstaged_epoch_installs_nothing ... ok
+test epoch::tests::a_second_prepare_while_one_is_staged_is_rejected ... ok
+test epoch::tests::a_stale_or_skipped_prepare_is_rejected ... ok
+test epoch::tests::discard_through_clears_a_staged_prepare_at_or_below_the_installed_epoch ... ok
+test epoch::tests::prepare_then_abort_discards_the_staged_change ... ok
+test epoch::tests::prepare_then_commit_applies_the_change_and_bumps_the_epoch ... ok
+test handoff::scene_time_tests::a_handoff_state_carries_its_scene_time ... ok
+test handoff::owner_tests::only_a_ship_with_an_owner_token_has_an_owner ... ok
+test load::tests::a_report_says_what_the_shard_holds ... ok
+test load::tests::a_window_nobody_reads_is_bounded ... ok
+test load::tests::a_window_is_summed_up_and_starts_over ... ok
+test load::tests::the_hot_cell_holds_most_players ... ok
+test clock::tests::a_shard_keeps_to_the_cluster_clock_through_late_ticks_and_a_stall ... ok
+test clock::tests::a_suspended_host_steps_forward_and_a_clock_set_back_is_slewed ... ok
+test net::tests::a_dead_tick_loop_stops_the_shard_with_an_error ... ok
+test net::tests::a_connected_client_is_told_the_scene_and_follows_a_change ... ok
+test net::tests::a_map_pushed_endpoint_supersedes_a_hand_registered_one ... ok
+test net::tests::a_peer_hello_token_round_trips_to_the_shard_id ... ok
+test net::tests::a_client_whose_scene_announcement_was_dropped_still_learns_the_scene ... ok
+test net::tests::a_scene_switch_reads_as_what_happened ... ok
+test net::tests::a_peer_hello_without_the_peer_token_is_refused ... ok
+test net::tests::a_full_shard_tells_the_client_it_is_full ... ok
+test net::tests::a_shard_with_a_peer_token_admits_only_that_token ... ok
+test net::tests::refused_peer_hellos_are_counted_but_written_only_a_few_times_a_window ... ok
+test net::tests::a_session_is_never_visible_without_its_write_queue ... ok
+test net::tests::the_front_end_never_prints_the_peer_token ... ok
+test net::tests::the_secret_is_not_sent_without_a_pin ... ok
+test orchestrated::tests::only_not_yet_and_nobody_there_are_tried_again ... ok
+test orchestrated::tests::the_cluster_secret_comes_from_the_environment_or_a_file ... ok
+test orchestrated::tests::the_options_never_print_the_secret ... ok
+test replicate::tests::a_change_carried_by_a_lost_frame_is_sent_again ... ok
+test replicate::tests::a_change_made_while_a_snapshot_is_going_out_is_not_lost ... ok
+test replicate::tests::a_copy_that_is_replaced_within_a_tick_loses_what_the_new_one_lacks ... ok
+test replicate::tests::a_lost_frame_owes_only_what_the_delivered_frame_did_not_carry ... ok
+test replicate::tests::a_snapshot_whose_rest_despawned_still_ends ... ok
+test replicate::tests::an_acknowledgement_settles_exactly_one_frame_and_presumes_older_ones_lost ... ok
+test replicate::tests::an_entity_is_sent_at_its_steps_rate_and_never_left_stale ... ok
+test replicate::tests::an_entity_no_frame_is_known_to_have_brought_is_sent_whole_with_what_it_lost ... ok
+test replicate::tests::interest_follows_a_moving_ship_and_tolerates_repeated_placement ... ok
+test replicate::tests::the_in_flight_list_is_bounded_and_ignores_empty_frames ... ok
+test shard::far::tests::a_far_replica_carries_only_what_draws_it ... ok
+test shard::physics::tests::partial_component_lists_merge_and_diff_back ... ok
+test shard::physics::tests::the_spawn_grid_starts_at_the_spawn_point_and_is_nearest_first ... ok
+test shard::tests::a_client_that_missed_the_scene_is_told_again_without_a_change ... ok
+test shard::tests::a_flood_of_inputs_is_capped_between_ticks ... ok
+test shard::tests::a_joining_client_is_told_the_scene_before_its_first_frame ... ok
+test shard::tests::a_scene_change_reaches_every_client_and_a_stale_one_is_ignored ... ok
+test shard::tests::an_undrained_outbox_is_bounded_and_sheds_only_old_deltas ... ok
+test shard::tests::the_orchestrators_scene_is_adopted_relayed_and_confirmed ... ok
+test net::tests::a_shard_presents_its_peer_token_when_it_dials_a_neighbour ... ok
+test net::tests::a_dead_neighbour_cannot_stall_the_tick_loop ... ok
+test net::tests::shards_with_trust_verify_each_other_and_plain_shards_still_talk ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.69s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/space-server/60fb20d659b1fd53/out/space_server-60fb20d659b1fd53)
+
+running 16 tests
+test tests::a_bad_command_line_is_an_error_not_a_panic ... ok
+test tests::a_bare_orchestrator_flag_is_enough ... ok
+test tests::a_peer_lands_in_the_shard_map_with_its_endpoint ... ok
+test tests::a_minimal_command_line_binds_loopback ... ok
+test tests::advertise_is_rejected_without_an_orchestrator_or_when_malformed ... ok
+test tests::bind_accepts_a_container_wildcard_address ... ok
+test tests::orchestrator_flags_are_parsed_and_do_not_require_shard_or_region ... ok
+test tests::the_advertised_address_defaults_to_the_bound_address ... ok
+test tests::an_explicit_advertise_overrides_the_bound_address ... ok
+test tests::an_orchestrated_shard_binds_the_fixed_default_port ... ok
+test tests::the_cluster_secret_is_named_by_file_only_and_only_when_orchestrated ... ok
+test tests::the_client_endpoint_is_for_an_orchestrated_shard_and_reaches_the_hello ... ok
+test tests::the_tick_origin_is_the_fixed_default_or_the_flags ... ok
+test tests::the_static_shard_path_still_requires_shard_and_region ... ok
+test tests::the_scene_flag_names_a_catalogue_scene_for_a_standalone_shard_only ... ok
+test tests::the_orchestrator_is_named_by_address_or_by_name ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/acceptance.rs (target/xtask-test/debug/build/space-server/89face660f1c0d80/out/acceptance-89face660f1c0d80)
+
+running 42 tests
+test a_client_at_rest_is_sent_a_frame_every_tick ... ok
+test a_client_is_redirected_only_after_the_peer_accepted ... ok
+test a_client_that_sat_still_can_start_moving ... ok
+test a_commit_installs_on_the_accepting_shards_own_clock ... ok
+test a_frame_the_client_never_acknowledged_is_sent_again ... ok
+test a_fresh_join_is_taken_only_by_the_shard_that_owns_the_spawn_point ... ok
+test a_claim_for_a_staged_entity_requires_the_offered_owner_token ... ok
+test a_fresh_join_over_the_wire_is_sent_to_the_spawn_points_owner ... ok
+test a_hello_without_a_token_is_refused_and_owns_nothing_that_is_staged ... ok
+test a_load_report_counts_a_transfer_that_is_staged ... ok
+test a_parked_ship_is_sent_when_a_client_flies_into_range ... ok
+test a_full_shard_refuses_an_incoming_handoff_with_target_full ... ok
+test a_player_being_handed_over_is_welcomed_by_a_shard_that_does_not_own_the_spawn_point ... ok
+test a_player_is_sent_client_endpoints_and_no_internal_ones ... ok
+test a_prepare_is_acked_and_a_commit_installs_the_new_map ... ok
+test a_player_who_leaves_before_the_install_leaves_no_ship_behind ... ok
+test a_redirected_clients_second_connection_is_told_the_scene ... ok
+test a_send_to_an_unknown_peer_is_counted_as_a_failure ... ok
+test a_snapshot_of_1000_ships_costs_about_158_bytes_per_entity ... ok
+test a_staged_transfer_without_a_commit_is_dropped_and_the_guid_is_reofferable ... ok
+test a_stale_epoch_offer_is_refused_and_the_transfer_aborts ... ok
+test an_adoption_that_never_comes_ends_like_a_fresh_join ... ok
+test an_entity_awaiting_install_cannot_be_offered_again ... ok
+test an_epoch_abort_leaves_the_map_untouched ... ok
+test an_epoch_change_after_the_commit_gate_aborts_and_releases_the_guid ... ok
+test an_epoch_commit_mid_handoff_aborts_with_epoch_changed_and_reoffers ... ok
+test an_observer_sees_no_gap_across_a_handoff ... ok
+test an_unanswered_offer_times_out_and_the_world_is_unchanged ... ok
+test an_undecodable_handoff_state_is_never_installed_as_a_default ... ok
+test an_unknown_peer_and_a_misattributed_commit_are_refused ... ok
+test client_gets_a_snapshot_then_deltas_and_its_input_ack_advances ... ok
+test handoff_keeps_the_guid_position_and_inputs_continuous ... ok
+test handoff_leaves_no_desync ... ok
+test a_refused_offer_is_not_repeated_every_tick ... ok
+test only_the_owner_can_call_off_a_staged_handoff ... ok
+test only_the_ships_own_player_is_redirected ... ok
+test the_installed_state_hashes_identically_to_the_committed_state ... ok
+test until_a_client_acknowledges_every_frame_names_its_ship ... ok
+test malformed_frames_end_the_session_instead_of_trusting_it ... ok
+test version_mismatch_is_refused_over_the_wire ... ok
+test a_client_can_connect_to_a_running_shard ... ok
+test a_client_let_go_of_is_sent_the_redirect_and_its_connection_is_closed ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.01s
+
+     Running tests/crossing.rs (target/xtask-test/debug/build/space-server/373fc81d22da5982/out/crossing-373fc81d22da5982)
+
+running 10 tests
+test a_commit_that_arrives_early_waits_for_its_tick ... ok
+test a_late_commit_is_caught_up_with_the_inputs_of_the_ticks_it_missed ... ok
+test a_commit_installed_after_a_stall_is_not_brought_forward_by_the_stall ... ok
+test a_ship_handed_over_flies_as_if_it_never_changed_shard ... ok
+test a_refused_body_does_not_call_off_the_ship_it_travels_with ... ok
+test shards_started_seconds_apart_count_the_same_ticks ... ok
+test a_players_handoff_is_not_called_off_by_bodies_going_the_other_way ... ok
+test a_standing_players_ship_is_not_handed_over_when_another_flies_past ... ok
+test inputs_sent_before_a_late_connection_are_said_again_and_kept ... ok
+test two_players_pushing_each_other_across_a_border ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/far.rs (target/xtask-test/debug/build/space-server/8113517f8abc7cf4/out/far-8113517f8abc7cf4)
+
+running 16 tests
+test a_body_far_inside_another_shard_is_seen_as_a_far_replica ... ok
+test a_lost_far_update_is_asked_for_again ... ok
+test a_player_on_another_shard_is_seen_as_a_far_player ... ok
+test a_ghost_shows_its_owners_state_of_the_tick_whoever_stepped_first ... ok
+test a_far_body_at_rest_costs_a_keep_alive_and_wakes_at_once ... ok
+test a_shard_that_is_merged_away_stays_a_far_neighbour_while_it_drains ... ok
+test far_replicas_of_a_silent_or_departed_shard_go_and_come_back_once ... ok
+test far_bodies_are_sent_at_the_rate_of_their_distance_step ... ok
+test from_far_replica_to_ghost_to_local_without_a_jump ... ok
+test from_local_to_ghost_to_far_replica_without_a_gap ... ok
+test a_far_sample_is_relayed_on_the_tick_it_arrives_whatever_the_acknowledgements_do ... ok
+test the_cost_of_far_replicas_is_bounded ... ok
+test what_a_peer_sends_is_bounded_and_cannot_overwrite_local_entities ... ok
+test a_player_on_the_spawn_point_is_sent_the_demo_areas_far_content_at_its_steps ... ok
+test the_far_content_costs_an_idle_client_what_its_bound_says ... ok
+test removals_are_split_over_far_updates_like_everything_else ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.11s
+
+     Running tests/four_cells.rs (target/xtask-test/debug/build/space-server/f7ae5b298ad37ea1/out/four_cells-f7ae5b298ad37ea1)
+
+running 17 tests
+test a_crate_slides_and_a_crate_falls_across_the_border_in_gravity ... ok
+test a_late_commit_does_not_sink_or_hop_a_falling_or_a_sliding_crate ... ok
+test a_shard_reports_its_load_once_a_second ... ok
+test a_shard_whose_region_is_merged_away_hands_everything_over_and_is_empty ... ok
+test a_pendulum_and_a_chain_swinging_over_the_border_stay_on_their_shard ... ok
+test a_ship_set_down_on_a_slab_of_the_neighbour_stands_still ... ok
+test a_body_ahead_of_a_player_who_is_changing_shard_waits_where_it_is ... ok
+test a_spring_across_the_corner_swings_as_on_one_shard ... ok
+test an_island_waits_for_a_member_that_is_on_its_way_before_it_moves_on ... ok
+test bodies_resting_against_and_on_a_ghost_do_not_move ... ok
+test bodies_pushed_across_each_border_and_through_the_corner_fly_as_on_one_shard ... ok
+test a_stack_on_the_border_stands_and_is_pushed_over_across_it ... ok
+test the_floating_crate_on_the_border_is_struck_the_same_on_one_shard ... ok
+test the_same_script_on_one_shard_and_on_four ... ok
+test a_player_passing_the_showcase_moves_no_body_it_does_not_reach ... ok
+test the_showcase_rests_for_a_minute_on_four_shards ... ok
+test the_far_content_is_on_its_shards_once_and_moves_as_on_one_shard ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.16s
+
+     Running tests/handoff_props.rs (target/xtask-test/debug/build/space-server/888b6e0b8c234fef/out/handoff_props-888b6e0b8c234fef)
+
+running 5 tests
+test the_ship_is_never_lost_across_a_map_change ... ignored, a commit that meets a changed epoch is refused after the sender let go (shard.rs on_commit); see the doc comment
+test the_model_hands_the_ship_over ... ok
+test every_input_is_applied_exactly_once_across_a_handoff ... ok
+test one_simulator_and_no_stale_commit_under_any_interleaving ... ok
+test the_ship_is_never_lost_while_the_map_stands_still ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/map_push.rs (target/xtask-test/debug/build/space-server/0fd4081aab0f5aba/out/map_push-0fd4081aab0f5aba)
+
+running 7 tests
+test a_newer_push_is_installed_like_a_commit_the_shard_missed ... ok
+test a_placeholder_endpoint_is_never_offered_as_a_peer_address ... ok
+test a_push_older_than_the_shards_map_is_ignored ... ok
+test installing_a_newer_epoch_via_a_push_clears_the_staged_prepare ... ok
+test the_unresolved_sentinel_is_never_offered_as_a_peer_address ... ok
+test the_map_push_supplies_the_real_endpoint ... ok
+test a_map_refresh_that_changes_a_peers_address_repoints_the_cached_sender ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/orchestrated.rs (target/xtask-test/debug/build/space-server/0d28f3f41c4f24a4/out/orchestrated-0d28f3f41c4f24a4)
+
+running 11 tests
+test a_shard_stops_when_it_loses_its_orchestrator ... ok
+test a_shard_does_not_give_its_secret_to_an_orchestrator_it_cannot_verify ... ok
+test a_shard_without_a_secret_registers_with_a_self_signed_orchestrator ... ok
+test a_welcome_with_a_tick_origin_in_the_future_is_refused ... ok
+test a_final_refusal_ends_the_boot_with_the_reason ... ok
+test an_orchestrated_shard_requires_the_peer_token_of_its_welcome ... ok
+test an_orchestrated_shard_takes_its_two_addresses_from_its_welcome ... ok
+test a_shard_told_to_wait_asks_again_until_it_is_welcomed ... ok
+test orchestrated_shards_count_from_the_origin_their_welcome_names ... ok
+test a_shard_told_to_stop_ends_in_an_orderly_way ... ok
+test an_orchestrator_that_never_answers_is_given_up_on ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.48s
+
+     Running tests/physics.rs (target/xtask-test/debug/build/space-server/e37899acf2b8d43d/out/physics-e37899acf2b8d43d)
+
+running 24 tests
+test a_body_flying_across_a_border_is_seen_without_a_gap_or_a_jump ... ok
+test a_body_crosses_a_border_1e13_metres_from_the_origin ... ok
+test a_crate_in_reach_of_a_swinging_pendulum_does_not_change_shard_every_swing ... ok
+test a_player_pushes_a_crate_across_the_border_and_keeps_pushing ... ok
+test a_body_that_keeps_coming_back_is_held_longer_each_time ... ok
+test a_players_ship_is_drawn_as_a_player_everywhere ... ok
+test a_busy_spawn_point_never_puts_a_ship_across_a_border ... ok
+test a_crate_falls_through_the_gravity_room_across_a_border ... ok
+test a_refused_body_offer_leaves_the_body_where_it_was ... ok
+test a_split_hands_the_carved_octants_bodies_to_the_child ... ok
+test a_spring_across_a_border_keeps_its_period ... ok
+test an_epoch_change_aborts_a_body_transfer ... ok
+test an_old_peer_is_refused_with_both_versions ... ok
+test an_unanswered_body_offer_times_out_and_nothing_moved ... ok
+test a_scene_change_replaces_the_bodies_cluster_wide ... ok
+test an_unowned_body_handoff_keeps_h1_to_h8 ... ok
+test bodies_colliding_head_on_at_a_border_match_one_shard ... ok
+test bodies_colliding_head_on_1e13_metres_from_the_origin_match_one_shard ... ok
+test joining_players_get_distinct_free_spawn_points_and_ships_are_solid ... ok
+test a_settled_body_ends_on_the_shard_that_owns_its_position ... ok
+test replication_bandwidth_of_the_moving_showcase ... ok
+test the_zero_g_corner_settles_on_a_carved_octant ... ok
+test a_player_running_through_a_split_showcase_leaves_it_settled ... ok
+test over_quic_a_body_crosses_between_two_real_shards ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.08s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-sim/91522e7a4fe963de/out/space_sim-91522e7a4fe963de)
+
+running 62 tests
+test body::tests::bodies_round_trip ... ok
+test codec::tests::round_trip_and_strictness ... ok
+test body::tests::hostile_bodies_are_rejected ... ok
+test components::tests::identity_state_is_a_resting_ship ... ok
+test gravity::tests::a_reach_fades_the_pull_to_exactly_zero ... ok
+test gravity::tests::a_point_mass_pulls_by_the_inverse_square_far_away_and_exactly ... ok
+test components::tests::registry_matches_the_component_ids ... ok
+test articulation::tests::articulations_round_trip_and_reject_hostile_input ... ok
+test motion::tests::the_scene_clock_counts_in_simulation_ticks ... ok
+test gravity::tests::zones_have_an_inside_a_soft_edge_and_an_outside ... ok
+test motion::tests::terms_add_up_and_a_tilt_lifts_the_plane ... ok
+test motion::tests::a_circle_goes_round_once_per_period ... ok
+test orbits::tests::belt_bodies_are_reachable_and_periodic ... ok
+test orbits::tests::body_count_covers_star_planets_and_belt ... ok
+test orbits::tests::rail_pos_is_periodic_in_ticks_within_quantisation ... ok
+test params::tests::placeholder_values_are_positive_and_finite ... ok
+test orbits::tests::rail_pos_is_periodic_in_seconds ... ok
+test orbits::tests::rail_pos_is_pure_across_instances ... ok
+test physics::tests::clamp_unit_scales_but_does_not_truncate ... ok
+test physics::tests::lift_pushes_against_gravity_only ... ok
+test physics::tests::normalize_recovers_a_degenerate_quat ... ok
+test physics::tests::quat_identity_is_neutral ... ok
+test physics::tests::quat_rotate_matches_axis_rotations ... ok
+test physics::tests::step_ship_is_pure_and_finite ... ok
+test physics::tests::zero_input_from_rest_does_nothing ... ok
+test prediction::tests::apply_input_keeps_the_queue_sorted ... ok
+test prediction::tests::apply_input_replaces_a_duplicate_tick ... ok
+test physics::tests::coasting_snaps_velocities_to_zero_and_freezes_the_quat ... ok
+test prediction::tests::pending_queue_is_bounded ... ok
+test prediction::tests::predict_from_rest_with_nothing_coasts ... ok
+test prediction::tests::predict_is_bounded_for_an_absurd_tick ... ok
+test orbits::tests::out_of_range_body_index_panics ... ok
+test prediction::tests::predict_coasts_over_a_gap ... ok
+test prediction::tests::predict_replays_pending_inputs ... ok
+test prediction::tests::apply_input_ignores_a_tick_the_authority_already_covers ... ok
+test prediction::tests::predict_matches_the_server_with_lossless_in_order_delivery ... ok
+test prediction::tests::reconcile_drops_by_tick_not_by_count ... ok
+test prediction::tests::reconcile_drops_consumed_inputs_and_reports_zero ... ok
+test prediction::tests::reconcile_drops_inputs_the_authority_has_passed ... ok
+test prediction::tests::reconcile_reports_the_position_correction ... ok
+test shape::tests::hostile_shapes_are_rejected ... ok
+test prediction::tests::reconcile_ignores_a_snapshot_older_than_the_authority ... ok
+test sim_world::tests::despawn_removes_the_ship_from_the_hash ... ok
+test sim_world::tests::duplicate_inputs_are_resolved_deterministically ... ok
+test sim_world::tests::far_future_inputs_are_dropped ... ok
+test shape::tests::catalogue_validates_meshes ... ok
+test sim_world::tests::fnv1a_matches_the_reference_vector ... ok
+test sim_world::tests::guid_state_hash_ignores_shard_authority ... ok
+test sim_world::tests::idle_ship_is_never_stamped ... ok
+test sim_world::tests::guid_state_hash_is_spawn_order_independent ... ok
+test shape::tests::every_shape_round_trips_and_builds ... ok
+test sim_world::tests::buffer_bound_holds_with_real_and_spoofed_guids ... ok
+test sim_world::tests::ships_are_listed_in_entity_order_through_despawns_and_reuse ... ok
+test sim_world::tests::spawn_and_step_moves_the_ship ... ok
+test sim_world::tests::spoofed_guids_never_enter_the_buffer ... ok
+test sim_world::tests::unknown_guids_are_dropped ... ok
+test spring::tests::force_is_hookes_law_and_ropes_only_pull ... ok
+test spring::tests::springs_round_trip_and_reject_hostile_input ... ok
+test tick::tests::clock_constants_are_consistent ... ok
+test sim_world::tests::input_buffer_stays_bounded_under_a_flood ... ok
+test sim_world::tests::settled_ship_is_not_stamped ... ok
+test sim_world::tests::one_input_per_entity_per_tick_whatever_the_arrival_order ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/acceptance.rs (target/xtask-test/debug/build/space-sim/2abe84d2e8c295d9/out/acceptance-2abe84d2e8c295d9)
+
+running 18 tests
+test components_are_registered ... ok
+test ecs_tick_tracks_sim_tick ... ok
+test hash_sensitivity ... ok
+test idle_ships_are_not_replicated ... ok
+test orbits_deterministic ... ok
+test prediction_converges_under_latency_reorder_and_loss ... ok
+test coasting_ship_is_replicated ... ok
+test prediction_reconcile ... ok
+test ship_state_codec_edge_positions ... ok
+test ship_state_codec_is_lossless ... ok
+test ship_state_codec_rejects_non_finite_dynamics ... ok
+test ship_state_codec_rejects_states_that_would_poison_the_integrator ... ok
+test step_ship_physics ... ok
+test world_pos_codec_validates ... ok
+test write_between_steps_is_replicated_by_the_next_step ... ok
+test prediction_correction_bounded ... ok
+test bit_identity ... ok
+test determinism_10k_ticks ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/gravity.rs (target/xtask-test/debug/build/space-sim/81fd646378c388ed/out/gravity-81fd646378c388ed)
+
+running 2 tests
+test beyond_the_reach_nothing_moves ... ok
+test an_orbit_keeps_the_kepler_period_here_and_far_away ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/orbits.rs (target/xtask-test/debug/build/space-sim/050d8c6702c2d787/out/orbits-050d8c6702c2d787)
+
+running 6 tests
+test beyond_the_reach_nothing_is_carried ... ok
+test a_clock_jump_carries_what_the_moon_holds ... ok
+test a_jump_ahead_carries_what_the_moon_holds_and_keeps_later_inputs ... ok
+test fast_travel_scales_with_the_distance_to_the_nearest_surface ... ok
+test normal_flight_is_unchanged ... ok
+test a_ship_lands_on_a_moving_moon_and_stays_landed ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/physics.rs (target/xtask-test/debug/build/space-sim/88f30c378144483c/out/physics-88f30c378144483c)
+
+running 26 tests
+test a_body_moves_between_worlds_mid_flight ... ok
+test a_ghost_takes_no_input_that_was_filed_for_the_ship_it_replaces ... ok
+test a_five_crate_stack_stands_for_ten_seconds ... ok
+test a_chain_hangs_from_its_anchor ... ok
+test a_resting_stack_is_not_disturbed_when_a_passer_by_leaves_its_bubble ... ok
+test a_resting_stack_moved_into_another_bubble_keeps_standing ... ok
+test bubbles_merge_before_bodies_touch_and_split_after ... ok
+test ccd_stops_a_fast_ball_at_a_thin_wall ... ok
+test convex_convex_collision_conserves_momentum ... ok
+test balls_in_a_concave_bowl_settle_at_the_bottom ... ok
+test export_import_round_trip_and_hostile_lists ... ok
+test falling_in_a_zone_and_weightless_outside ... ok
+test ghosts_push_and_are_never_integrated ... ok
+test hinged_door_swings_within_its_limits ... ok
+test islands_group_bodies_by_proximity_and_springs ... ok
+test merges_and_reanchors_do_not_perturb_motion ... ok
+test orbit_around_a_point_mass_conserves_energy ... ok
+test physics_prediction_matches_the_server ... ok
+test ship_flight_feel_is_unchanged ... ok
+test ships_collide_with_the_world_and_push_bodies ... ok
+test spring_pendulum_period_and_damping ... ok
+test determinism_same_inputs_and_spawn_order ... ok
+test two_bodies_an_au_apart_each_keep_micrometre_precision ... ok
+test a_long_straight_flight_arrives_where_the_analytic_answer_says ... ok
+test a_dynamic_concave_body_uses_its_cached_convex_decomposition ... ok
+test the_same_scene_moves_the_same_anywhere_in_the_world ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/size_probe.rs (target/xtask-test/debug/build/space-sim/45ef552370763927/out/size_probe-45ef552370763927)
+
+running 1 test
+test per_entity_snapshot_size_is_measured ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-stream/9f27d1b8f32db5a3/out/space_stream-9f27d1b8f32db5a3)
+
+running 39 tests
+test jpeg::tests::box_filter_averages_blocks ... ok
+test jpeg::tests::dimensions_rejects_garbage ... ok
+test jpeg::tests::bad_buffers_are_rejected ... ok
+test jpeg::tests::halving_matches_the_generic_box_filter ... ok
+test jpeg::tests::other_factors_average_whole_and_partial_blocks ... ok
+test jpeg::tests::odd_sizes_round_up ... ok
+test jpeg::tests::jpeg_round_trip_dimensions_full_and_half ... ok
+test jpeg::tests::alpha_is_ignored ... ok
+test protocol::tests::dom_codes_map_to_keys ... ok
+test jpeg::tests::quality_band_orders_output_size ... ok
+test protocol::tests::dom_key_values_map_to_text_entry_keys ... ok
+test protocol::tests::frame_header_round_trips_seq_and_flag ... ok
+test protocol::tests::frame_wire_bytes_are_big_endian_seq_then_flag ... ok
+test jpeg::tests::scratch_is_reused_and_does_not_change_the_output ... ok
+test protocol::tests::key_indices_are_dense_and_match_the_wire_ids ... ok
+test protocol::tests::movement_and_text_entry_keys_are_told_apart ... ok
+test protocol::tests::short_frame_is_rejected ... ok
+test protocol::tests::malformed_input_is_rejected ... ok
+test protocol::tests::malformed_text_is_rejected ... ok
+test protocol::tests::the_wire_ids_are_append_only ... ok
+test protocol::tests::viewer_input_round_trips ... ok
+test protocol::tests::viewer_input_wire_bytes_are_stable ... ok
+test server::tests::a_full_queue_merges_state_but_never_loses_a_key ... ok
+test protocol::tests::decoding_never_panics_and_accepted_messages_round_trip ... ok
+test server::tests::keys_are_reference_counted_across_viewers ... ok
+test server::tests::late_joiner_gets_latest_frame ... ok
+test server::tests::loopback_frame_round_trip ... ok
+test server::tests::max_viewers_is_enforced ... ok
+test server::tests::merged_turns_stay_finite ... ok
+test server::tests::oversized_input_is_rejected_and_server_keeps_serving ... ok
+test server::tests::a_leaving_viewer_releases_its_keys_but_not_another_viewers ... ok
+test server::tests::the_framed_message_is_built_once_and_shared ... ok
+test server::tests::typed_text_and_text_entry_keys_reach_the_client_in_order ... ok
+test server::tests::typed_text_cannot_grow_a_full_queue ... ok
+test server::tests::viewer_count_tracks_connections ... ok
+test server::tests::viewer_input_reaches_client ... ok
+test server::tests::input_is_read_while_a_frame_send_is_stalled ... ok
+test server::tests::stalled_viewer_is_dropped_after_write_timeout ... ok
+test server::tests::handshake_timeout_drops_silent_peer ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-test-support/48967079cb850569/out/space_test_support-48967079cb850569)
+
+running 5 tests
+test net::tests::it_is_loopback_with_port_zero ... ok
+test rng::tests::one_seed_gives_one_sequence ... ok
+test rng::tests::seed_zero_gives_the_published_splitmix64_vectors ... ok
+test rng::tests::floats_stay_in_their_ranges ... ok
+test fs::tests::a_thousand_calls_give_a_thousand_paths ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/boundaries.rs (target/xtask-test/debug/build/space-test-support/a277b5e1cdf43135/out/boundaries-a277b5e1cdf43135)
+
+running 2 tests
+test this_crate_depends_on_no_workspace_crate ... ok
+test other_crates_use_it_as_a_dev_dependency_only ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-viewer/1359409c6a7adbc8/out/space_viewer-1359409c6a7adbc8)
+
+running 27 tests
+test tests::a_paste_that_reaches_the_field_follows_the_paste_rules ... ok
+test tests::a_key_press_types_its_character_exactly_once ... ok
+test tests::a_drag_is_a_relative_turn ... ok
+test tests::a_paste_is_typed_character_by_character ... ok
+test tests::an_on_screen_keyboard_types_deletes_and_enters_through_the_field ... ok
+test tests::a_reconnect_resets_the_sequence_and_discards_the_old_decode ... ok
+test tests::an_input_method_sends_the_committed_text_once ... ok
+test tests::blur_releases_every_held_key ... ok
+test tests::browser_shortcuts_are_left_alone ... ok
+test tests::frames_that_are_not_newer_are_dropped ... ok
+test tests::frames_arriving_during_a_decode_collapse_to_the_newest ... ok
+test tests::key_messages_use_the_shared_wire_format ... ok
+test tests::field_edits_map_to_text_and_strokes ... ok
+test tests::movement_keys_work_while_an_input_method_is_on ... ok
+test tests::other_text_controls_of_the_page_keep_their_keyboard ... ok
+test tests::pointer_is_normalised_and_clamped ... ok
+test tests::pointer_positions_are_relative_to_the_fitted_picture ... ok
+test tests::reconnect_backs_off_and_is_capped ... ok
+test tests::reconnect_presses_every_held_key_again ... ok
+test tests::text_entry_keys_are_strokes ... ok
+test tests::text_inserted_without_key_events_is_typed_once ... ok
+test tests::the_default_stream_is_on_the_host_that_served_the_page ... ok
+test tests::the_field_is_reset_exactly_when_its_content_was_taken ... ok
+test tests::the_status_line_names_the_address_and_clears_when_live ... ok
+test tests::the_picture_is_fitted_into_the_element_with_its_aspect_kept ... ok
+test tests::viewer_messages_decode_with_the_server_decoder ... ok
+test tests::typed_characters_respect_the_keyboard_layout ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-world/67ebd2ad1fc05b57/out/space_world-67ebd2ad1fc05b57)
+
+running 34 tests
+test cell::tests::to_octree_node_matches_node_at ... ok
+test cell::tests::root_node_is_shared_by_the_whole_space ... ok
+test galaxy::tests::atan2_turns_matches_quadrants ... ok
+test galaxy::tests::density_falls_with_radius ... ok
+test galaxy::tests::disc_edge_is_where_the_radial_test_puts_it ... ok
+test galaxy::tests::star_at_is_a_pure_function_of_seed_and_node ... ok
+test hash::tests::helpers_stay_in_range ... ok
+test hash::tests::mix_is_order_sensitive_and_deterministic ... ok
+test galaxy::tests::star_at_handles_the_edge_of_the_cell_space ... ok
+test hash::tests::splitmix64_matches_reference_vector ... ok
+test interest::tests::a_query_across_the_cell_wrap_measures_the_short_way ... ok
+test interest::tests::degenerate_radii_match_nothing ... ok
+test galaxy::tests::isqrt_matches_u64_for_small_values ... ok
+test interest::tests::max_radius_shrinks_when_the_largest_is_removed ... ok
+test interest::tests::reinsert_updates_in_place_and_moves_across_cells ... ok
+test lod::tests::geometric_error_tolerates_any_split_level ... ok
+test interest::tests::a_huge_radius_walks_the_occupied_cells ... ok
+test interest::tests::cube_walk_and_occupied_walk_agree ... ok
+test octree::tests::bounds_span_the_node_size ... ok
+test octree::tests::center_is_the_midpoint_of_the_bounds ... ok
+test octree::tests::children_partition_parent ... ok
+test octree::tests::node_at_matches_containing_cell ... ok
+test octree::tests::parent_child_round_trip ... ok
+test pos::tests::cell_key_matches_cell ... ok
+test pos::tests::millimetre_round_trip_is_exact ... ok
+test pos::tests::new_normalises_local_overflow ... ok
+test pos::tests::normalisation_keeps_local_in_range ... ok
+test pos::tests::offset_never_rounds_local_up_to_cell_half ... ok
+test pos::tests::offset_preserves_precision_far_from_origin ... ok
+test lod::tests::select_is_bounded_for_an_oversized_candidate_tree ... ok
+test system::tests::belt_height_is_independent_of_orbital_phase ... ok
+test pos::tests::offsets_always_stay_in_the_half_open_range ... ok
+test lod::tests::deep_band_traversal_is_bounded_by_the_leaf_budget ... ok
+test lod::tests::select_from_matches_select_over_the_candidates ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/acceptance.rs (target/xtask-test/debug/build/space-world/efb486c808bae73d/out/acceptance-efb486c808bae73d)
+
+running 10 tests
+test cell_normalization ... ok
+test galaxy_deterministic ... ok
+test interest_cap ... ok
+test lod_bounded ... ok
+test octree_roundtrip ... ok
+test position_precision ... ok
+test system_orbits ... ok
+test bench_interest_insert ... ok
+test lod_monotonic ... ok
+test bench_interest_query ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/xtask/b78e53d735039098/out/xtask-b78e53d735039098)
+
+running 46 tests
+test e2e::tests::the_group_id_is_the_trimmed_number ... ok
+test e2e::tests::container_ids_are_the_non_empty_lines ... ok
+test e2e::tests::the_command_lines_are_the_documented_ones ... ok
+test e2e::tests::the_live_test_and_its_variable_are_where_xtask_expects_them ... ok
+test e2e::tests::every_compose_variable_is_read_by_the_compose_file ... ok
+test e2e::tests::the_server_host_follows_a_tcp_docker_host ... ok
+test e2e::tests::the_test_run_gets_the_server_and_its_own_pin_file ... ok
+test e2e::tests::the_secret_is_48_hex_characters_and_new_every_time ... ok
+test tests::env_exports_survive_a_prefix_with_spaces_and_quotes ... ok
+test tests::every_test_runs_whatever_fails_and_a_failure_still_fails_the_task ... ok
+test tests::env_exports_sets_the_three_vulkan_vars ... ok
+test tests::gpu_setup_is_only_supported_on_linux ... ok
+test tests::nextest_runs_the_whole_workspace_into_the_test_target_dir ... ok
+test tests::nextest_config_runs_the_timing_tests_alone ... ok
+test tests::nextest_config_serialises_the_same_gpu_packages ... ok
+test tests::shell_words_are_single_quoted ... ok
+test tests::tests_build_inside_the_configured_target_dir ... ok
+test tests::the_cargo_test_fallback_runs_gpu_packages_single_threaded ... ok
+test tests::the_workspace_root_is_found_from_anywhere ... ok
+test tests::verify_deb_reports_a_missing_file ... ok
+test tests::vulkan_debs_have_sha256_pins ... ok
+test tests::verify_deb_accepts_the_matching_hash ... ok
+test tests::verify_deb_rejects_a_mismatched_hash ... ok
+test viewer::tests::a_non_loopback_bind_needs_allow_remote ... ok
+test viewer::tests::a_lockfile_without_or_with_two_versions_is_an_error ... ok
+test viewer::tests::content_types_follow_the_file_extension ... ok
+test viewer::tests::only_a_cli_of_the_locked_version_is_used ... ok
+test viewer::tests::a_link_out_of_the_site_directory_is_not_served ... ok
+test viewer::tests::only_regular_files_inside_the_root_are_read ... ok
+test viewer::tests::plain_paths_name_files_in_the_site ... ok
+test viewer::tests::request_lines_are_parsed_strictly ... ok
+test tests::env_exports_round_trip_through_a_shell ... ok
+test viewer::tests::paths_that_could_leave_the_site_are_rejected ... ok
+test viewer::tests::the_build_is_the_locked_release_wasm_build_into_the_target_dir ... ok
+test viewer::tests::the_bindgen_version_is_read_from_a_lockfile_with_lf_or_crlf ... ok
+test viewer::tests::the_announcement_says_what_to_open_and_where_the_stream_is_expected ... ok
+test viewer::tests::the_cli_version_is_the_second_word ... ok
+test viewer::tests::the_install_command_names_the_lockfile_version ... ok
+test viewer::tests::the_request_head_is_read_up_to_the_blank_line_and_no_further ... ok
+test viewer::tests::the_request_line_is_the_first_line_of_the_head ... ok
+test viewer::tests::the_cli_is_looked_for_on_path_then_in_cargos_bin_directory ... ok
+test viewer::tests::the_stream_address_must_be_a_websocket_url ... ok
+test viewer::tests::the_ws_address_is_percent_encoded_into_the_link ... ok
+test viewer::tests::the_checkout_matches_what_the_viewer_command_expects ... ok
+test viewer::tests::the_server_serves_the_site_directory_and_nothing_else ... ok
+test viewer::tests::the_request_head_is_capped_in_size_and_time ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/assets.rs (target/xtask-test/debug/build/xtask/39ed41fbb53ffa84/out/assets-39ed41fbb53ffa84)
+
+running 3 tests
+test manifest_lists_the_fourteen_room_ids ... ok
+test glbs_are_valid_and_match_manifest ... ok
+test manifest_files_exist_with_matching_size_and_sha256 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/cli.rs (target/xtask-test/debug/build/xtask/2a861a95e7b4a0db/out/cli-2a861a95e7b4a0db)
+
+running 15 tests
+test e2e_documents_its_flags ... ok
+test e2e_dry_run_follows_docker_host_and_docker_gid ... ok
+test e2e_dry_run_lists_every_command_in_order ... ok
+test e2e_without_docker_exits_2_and_says_it_is_not_a_pass ... ok
+test gpu_setup_flags_are_accepted ... ok
+test gpu_setup_print_env_parses_and_prints_exports ... ok
+test gpu_setup_print_env_quotes_the_prefix ... ok
+test lint_dry_run_lists_fmt_and_clippy_only ... ok
+test lint_subcommand_is_accepted ... ok
+test stub_subcommands_print_and_exit_2 ... ok
+test viewer_is_listed_and_documents_its_flags ... ok
+test viewer_names_the_install_command_when_wasm_bindgen_is_missing ... ok
+test viewer_refuses_a_non_loopback_bind_and_bad_arguments ... ok
+test ci_builds_tests_inside_cargo_target_dir ... ok
+test ci_runs_from_the_workspace_root_whatever_the_cwd ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+   Doc-tests space_ecs
+
+running 9 tests
+test crates/space-ecs/src/component.rs - component::ComponentDef (line 33) ... ok
+test crates/space-ecs/src/entity.rs - entity::Entity (line 16) ... ok
+test crates/space-ecs/src/component.rs - component::Component (line 165) ... ok
+test crates/space-ecs/src/command.rs - command::CommandBuffer (line 45) ... ok
+test crates/space-ecs/src/macros.rs - macros::register_components (line 17) ... ok
+test crates/space-ecs/src/stage.rs - stage::Stage (line 11) ... ok
+test crates/space-ecs/src/query.rs - query::Query (line 364) ... ok
+test crates/space-ecs/src/query.rs - query::WithEntity (line 212) ... ok
+test crates/space-ecs/src/world.rs - world::World::spawn (line 208) ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+   Doc-tests space_harness
+
+running 2 tests
+test crates/space-harness/src/lib.rs - (line 24) - compile ... ok
+test crates/space-harness/src/hub.rs - hub (line 9) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+   Doc-tests space_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_mcp_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_net
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_orchestrator
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_scene
+
+running 1 test
+test crates/space-scene/src/lib.rs - (line 30) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_sim
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_stream
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_test_support
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_viewer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_world
+
+running 4 tests
+test crates/space-world/src/pos.rs - pos::WorldPos (line 46) ... ok
+test crates/space-world/src/interest.rs - interest::InterestGrid (line 95) ... ok
+test crates/space-world/src/galaxy.rs - galaxy::Galaxy (line 31) ... ok
+test crates/space-world/src/system.rs - system::StarSystem (line 32) ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+xtask: running `cargo test -p space-render -p space-client -p space-mcp-client --locked --no-fail-fast --target-dir target/xtask-test -- --test-threads=1`
+   Compiling ring v0.17.14
+   Compiling space-render v0.1.0 (/workspace/crates/space-render)
+warning: space-render@0.1.0: naga version: 30.0.2
+warning: space-render@0.1.0: rq_triangle: 2321 SPIR-V words
+warning: space-render@0.1.0: gi_probe: 4773 SPIR-V words
+warning: space-render@0.1.0: tonemap: 883 SPIR-V words
+warning: space-render@0.1.0: forward_vs: 4314 SPIR-V words
+warning: space-render@0.1.0: forward_fs: 5400 SPIR-V words
+warning: space-render@0.1.0: forward_fs_shadow: 7795 SPIR-V words
+warning: space-render@0.1.0: forward_glass_vs: 4315 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs: 5371 SPIR-V words
+warning: space-render@0.1.0: forward_glass_fs_shadow: 7766 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_vs: 4026 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs: 5687 SPIR-V words
+warning: space-render@0.1.0: forward_mesh_fs_shadow: 8082 SPIR-V words
+warning: space-render@0.1.0: forward_sky_vs: 3501 SPIR-V words
+warning: space-render@0.1.0: forward_sky_fs: 3658 SPIR-V words
+warning: space-render@0.1.0: post: 6714 SPIR-V words
+warning: space-render@0.1.0: post_rq: 10082 SPIR-V words
+warning: space-render@0.1.0: overlay_vs: 556 SPIR-V words
+warning: space-render@0.1.0: overlay_fs: 354 SPIR-V words
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.17
+   Compiling rcgen v0.14.10
+   Compiling quinn-proto v0.11.19
+   Compiling quinn v0.11.12
+   Compiling space-net v0.1.0 (/workspace/crates/space-net)
+   Compiling space-server v0.1.0 (/workspace/crates/space-server)
+   Compiling space-client v0.1.0 (/workspace/crates/space-client)
+   Compiling space-orchestrator v0.1.0 (/workspace/crates/space-orchestrator)
+   Compiling space-mcp-server v0.1.0 (/workspace/crates/space-mcp-server)
+   Compiling space-mcp-client v0.1.0 (/workspace/crates/space-mcp-client)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.86s
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-client/3ff8ca0cdb3e1846/out/space_client-3ff8ca0cdb3e1846)
+
+running 107 tests
+test adaptive::tests::a_cheap_scene_stays_at_level_zero ... ok
+test adaptive::tests::a_fixed_level_stays ... ok
+test adaptive::tests::an_expensive_scene_settles_and_then_recovers_one_step_at_a_time ... ok
+test adaptive::tests::apply_sets_the_level_and_spares_ci ... ok
+test adaptive::tests::the_modes_parse ... ok
+test adaptive::tests::without_adapt_the_level_never_changes_but_the_time_is_kept ... ok
+test address::tests::a_name_that_does_not_exist_fails_with_its_name ... ok
+test address::tests::failures_are_explained_in_plain_words ... ok
+test address::tests::ipv4_with_and_without_a_port ... ok
+test address::tests::ipv6_bare_bracketed_and_with_a_port ... ok
+test address::tests::literals_resolve_to_themselves_and_localhost_resolves ... ok
+test address::tests::names_with_and_without_a_port ... ok
+test address::tests::nonsense_is_refused_with_a_reason ... ok
+test app::tests::a_failed_attempt_returns_to_the_connect_screen_with_a_reason ... ok
+test app::tests::a_malformed_address_is_refused_on_the_spot ... ok
+test app::tests::no_key_ends_a_client_without_a_window ... ok
+test app::tests::other_players_face_where_they_are_going ... ok
+test app::tests::quaternions_become_rotation_matrices ... ok
+test app::tests::the_client_starts_on_the_connect_screen_and_takes_typing ... ok
+test app::tests::the_harness_is_told_when_the_app_goes_away ... ok
+test app::tests::the_hud_position_is_relative_to_the_anchor ... ok
+test app::tests::the_hud_tells_gravity_and_landing ... ok
+test app::tests::the_pauses_between_automatic_attempts_grow_to_a_cap ... ok
+test app::tests::the_test_model_stands_in_front_of_every_spawn_point ... ok
+test app::tests::with_a_server_given_the_client_retries_until_somebody_takes_over ... ok
+test bodies::tests::a_coil_far_outside_the_view_is_not_built ... ok
+test bodies::tests::a_coil_runs_from_end_to_end ... ok
+test bodies::tests::every_showcase_shape_gets_a_mesh_once ... ok
+test bodies::tests::poses_interpolate_extrapolate_a_little_and_hold ... ok
+test bodies::tests::sparse_samples_of_an_orbit_are_joined_along_their_velocities ... ok
+test bodies::tests::the_draw_delay_follows_the_drawn_distance_without_stepping ... ok
+test connect::tests::a_long_text_scrolls_with_the_caret ... ok
+test connect::tests::an_error_stays_until_the_text_is_edited ... ok
+test connect::tests::backspace_delete_and_the_caret_keys ... ok
+test connect::tests::enter_submits_and_escape_steps_back_without_touching_the_text ... ok
+test connect::tests::the_field_is_bounded ... ok
+test connect::tests::the_prefill_is_editable_with_the_caret_behind_it ... ok
+test connect::tests::typing_inserts_at_the_caret ... ok
+test connect::tests::white_space_and_control_characters_are_not_typed ... ok
+test demo_area::tests::the_area_has_every_feature_on_display ... ok
+test demo_area::tests::the_area_is_finite_and_bounded ... ok
+test demo_area::tests::the_kestrel_stands_on_its_apron_clear_of_the_stations ... ok
+test demo_area::tests::the_spawn_point_is_clear_and_on_the_floor ... ok
+test demo_area::tests::the_static_meshes_are_reused_from_frame_to_frame ... ok
+test input::tests::f_toggles_fast_travel_and_the_brake_assist_leaves_a_fast_ship_alone ... ok
+test input::tests::on_the_connect_screen_text_is_typed_and_movement_is_ignored ... ok
+test input::tests::the_brake_assist_stops_a_ship_that_is_let_go ... ok
+test input::tests::the_camera_modes_toggle_and_have_names ... ok
+test input::tests::the_view_wraps_in_yaw_and_stops_in_pitch ... ok
+test input::tests::thrust_follows_held_keys_and_view_and_is_normalised ... ok
+test input::tests::while_connecting_only_escape_does_anything ... ok
+test input::tests::while_playing_keys_fly_and_text_is_commands ... ok
+test kestrel::tests::a_berth_places_the_model ... ok
+test kestrel::tests::both_levels_of_detail_load_from_the_binary ... ok
+test kestrel::tests::the_detail_follows_the_distance_and_the_meshes_are_shared ... ok
+test link::tests::a_far_replicas_samples_are_of_the_tick_its_origin_names ... ok
+test link::tests::a_frame_without_our_ship_is_ignored ... ok
+test link::tests::a_placeholder_ship_on_the_accepting_shard_is_not_the_switch ... ok
+test link::tests::a_redirect_is_dialed_at_the_client_endpoint_on_the_entry_host ... ok
+test link::tests::a_replica_keeps_its_anchor_across_a_handoff ... ok
+test link::tests::a_replica_keeps_the_acknowledgements ... ok
+test link::tests::a_resting_entity_holds_until_it_moves ... ok
+test link::tests::a_shard_joined_for_a_handoff_is_told_the_inputs_still_to_come ... ok
+test link::tests::a_snapshot_in_three_chunks_is_one_snapshot ... ok
+test link::tests::a_switch_on_one_timeline_keeps_the_ticks_and_the_histories ... ok
+test link::tests::an_older_frame_still_names_the_ship_but_never_rewinds_it ... ok
+test link::tests::an_unknown_scene_is_kept_and_resolves_to_the_default ... ok
+test link::tests::at_the_same_revision_the_shard_being_played_on_decides ... ok
+test link::tests::bodies_are_merged_tracked_and_kept_apart_from_ships ... ok
+test link::tests::every_tick_gets_exactly_one_input ... ok
+test link::tests::other_ships_are_tracked_and_removed ... ok
+test link::tests::server_name_matches_the_shards_certificate ... ok
+test link::tests::switching_shards_keeps_the_ship_and_its_origin ... ok
+test link::tests::the_anchor_is_a_point_of_the_maps_root_region ... ok
+test link::tests::the_input_clock_keeps_running_between_frames ... ok
+test link::tests::the_new_shards_ships_are_taken_over_at_the_switch ... ok
+test link::tests::the_player_visual_makes_a_ghost_a_player ... ok
+test link::tests::the_scene_follows_the_highest_revision_and_never_rolls_back ... ok
+test link::tests::tokens_are_unique_per_link ... ok
+test meshes::tests::shapes_become_closed_solids_of_their_size ... ok
+test meshes::tests::signs_read_and_rotations_turn ... ok
+test meshes::tests::the_bowl_is_its_collider_made_solid ... ok
+test predict::tests::a_late_input_that_leaves_fast_travel_is_no_step_back ... ok
+test predict::tests::a_ship_at_rest_on_the_planetoid_stays_landed ... ok
+test predict::tests::leaving_fast_travel_at_speed_is_no_correction ... ok
+test predict::tests::leaving_fast_travel_is_no_step_back_with_uneven_frames ... ok
+test predict::tests::the_clock_runs_on_through_a_change_of_shard ... ok
+test predict::tests::the_ship_is_drawn_one_tick_behind_the_newest_input ... ok
+test scenes::tests::distances_read_naturally ... ok
+test scenes::tests::every_scene_has_a_world ... ok
+test scenes::tests::positions_convert_to_metres_and_back ... ok
+test scenes::tests::the_demo_areas_sky_is_the_solar_system_at_real_size ... ok
+test scenes::tests::the_galaxy_is_bounded_and_has_a_cube_in_front_of_the_spawn_point ... ok
+test scenes::tests::the_material_chart_sweeps_roughness ... ok
+test scenes::tests::the_scenes_differ_from_each_other ... ok
+test scenes::tests::the_shared_models_are_one_arc_each ... ok
+test scenes::tests::the_sky_moves_one_year_per_hour ... ok
+test tofu::tests::a_file_that_is_not_a_map_of_pins_is_an_error ... ok
+test tofu::tests::the_config_directory_follows_the_platform ... ok
+test tofu::tests::the_store_is_saved_with_its_directory_and_loaded_again ... ok
+test tofu::tests::the_store_round_trips_through_json ... ok
+test ui::tests::text_is_wrapped_at_spaces_and_bounded ... ok
+test ui::tests::the_connect_screen_draws_at_every_size_and_status ... ok
+test ui::tests::the_field_shows_a_whole_address_at_every_size ... ok
+test ui::tests::the_hud_draws_and_an_empty_one_draws_nothing ... ok
+test ui::tests::the_key_hint_offers_esc_only_for_what_esc_does ... ok
+test ui::tests::the_scale_follows_the_frame_size ... ok
+
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.12s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/space-client/1ecf4b9fdb03b3a1/out/space_client-1ecf4b9fdb03b3a1)
+
+running 13 tests
+test tests::help_is_help_and_lists_every_flag_and_the_keys ... ok
+test tests::no_arguments_is_a_window_on_the_connect_screen ... ok
+test tests::pins_are_given_and_reset_on_the_command_line ... ok
+test tests::the_front_end_is_window_headless_or_stream ... ok
+test tests::the_harness_flags_work_with_every_front_end ... ok
+test tests::the_old_scene_flags_are_ignored_and_the_other_offline_flags_refused ... ok
+test tests::the_remaining_flags_are_validated ... ok
+test tests::the_server_address_is_checked_for_shape_only ... ok
+test window::tests::movement_keys_match_the_browser_viewer ... ok
+test window::tests::pasted_and_typed_text_drops_control_characters ... ok
+test window::tests::reading_the_clipboard_is_harmless ... ok
+test window::tests::text_entry_keys_match_the_browser_viewer ... ok
+test window::tests::the_paste_shortcuts_are_recognised ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client.rs (target/xtask-test/debug/build/space-client/e9765a2fbd8fe0a9/out/client-e9765a2fbd8fe0a9)
+
+running 15 tests
+test a_client_started_before_its_shard_connects_when_the_shard_appears ... ok
+test a_headless_client_driven_through_the_hub_connects_flies_and_shows_the_demo_area ... ok
+test a_lua_script_waits_for_a_scene_switch ... ok
+test a_split_while_connected_does_not_move_the_scene ... ok
+test a_stream_viewer_types_the_address_and_plays ... ok
+test escape_never_ends_a_headless_client ... ok
+test every_scene_renders_with_a_player_in_it_at_every_preset ... ok
+test losing_the_server_returns_to_the_connect_screen_with_a_message ... ok
+test no_viewer_can_end_a_stream_client_with_escape ... ok
+test players_on_neighbouring_shards_see_each_other_as_characters ... ok
+test players_see_each_other_as_characters_and_unowned_ships_as_ships ... ok
+test the_harness_refuses_a_public_address_without_a_token ... ok
+test the_scene_switches_live_when_the_shards_scene_changes ... ok
+test the_script_flag_runs_a_lua_script_and_its_outcome_is_the_exit_code ... ok
+test two_clients_who_dial_two_shards_start_together_and_agree_where_the_scene_is ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 81.14s
+
+     Running tests/entry.rs (target/xtask-test/debug/build/space-client/5a6ed50cbb9d4f05/out/entry-5a6ed50cbb9d4f05)
+
+running 6 tests
+test a_client_endpoint_without_an_ip_is_dialed_on_the_host_of_the_entry_address ... ok
+test a_client_pointed_at_the_control_port_is_told_what_it_dialed ... ok
+test a_client_that_dials_the_player_port_starts_on_the_spawn_point_and_one_that_dials_another_shard_does_too ... ok
+test a_client_whose_shard_dies_comes_back_through_the_entry_address_onto_the_replacement ... ok
+test two_redirects_are_followed_and_a_third_ends_the_join_with_a_reason ... ok
+test while_the_cluster_is_starting_the_client_says_so_and_gets_in_when_a_shard_is_there ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.37s
+
+     Running tests/handoff.rs (target/xtask-test/debug/build/space-client/d59ed52fd6b4fdd3/out/handoff-d59ed52fd6b4fdd3)
+
+running 9 tests
+test a_bystander_keeps_its_one_session_when_somebody_elses_ship_crosses ... ok
+test a_client_that_disconnects_mid_handoff_leaves_nothing_behind ... ok
+test a_handoff_connection_the_accepting_shard_ended_is_not_reused ... ok
+test a_handoff_to_a_shard_that_is_behind_does_not_roll_the_scene_back ... ok
+test a_join_snapshot_in_several_chunks_arrives_whole ... ok
+test the_client_follows_its_ship_to_the_neighbouring_shard ... ok
+test the_client_learns_the_scene_on_join_and_follows_a_change ... ok
+test the_inputs_sent_just_before_a_handoff_connection_are_said_again_on_it ... ok
+test the_ship_flies_out_of_the_spawn_shard_and_back_in_seamlessly ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.43s
+
+     Running tests/live_stack.rs (target/xtask-test/debug/build/space-client/52aa2f0f7d131b81/out/live_stack-52aa2f0f7d131b81)
+
+running 3 tests
+test a_player_on_the_running_stack_is_handed_to_the_next_shard ... ignored, needs the compose stack: run it with `cargo run -p xtask -- e2e`
+test a_player_who_enters_through_the_player_port_is_handed_to_the_next_shard_and_parks_there ... ok
+test the_pilot_flies_towards_the_target_and_brakes_at_it ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.46s
+
+     Running tests/physics.rs (target/xtask-test/debug/build/space-client/16474599b309be4a/out/physics-16474599b309be4a)
+
+running 3 tests
+test a_player_lands_in_the_gravity_room_and_lifts_off ... ok
+test a_ship_pushes_a_floating_crate ... ok
+test the_showcase_arrives_and_moves_smoothly ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.62s
+
+     Running tests/seamless.rs (target/xtask-test/debug/build/space-client/e77a849142509ee2/out/seamless-e77a849142509ee2)
+
+running 7 tests
+test a_fast_loop_over_the_demo_area_is_seamless_at_the_borders ... ok
+test a_loop_through_all_four_cells_is_seamless ... ok
+test a_standing_player_is_not_handed_over_because_another_flies_past ... ok
+test an_input_during_the_handoff_is_not_lost ... ok
+test crossing_beside_the_showcase_takes_one_prompt_handoff_and_nothing_pops ... ok
+test standing_on_a_border_and_walking_along_it_is_no_ping_pong ... ok
+test the_bounds_compare_a_switch_with_ordinary_flight ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 157.05s
+
+     Running tests/tofu.rs (target/xtask-test/debug/build/space-client/dac1ea8d76fe1080/out/tofu-dac1ea8d76fe1080)
+
+running 10 tests
+test a_copied_ca_in_front_of_a_foreign_leaf_is_refused_and_nothing_is_stored ... ok
+test a_corrupt_store_is_treated_as_empty ... ok
+test a_pin_given_on_the_command_line_skips_the_store ... ok
+test a_server_of_another_ca_is_refused_and_the_store_is_unchanged ... ok
+test a_server_without_a_cluster_secret_connects_unpinned_and_stores_nothing ... ok
+test a_stored_pin_refuses_a_server_that_presents_no_ca ... ok
+test reset_pins_deletes_the_file_and_exits_zero ... ok
+test the_first_connection_records_the_pin_and_succeeds ... ok
+test the_player_link_dials_through_the_store ... ok
+test the_second_connection_uses_the_recorded_pin ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.39s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-mcp-client/1b48a86995317e9c/out/space_mcp_client-1b48a86995317e9c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/xtask-test/debug/build/space-mcp-client/634681025eeea0ff/out/space_mcp_client-634681025eeea0ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client_tools.rs (target/xtask-test/debug/build/space-mcp-client/a6e07f3eeb42d799/out/client_tools-a6e07f3eeb42d799)
+
+running 7 tests
+test a_client_of_a_no_tick_shard_receives_frames_when_the_shard_is_stepped ... ok
+test a_connect_that_is_still_dialling_does_not_block_the_other_tools ... ok
+test capture_frame_draws_the_bodies_the_shard_replicates ... ok
+test capture_frame_returns_a_jpeg_on_a_gpu ... ok
+test connect_thrust_and_status_drive_a_real_shard ... ok
+test save_capture_creates_the_directory_and_reports_failures ... ok
+test the_client_exposes_its_tools_and_rejects_bad_calls ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.74s
+
+     Running unittests src/lib.rs (target/xtask-test/debug/build/space-render/9f8cff8533aaa908/out/space_render-9f8cff8533aaa908)
+
+running 60 tests
+test environment::tests::ambient_is_the_hemisphere_average ... ok
+test environment::tests::radiance_is_the_gradient_by_elevation ... ok
+test environment::tests::reflection_runs_from_the_mirror_lookup_to_the_ambient_average ... ok
+test environment::tests::the_default_is_no_environment ... ok
+test mesh::tests::a_mirroring_node_keeps_triangles_counter_clockwise ... ok
+test mesh::tests::a_triangle_loads_with_its_hierarchy_material_and_generated_normal ... ok
+test mesh::tests::a_vertex_colour_gradient_is_rounded_into_a_bounded_number_of_parts ... ok
+test mesh::tests::alpha_modes_are_warnings ... ok
+test mesh::tests::an_emissive_texture_dims_the_glow_to_its_average ... ok
+test mesh::tests::closed_and_open_meshes_are_told_apart ... ok
+test mesh::tests::hand_built_meshes_are_validated ... ok
+test mesh::tests::malformed_files_are_rejected ... ok
+test mesh::tests::parts_that_share_a_material_are_merged ... ok
+test mesh::tests::rotation_helpers_are_orthonormal ... ok
+test mesh::tests::strips_fans_and_unindexed_primitives_are_triangulated ... ok
+test mesh::tests::texture_coordinates_and_an_embedded_png_load ... ok
+test mesh::tests::the_sample_character_is_a_closed_upright_textured_person ... ok
+test mesh::tests::the_sample_ship_survives_a_round_trip_through_glb ... ok
+test mesh::tests::unsupported_texture_features_are_warnings_not_errors ... ok
+test mesh::tests::uvs_and_textures_survive_a_round_trip_through_glb ... ok
+test mesh::tests::vertex_colours_become_one_part_per_face_colour ... ok
+test overlay::tests::rects_keep_their_order_and_degenerate_ones_are_dropped ... ok
+test overlay::tests::text_draws_the_font_dots_inside_its_measured_box ... ok
+test overlay::tests::text_size_counts_glyph_cells_without_trailing_spacing ... ok
+test overlay::tests::the_font_covers_printable_ascii_with_distinct_glyphs ... ok
+test params::tests::as_bytes_covers_the_whole_struct ... ok
+test params::tests::every_mirror_is_at_least_the_wgsl_block_size ... ok
+test params::tests::forward_params_matches_wgsl ... ok
+test params::tests::gi_params_matches_wgsl ... ok
+test params::tests::gpu_instance_matches_wgsl ... ok
+test params::tests::mesh_instance_matches_wgsl ... ok
+test params::tests::post_params_matches_wgsl ... ok
+test params::tests::rq_params_matches_wgsl ... ok
+test params::tests::tone_params_matches_wgsl ... ok
+test passes::frame_key_tests::the_ray_probe_ignores_the_scale ... ok
+test passes::frame_key_tests::the_scene_size_follows_the_clamped_scale ... ok
+test quality::tests::default_is_high ... ok
+test quality::tests::feature_matrix ... ok
+test quality::tests::parses_names_case_insensitively ... ok
+test quality::tests::the_ray_budget_table ... ok
+test scene::tests::cube_is_a_closed_box ... ok
+test scene::tests::far_small_models_do_not_occlude_from_off_screen ... ok
+test scene::tests::icosphere_is_a_closed_regular_icosahedron ... ok
+test scene::tests::reversed_projection_keeps_depth_precision_at_astronomical_range ... ok
+test scene::tests::sees_sphere_ahead_behind_and_beside ... ok
+test scene::tests::sees_sphere_never_culls_a_degenerate_pose ... ok
+test scene::tests::shader_sphere_faces_match_the_rust_mesh ... ok
+test scene::tests::sphere_level_grows_with_projected_size ... ok
+test scene::tests::sphere_levels_are_closed_unit_surfaces ... ok
+test scene::tests::the_inverse_of_a_turned_cameras_view_projection_is_its_inverse ... ok
+test scene::tests::the_sphere_is_wound_counter_clockwise_and_the_cube_clockwise ... ok
+test texture::tests::interlaced_png_decodes ... ok
+test texture::tests::jpeg_decodes ... ok
+test texture::tests::malformed_images_are_rejected ... ok
+test texture::tests::mip_chain_halves_to_one_texel_and_filters_in_linear_light ... ok
+test texture::tests::png_colour_types_depths_and_filters_decode ... ok
+test texture::tests::png_round_trips_exactly ... ok
+test texture::tests::procedural_textures_have_the_documented_layout ... ok
+test texture::tests::srgb_tables_round_trip_every_byte ... ok
+test texture::tests::texture_sizes_are_validated ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/gpu.rs (target/xtask-test/debug/build/space-render/ceee2f80cbb3f143/out/gpu-ceee2f80cbb3f143)
+
+running 54 tests
+test a_body_around_a_light_does_not_block_it ... ok
+test a_floor_seen_from_below_shows_its_underside_not_its_top_or_the_sky ... ok
+test a_frame_reports_its_gpu_time ... ok
+test a_gold_mirror_reflects_everything_in_gold ... ok
+test a_mesh_cube_renders_like_the_procedural_box ... ok
+test a_mirror_shows_the_environment_where_the_screen_has_nothing ... ok
+test a_model_behind_the_camera_is_not_drawn_and_changes_no_pixel ... ok
+test a_model_casts_a_shadow_on_the_floor_and_receives_one ... ok
+test a_model_has_the_same_outline_rasterised_and_ray_traced ... ok
+test a_model_is_seen_through_glass ... ok
+test a_model_is_uploaded_once_and_its_blas_built_once ... ok
+test a_model_is_visible_in_a_mirror_reflection ... ok
+test a_model_outside_the_view_still_casts_its_shadow ... ok
+test a_model_too_small_to_see_is_skipped ... ok
+test a_scaled_frame_keeps_its_size_and_a_sharp_overlay ... ok
+test a_scaled_frame_still_has_shadows_and_reflections ... ok
+test a_smaller_ray_budget_keeps_the_skys_shadow ... ok
+test a_smooth_metal_sphere_mirrors_the_environment ... ok
+test a_textured_quad_shows_its_texture_where_the_uvs_put_it ... ok
+test an_open_mesh_casts_shadows_from_both_sides ... ok
+test bodies_at_astronomical_distances_are_drawn_and_depth_sorted ... ok
+test brdf_analytic_light_lights_the_sphere ... ok
+test changing_the_scale_between_frames_is_clean ... ok
+test context_reports_its_device ... ok
+test every_face_of_a_box_is_lit_by_the_environment_from_the_side_it_faces ... ok
+test fog_fades_into_the_painted_sky_behind_it ... ok
+test fog_shifts_distant_pixels_toward_fog_colour ... ok
+test forward_pass_draws_the_sphere ... ok
+test glass_in_front_of_nothing_shows_the_environment ... ok
+test glass_seen_from_close_up_and_at_a_grazing_angle_is_not_dark ... ok
+test lod_galaxy_renders ... ok
+test mutation_empty_scene_ray_probe_has_no_hits ... ok
+test mutation_skip_forward_draw_blanks_the_frame ... ok
+test no_environment_changes_nothing ... ok
+test pbr_roughness_and_metalness_shape_the_highlight ... ok
+test probe_gi_is_deterministic ... ok
+test probe_gi_lights_the_receiver ... ok
+test probe_gi_sees_mesh_models ... ok
+test rasterised_and_ray_traced_shapes_have_the_same_outline ... ok
+test ray_query_hits_the_sphere ... ok
+test reflections_and_refraction_follow_the_camera_when_it_turns ... ok
+test refraction_displaces_the_background_seen_through_glass ... ok
+test scale_one_changes_no_pixel ... ok
+test shadow_rays_ignore_the_faces_they_leave_a_solid_through ... ok
+test sky_light_bounces_off_what_the_probes_see ... ok
+test ssr_reflects_a_bright_object_where_mirror_geometry_predicts ... ok
+test swapchain_without_surface_extension_is_a_clean_error ... ok
+test the_default_ray_budget_changes_no_pixel ... ok
+test the_environment_lights_what_is_in_shadow ... ok
+test the_overlay_draws_text_and_rectangles_over_the_finished_frame ... ok
+test the_probes_keep_the_sky_out_of_a_closed_room ... ok
+test the_sample_ship_renders_with_every_preset ... ok
+test the_sky_does_not_light_the_inside_of_a_closed_room ... ok
+test the_skys_shadow_under_a_ball_is_smooth_and_steady ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.73s
+
+     Running tests/mesh_faces.rs (target/xtask-test/debug/build/space-render/01b5e4c7b80f5363/out/mesh_faces-01b5e4c7b80f5363)
+
+running 3 tests
+test every_face_of_a_cuboid_points_away_from_its_centre ... ok
+test the_plane_faces_up_and_is_open ... ok
+test the_sample_models_are_closed_and_wound_and_shaded_outwards ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests space_client
+
+running 2 tests
+test crates/space-client/src/app.rs - app (line 11) ... ignored
+test crates/space-client/src/link.rs - link (line 127) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_mcp_client
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests space_render
+
+running 1 test
+test crates/space-render/src/lib.rs - (line 42) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

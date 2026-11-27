@@ -132,7 +132,7 @@ No window, no display, works on software Vulkan.
 ```sh
 space-client --headless --harness 127.0.0.1:8098            # starts on the connect screen
 curl http://127.0.0.1:8098/                                  # the route list
-curl http://127.0.0.1:8098/state                             # screen, address, shard, shard_address, position, speed, fps ...
+curl http://127.0.0.1:8098/state                             # screen, address, shard, shard_address, position, speed, fps, gpu_ms (GPU time of the last frame, null if unknown), render_level (adaptive level 0-6; the HUD's first line shows both) ...
 curl -o frame.png http://127.0.0.1:8098/frame.png            # what the player sees now (or /frame.jpg)
 curl -X POST http://127.0.0.1:8098/input -d '[{"text":"7"},{"press":"backspace"},{"press":"enter"}]'
 curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'

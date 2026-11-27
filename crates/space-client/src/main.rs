@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use space_client::adaptive::AdaptiveMode;
 use space_client::address::{ServerAddress, DEFAULT_PORT};
 use space_client::app::{App, AppConfig, TestModel};
 use space_client::headless::{run_headless, HeadlessConfig, DEFAULT_FPS};
@@ -90,6 +91,8 @@ struct Config {
     /// `--size WxH` (default: [`Config::size`]).
     size: Option<(u32, u32)>,
     quality: QualityPreset,
+    /// `--adaptive`: how the ray budget and render scale follow the GPU time.
+    adaptive: AdaptiveMode,
     /// Windowed presentation waits for the vertical blank (`--no-vsync` clears it).
     vsync: bool,
     /// `--frames N`: stop after N frames.
@@ -119,6 +122,7 @@ impl Default for Config {
             server: None,
             size: None,
             quality: QualityPreset::default(),
+            adaptive: AdaptiveMode::Auto,
             vsync: true,
             frames: None,
             fps: DEFAULT_FPS,
@@ -197,6 +201,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 config.quality = value("high, medium, low or ci")?
                     .parse()
                     .map_err(|e| format!("--quality: {e}"))?;
+            }
+            "--adaptive" => {
+                config.adaptive = value("auto, off or a level 0-6")?
+                    .parse()
+                    .map_err(|e| format!("--adaptive: {e}"))?;
             }
             "--no-vsync" => config.vsync = false,
             "--frames" => {
@@ -284,7 +293,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
 fn usage() -> String {
     format!(
         "usage: space-client [--server ADDR] [--headless | --stream ADDR]\n\
-        \x20                   [--size WxH] [--quality high|medium|low|ci] [--no-vsync]\n\
+        \x20                   [--size WxH] [--quality high|medium|low|ci] [--adaptive auto|off|0-6]\n\
+        \x20                   [--no-vsync]\n\
         \x20                   [--frames N] [--fps N] [--glb FILE [--glb-scale S]]\n\
         \x20                   [--harness ADDR] [--script FILE [--script-timeout S]]\n\
         \x20                   [--out-dir DIR] [--pin HEX] [--reset-pins]\n\
@@ -324,6 +334,9 @@ fn usage() -> String {
         \x20                window, 640x480 without one)\n\
         \x20 --quality P    quality preset: high (default), medium, low or ci\n\
         \x20                (shadows, fog, screen-space reflections, refraction)\n\
+        \x20 --adaptive M   lower ray counts and render resolution when the GPU\n\
+        \x20                misses the frame budget: auto (default), off, or a\n\
+        \x20                fixed level 0-6\n\
         \x20 --no-vsync     window: present as fast as frames render\n\
         \x20 --frames N     exit after N frames\n\
         \x20 --fps N        headless/stream: frame rate cap (default {DEFAULT_FPS})\n\
@@ -554,7 +567,7 @@ fn run(config: &Config) -> Result<u8, Fatal> {
         ),
         _ => None,
     };
-    let app = App::new(
+    let mut app = App::new(
         AppConfig {
             server: config.server.clone(),
             quality: config.quality,
@@ -564,6 +577,13 @@ fn run(config: &Config) -> Result<u8, Fatal> {
         runtime.handle().clone(),
         Arc::clone(&hub),
     );
+    let target = match config.front_end {
+        FrontEnd::Window => Duration::from_secs_f64(1.0 / 60.0),
+        FrontEnd::Headless | FrontEnd::Stream(_) => {
+            Duration::from_secs_f64(1.0 / f64::from(config.fps))
+        }
+    };
+    app.set_adaptive(config.adaptive, target);
     let (width, height) = config.size();
     // The script starts with the client: let it find the real state at once.
     app.announce(width, height);
@@ -768,6 +788,7 @@ mod tests {
         .expect("the entrypoint form parses");
         assert_eq!(docker.server.as_deref(), Some("shard:7777"));
         assert_eq!(docker.quality, QualityPreset::Low);
+        assert_eq!(docker.adaptive, AdaptiveMode::Auto);
         // Only the window's own keyboard may end the client: the keys of the
         // other front ends come from whoever can reach them.
         assert!(parse(&[]).unwrap().front_end.user_may_quit());
@@ -864,6 +885,18 @@ mod tests {
         .expect("parses");
         assert_eq!(config.size(), (64, 48));
         assert_eq!(config.quality, QualityPreset::Medium);
+        for (arg, want) in [
+            ("off", AdaptiveMode::Fixed(0)),
+            ("3", AdaptiveMode::Fixed(3)),
+            ("auto", AdaptiveMode::Auto),
+        ] {
+            assert_eq!(parse(&["--adaptive", arg]).unwrap().adaptive, want, "{arg}");
+        }
+        for bad in ["9", "fast"] {
+            let err = parse(&["--adaptive", bad]).expect_err(bad);
+            assert!(err.starts_with("--adaptive:"), "{err}");
+        }
+        assert!(parse(&["--adaptive"]).is_err());
         assert!(!config.vsync);
         assert_eq!((config.frames, config.fps), (Some(600), 60));
         assert_eq!(config.glb, Some(PathBuf::from("ship.glb")));

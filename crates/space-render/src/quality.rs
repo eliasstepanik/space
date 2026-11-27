@@ -83,6 +83,21 @@
 //! `FEATURE_REFRACT` is set; otherwise they render as ordinary opaque
 //! surfaces) so the post pass can see the opaque scene *behind* the glass.
 //!
+//! ## Ray budget
+//!
+//! A [`RayBudget`] lowers the per-pixel ray counts of a preset without
+//! touching any flag, density or roughness, so the same pipelines run
+//! ([`RenderFeatures::with_budget`]). `Half` / `Quarter` divide `sky_rays` by
+//! 2 / 4 (never below 1 when there were any) and `ssr_steps` by 2 / 4 (never
+//! below 8 when SSR is on), and cap `glass_bounces` at 1. `Full` (the default)
+//! changes nothing.
+//!
+//! | preset | Full (sky, ssr, glass) | Half    | Quarter |
+//! |--------|------------------------|---------|---------|
+//! | High   | 8, 32, 3               | 4, 16, 1 | 2, 8, 1 |
+//! | Medium | 4, 16, 1               | 2, 8, 1  | 1, 8, 1 |
+//! | Low/Ci | 0, 0, 0                | 0, 0, 0  | 0, 0, 0 |
+//!
 //! ## Adding a feature
 //!
 //! 1. add a `bool` (and any level) to [`RenderFeatures`] and set it in each
@@ -278,6 +293,42 @@ impl RenderFeatures {
     pub const fn needs_post(self) -> bool {
         self.flags() & POST_FEATURES != 0
     }
+
+    /// These features with the per-pixel ray counts lowered to `budget` (see
+    /// the module docs, "Ray budget"). No flag changes, so the pipelines stay.
+    #[must_use]
+    pub const fn with_budget(mut self, budget: RayBudget) -> Self {
+        let div = match budget {
+            RayBudget::Full => return self,
+            RayBudget::Half => 2,
+            RayBudget::Quarter => 4,
+        };
+        if self.sky_rays > 0 {
+            let n = self.sky_rays / div;
+            self.sky_rays = if n > 1 { n } else { 1 };
+        }
+        if self.ssr {
+            let n = self.ssr_steps / div;
+            self.ssr_steps = if n > 8 { n } else { 8 };
+        }
+        if self.glass_bounces > 1 {
+            self.glass_bounces = 1;
+        }
+        self
+    }
+}
+
+/// How many rays a pixel may cast: a knob on top of a [`QualityPreset`] that
+/// changes counts only, never which pipelines run. See the module docs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RayBudget {
+    /// The preset's own counts.
+    #[default]
+    Full,
+    /// Sky rays and SSR steps halved, glass bounces at most 1.
+    Half,
+    /// Sky rays and SSR steps quartered, glass bounces at most 1.
+    Quarter,
 }
 
 #[cfg(test)]
@@ -293,6 +344,35 @@ mod tests {
         }
         assert!("ultra".parse::<QualityPreset>().is_err());
         assert!("".parse::<QualityPreset>().is_err());
+    }
+
+    #[test]
+    fn the_ray_budget_table() {
+        use RayBudget::{Full, Half, Quarter};
+        let counts = |p: QualityPreset, b: RayBudget| {
+            let f = p.features().with_budget(b);
+            (f.sky_rays, f.ssr_steps, f.glass_bounces)
+        };
+        let table = [
+            (QualityPreset::High, [(8, 32, 3), (4, 16, 1), (2, 8, 1)]),
+            (QualityPreset::Medium, [(4, 16, 1), (2, 8, 1), (1, 8, 1)]),
+            (QualityPreset::Low, [(0, 0, 0); 3]),
+            (QualityPreset::Ci, [(0, 0, 0); 3]),
+        ];
+        for (p, row) in table {
+            for (b, want) in [Full, Half, Quarter].into_iter().zip(row) {
+                assert_eq!(counts(p, b), want, "{p} {b:?}");
+                let (f, g) = (p.features(), p.features().with_budget(b));
+                assert_eq!(f.flags(), g.flags(), "{p} {b:?}");
+                assert_eq!(f.needs_post(), g.needs_post(), "{p} {b:?}");
+                assert_eq!(
+                    (f.fog, f.fog_density, f.ssr_max_roughness),
+                    (g.fog, g.fog_density, g.ssr_max_roughness)
+                );
+            }
+            assert_eq!(p.features().with_budget(Full), p.features());
+        }
+        assert_eq!(RayBudget::default(), Full);
     }
 
     #[test]

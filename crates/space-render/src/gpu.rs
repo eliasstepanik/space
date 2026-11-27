@@ -12,6 +12,7 @@
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
@@ -26,8 +27,11 @@ use crate::passes::{
     DrawRun, FrameDraw, FrameGpu, FrameKey, FrameTarget, InstanceBuffer, MeshDraw, MeshGpu,
     MeshTlasInstance, PipelineConfig, ShapeBlas, Tlas, WhiteTexture, MAX_CUSTOM_INDEX,
 };
-use crate::quality::{self, QualityPreset};
-use crate::scene::{sphere_level_for, sphere_vertex_count, Scene, SHAPE_BOX, SPHERE_LEVELS};
+use crate::quality::{self, QualityPreset, RayBudget, RenderFeatures};
+use crate::scene::{
+    occludes_off_screen, sphere_level_for, sphere_vertex_count, CameraPose, Scene, SHAPE_BOX,
+    SPHERE_LEVELS,
+};
 use crate::swapchain::{PresentOutcome, Swapchain, PRESENT_TIMEOUT_NS};
 
 /// Largest frame edge the renderer accepts, in pixels: a sanity bound that
@@ -174,6 +178,22 @@ pub struct RenderOptions {
     /// TLAS, [`RqParams`] colours) instead of the forward pass. Used by the
     /// ray-query correctness test and by `render_ray_probe`.
     pub ray_probe: bool,
+    /// Per-pixel ray counts relative to the preset's (default
+    /// [`RayBudget::Full`]: unchanged). Never changes which pipelines run.
+    pub ray_budget: RayBudget,
+    /// The 3D scene is rendered at round(width*scale) x round(height*scale)
+    /// and scaled up to the frame by the tone map; clamped to 0.25..=1.0;
+    /// ignored by the ray probe. The overlay is always drawn at the frame's
+    /// size.
+    pub render_scale: f32,
+}
+
+impl RenderOptions {
+    /// The render features this frame uses: the preset's, under the ray budget.
+    #[must_use]
+    pub fn features(&self) -> RenderFeatures {
+        self.preset.features().with_budget(self.ray_budget)
+    }
 }
 
 impl Default for RenderOptions {
@@ -188,6 +208,8 @@ impl Default for RenderOptions {
             mutate_skip_gi_dispatch: false,
             mutate_zero_light_count: false,
             ray_probe: false,
+            ray_budget: RayBudget::Full,
+            render_scale: 1.0,
         }
     }
 }
@@ -203,6 +225,13 @@ pub struct FrameOutput {
     pub validation_messages: u32,
     /// Number of render instances drawn.
     pub instance_count: usize,
+    /// Mesh models rasterised in this frame (those in view and not sub-pixel).
+    pub models_drawn: usize,
+    /// Mesh models placed in the ray-traced scene in this frame.
+    pub models_traced: usize,
+    /// GPU execution time of this frame; `None` on a device without
+    /// timestamp queries.
+    pub gpu_time: Option<Duration>,
 }
 
 /// What a context has done for the mesh models it has drawn (see
@@ -336,6 +365,11 @@ struct RenderCache {
     /// How many models have been uploaded, and BLASes built, so far.
     model_uploads: u64,
     blas_builds: u64,
+    /// Models drawn / given a TLAS placement by the last frame.
+    models_drawn: usize,
+    models_traced: usize,
+    /// GPU time of the most recent frame known to be complete.
+    gpu_time: Option<Duration>,
     /// What an untextured mesh part samples; created with the first model.
     white: Option<WhiteTexture>,
     /// The overlay's rectangles (an instance-rate vertex buffer); created
@@ -384,6 +418,9 @@ pub struct RenderContext {
     /// True when the instance was created with the window-surface extensions
     /// (`ContextOptions::window_display`); `Swapchain::new` refuses otherwise.
     pub(crate) window_surface: bool,
+    /// `(timestamp period in ns, valid bits)` when the device and the chosen
+    /// queue family can time a frame.
+    gpu_timer: Option<(f32, u32)>,
 }
 
 impl RenderContext {
@@ -559,7 +596,7 @@ impl RenderContext {
 
         // Anisotropic filtering for model textures: an optional core feature,
         // enabled where the device has it (nearly everywhere).
-        let (max_anisotropy, max_texture_dimension) = unsafe {
+        let (max_anisotropy, max_texture_dimension, timestamp_limits) = unsafe {
             let limits = instance
                 .get_physical_device_properties(physical_device)
                 .limits;
@@ -574,6 +611,10 @@ impl RenderContext {
                     0.0
                 },
                 limits.max_image_dimension2_d,
+                (
+                    limits.timestamp_compute_and_graphics != 0,
+                    limits.timestamp_period,
+                ),
             )
         };
         let core_features =
@@ -602,6 +643,9 @@ impl RenderContext {
             })
             .ok_or_else(|| RenderError::new("no graphics+compute queue family"))?
             as u32;
+        let valid_bits = queue_props[queue_family as usize].timestamp_valid_bits;
+        let gpu_timer = (timestamp_limits.0 && valid_bits > 0 && timestamp_limits.1 > 0.0)
+            .then_some((timestamp_limits.1, valid_bits));
         let priorities = [1.0f32];
         let queue_create = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -669,6 +713,7 @@ impl RenderContext {
             max_texture_dimension,
             validation_active: with_debug_utils,
             window_surface,
+            gpu_timer,
         })
     }
 
@@ -759,7 +804,7 @@ impl RenderContext {
     /// forward shaders it would without the feature.
     #[must_use]
     pub fn shadows_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
-        options.preset.features().shadows
+        options.features().shadows
             && self.ray_query.complete()
             && !options.ray_probe
             && !scene.lights.is_empty()
@@ -771,7 +816,7 @@ impl RenderContext {
     /// trace rays and there is glass in the scene.
     #[must_use]
     pub fn glass_rays_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
-        options.preset.features().refraction
+        options.features().refraction
             && self.ray_query.complete()
             && !options.ray_probe
             && scene.instances.iter().any(|i| i.transmission > 0.0)
@@ -783,7 +828,7 @@ impl RenderContext {
     /// the scene has an environment to keep out.
     #[must_use]
     pub fn sky_occlusion_active(&self, scene: &Scene, options: &RenderOptions) -> bool {
-        options.preset.features().sky_rays > 0
+        options.features().sky_rays > 0
             && self.ray_query.complete()
             && !options.ray_probe
             && !scene.environment.is_none()
@@ -807,13 +852,25 @@ impl RenderContext {
         if pixels.is_err() {
             self.discard_frame(&mut cache);
         }
+        let (models_drawn, models_traced) = (cache.models_drawn, cache.models_traced);
+        let gpu_time = cache.gpu_time;
         Ok(FrameOutput {
             width,
             height,
             pixels: pixels?,
             validation_messages: validation_message_count().wrapping_sub(before),
             instance_count: scene.instances.len(),
+            models_drawn,
+            models_traced,
+            gpu_time,
         })
+    }
+
+    /// GPU execution time of the most recently completed frame; `None` before
+    /// the first one and on a device without timestamp queries.
+    #[must_use]
+    pub fn last_gpu_time(&self) -> Option<Duration> {
+        self.cache().gpu_time
     }
 
     /// Render one frame of `scene` at the swapchain's size straight into its
@@ -893,7 +950,12 @@ impl RenderContext {
         let frame = self.record_frame(cache, scene, options, FrameTarget::Readback)?;
         frame.submit(self.queue, None, None)?;
         frame.wait(u64::MAX)?;
-        frame.read_pixels()
+        let time = self.gpu_timer.and_then(|(p, b)| frame.gpu_time(p, b));
+        let pixels = frame.read_pixels();
+        if time.is_some() {
+            cache.gpu_time = time;
+        }
+        pixels
     }
 
     fn render_present(
@@ -942,6 +1004,9 @@ impl RenderContext {
     ) -> Result<(), RenderError> {
         if let Some((have, frame)) = &cache.frame {
             frame.wait(timeout_ns)?;
+            if let Some(t) = self.gpu_timer.and_then(|(p, b)| frame.gpu_time(p, b)) {
+                cache.gpu_time = Some(t);
+            }
             if *have == key {
                 return Ok(());
             }
@@ -954,6 +1019,7 @@ impl RenderContext {
             &self.pipelines,
             self.cmd_pool,
             key,
+            self.gpu_timer.is_some(),
         )?;
         cache.frame = Some((key, frame));
         Ok(())
@@ -982,7 +1048,11 @@ impl RenderContext {
         let count = u32::try_from(scene.instances.len())
             .map_err(|_| RenderError::new("the scene has more than u32::MAX instances"))?;
         let grown = |n: u32, min: u32| n.max(min).checked_next_power_of_two().unwrap_or(n);
-        let Some((width, height)) = cache.frame.as_ref().map(|(k, _)| (k.width, k.height)) else {
+        let Some((width, height, render_width, render_height)) = cache
+            .frame
+            .as_ref()
+            .map(|(k, _)| (k.width, k.height, k.render_width, k.render_height))
+        else {
             return Err(RenderError::new("no frame resources to record into"));
         };
 
@@ -1009,7 +1079,7 @@ impl RenderContext {
         // reflects from off screen (which the environment would otherwise
         // shine through).
         let glass_rays = self.glass_rays_active(scene, options)
-            || (options.preset.features().ssr && self.sky_occlusion_active(scene, options));
+            || (options.features().ssr && self.sky_occlusion_active(scene, options));
         let traces_rays = options.gi_enabled || options.ray_probe || shadows || glass_rays;
 
         // Mesh models: upload any model seen for the first time (buffers and
@@ -1040,7 +1110,15 @@ impl RenderContext {
         let mut mesh_records = Vec::new();
         let mut mesh_draws = Vec::new();
         let mut mesh_placements = Vec::new();
+        let focal_px = render_height as f32 / (2.0 * (scene.camera.fov_y * 0.5).tan()).max(1e-6);
+        let mut models_drawn = 0usize;
         for model in &scene.models {
+            let (draw, trace) = model_cull(&scene.camera, focal_px, model);
+            let trace = trace && traces_rays;
+            if !draw && !trace {
+                continue;
+            }
+            models_drawn += usize::from(draw);
             let key = mesh_key(&model.mesh);
             let gpu = match cache.meshes.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
@@ -1064,19 +1142,21 @@ impl RenderContext {
                 let Some(source) = model.mesh.parts.get(part.part) else {
                     continue;
                 };
-                mesh_draws.push(MeshDraw {
-                    vertices: gpu.vertices.handle,
-                    indices: gpu.indices.handle,
-                    first_index: part.first_index,
-                    index_count: part.index_count,
-                    record: mesh_records.len() as u32,
-                    texture_set: part.texture_set,
-                });
+                if draw {
+                    mesh_draws.push(MeshDraw {
+                        vertices: gpu.vertices.handle,
+                        indices: gpu.indices.handle,
+                        first_index: part.first_index,
+                        index_count: part.index_count,
+                        record: mesh_records.len() as u32,
+                        texture_set: part.texture_set,
+                    });
+                }
                 mesh_records.push(mesh_record(model, &source.material, gpu.is_sheet()));
             }
             // A placement the rays can see: its records start at `first_record`
             // and follow the BLAS's geometry order (one per drawn part).
-            if traces_rays && is_placeable(model) {
+            if trace {
                 if first_record >= MAX_CUSTOM_INDEX {
                     return Err(RenderError::new(
                         "the scene has more mesh parts than a ray hit can address",
@@ -1103,6 +1183,8 @@ impl RenderContext {
                 });
             }
         }
+        cache.models_drawn = models_drawn;
+        cache.models_traced = mesh_placements.len();
         let record_count = mesh_records.len() as u32;
         if cache
             .mesh_records
@@ -1167,7 +1249,7 @@ impl RenderContext {
         }
 
         // Group the instances by detail level: one instanced draw per level.
-        let runs = group_by_detail(scene, height, &mut cache.ordered);
+        let runs = group_by_detail(scene, render_height, &mut cache.ordered);
 
         let cache: &'c RenderCache = cache;
         let (Some((_, frame)), Some(instances), Some(mesh_buffer)) =
@@ -1223,7 +1305,8 @@ impl RenderContext {
         }
         frame.tone_params.write(params::as_bytes(&tone_params))?;
         if let Some(post) = frame.post_params() {
-            let post_params = build_post_params(&forward_params, width, height, options);
+            let post_params =
+                build_post_params(&forward_params, render_width, render_height, options);
             post.write(params::as_bytes(&post_params))?;
         }
         if options.ray_probe {
@@ -1255,6 +1338,36 @@ impl RenderContext {
 /// Cache key of a shared mesh: the address of its `MeshData`.
 fn mesh_key(mesh: &Arc<MeshData>) -> usize {
     Arc::as_ptr(mesh) as usize
+}
+
+/// Pixels below which a model's bounding sphere is not rasterised or traced.
+const MIN_MODEL_RADIUS_PX: f32 = 0.25;
+
+/// The bounding sphere of `model` (camera-relative centre, radius).
+fn model_sphere(model: &ModelInstance) -> ([f32; 3], f32) {
+    let local = model.mesh.center();
+    let centre = [0, 1, 2].map(|r| {
+        model.position[r]
+            + (0..3)
+                .map(|k| model.rotation[r][k] * local[k] * model.scale)
+                .sum::<f32>()
+    });
+    (centre, model.mesh.radius() * model.scale.abs())
+}
+
+/// `(draw, trace)` for `model`: whether it is rasterised and whether it
+/// belongs in the ray-traced scene.
+fn model_cull(camera: &CameraPose, focal_px: f32, model: &ModelInstance) -> (bool, bool) {
+    if !is_placeable(model) {
+        return (true, false);
+    }
+    let (c, r) = model_sphere(model);
+    let d = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+    if d > r && r / (d - r) * focal_px < MIN_MODEL_RADIUS_PX {
+        return (false, false);
+    }
+    let visible = camera.sees_sphere(c, r);
+    (visible, visible || occludes_off_screen(c, r))
 }
 
 /// The rows of `model`'s 3x4 model -> camera-relative world matrix.
@@ -1442,7 +1555,7 @@ fn build_uniforms(
     let view_proj = scene.view_proj();
     let inv_view_proj = scene.inv_view_proj().unwrap_or(view_proj);
     let tan_half_fov = (cam.fov_y * 0.5).tan();
-    let features = options.preset.features();
+    let features = options.features();
     let fog_density = features.fog_density * options.fog_scale.max(0.0);
     let mut feature_flags = features.flags();
     // No fog at all (also for a NaN density) clears the feature bit.
@@ -1543,7 +1656,7 @@ fn build_post_params(
     height: u32,
     options: &RenderOptions,
 ) -> params::PostParams {
-    let features = options.preset.features();
+    let features = options.features();
     params::PostParams {
         camera: forward.camera,
         features: features.flags(),
