@@ -24,13 +24,21 @@
 //! routed to [`Shard::peer_message`] instead of [`Shard::join`], so no ship is
 //! spawned for a neighbour shard.
 //!
-//! **This is identification, not authentication.** The transport is QUIC with a
-//! self-signed certificate and no pinning (a peer cannot verify who it dialled);
-//! the hello handshake checks the protocol version only; the `shard:<id>` token
-//! is a plain string any client can type; and [`Shard::peer_message`] only
-//! checks that the claimed id is in the shard's map. The orchestrator-issued
-//! `ShardWelcome::peer_token` is **not** presented on peer connections and
-//! nothing verifies it. See `docs/security-notes.md`.
+//! **The peer token.** An orchestrated shard is handed a secret in its
+//! `ShardWelcome` (`peer_token`) and gives it to its front end
+//! ([`ShardNet::set_peer_token`]). From then on it presents the token in every
+//! hello to another shard — behind its id, `shard:<id>:<token>`, in the hello's
+//! existing token field — and **refuses** a peer hello that does not carry the
+//! same one ([`RejectReason::Unauthorized`](space_protocol::RejectReason),
+//! compared in constant time, before a single peer message is read). A shard
+//! that holds no token (a standalone shard wired by hand with `--peer`) accepts
+//! peers as before: on the `shard:<id>` string alone, with
+//! [`Shard::peer_message`] checking that the id is in its map.
+//!
+//! What this is not: the transport is QUIC with a self-signed certificate and
+//! no pinning, so a dialler cannot verify who it reached, and the token is one
+//! secret for the whole cluster — it says "a shard of this cluster", not which
+//! one. See `docs/security-notes.md`.
 //!
 //! # Outbox ordering to a peer
 //!
@@ -67,7 +75,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use space_net::{
-    accept_incoming, client_endpoint_for, connect, connect_within, hello, server_endpoint, Conn,
+    accept_incoming, connect, connect_within, hello, server_endpoint, Conn, LogBudget, Secret,
 };
 use space_protocol::{Message, ShardHello, ShardId, ShardWelcome};
 use tokio::sync::{mpsc, Mutex};
@@ -96,6 +104,15 @@ const WRITE_QUEUE: usize = 64;
 /// it only bounds growth against a peer that has stopped reading.
 const PEER_QUEUE: usize = 256;
 
+/// How long a client the shard has let go of (see [`ShardNet::serve`]'s
+/// writer) is given to read the shard's last word before its connection is
+/// closed.
+const LAST_WORD_DRAIN: Duration = Duration::from_secs(1);
+
+/// Application close code for a client connection the shard closes after
+/// sending the client on to another shard.
+const SENT_ON_CLOSE_CODE: u32 = 0x25;
+
 /// The `player_token` prefix that marks a connection as coming from another shard.
 pub const PEER_TOKEN_PREFIX: &str = "shard:";
 
@@ -103,13 +120,31 @@ pub const PEER_TOKEN_PREFIX: &str = "shard:";
 /// certificate is issued for it).
 pub const SERVER_NAME: &str = "space.local";
 
-/// Parse a peer hello token into the shard id it names.
+/// Parse a peer hello token into the shard id it names: `shard:<id>`, with or
+/// without a peer token behind it (`shard:<id>:<token>`).
 #[must_use]
 pub fn peer_shard_id(token: &str) -> Option<ShardId> {
+    let rest = token.strip_prefix(PEER_TOKEN_PREFIX)?;
+    let id = rest.split_once(':').map_or(rest, |(id, _)| id);
+    id.parse::<u32>().ok().map(ShardId)
+}
+
+/// The peer token a peer hello presents: what follows `shard:<id>:`, empty
+/// when the hello carries none.
+#[must_use]
+pub fn presented_peer_token(token: &str) -> &str {
     token
         .strip_prefix(PEER_TOKEN_PREFIX)
-        .and_then(|rest| rest.parse::<u32>().ok())
-        .map(ShardId)
+        .and_then(|rest| rest.split_once(':'))
+        .map_or("", |(_, secret)| secret)
+}
+
+/// Whether a peer hello presenting `presented` is let in by a shard that
+/// holds `expected`. A shard that holds no token lets every peer in (the
+/// standalone case); one that holds a token wants exactly that token.
+#[must_use]
+pub fn peer_token_admits(expected: &str, presented: &str) -> bool {
+    expected.is_empty() || space_net::constant_time_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 /// The queue end of a peer's FIFO sender, plus a flag the sender sets when it has
@@ -146,7 +181,33 @@ pub struct ShardNet {
     /// Count of peer sends that failed to connect or send (logged, not silently
     /// dropped). Exposed for tests and a future metrics surface.
     peer_send_failures: Arc<AtomicU64>,
+    /// The cluster's peer token (see the module docs), empty until
+    /// [`ShardNet::set_peer_token`] — and for good on a standalone shard.
+    /// Never held across an await. A [`Secret`]: this struct derives `Debug`,
+    /// and so does everything that holds one.
+    peer_token: std::sync::RwLock<Secret>,
+    /// Peer hellos refused for a missing or wrong peer token.
+    peers_refused: AtomicU64,
+    /// How many of those refusals may be written to the log (see
+    /// [`PEER_REFUSAL_LINES`]): the count above is exact, the log is not.
+    refusal_lines: LogBudget,
+    /// The cluster CA this shard holds (a cluster with a secret): its
+    /// certificate is issued from it and peers are verified against its pin.
+    trust: Option<space_net::ClusterTrust>,
 }
+
+/// How many refused peer hellos a shard writes to its log per
+/// [`PEER_REFUSAL_WINDOW`].
+///
+/// Anybody who can reach a shard's game port can cause such a refusal — it
+/// takes a hello whose token starts with `shard:<number>` — as often as they
+/// like, and a shard's log is a file nobody rotates. So the first few of a
+/// window are written, the rest are counted ([`ShardNet::peers_refused`]) and
+/// summed up in the next line that is.
+pub const PEER_REFUSAL_LINES: u32 = 3;
+
+/// The window [`PEER_REFUSAL_LINES`] applies to.
+pub const PEER_REFUSAL_WINDOW: Duration = Duration::from_secs(10);
 
 impl ShardNet {
     /// Bind a shard's endpoint on `bind`.
@@ -155,16 +216,81 @@ impl ShardNet {
     ///
     /// [`io::Error`] when the socket cannot be bound.
     pub fn bind(bind: SocketAddr) -> io::Result<Self> {
-        let (config, _cert) = space_net::crypto::make_server_config();
+        Self::bind_trusted(bind, None)
+    }
+
+    /// [`ShardNet::bind`] for a shard of a cluster that has a secret: with
+    /// `trust` the endpoint presents a certificate issued from the cluster CA
+    /// and every peer this shard dials is verified against that CA's pin;
+    /// without it, a self-signed certificate and unverified peers, as before.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the socket cannot be bound.
+    pub fn bind_trusted(
+        bind: SocketAddr,
+        trust: Option<space_net::ClusterTrust>,
+    ) -> io::Result<Self> {
+        let config = match &trust {
+            Some(trust) => trust.server_config(),
+            None => space_net::crypto::make_server_config().0,
+        };
         let endpoint = server_endpoint(bind, config)?;
         Ok(Self {
             endpoint,
+            trust,
             shard_endpoints: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             orchestrator: Mutex::new(None),
             peer_send_failures: Arc::new(AtomicU64::new(0)),
+            peer_token: std::sync::RwLock::new(Secret::default()),
+            peers_refused: AtomicU64::new(0),
+            refusal_lines: LogBudget::new(PEER_REFUSAL_LINES, PEER_REFUSAL_WINDOW),
         })
+    }
+
+    /// Hold `token` as the cluster's peer token: present it in every hello to
+    /// another shard, and refuse a peer hello that does not carry it. An empty
+    /// token means none (peers are then accepted on their id alone).
+    ///
+    /// Called once, with the token from the orchestrator's `ShardWelcome`,
+    /// before the shard serves or ticks. The token is never logged.
+    pub fn set_peer_token(&self, token: &str) {
+        // (A poisoned lock still holds a token: whoever panicked was only
+        // reading or replacing it.)
+        let mut held = self
+            .peer_token
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = Secret::new(token);
+    }
+
+    /// The peer token this shard holds (empty: none).
+    fn peer_token(&self) -> Secret {
+        self.peer_token
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The log line for the peer hello that was just refused, if the budget
+    /// has room for one ([`PEER_REFUSAL_LINES`]): who claimed to be which
+    /// shard, and how many refusals before it were not written. Never the
+    /// token that was presented.
+    fn refusal_line(&self, peer: ShardId, from: SocketAddr) -> Option<String> {
+        let held_back = self.refusal_lines.admit()?;
+        Some(format!(
+            "space-server: a hello claiming to be peer {peer} from {from} was refused: it did \
+             not present this cluster's peer token{}",
+            space_net::held_back_note(held_back)
+        ))
+    }
+
+    /// How many peer hellos were refused for a missing or wrong peer token.
+    #[must_use]
+    pub fn peers_refused(&self) -> u64 {
+        self.peers_refused.load(Ordering::SeqCst)
     }
 
     /// The bound address.
@@ -208,6 +334,21 @@ impl ShardNet {
                     return; // refused: the reason was already sent
                 };
                 if let Some(peer) = peer_shard_id(&hello.player_token) {
+                    // A shard of this cluster proves it with the peer token.
+                    // Refused before anything it says is read (the token
+                    // itself is never logged, only that it was not right).
+                    let presented = presented_peer_token(&hello.player_token);
+                    if !peer_token_admits(net.peer_token().expose(), presented) {
+                        // Counted every time, written a few times a window:
+                        // anybody who reaches this port can cause it.
+                        net.peers_refused.fetch_add(1, Ordering::SeqCst);
+                        if let Some(line) = net.refusal_line(peer, conn.remote_address()) {
+                            eprintln!("{line}");
+                        }
+                        conn.reject(space_protocol::RejectReason::Unauthorized)
+                            .await;
+                        return;
+                    }
                     net.serve_peer(conn, peer, shard).await;
                 } else {
                     net.serve_client(conn, hello, shard).await;
@@ -244,10 +385,12 @@ impl ShardNet {
         };
         let welcome = match joined {
             Ok(welcome) => welcome,
-            Err(reason) => {
-                // The refusal has to *arrive*: writing it and returning would
-                // drop the connection and the close would beat the reason there.
-                conn.reject(reason).await;
+            Err(refusal) => {
+                // Not welcomed: refused, or sent to the shard a new player
+                // starts on (`Shard::join`). Either answer has to *arrive*:
+                // writing it and returning would drop the connection and the
+                // close would beat it there.
+                conn.turn_away(&refusal.into_message()).await;
                 return;
             }
         };
@@ -267,7 +410,21 @@ impl ShardNet {
             let dead = Arc::clone(&dead);
             tokio::spawn(async move {
                 while let Some(message) = rx.recv().await {
+                    // The shard's last word to a client it has let go of (one
+                    // that came for a handoff that never completed, on a shard
+                    // that does not own the spawn point): where a new player
+                    // starts, or "try again". Nothing follows it.
+                    let last = matches!(message, Message::JoinRedirect(_) | Message::Reject(_));
                     if conn.send(&message).await.is_err() {
+                        dead.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    if last {
+                        // Given a moment to be read (the client closes when it
+                        // has), then closed from here.
+                        let _ =
+                            tokio::time::timeout(LAST_WORD_DRAIN, conn.connection().closed()).await;
+                        conn.close(SENT_ON_CLOSE_CODE, "sent on");
                         dead.store(true, Ordering::SeqCst);
                         return;
                     }
@@ -483,8 +640,10 @@ impl ShardNet {
         let dead = Arc::new(AtomicBool::new(false));
         let failures = Arc::clone(&self.peer_send_failures);
         let task_dead = Arc::clone(&dead);
+        let hello = peer_hello_with(local, self.peer_token().expose());
+        let pin = self.trust.as_ref().map(space_net::ClusterTrust::pin);
         tokio::spawn(async move {
-            run_peer_sender(rx, addr, shard_id, local, task_dead, failures).await;
+            run_peer_sender(rx, addr, shard_id, hello, pin, task_dead, failures).await;
         });
         let sender = PeerSender {
             tx,
@@ -556,14 +715,16 @@ async fn run_peer_sender(
     mut rx: mpsc::Receiver<Message>,
     addr: SocketAddr,
     peer: ShardId,
-    local: ShardId,
+    hello: space_protocol::Hello,
+    pin: Option<space_net::ClusterPin>,
     dead: Arc<AtomicBool>,
     failures: Arc<AtomicU64>,
 ) {
     // One client endpoint for the life of the sender: a quinn `Endpoint` drives
     // its connections, so it must outlive them. It is bound in the address
-    // family of the peer it dials.
-    let endpoint = match client_endpoint_for(addr) {
+    // family of the peer it dials. With a `pin` the peer must present a
+    // certificate of the cluster CA before the hello (and its token) is sent.
+    let endpoint = match space_net::client_endpoint_pinned(addr, pin.as_ref()) {
         Ok(endpoint) => endpoint,
         Err(e) => {
             failures.fetch_add(1, Ordering::SeqCst);
@@ -575,7 +736,6 @@ async fn run_peer_sender(
     let mut conn: Option<Conn> = None;
     while let Some(message) = rx.recv().await {
         if conn.as_ref().is_none_or(|c| c.is_closed()) {
-            let hello = peer_hello(local);
             let dial = connect_within(&endpoint, addr, SERVER_NAME, &hello, PEER_DIAL_TIMEOUT);
             conn = match dial.await {
                 Ok((conn, _welcome)) => Some(conn),
@@ -616,7 +776,18 @@ async fn run_peer_sender(
 /// parse it and treat the peer as a client.
 #[must_use]
 pub fn peer_hello(shard: ShardId) -> space_protocol::Hello {
-    hello(format!("{PEER_TOKEN_PREFIX}{}", shard.0))
+    peer_hello_with(shard, "")
+}
+
+/// [`peer_hello`] presenting the cluster's peer token (`shard:7:<token>`);
+/// with an empty token it is exactly [`peer_hello`].
+#[must_use]
+pub fn peer_hello_with(shard: ShardId, peer_token: &str) -> space_protocol::Hello {
+    if peer_token.is_empty() {
+        hello(format!("{PEER_TOKEN_PREFIX}{}", shard.0))
+    } else {
+        hello(format!("{PEER_TOKEN_PREFIX}{}:{peer_token}", shard.0))
+    }
 }
 
 /// The shard's persistent control connection to the orchestrator (Phase 3).
@@ -627,11 +798,25 @@ pub fn peer_hello(shard: ShardId) -> space_protocol::Hello {
 /// [`Shard::orchestrator_message`]). It reuses `run_peer_sender`'s shape because
 /// order matters for epoch messages for the same reason it matters for handoff
 /// messages.
+///
+/// **A shard does not outlive this link.** It registers once; when the
+/// connection closes — the orchestrator stopped, restarted, closed it, or was
+/// not heard from for the transport's idle timeout — the reader ends and
+/// [`OrchestratorLink::lost`] resolves. Nothing re-dials: the orchestrator
+/// replaces a shard whose link closed under a new id, so the old process has
+/// nothing left to be. Whoever runs the shard stops it then
+/// ([`crate::orchestrated`]).
 pub struct OrchestratorLink {
     /// The shard's outbound sender: queue a message to send to the orchestrator.
     pub tx: mpsc::Sender<Message>,
-    /// The reader task handle (kept so a caller can abort it on shutdown).
+    /// The reader task handle (kept so a caller can abort it on shutdown). It
+    /// ends by itself when the link is lost.
     reader: JoinHandle<()>,
+    /// Why the link was lost, once it is (`None` while it is up).
+    lost: tokio::sync::watch::Receiver<Option<String>>,
+    /// Why the orchestrator told this shard to stop, once it has
+    /// ([`space_protocol::ShardRetire`]; `None` until then).
+    retired: tokio::sync::watch::Receiver<Option<String>>,
     /// The sender task handle.
     sender: JoinHandle<()>,
 }
@@ -651,13 +836,45 @@ impl OrchestratorLink {
     ///
     /// # Errors
     ///
-    /// A [`space_net::NetError`] if the connection or handshake fails.
+    /// A [`space_net::NetError`] if the connection or handshake fails;
+    /// [`space_net::NetError::Rejected`] with the orchestrator's reason when it
+    /// refused the hello ([`space_protocol::RejectReason::Draining`]: not yet,
+    /// ask again; anything else is final).
+    ///
+    /// Invariant: a non-empty cluster secret is only ever written to a
+    /// connection whose certificate chains to the CA of that secret. The
+    /// orchestrator is verified against the pin derived from `hello.secret`.
     pub async fn handshake(
         addr: SocketAddr,
         hello: ShardHello,
     ) -> Result<(ShardWelcome, Conn), space_net::NetError> {
-        let endpoint =
-            client_endpoint_for(addr).map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
+        let pin = space_net::ClusterTrust::from_secret(&hello.secret).map(|t| t.pin());
+        Self::handshake_pinned(addr, hello, pin.as_ref()).await
+    }
+
+    /// [`OrchestratorLink::handshake`] with the pin to verify the orchestrator
+    /// against (`None`: no verification, only allowed without a secret).
+    ///
+    /// Invariant: a non-empty cluster secret is only ever written to a
+    /// connection whose certificate chains to the CA of that secret.
+    ///
+    /// # Errors
+    ///
+    /// As [`OrchestratorLink::handshake`]; [`space_net::NetError::Untrusted`]
+    /// when the orchestrator's certificate does not chain to `pin`, or at once
+    /// (nothing dialled) when `hello` carries a secret and `pin` is `None`.
+    pub async fn handshake_pinned(
+        addr: SocketAddr,
+        hello: ShardHello,
+        pin: Option<&space_net::ClusterPin>,
+    ) -> Result<(ShardWelcome, Conn), space_net::NetError> {
+        if !hello.secret.is_empty() && pin.is_none() {
+            return Err(space_net::NetError::Untrusted(
+                "refusing to send the cluster secret over an unverified connection".into(),
+            ));
+        }
+        let endpoint = space_net::client_endpoint_pinned(addr, pin)
+            .map_err(|e| space_net::NetError::Handshake(e.to_string()))?;
         let (conn, _welcome) =
             connect(&endpoint, addr, SERVER_NAME, &peer_hello(hello.shard)).await?;
         // The orchestrator answered the transport handshake with a placeholder;
@@ -687,13 +904,10 @@ impl OrchestratorLink {
         let welcome = match next.map_err(|e| space_net::NetError::Io(e.to_string()))? {
             Some(Message::ShardWelcome(w)) => w,
             Some(Message::Reject(reject)) => {
-                let why = match reject.reason {
-                    space_protocol::RejectReason::Other(text) => text,
-                    other => format!("{other:?}"),
-                };
-                return Err(space_net::NetError::Protocol(format!(
-                    "the orchestrator rejected this shard's hello: {why}"
-                )));
+                // The orchestrator said no, and why. Whether that is final
+                // ("wrong cluster") or "ask again" (`Draining`: a map change
+                // is in flight) is the caller's to act on.
+                return Err(space_net::NetError::Rejected(reject.reason));
             }
             Some(other) => {
                 return Err(space_net::NetError::Protocol(format!(
@@ -733,7 +947,9 @@ impl OrchestratorLink {
         // The reader ending is the end of this shard's membership of the
         // cluster: no further epoch or map push will reach it, and nothing
         // re-dials. That must not happen silently, so whatever ends the loop is
-        // logged.
+        // logged — and it is what `lost` reports, so the shard is stopped.
+        let (lost_tx, lost) = tokio::sync::watch::channel(None::<String>);
+        let (retired_tx, retired) = tokio::sync::watch::channel(None::<String>);
         let reader = {
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -768,6 +984,15 @@ impl OrchestratorLink {
                                     println!("{}", scene_switch_line(id, before, after));
                                 }
                             }
+                            Message::ShardRetire(retire) => {
+                                // The orderly end: this shard is drained and
+                                // told to stop. Whoever runs it is watching
+                                // for this, and stops it with exit status 0.
+                                // (One that names another shard is not ours.)
+                                if retire.shard == shard.lock().await.shard() {
+                                    let _ = retired_tx.send(Some(retire.reason));
+                                }
+                            }
                             _ => {}
                         },
                         Ok(None) => {
@@ -782,15 +1007,78 @@ impl OrchestratorLink {
                     "space-server: the orchestrator link closed ({why}); this shard no longer \
                      receives epoch changes or map pushes"
                 );
+                // Whoever runs the shard is watching for this.
+                let _ = lost_tx.send(Some(why));
             })
         };
-        Self { tx, reader, sender }
+        Self {
+            tx,
+            reader,
+            sender,
+            lost,
+            retired,
+        }
+    }
+
+    /// Why the orchestrator told this shard to stop, if it has
+    /// ([`space_protocol::ShardRetire`]): the orderly end of a shard whose
+    /// region was merged away and which has handed everything over.
+    #[must_use]
+    pub fn retired_reason(&self) -> Option<String> {
+        self.retired.borrow().clone()
+    }
+
+    /// A watcher that resolves when this shard is told to stop (see
+    /// [`Self::retired_reason`]); never, if it is not.
+    #[must_use]
+    pub fn retired_signal(&self) -> LinkLost {
+        LinkLost(self.retired.clone())
+    }
+
+    /// Why the link was lost, if it has been: the connection's close reason.
+    /// `None` while it is up — and after [`OrchestratorLink::close`], which is
+    /// this side stopping on purpose, not a loss.
+    #[must_use]
+    pub fn lost_reason(&self) -> Option<String> {
+        self.lost.borrow().clone()
+    }
+
+    /// A watcher that resolves when the link is lost (see [`LinkLost`]).
+    #[must_use]
+    pub fn lost_signal(&self) -> LinkLost {
+        LinkLost(self.lost.clone())
     }
 
     /// Stop the link's tasks.
     pub fn close(self) {
         self.reader.abort();
         self.sender.abort();
+    }
+}
+
+/// Resolves when a shard's [`OrchestratorLink`] is lost: the orchestrator
+/// closed the connection, went away ([`space_net::IDLE_TIMEOUT`] of silence —
+/// the transport pings, so an orchestrator that is merely quiet never looks
+/// lost) or the stream broke.
+#[derive(Debug, Clone)]
+pub struct LinkLost(tokio::sync::watch::Receiver<Option<String>>);
+
+impl LinkLost {
+    /// Wait for the loss and say why. Never resolves when the link was closed
+    /// from this side ([`OrchestratorLink::close`]): nothing was lost then.
+    pub async fn wait(mut self) -> String {
+        // (The borrowed value is copied out before anything else is awaited:
+        // a watch borrow is not `Send`.)
+        let lost = self
+            .0
+            .wait_for(Option::is_some)
+            .await
+            .map(|why| why.clone().unwrap_or_default());
+        match lost {
+            Ok(why) => why,
+            // The sender went without a word: the link was closed from here.
+            Err(_) => std::future::pending().await,
+        }
     }
 }
 
@@ -810,6 +1098,7 @@ fn scene_switch_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space_net::client_endpoint_for;
 
     /// The token a shard dials its peers with must parse back to its own id, or
     /// the accepting shard mistakes the peer for a client (and every handoff
@@ -819,7 +1108,290 @@ mod tests {
         for id in [1u32, 7, 100, u32::MAX - 1] {
             let hello = peer_hello(ShardId::new(id));
             assert_eq!(peer_shard_id(&hello.player_token), Some(ShardId::new(id)));
+            assert_eq!(presented_peer_token(&hello.player_token), "");
+            // With the cluster's peer token behind the id: the id still parses
+            // (a hello that did not would be taken for a player's), and the
+            // token comes back whole, colons included.
+            for token in ["0123456789abcdef", "with:colons:in:it"] {
+                let hello = peer_hello_with(ShardId::new(id), token);
+                assert_eq!(peer_shard_id(&hello.player_token), Some(ShardId::new(id)));
+                assert_eq!(presented_peer_token(&hello.player_token), token);
+            }
         }
+        assert_eq!(peer_shard_id("player-1"), None);
+        assert_eq!(peer_shard_id("shard:x"), None);
+        assert_eq!(peer_shard_id("shard::token"), None);
+        assert_eq!(presented_peer_token("player-1"), "");
+    }
+
+    /// The rule a peer hello is admitted by: a shard that holds no token lets
+    /// every peer in (standalone shards), one that holds a token wants exactly
+    /// that token.
+    #[test]
+    fn a_shard_with_a_peer_token_admits_only_that_token() {
+        assert!(peer_token_admits("", ""));
+        assert!(peer_token_admits("", "anything"));
+        assert!(peer_token_admits("s3cret-token", "s3cret-token"));
+        for wrong in ["", "s3cret-toke", "s3cret-token2", "S3cret-token"] {
+            assert!(!peer_token_admits("s3cret-token", wrong), "{wrong:?}");
+        }
+    }
+
+    /// Over the real transport: a shard that holds the cluster's peer token
+    /// refuses a peer hello without it — and one with a wrong one — with
+    /// `Unauthorized`, before any peer message is read; the same hello with
+    /// the token is welcomed, and a player's hello is untouched by all of it.
+    ///
+    /// Mutation this catches: checking map membership only (anybody who can
+    /// reach the port and guesses a neighbour's id speaks the handoff protocol
+    /// as that neighbour), or taking a token-carrying hello for a player's.
+    #[tokio::test]
+    async fn a_peer_hello_without_the_peer_token_is_refused() {
+        let (net, shard, serve) = served_shard().await;
+        net.set_peer_token("the-cluster-peer-token");
+        let bound = net.local_addr().expect("addr");
+        let endpoint = client_endpoint_for(bound).expect("client endpoint");
+        let peer = ShardId::new(2);
+
+        for hello in [
+            peer_hello(peer),
+            peer_hello_with(peer, "not-the-token"),
+            peer_hello_with(peer, "the-cluster-peer-toke"),
+        ] {
+            let err = connect(&endpoint, bound, SERVER_NAME, &hello)
+                .await
+                .expect_err("a peer without the token is refused");
+            assert_eq!(
+                err,
+                space_net::NetError::Rejected(space_protocol::RejectReason::Unauthorized)
+            );
+        }
+        assert_eq!(net.peers_refused(), 3);
+        assert_eq!(
+            shard.lock().await.stats().clients,
+            0,
+            "a refused peer is not a player either"
+        );
+
+        let (conn, welcome) = connect(
+            &endpoint,
+            bound,
+            SERVER_NAME,
+            &peer_hello_with(peer, "the-cluster-peer-token"),
+        )
+        .await
+        .expect("a peer with the token is let in");
+        assert_eq!(welcome.session, 0, "a peer gets no session");
+        assert_eq!(shard.lock().await.stats().clients, 0);
+        conn.close(0, "done");
+
+        connect(&endpoint, bound, SERVER_NAME, &hello("player"))
+            .await
+            .expect("a player needs no peer token");
+        assert_eq!(net.peers_refused(), 3);
+        serve.abort();
+        net.close();
+    }
+
+    /// The sending half: a shard that holds the token presents it when it
+    /// dials a neighbour, so two shards of one cluster reach each other and a
+    /// shard of another cluster (another token) does not.
+    ///
+    /// Mutation this catches: `run_peer_sender` dialling with the bare
+    /// `shard:<id>` hello — every handoff message between orchestrated shards
+    /// would be refused.
+    #[tokio::test]
+    async fn a_shard_presents_its_peer_token_when_it_dials_a_neighbour() {
+        let (net_b, _shard_b, serve_b) = served_shard().await;
+        net_b.set_peer_token("token-of-cluster-one");
+        let addr_b = net_b.local_addr().expect("addr");
+        let me = ShardId::new(7);
+
+        // A shard of another cluster: its dial is refused, and both sides
+        // count it.
+        let stranger = ShardNet::bind(loopback()).expect("bind");
+        stranger.set_peer_token("token-of-cluster-two");
+        stranger
+            .send_to_peer(me, ShardId::new(1), Some(addr_b), probe())
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (net_b.peers_refused() == 0 || stranger.peer_send_failures() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(net_b.peers_refused(), 1, "the stranger was refused");
+        assert!(stranger.peer_send_failures() > 0, "and was told so");
+        stranger.close();
+
+        // A shard of the same cluster: the dial goes through (nothing is
+        // refused, nothing fails), and the message is delivered — the serving
+        // side logs nothing about a refusal.
+        let friend = ShardNet::bind(loopback()).expect("bind");
+        friend.set_peer_token("token-of-cluster-one");
+        friend
+            .send_to_peer(me, ShardId::new(1), Some(addr_b), probe())
+            .await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(net_b.peers_refused(), 1, "the friend was let in");
+        assert_eq!(friend.peer_send_failures(), 0);
+        friend.close();
+        serve_b.abort();
+        net_b.close();
+    }
+
+    /// The front end derives `Debug` and holds the cluster's peer token: a
+    /// print of it — in a test failure, or of anything that holds it — must
+    /// not contain the token.
+    ///
+    /// Mutation this catches: holding the token as a plain `String` again.
+    #[tokio::test]
+    async fn the_front_end_never_prints_the_peer_token() {
+        let net = ShardNet::bind(loopback()).expect("bind");
+        net.set_peer_token("do-not-print-this-peer-token");
+        assert_eq!(net.peer_token().expose(), "do-not-print-this-peer-token");
+        let printed = format!("{net:?}");
+        assert!(!printed.contains("do-not-print"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        net.close();
+    }
+
+    /// Refused peer hellos are counted one by one and written a few times a
+    /// window: anybody who can reach the port can cause one, as often as they
+    /// like. The lines never contain a token.
+    ///
+    /// Mutation this catches: one line per refusal again (a log filled by a
+    /// stranger at the speed of their uplink).
+    #[tokio::test]
+    async fn refused_peer_hellos_are_counted_but_written_only_a_few_times_a_window() {
+        let (net, _shard, serve) = served_shard().await;
+        net.set_peer_token("the-cluster-peer-token");
+        let from = loopback();
+        let lines: Vec<String> = (0..200)
+            .filter_map(|_| net.refusal_line(ShardId::new(1), from))
+            .collect();
+        assert_eq!(lines.len(), PEER_REFUSAL_LINES as usize, "{lines:?}");
+        assert!(lines
+            .iter()
+            .all(|line| line.contains("to be peer shard 1 from") && line.contains("refused")));
+        assert!(lines.iter().all(|line| !line.contains("peer-token")));
+
+        // Over the transport: every refusal is counted, whatever was written.
+        let bound = net.local_addr().expect("addr");
+        let endpoint = client_endpoint_for(bound).expect("client endpoint");
+        for _ in 0..5 {
+            let err = connect(
+                &endpoint,
+                bound,
+                SERVER_NAME,
+                &peer_hello_with(ShardId::new(1), "wrong"),
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(
+                err,
+                space_net::NetError::Rejected(space_protocol::RejectReason::Unauthorized)
+            );
+        }
+        assert_eq!(net.peers_refused(), 5);
+        serve.abort();
+        net.close();
+    }
+
+    /// [`served_shard`] on a [`ShardNet::bind_trusted`] endpoint.
+    async fn served_trusted_shard(
+        trust: Option<space_net::ClusterTrust>,
+    ) -> (Arc<ShardNet>, JoinHandle<()>) {
+        let net = Arc::new(ShardNet::bind_trusted(loopback(), trust).expect("bind"));
+        let shard = Arc::new(Mutex::new(Shard::new(crate::ShardConfig::new(
+            ShardId::new(1),
+            net.local_addr().expect("addr"),
+            space_world::NodeRef::new(64, [0, 0, 0]),
+        ))));
+        let serve = tokio::spawn({
+            let net = Arc::clone(&net);
+            async move { net.serve(shard).await }
+        });
+        (net, serve)
+    }
+
+    /// Send one peer message from `from` to `to` and wait for the dial to
+    /// settle: `true` when it was delivered (no failure counted, nothing refused).
+    async fn peer_message_arrives(from: &ShardNet, to: &ShardNet) -> bool {
+        let addr = to.local_addr().expect("addr");
+        from.send_to_peer(ShardId::new(7), ShardId::new(1), Some(addr), probe())
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while from.peer_send_failures() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        from.peer_send_failures() == 0 && to.peers_refused() == 0
+    }
+
+    /// Two shards that hold the cluster's trust verify each other and
+    /// exchange a peer message; a shard with trust does not dial a peer that
+    /// only has a self-signed certificate (nothing is sent, a failure is
+    /// counted); two plain shards still exchange one.
+    ///
+    /// Mutation this catches: `peer_sender` dialling without the pin — the
+    /// peer token would go to a peer that never proved it holds the secret.
+    #[tokio::test]
+    async fn shards_with_trust_verify_each_other_and_plain_shards_still_talk() {
+        let trust = || space_net::ClusterTrust::from_secret("cluster-secret");
+
+        let (a, serve_a) = served_trusted_shard(trust()).await;
+        let (b, serve_b) = served_trusted_shard(trust()).await;
+        assert!(peer_message_arrives(&a, &b).await, "trusted -> trusted");
+        a.close();
+        b.close();
+        serve_a.abort();
+        serve_b.abort();
+
+        let (a, serve_a) = served_trusted_shard(trust()).await;
+        let (plain, serve_plain) = served_trusted_shard(None).await;
+        assert!(
+            !peer_message_arrives(&a, &plain).await,
+            "a shard with trust must not dial a self-signed peer"
+        );
+        assert!(a.peer_send_failures() > 0);
+        assert_eq!(plain.peers_refused(), 0, "no hello arrived at all");
+        a.close();
+        plain.close();
+        serve_a.abort();
+        serve_plain.abort();
+
+        let (a, serve_a) = served_trusted_shard(None).await;
+        let (b, serve_b) = served_trusted_shard(None).await;
+        assert!(peer_message_arrives(&a, &b).await, "plain -> plain");
+        a.close();
+        b.close();
+        serve_a.abort();
+        serve_b.abort();
+    }
+
+    /// A hello with a secret and no pin is refused before anything is dialled.
+    ///
+    /// Mutation this catches: dropping the guard — the secret would be
+    /// written to a connection nobody verified.
+    #[tokio::test]
+    async fn the_secret_is_not_sent_without_a_pin() {
+        // Nobody listens here: a dial would take the handshake timeout.
+        let nobody = std::net::UdpSocket::bind(loopback()).expect("bind");
+        let addr = nobody.local_addr().expect("addr");
+        let hello = ShardHello {
+            cluster: "c".into(),
+            shard: ShardId::NONE,
+            endpoint: addr,
+            region: None,
+            client_endpoint: None,
+            secret: "a-secret".into(),
+        };
+        let started = std::time::Instant::now();
+        let err = OrchestratorLink::handshake_pinned(addr, hello, None)
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, space_net::NetError::Untrusted(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     fn probe() -> Message {

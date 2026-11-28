@@ -61,8 +61,10 @@ pub struct ClientState {
     pub screen: Screen,
     /// The error text on the [`Screen::Error`] screen.
     pub error: Option<String>,
-    /// The server address: what is typed in the connect prompt, or the server
-    /// being connected to / played on.
+    /// The server address: what is typed in the connect prompt, or the
+    /// address being connected to / that was connected through — the
+    /// **entry** address. It need not be a shard's: the orchestrator's player
+    /// port sends a client on to one ([`shard_address`](Self::shard_address)).
     pub address: String,
     /// The shard currently played on.
     pub shard: Option<u32>,
@@ -109,6 +111,13 @@ pub struct ClientState {
     pub height: u32,
     /// Frames per second, as the client measures it.
     pub fps: f32,
+    /// GPU execution time of the last frame, milliseconds (`null` until
+    /// one is known, or on a device without timestamp queries).
+    #[serde(default)]
+    pub gpu_ms: Option<f32>,
+    /// The adaptive render level in force: 0 (full quality) to 6.
+    #[serde(default)]
+    pub render_level: u32,
     /// The strength of the gravity at the ship, m/s² (0 in weightless
     /// space): what the client's prediction of the scene's physics finds
     /// there (the demo area's gravity room pulls with 9.81).
@@ -133,6 +142,12 @@ pub struct ClientState {
     /// The largest such correction of the last five seconds, metres.
     #[serde(default)]
     pub correction_max_m: f64,
+    /// The address (`ip:port`) of the shard being played on: the entry
+    /// [`address`](Self::address) itself when that is a shard, otherwise the
+    /// shard the client was sent on to — and, after a shard transition, the
+    /// shard that took the ship. `None` while not on a server.
+    #[serde(default)]
+    pub shard_address: Option<String>,
     /// Whether fast travel is on (`F` while playing).
     #[serde(default)]
     pub fast: bool,
@@ -148,6 +163,57 @@ pub struct ClientState {
     /// area; empty elsewhere): what a script steers by.
     #[serde(default)]
     pub sky: Vec<SkyBodyState>,
+    /// The ship **as the last frame drew it**, metres from the scene's spawn
+    /// point (the frame of [`scene_position`](Self::scene_position)):
+    /// predicted ahead of the shard's word and interpolated between ticks, so
+    /// it moves every frame — where `scene_position` is the shard's word and
+    /// moves thirty times a second. What a player sees; what to look at for a
+    /// step or a rubber band. `None` until the client predicts its ship.
+    #[serde(default)]
+    pub drawn_position: Option<[f64; 3]>,
+    /// The ship's velocity as drawn, metres/second.
+    #[serde(default)]
+    pub drawn_velocity: Option<[f64; 3]>,
+    /// The tick of the shard's clock the ship was drawn at, with its fraction
+    /// (a few ticks ahead of [`tick`](Self::tick)). Every shard of a cluster
+    /// counts the same ticks, so it runs on through a shard transition; a
+    /// step in it is a clock that started over.
+    #[serde(default)]
+    pub drawn_tick: Option<f64>,
+    /// How many other players' characters and unflown ships the last frame
+    /// drew.
+    #[serde(default)]
+    pub others_drawn: u32,
+    /// Those other players and ships, nearest first (at most 64): where each
+    /// was drawn and which copy of it the shard sends.
+    #[serde(default)]
+    pub others: Vec<OtherState>,
+    /// How many of the bodies and ships the last frame drew are **far
+    /// replicas**: simulated by another shard, beyond the reach of its border
+    /// ghosts, and relayed by the shard being played on.
+    #[serde(default)]
+    pub far_drawn: u32,
+}
+
+/// Another player's character or an unflown ship as the client draws it
+/// ([`ClientState::others`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OtherState {
+    /// The ship's guid, `"shard:serial"`.
+    pub guid: String,
+    /// Whether a player flies it (drawn as a character).
+    pub player: bool,
+    /// Where it is drawn, metres from the scene's spawn point.
+    pub position: [f64; 3],
+    /// How far that is from the ship (as drawn), metres.
+    pub distance: f64,
+    /// Which copy this is: `"local"`, `"ghost"` or `"far"` (see
+    /// [`BodyState::source`]).
+    pub source: String,
+    /// Its distance step ([`BodyState::step`]).
+    pub step: u32,
+    /// The age of its newest sample, seconds ([`BodyState::sample_age_s`]).
+    pub sample_age_s: f64,
 }
 
 /// One body of the solar system as the client draws it ([`ClientState::sky`]).
@@ -185,6 +251,24 @@ pub struct BodyState {
     pub parts: u32,
     /// Whether it is in the picture.
     pub in_view: bool,
+    /// Which copy of it the shard being played on sends: `"local"` (that
+    /// shard simulates it), `"ghost"` (a neighbour does, near the border: the
+    /// shard holds a ghost of it) or `"far"` (another shard does, further
+    /// off: a far replica, for seeing only).
+    #[serde(default)]
+    pub source: String,
+    /// Its distance step, 0 to 3: how often its motion is sent at this
+    /// distance (30, 10, 5, 1 times a second out to 100 m, 250 m, 1 km,
+    /// 10 km).
+    #[serde(default)]
+    pub step: u32,
+    /// How old its newest sample is, seconds: the newest tick heard minus
+    /// the tick that sample is the state of. Small for something that moves
+    /// (its step's spacing at most, plus a few ticks for a far replica);
+    /// it grows for as long as a body is at rest, because nothing is sent
+    /// for a body that does not change.
+    #[serde(default)]
+    pub sample_age_s: f64,
 }
 
 impl ClientState {
@@ -644,8 +728,23 @@ mod tests {
             speed: 0.25,
             parts: 1,
             in_view: true,
+            source: "far".into(),
+            step: 2,
+            sample_age_s: 0.2,
         }];
         state.bodies_in_view = 1;
+        state.far_drawn = 1;
+        state.gpu_ms = Some(7.5);
+        state.render_level = 3;
+        state.others = vec![OtherState {
+            guid: "2:1".into(),
+            player: true,
+            position: [-200.0, 0.0, 0.0],
+            distance: 200.0,
+            source: "far".into(),
+            step: 1,
+            sample_age_s: 0.1,
+        }];
         state.correction_m = 0.002;
         state.fast = true;
         state.nearest = Some("Moon".into());
@@ -662,6 +761,13 @@ mod tests {
             serde_json::json!([12.0, -1.4, -1.6])
         );
         assert_eq!(json["bodies_in_view"], 1);
+        assert_eq!(json["bodies"][0]["source"], "far");
+        assert_eq!(json["bodies"][0]["step"], 2);
+        assert_eq!(json["far_drawn"], 1);
+        assert_eq!(json["gpu_ms"], 7.5);
+        assert_eq!(json["render_level"], 3);
+        assert_eq!(json["others"][0]["source"], "far");
+        assert_eq!(json["others"][0]["player"], true);
         assert_eq!(json["correction_m"], 0.002);
         assert_eq!(json["screen"], "online");
         assert_eq!(json["error"], serde_json::Value::Null);
@@ -706,13 +812,33 @@ mod tests {
             "bodies_in_view",
             "correction_m",
             "correction_max_m",
+            "shard_address",
             "fast",
             "nearest",
             "nearest_surface_m",
             "sky",
+            "drawn_position",
+            "drawn_velocity",
+            "drawn_tick",
+            "others_drawn",
+            "others",
+            "far_drawn",
+            "gpu_ms",
+            "render_level",
         ] {
             old.as_object_mut().unwrap().remove(field);
         }
+        // The shard's own address, beside the entry address: null while not
+        // on a server, a string once on a shard.
+        assert_eq!(fresh["shard_address"], serde_json::Value::Null);
+        let on_a_shard = ClientState {
+            address: "play.example.org:7777".into(),
+            shard_address: Some("203.0.113.7:7871".into()),
+            ..ClientState::default()
+        };
+        let json = serde_json::to_value(&on_a_shard).unwrap();
+        assert_eq!(json["address"], "play.example.org:7777");
+        assert_eq!(json["shard_address"], "203.0.113.7:7871");
         assert_eq!(
             serde_json::from_value::<ClientState>(old).unwrap(),
             ClientState::default()

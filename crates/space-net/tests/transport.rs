@@ -22,16 +22,21 @@
 //! | [`connect_gives_up_when_the_server_never_answers_the_hello`] | `connect_within` is bounded by its own limit, not by the idle timeout |
 //! | [`accept_gives_up_on_a_client_that_never_sends_a_hello`] | `accept_incoming_within` is bounded the same way |
 //! | [`a_policy_reject_reaches_the_client_with_its_reason`] | `Conn::reject` drains before closing, so the client sees `Rejected(reason)` |
+//! | [`join_returns_the_redirect_a_server_turned_it_away_with`] | a `JoinRedirect` in place of a welcome reaches `join` whole (`Joined::Elsewhere`), and the connection is finished |
+//! | [`connect_reports_a_redirect_as_an_error_that_says_what_the_address_is`] | `connect` (a shard's dial) is not sent on: a redirect is a readable error |
+//! | [`join_still_takes_a_welcome_and_a_version_mismatch_is_still_readable`] | the two old answers are unchanged through `join` |
 //! | [`client_endpoint_for_binds_the_family_it_dials`], [`an_ipv6_server_is_diallable_through_client_endpoint_for`] | the client socket is bound in the address family of its target |
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use space_net::{
-    accept_connection, client_endpoint_on, connect, server_endpoint, MessageClass, NetError,
+    accept_connection, client_endpoint_on, connect, join, server_endpoint, Joined, MessageClass,
+    NetError,
 };
 use space_protocol::{
-    encode_frame, Delta, EntityGuid, EntitySnapshot, Hello, InputTick, Message, PlayerInput,
-    Redirect, RejectReason, ShardId, ShardMap, Snapshot, Welcome, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    encode_frame, Delta, EntityGuid, EntitySnapshot, Hello, InputTick, JoinRedirect, Message,
+    PlayerInput, Redirect, RejectReason, ShardId, ShardMap, Snapshot, Welcome, MAX_FRAME_SIZE,
+    PROTOCOL_VERSION,
 };
 use space_world::WorldPos;
 
@@ -433,6 +438,7 @@ async fn snapshot_stream_round_trips() {
             vec![(0, space_sim_wire_placeholder_payload())],
         )],
         input_ack: 2,
+        more: false,
     });
     assert_eq!(MessageClass::of(&msg), MessageClass::Stream);
     conn.send(&msg).await.expect("send snapshot");
@@ -726,6 +732,141 @@ async fn a_policy_reject_reaches_the_client_with_its_reason() {
     server_task.await.expect("server task");
 }
 
+/// A join redirect naming shard 7, whose map sends players to
+/// `client_endpoint`.
+fn join_redirect(client_endpoint: SocketAddr) -> JoinRedirect {
+    let mut map = shard_map("10.1.2.3:7871".parse().expect("addr"));
+    map.regions[0] = map.regions[0].clone().with_client_endpoint(client_endpoint);
+    JoinRedirect {
+        shard: ShardId::new(7),
+        shard_map: map,
+    }
+}
+
+/// A server that is not the shard to play on answers a hello with a
+/// `JoinRedirect` and closes; `join` hands the redirect back — whole, with
+/// the map that names the client endpoint — and the server's close does not
+/// have to run into its drain timeout, because the client closes as soon as
+/// it has read the answer.
+///
+/// Mutation this catches: `join` treating the redirect as a protocol error
+/// (no client could ever enter through the orchestrator), or `turn_away`
+/// closing before the answer was read (the client sees a lost connection).
+#[tokio::test]
+async fn join_returns_the_redirect_a_server_turned_it_away_with() {
+    let (server, bound) = server();
+    let sent = join_redirect("0.0.0.0:7871".parse().expect("addr"));
+    let to_send = sent.clone();
+    let server_task = tokio::spawn(async move {
+        let (conn, hello) = accept_connection(server.accept()).await.expect("accept");
+        assert_eq!(hello.player_token, "player-1");
+        let started = std::time::Instant::now();
+        conn.turn_away(&Message::JoinRedirect(to_send)).await;
+        (started.elapsed(), conn.is_closed())
+    });
+
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let joined = join(&client, bound, "space.local", &space_net::hello("player-1"))
+        .await
+        .expect("a redirect is an answer, not an error");
+    let Joined::Elsewhere(got) = joined else {
+        panic!("expected the redirect, got {joined:?}");
+    };
+    assert_eq!(got, sent);
+    assert_eq!(
+        got.shard_map.client_endpoint_of(got.shard),
+        Some("0.0.0.0:7871".parse().expect("addr"))
+    );
+    let (took, closed) = server_task.await.expect("server task");
+    assert!(closed, "the connection is finished once the answer is read");
+    assert!(
+        took < std::time::Duration::from_millis(900),
+        "the client closes when it has read the redirect; the server does not wait out its \
+         drain: {took:?}"
+    );
+}
+
+/// `connect` is for a caller that wants the peer at the address itself — a
+/// shard dialling a neighbour or its orchestrator. Sent on, it reports an
+/// error that says what the address is, instead of a welcome it never got.
+#[tokio::test]
+async fn connect_reports_a_redirect_as_an_error_that_says_what_the_address_is() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.turn_away(&Message::JoinRedirect(join_redirect(
+            "0.0.0.0:7871".parse().expect("addr"),
+        )))
+        .await;
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let err = connect(&client, bound, "space.local", &space_net::hello("shard:3"))
+        .await
+        .expect_err("not a welcome");
+    let NetError::Protocol(why) = &err else {
+        panic!("expected a protocol error, got {err:?}");
+    };
+    assert!(
+        why.contains("player entry") && why.contains("shard 7"),
+        "{why}"
+    );
+    server_task.await.expect("server task");
+}
+
+/// `join` takes a welcome like `connect` does, and a version mismatch is
+/// still the readable refusal it always was — the redirect did not replace
+/// either answer.
+#[tokio::test]
+async fn join_still_takes_a_welcome_and_a_version_mismatch_is_still_readable() {
+    // A welcome.
+    let (shard, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(shard.accept()).await.expect("accept");
+        conn.send_control(&Message::Welcome(welcome(bound)))
+            .await
+            .expect("welcome");
+        conn
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let joined = join(&client, bound, "space.local", &space_net::hello("player-1"))
+        .await
+        .expect("join");
+    let Joined::Shard(conn, got) = joined else {
+        panic!("expected a welcome, got {joined:?}");
+    };
+    assert_eq!(got.session, 42);
+    assert!(!conn.is_closed());
+    let _server_conn = server_task.await.expect("server task");
+
+    // Another protocol version: refused at the gate, with both versions.
+    let (gate, bound) = self::server();
+    let server_task = tokio::spawn(async move {
+        accept_connection(gate.accept())
+            .await
+            .expect_err("the gate refuses")
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let old = Hello {
+        protocol: PROTOCOL_VERSION - 1,
+        player_token: "player-1".into(),
+    };
+    let err = join(&client, bound, "space.local", &old)
+        .await
+        .expect_err("a version mismatch");
+    assert_eq!(
+        err,
+        NetError::VersionMismatch {
+            seen: PROTOCOL_VERSION - 1,
+            expected: PROTOCOL_VERSION,
+        }
+    );
+    assert!(err.to_string().contains("protocol version"), "{err}");
+    assert!(matches!(
+        server_task.await.expect("server task"),
+        NetError::VersionMismatch { .. }
+    ));
+}
+
 /// `client_endpoint_for` binds a socket of the family it is asked to dial.
 ///
 /// The IPv6 half is skipped on a host without IPv6 (the bind fails there, which
@@ -778,4 +919,165 @@ async fn an_ipv6_server_is_diallable_through_client_endpoint_for() {
     let (_server_conn, hello) = server_task.await.expect("server task");
     assert_eq!(hello.player_token, "v6");
     assert!(!conn.is_closed());
+}
+
+/// A client endpoint whose connections grant the peer **no** flow-control
+/// credit on a stream: whatever the server writes on the control stream waits
+/// for a window that never opens. It keeps its connection alive like any
+/// other (keep-alive pings), so the idle timeout does not end the wait.
+fn windowless_client() -> quinn::Endpoint {
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(quinn::VarInt::from_u32(0));
+    transport.keep_alive_interval(Some(space_net::KEEP_ALIVE_INTERVAL));
+    let mut config = space_net::crypto::make_client_config();
+    config.transport_config(std::sync::Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client(addr()).expect("client endpoint");
+    endpoint.set_default_client_config(config);
+    endpoint
+}
+
+/// The last word to a peer — a `Reject`, a `JoinRedirect` — is written with a
+/// bound. A peer that says hello and grants no receive window cannot be
+/// written to at all; without the bound `turn_away` waits on that write for as
+/// long as the peer keeps its connection up, and with it whatever the caller
+/// holds (one of the player port's 256 slots, a shard's serving task).
+///
+/// Mutation this catches: `send_last` awaiting `write_all` with no timeout —
+/// the server task below then never finishes and the outer timeout fails the
+/// test.
+#[tokio::test]
+async fn a_peer_that_grants_no_receive_window_cannot_hold_the_last_word() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, _hello) = accept_connection(server.accept()).await.expect("accept");
+        let started = std::time::Instant::now();
+        conn.turn_away(&Message::JoinRedirect(join_redirect(
+            "0.0.0.0:7871".parse().expect("addr"),
+        )))
+        .await;
+        (started.elapsed(), conn.is_closed())
+    });
+
+    let client = windowless_client();
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("dial")
+        .await
+        .expect("the transport handshake");
+    let (mut send, _recv) = conn.open_bi().await.expect("the control stream");
+    send.write_all(&encode_frame(&Message::Hello(space_net::hello("deaf"))))
+        .await
+        .expect("the hello");
+
+    let (took, closed) = tokio::time::timeout(std::time::Duration::from_secs(8), server_task)
+        .await
+        .expect("turn_away must return although the peer never opens a window")
+        .expect("server task");
+    assert!(closed, "the connection is closed, read or not");
+    assert!(
+        took >= space_net::LAST_WORD_TIMEOUT,
+        "the write really was blocked (else this test proves nothing): {took:?}"
+    );
+    assert!(
+        took <= space_net::TURN_AWAY_LIMIT + std::time::Duration::from_millis(500),
+        "bounded by the write's limit and the drain: {took:?}"
+    );
+    // The peer sees the connection end; it was not left hanging either.
+    tokio::time::timeout(std::time::Duration::from_secs(3), conn.closed())
+        .await
+        .expect("the server closed the connection");
+}
+
+/// The first frame of a connection is a hello, and is read with a hello's
+/// size limit: a header that declares more is refused at once, from the
+/// header alone. Before, a stranger's first eight bytes had the server
+/// allocate up to the general frame limit (1 MiB) and wait for the payload
+/// until the handshake timeout.
+///
+/// Mutation this catches: reading the first frame with `read_frame` (the
+/// general limit) — the accept below then waits for a payload that never
+/// comes and ends as a `Handshake` timeout five seconds later.
+#[tokio::test]
+async fn a_first_frame_larger_than_a_hello_is_refused_from_its_header() {
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let outcome = accept_connection(server.accept()).await.map(|_| ());
+        (outcome, started.elapsed())
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let conn = client
+        .connect(bound, "space.local")
+        .expect("dial")
+        .await
+        .expect("the transport handshake");
+    let (mut send, _recv) = conn.open_bi().await.expect("the control stream");
+    // A header only: one byte more than a hello may be, far below the general
+    // frame limit, in this build's protocol version. No payload follows.
+    let declared = space_net::MAX_HELLO_PAYLOAD + 1;
+    assert!(declared < MAX_FRAME_SIZE);
+    let mut header = Vec::new();
+    header.extend_from_slice(&(declared as u32).to_be_bytes());
+    header.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    send.write_all(&header).await.expect("the header");
+
+    let (outcome, took) = server_task.await.expect("server task");
+    let err = outcome.expect_err("not a hello");
+    assert!(
+        matches!(err, NetError::Io(_)),
+        "refused as a bad frame, not timed out as a missing hello: {err:?}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "refused from the header, without waiting for the payload: {took:?}"
+    );
+}
+
+/// The largest hello anything legitimate sends still fits: a shard's hello to
+/// a peer with the longest peer token the orchestrator accepts
+/// (`MAX_SECRET_LEN`) behind the largest shard id. And a hello that cannot
+/// fit is refused where it is built, with the reason, not sent to a server
+/// that would close on it without a word.
+#[tokio::test]
+async fn the_largest_legitimate_hello_fits_and_a_larger_one_is_refused_by_the_sender() {
+    let token = format!(
+        "shard:{}:{}",
+        u32::MAX,
+        "t".repeat(space_net::MAX_SECRET_LEN)
+    );
+    let frame = encode_frame(&Message::Hello(space_net::hello(token.clone())));
+    let payload = frame.len() - space_protocol::FRAME_HEADER_LEN;
+    assert!(
+        payload * 2 < space_net::MAX_HELLO_PAYLOAD,
+        "the largest hello is {payload} bytes: it must fit with room to spare"
+    );
+
+    let (server, bound) = server();
+    let server_task = tokio::spawn(async move {
+        let (conn, hello) = accept_connection(server.accept()).await.expect("accept");
+        conn.send_control(&Message::Welcome(welcome(bound)))
+            .await
+            .expect("welcome");
+        (conn, hello)
+    });
+    let client = client_endpoint_on(addr()).expect("client endpoint");
+    let (_conn, _welcome) = connect(
+        &client,
+        bound,
+        "space.local",
+        &space_net::hello(token.clone()),
+    )
+    .await
+    .expect("the largest legitimate hello is taken");
+    let (_server_conn, hello) = server_task.await.expect("server task");
+    assert_eq!(hello.player_token, token);
+
+    let too_long = space_net::hello("x".repeat(space_net::MAX_HELLO_PAYLOAD));
+    let err = connect(&client, bound, "space.local", &too_long)
+        .await
+        .expect_err("a hello no server reads");
+    assert!(
+        matches!(&err, NetError::Protocol(why) if why.contains("hello")),
+        "{err:?}"
+    );
 }

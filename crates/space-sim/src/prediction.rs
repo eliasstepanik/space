@@ -525,6 +525,7 @@ mod tests {
     use crate::sim_world::SimWorld;
     use crate::ShipState;
     use space_protocol::{EntityGuid, PlayerInput, ShardId};
+    use space_test_support::Rng;
     use space_world::WorldPos;
 
     fn guid() -> EntityGuid {
@@ -737,12 +738,12 @@ mod tests {
         server.spawn_ship(guid(), OWNER, start);
         let mut client = PredictedShip::new(start, 0, params);
 
-        let mut rng = SplitMix(0x1234_5678_9abc_def0);
+        let mut rng = Rng::new(0x1234_5678_9abc_def0);
         for tick in 1..=TICKS {
             let input = PlayerInput {
                 entity: guid(),
-                thrust: [rng.signed(), rng.signed(), rng.signed()],
-                torque: [rng.signed(), rng.signed(), rng.signed()],
+                thrust: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
+                torque: [rng.next_signed(), rng.next_signed(), rng.next_signed()],
                 tick,
                 fast: false,
             };
@@ -927,24 +928,5 @@ mod tests {
         // The next tick is live.
         p.apply_input(input(6, [0.0, 1.0, 0.0]));
         assert_eq!(p.pending[0].thrust, [0.0, 1.0, 0.0]);
-    }
-
-    /// A tiny integer-only PRNG so the test's input script is deterministic.
-    struct SplitMix(u64);
-
-    impl SplitMix {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        /// A float in `[-1, 1]` with 1e-6 resolution, from integers only.
-        fn signed(&mut self) -> f32 {
-            // The remainder fits u32, so the widening is exact.
-            ((self.next_u64() % 2_000_001) as u32 as f64 / 1_000_000.0 - 1.0) as f32
-        }
     }
 }

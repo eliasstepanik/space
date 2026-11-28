@@ -6,6 +6,13 @@
 //! H9) but launches no shard for it, so the first live shard that asks for the
 //! root adopts it ([`ControlPlane::handle_shard_hello`]).
 //!
+//! It settles the **cluster secret** too: a control port that is not on
+//! loopback does not start without one a shard could present
+//! ([`OrchestratorConfig::check_secret`]), and when the operator configured
+//! none, one is generated for the shards the orchestrator starts itself (it is
+//! handed to them by the launcher only when a hello needs it, and never
+//! printed).
+//!
 //! It also opens the scene file next to the counter ([`crate::scene`]): the
 //! scene an operator chose before a restart is restored, otherwise the
 //! configured initial scene applies. Unlike the counter, a scene file that
@@ -14,7 +21,7 @@
 
 use space_protocol::shard::{ShardMap, ShardRegion};
 
-use crate::config::OrchestratorConfig;
+use crate::config::{OrchestratorConfig, Secret};
 use crate::control::ControlPlane;
 use crate::epoch::EpochPublisher;
 use crate::ids::PersistentShardIdAllocator;
@@ -28,11 +35,16 @@ use crate::scene::{scene_path, SceneStore};
 ///
 /// # Errors
 ///
-/// The id counter file is corrupt, out of range or unreadable, the id space is
+/// The control port is not on loopback and no shard could present a cluster
+/// secret ([`OrchestratorConfig::check_secret`]); `min_shards` is more than
+/// the cluster can hold ([`OrchestratorConfig::check_shard_counts`]). The id
+/// counter file is corrupt, out of range or unreadable, the id space is
 /// exhausted, or the counter cannot be **written** (a `--state` path in a
 /// directory that does not exist, a read-only working directory): that is an
 /// error naming the path, not a panic.
 pub fn boot(config: OrchestratorConfig, peer_token: String) -> Result<ControlPlane, String> {
+    config.check_secret()?;
+    config.check_shard_counts()?;
     let mut ids = PersistentShardIdAllocator::open(&config.state_path, config.first_shard_id)
         .map_err(|e| e.to_string())?;
     let root_owner = ids
@@ -59,6 +71,10 @@ pub fn boot(config: OrchestratorConfig, peer_token: String) -> Result<ControlPla
     let mut control = ControlPlane::new(config, ids, EpochPublisher::new(map), peer_token);
     control.scene = scene;
     control.set_unclaimed_root_owner(root_owner);
+    // No secret configured: make one for the shards this orchestrator starts
+    // itself (a configured one is kept). From the same source as the web UI's
+    // form token; whether a hello *needs* it is the config's rule.
+    control.set_generated_secret(Secret::new(crate::webui::auth::random_token()));
     Ok(control)
 }
 
@@ -67,14 +83,7 @@ mod tests {
     use super::*;
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "space-orch-boot-unit-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ))
+        space_test_support::temp_path("space-orch-boot-unit", tag)
     }
 
     /// Mutation this catches: the `expect` that used to sit on the counter
@@ -95,6 +104,70 @@ mod tests {
             "the error names the state path: {err}"
         );
         assert!(err.contains("could not be persisted"), "{err}");
+    }
+
+    /// The cluster secret after a boot: the configured one, else a generated
+    /// one — and a control port that is not on loopback does not boot when no
+    /// shard could present one.
+    ///
+    /// Mutation this catches: booting an open control port with no secret at
+    /// all, generating over a configured secret, or generating the same one
+    /// twice.
+    #[test]
+    fn boot_settles_the_cluster_secret() {
+        let fresh = |tag: &str| {
+            let state_path = temp_path(tag).with_extension("id");
+            let _ = std::fs::remove_file(&state_path);
+            OrchestratorConfig {
+                state_path,
+                ..OrchestratorConfig::default()
+            }
+        };
+        // Loopback, nothing configured: one is generated for launched shards,
+        // and a hello needs none.
+        let a = boot(fresh("secret-a"), String::new()).expect("boot");
+        let b = boot(fresh("secret-b"), String::new()).expect("boot");
+        assert!(!a.secret_required() && !b.secret_required());
+        let generated = a.cluster_secret().expose().to_owned();
+        assert!(generated.len() >= OrchestratorConfig::MIN_SECRET_LEN);
+        assert_ne!(
+            generated,
+            b.cluster_secret().expose(),
+            "one per orchestrator"
+        );
+
+        // A configured secret is the secret, and is required.
+        let configured = OrchestratorConfig {
+            cluster_secret: Some(Secret::new("configured-cluster-secret")),
+            ..fresh("secret-c")
+        };
+        let c = boot(configured, String::new()).expect("boot");
+        assert!(c.secret_required());
+        assert_eq!(c.cluster_secret().expose(), "configured-cluster-secret");
+
+        // A reachable control port with no secret anybody could present.
+        let open = OrchestratorConfig {
+            bind: "0.0.0.0:7900".parse().expect("an address"),
+            ..fresh("secret-d")
+        };
+        let state = open.state_path.clone();
+        let err = boot(open.clone(), String::new()).expect_err("must not start");
+        assert!(err.contains("without a cluster secret"), "{err}");
+        assert!(!state.exists(), "refused before anything was written");
+        // ...but fine when it starts the shards itself: they get the generated one.
+        let managed = boot(
+            OrchestratorConfig {
+                min_shards: 4,
+                ..open
+            },
+            String::new(),
+        )
+        .expect("boot");
+        assert!(managed.secret_required());
+        assert!(!managed.cluster_secret().is_empty());
+        for control in [a, b, c, managed] {
+            std::fs::remove_file(&control.config.state_path).ok();
+        }
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn gpu_setup_print_env_quotes_the_prefix() {
 
 #[test]
 fn stub_subcommands_print_and_exit_2() {
-    for sub in ["e2e", "load", "parity", "web-smoke", "accept"] {
+    for sub in ["load", "parity", "web-smoke", "accept"] {
         let output = xtask().arg(sub).output().expect("spawn xtask");
         assert_eq!(output.status.code(), Some(2), "`xtask {sub}` should exit 2");
         assert_eq!(
@@ -354,6 +354,130 @@ fn viewer_names_the_install_command_when_wasm_bindgen_is_missing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("xtask: running"), "{stdout}");
     assert!(!wrote, "the target directory was created before stopping");
+}
+
+/// `xtask e2e --dry-run` from the workspace root, without the variables that
+/// change what it prints, plus `vars` and `extra` arguments.
+fn e2e_dry_run(vars: &[(&str, &str)], extra: &[&str]) -> String {
+    let mut command = xtask();
+    command
+        .args(["e2e", "--dry-run"])
+        .args(extra)
+        .current_dir(workspace_root())
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_GID")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let output = command.output().expect("spawn xtask");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn e2e_dry_run_lists_every_command_in_order() {
+    let stdout = e2e_dry_run(&[], &[]);
+    assert!(!stdout.contains("xtask: running"), "{stdout}");
+    assert!(!stdout.contains("SPACE_CLUSTER_SECRET"), "{stdout}");
+    assert!(
+        stdout.contains("SPACE_E2E_SERVER=127.0.0.1:7877"),
+        "{stdout}"
+    );
+    let dir = Path::new("target").join("xtask-test");
+    let dir = dir.display();
+    let compose = "docker compose -p space-e2e -f deploy/docker-compose.yaml";
+    let all = "docker ps --all --quiet --filter label=space.instance=space-e2e --filter \
+               label=space.role=shard";
+    let expected = [
+        "docker version --format {{.Server.Version}}".to_owned(),
+        "docker compose version".to_owned(),
+        format!(
+            "cargo test -p space-client --locked --target-dir {dir} --test live_stack --no-run"
+        ),
+        "docker build --file deploy/Dockerfile.shard --tag space/shard:e2e .".to_owned(),
+        "docker run --rm --entrypoint stat --volume /var/run/docker.sock:/var/run/docker.sock \
+         space/shard:e2e -c %g /var/run/docker.sock"
+            .to_owned(),
+        format!("{compose} down --volumes --remove-orphans"),
+        all.to_owned(),
+        format!("{compose} up --build --detach"),
+        "docker ps --quiet --filter label=space.instance=space-e2e --filter \
+         label=space.role=shard --filter status=running"
+            .to_owned(),
+        format!(
+            "cargo test -p space-client --locked --target-dir {dir} --test live_stack -- \
+             --ignored --exact a_player_on_the_running_stack_is_handed_to_the_next_shard \
+             --nocapture"
+        ),
+        format!("{compose} down --volumes --remove-orphans"),
+        all.to_owned(),
+    ];
+    let got: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("xtask: would run `"))
+        .map(|line| line.strip_suffix('`').unwrap_or(line))
+        .collect();
+    assert_eq!(got, expected, "{stdout}");
+}
+
+#[test]
+fn e2e_dry_run_follows_docker_host_and_docker_gid() {
+    let vars = [("DOCKER_HOST", "tcp://dind:2375"), ("DOCKER_GID", "991")];
+    let stdout = e2e_dry_run(&vars, &[]);
+    assert!(stdout.contains("SPACE_E2E_SERVER=dind:7877"), "{stdout}");
+    assert!(
+        stdout.contains("DOCKER_GID=991 (from the environment)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("--entrypoint stat"), "{stdout}");
+    let stdout = e2e_dry_run(&vars, &["--server-host", "10.1.2.3"]);
+    assert!(
+        stdout.contains("SPACE_E2E_SERVER=10.1.2.3:7877"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn e2e_without_docker_exits_2_and_says_it_is_not_a_pass() {
+    let empty = std::env::temp_dir().join(format!("xtask e2e empty {}", std::process::id()));
+    std::fs::create_dir_all(&empty).expect("temp dir");
+    let output = xtask()
+        .arg("e2e")
+        .current_dir(workspace_root())
+        .env("PATH", &empty)
+        // Windows also looks for `docker.exe` outside PATH (system directories, the
+        // application directory), so a runner with Docker installed may still find
+        // it. Point it at a daemon address nothing listens on: found or not, there
+        // is no working daemon.
+        .env("DOCKER_HOST", "tcp://127.0.0.1:1")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("DOCKER_GID")
+        .output()
+        .expect("spawn xtask");
+    let _ = std::fs::remove_dir_all(&empty);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a Docker daemon") && stderr.contains("not a pass"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("cargo test"));
+}
+
+#[test]
+fn e2e_documents_its_flags() {
+    let output = xtask()
+        .args(["e2e", "--help"])
+        .output()
+        .expect("spawn xtask");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--dry-run") && help.contains("--server-host <HOST>"),
+        "{help}"
+    );
 }
 
 #[test]

@@ -167,6 +167,10 @@ reviewer does not read them as omissions:
   ticket are deferred; see `docs/security-notes.md`.
   `space-net/src/crypto.rs`'s "pinning real certificates is an orchestrator
   (Phase 3) concern" line remains true: no certificate is pinned.
+  **Update:** cluster certificate pinning is now implemented on the
+  orchestrator and shard side (orchestrator control/player ports, shard to
+  orchestrator, shard to shard); client-side verification is still open. See
+  "Cluster certificate pinning" in `docs/security-notes.md`.
 * **Cross-host scheduling.** The launcher places shards on one Docker host.
   Multi-host placement is a `Launcher` impl detail and is out of scope.
 
@@ -203,6 +207,15 @@ impl PersistentShardIdAllocator {
   the id is not present in the launch spec.
 
 ### 3.2 Topology and split geometry (`topology.rs`, pure)
+
+> **Changed since (`docs/plan-sharding.md` §1).** A region may now be carved
+> out of any enclosing region at any depth down to one cell
+> (`topology::carve_plan`; the octant split below is the special case and
+> keeps its size floor), so `SPLIT_MAX_DEPTH` and the ceiling it stood for
+> are gone: `validate` accepts every node `validate_node` does, depth 64
+> included. A merge gives a region back to the **nearest enclosing** region's
+> owner, which need not be its parent node, and §3.3's recipient rule is now
+> "every shard of the published map, plus every owner the change names".
 
 Geometry arithmetic first, because it is easy to get wrong:
 `NodeRef::size_m(d) = CELL_SIZE × 2^(64−d)` with `CELL_SIZE = 1024 m`, so
@@ -395,6 +408,11 @@ what blocks. Each task ends with `cargo xtask ci` green (F15) — nothing is
 Critical path: **P3.1 → P3.6 → P3.7 → P3.10 → P3.11**. P3.0 gates only the
 Docker claim, not the logic.
 
+**P3.0 as built:** `xtask e2e` and the `docker-e2e` job do not run the spike binary:
+by the time they were written the `DockerLauncher` (P3.8) and the compose stack
+(P3.12) existed, so the check starts that stack and flies a player from one shard
+container to the next (`deploy/README.md`, "The end-to-end check").
+
 ---
 
 ## 5. Acceptance tests
@@ -517,10 +535,12 @@ Phase 3 is done when:
 5. §6 lists no open risk without a mitigation, and this document is updated to
    record anything that changed during implementation.
 
-## Deferred: bollard DockerLauncher
+## Implemented: DockerLauncher (without bollard)
 
-**Status: deferred, by lead authorization.** The `bollard`-backed `DockerLauncher`
-(P3.8) is **not** implemented. `bollard` and its entire hyper/http/futures
+**Status: implemented.** `launcher/docker.rs` is a full `DockerLauncher` that
+speaks hand-rolled HTTP/1.1 over the Docker socket; it does not use `bollard`
+(no new dependency). The text below is the original history of why `bollard`
+was dropped, kept for context. At that time `bollard` and its entire hyper/http/futures
 dependency tree are absent from the offline cargo cache
 (`cargo metadata --offline` → "no matching package named `bollard`"; F17's
 `--no-default-features --features http` workaround resolved only inside the

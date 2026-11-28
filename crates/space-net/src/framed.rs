@@ -25,6 +25,22 @@ use quinn::{Connection, RecvStream};
 use space_protocol::codec::{FRAME_HEADER_LEN, MAX_FRAME_SIZE};
 use space_protocol::Message;
 
+/// The largest payload the **first** frame of a connection — a
+/// [`space_protocol::Hello`] — may declare, in bytes.
+///
+/// A hello is a tag, a version and one token: about 60 bytes from a player
+/// (`space-client-<unique>`), and `shard:<id>:<peer token>` between shards —
+/// under 100 bytes with a generated peer token, and 1 051 bytes at most with
+/// a configured one (the orchestrator refuses a peer token over
+/// [`MAX_SECRET_LEN`] characters at startup). Four times that is headroom,
+/// not an invitation: the general frame limit is 1 MiB, and before this cap a
+/// stranger's first eight bytes made the receiver allocate all of it.
+pub const MAX_HELLO_PAYLOAD: usize = 4 * 1024;
+
+/// The longest shared secret (a cluster's peer token) that is certain to fit
+/// a hello ([`MAX_HELLO_PAYLOAD`]) with room to spare, in bytes.
+pub const MAX_SECRET_LEN: usize = 1024;
+
 /// Which transport path a message uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageClass {
@@ -204,12 +220,30 @@ pub async fn recv_stream_message(conn: &Connection) -> Result<Option<Message>, i
 /// [`space_protocol::CodecError`] (wrapped in an [`io::Error`]) on an oversized,
 /// truncated or otherwise invalid frame; I/O errors on transport failure.
 pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Message>, io::Error> {
+    read_frame_capped(stream, MAX_FRAME_SIZE).await
+}
+
+/// [`read_frame`] for a frame whose payload may be at most `max_payload`
+/// bytes (never more than [`MAX_FRAME_SIZE`]): a larger declared length is
+/// refused from the header alone, before anything is allocated for it.
+///
+/// This is what reads the **first** frame of a connection
+/// ([`MAX_HELLO_PAYLOAD`]): whoever sends it has proved nothing yet, and a
+/// megabyte per five header bytes is not something to hand a stranger.
+///
+/// # Errors
+///
+/// As [`read_frame`].
+pub async fn read_frame_capped(
+    stream: &mut RecvStream,
+    max_payload: usize,
+) -> Result<Option<Message>, io::Error> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     if !read_exact_opt(stream, &mut header).await? {
         return Ok(None);
     }
     let declared = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    if declared > MAX_FRAME_SIZE {
+    if declared > max_payload.min(MAX_FRAME_SIZE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             space_protocol::CodecError::Oversized { declared }.to_string(),

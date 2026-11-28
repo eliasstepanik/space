@@ -18,6 +18,7 @@ members = [
     "crates/space-mcp-client",
     "crates/space-harness",
     "crates/space-scene",
+    "crates/space-test-support",
 ]
 
 [workspace.package]
@@ -37,6 +38,8 @@ space-sim = { path = "crates/space-sim" }
 space-scene = { path = "crates/space-scene" }
 space-render = { path = "crates/space-render" }
 space-stream = { path = "crates/space-stream", default-features = false }
+# Test helpers shared across crates (dev-dependency only; depends on no workspace crate).
+space-test-support = { path = "crates/space-test-support" }
 # Wire format: `serde` (derive) + `bincode` 2.x, both pure Rust.
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", default-features = false, features = ["std", "serde"] }
@@ -55,6 +58,10 @@ bincode = { version = "2", default-features = false, features = ["std", "serde"]
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# `ring` is also a direct dependency of space-net now (same sanctioned exception):
+# PBKDF2 for the cluster CA seed and the Ed25519 public key of the cluster CA.
+# It is the version rustls/quinn/rcgen already build, so Cargo.lock gains nothing.
+ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # `quinn::Connection::send_datagram` takes a `bytes::Bytes`.
 bytes = "1"
@@ -135,6 +142,13 @@ lunita = "=0.1.2"
 # with it every simulated trajectory, so an upgrade is a reviewed change.
 rapier3d-f64 = { version = "0.36", default-features = false, features = ["dim3", "f64", "std", "block-solver", "enhanced-determinism"] }
 
+# Property tests (dev-dependency only: the frame decoder and the handoff guarantees). Pure
+# Rust. Default features are off: `fork` and `timeout` would add `rusty-fork` and `tempfile`
+# (a child process per case), which the tests do not need. The tests run it with a fixed seed
+# and without regression files, so a failure is the same on every run.
+# It adds these crates to the lockfile: proptest, core_detect, rand_xorshift, unarray (regex-syntax, rand and chacha20 were already there).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [workspace.lints.cargo]
 # `space-world` in [workspace.dependencies] is reserved for the later Phase-1
 # crates that build on it.
@@ -162,6 +176,24 @@ opt-level = 3
 
 [profile.dev.package.space-stream]
 opt-level = 3
+
+# The physics. The shard tests that run the demo area on four shards step it
+# for minutes of simulated time (`space-server/tests/four_cells.rs`), and at
+# opt-level 0 the solver and the collision detection are where that time goes.
+# `space-sim` is the glue around them (it reads and writes every body every
+# tick). No dependency is added or changed by this: two crates the workspace
+# already uses are built optimised once, and one small crate of ours. Measured
+# on that test file: 6.7 s -> 0.84 s per 300 ticks. Floating-point results do
+# not depend on the opt-level (no fast-math), so trajectories are the same in
+# debug and release.
+[profile.dev.package.rapier3d-f64]
+opt-level = 3
+
+[profile.dev.package.parry3d-f64]
+opt-level = 3
+
+[profile.dev.package.space-sim]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

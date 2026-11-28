@@ -82,10 +82,10 @@ pub use params::{
     Camera, ForwardParams, GiParams, GpuInstance, Light, MeshInstanceGpu, PostParams, RqParams,
     ToneParams,
 };
-pub use quality::{ParsePresetError, QualityPreset, RenderFeatures};
+pub use quality::{ParsePresetError, QualityPreset, RayBudget, RenderFeatures};
 pub use scene::{
-    cube_mesh, icosphere_mesh, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH, SHAPE_BOX,
-    SHAPE_SPHERE, STAR_RADIUS_M,
+    cube_mesh, icosphere_mesh, occludes_off_screen, CameraPose, Scene, SceneLight, BOX_LOD_DEPTH,
+    OCCLUDER_ANGLE, OCCLUDER_RANGE, SHAPE_BOX, SHAPE_SPHERE, STAR_RADIUS_M,
 };
 pub use swapchain::{PresentOutcome, Swapchain, SwapchainConfig, WindowHandles};
 pub use texture::Texture;

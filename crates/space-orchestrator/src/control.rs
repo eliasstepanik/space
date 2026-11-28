@@ -6,14 +6,19 @@
 //! a socket.
 //!
 //! The handlers implemented in this slice:
-//! * [`ControlPlane::handle_shard_hello`] — confirm the id (the reserved root
-//!   owner, a restarting owner, or the id a split allocated for its child; a
-//!   hello never allocates one), return a [`ShardWelcome`] carrying the current
-//!   map and an issued `peer_token`. Only the protocol version and the cluster name are
-//!   checked on the way in, and the `peer_token` is **not enforced** by anyone
-//!   today (shards never present it; `Shard::peer_message` checks map membership
-//!   only). The control port binds to loopback by default, which is the only
-//!   mitigation. See `docs/security-notes.md`.
+//! * [`ControlPlane::check_credentials`] — the way in: the **cluster secret**
+//!   when one is required (one was configured, or the control port is not on
+//!   loopback), compared in constant time and checked first; then the cluster
+//!   name.
+//! * [`ControlPlane::handle_shard_hello`] — a hello that *claims* what the
+//!   published map already says: the reserved root (by a region-less hello, or
+//!   by its id), or an owner's first registration. It confirms the id and
+//!   returns a [`ShardWelcome`] carrying the current map and the cluster's
+//!   `peer_token` (which shards present to each other and refuse a peer
+//!   without). It never allocates an id and never creates a region: a shard
+//!   that registers without a region once the root is taken is given one by
+//!   [`crate::orchestrator::Orchestrator::handle_shard_hello`], through an
+//!   epoch change.
 //! * [`ControlPlane::handle_load_report`] — feed the autoscaler.
 //! * [`ControlPlane::handle_admin`] — the admin verbs. Verbs whose machinery
 //!   arrives with a later slice return an honest [`AdminReply::Refused`] rather
@@ -22,16 +27,18 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use space_net::Conn;
 use space_protocol::control::{AdminCommand, AdminReply, LoadReport};
 use space_protocol::shard::{EpochAck, ShardId, ShardMap, ShardRegion};
-use space_protocol::{Message, SceneAck, ShardHello, ShardWelcome};
-use tokio::sync::{mpsc, Mutex};
+use space_protocol::{Message, RejectReason, SceneAck, ShardHello, ShardWelcome};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::autoscale::Autoscaler;
-use crate::config::OrchestratorConfig;
+use crate::config::{OrchestratorConfig, Secret};
 use crate::epoch::EpochPublisher;
 use crate::ids::PersistentShardIdAllocator;
 use crate::scene::SceneStore;
@@ -47,8 +54,24 @@ pub struct ControlPlane {
     pub publisher: EpochPublisher,
     /// The autoscaler (H14).
     pub autoscaler: Autoscaler,
-    /// The shared peer secret handed to every shard on welcome.
-    pub peer_token: String,
+    /// The shared peer secret handed to every shard on welcome. Shards present
+    /// it to each other and refuse a peer hello without it; empty = none is
+    /// issued (peers are then accepted on map membership alone). A
+    /// [`Secret`]: this struct derives `Debug`, and so does the orchestrator
+    /// around it.
+    pub peer_token: Secret,
+    /// The cluster secret: what a `ShardHello` must carry when
+    /// [`Self::secret_required`], and what the orchestrator hands the shards it
+    /// starts itself **only when** a hello needs it (otherwise they are handed
+    /// none). The configured one, or one [`crate::boot::boot`] generated;
+    /// empty when there is neither.
+    cluster_secret: Secret,
+    /// The cluster's certificate authority, derived from the cluster secret;
+    /// see [`Self::cluster_trust`]. Its `Debug` shows the pin only.
+    trust: Option<space_net::ClusterTrust>,
+    /// Whether a hello without the right cluster secret is refused
+    /// ([`OrchestratorConfig::secret_required`]).
+    secret_required: bool,
     /// The cluster's scene, its revision and where it is persisted. Not part
     /// of the map and not published through the epoch protocol
     /// ([`crate::scene`]). [`Self::new`] starts it in memory at the configured
@@ -69,15 +92,101 @@ impl ControlPlane {
         publisher: EpochPublisher,
         peer_token: String,
     ) -> Self {
-        Self {
+        let mut plane = Self {
             scene: SceneStore::in_memory(config.initial_scene),
+            cluster_secret: config.cluster_secret.clone().unwrap_or_default(),
+            secret_required: config.secret_required(),
+            trust: None,
+            autoscaler: Autoscaler::with_config(config.scale),
             config,
             ids,
             publisher,
-            autoscaler: Autoscaler::new(),
-            peer_token,
+            peer_token: Secret::new(peer_token),
             unclaimed_root_owner: None,
+        };
+        plane.trust = plane.derive_trust();
+        plane
+    }
+
+    /// The one rule for [`Self::cluster_trust`]: a trust when a secret is
+    /// required and there is one, none otherwise.
+    fn derive_trust(&self) -> Option<space_net::ClusterTrust> {
+        if self.secret_required {
+            space_net::ClusterTrust::from_secret(self.cluster_secret.expose())
+        } else {
+            None
         }
+    }
+
+    /// The cluster's certificate authority: what the control port and the
+    /// player port present certificates from, and whose pin the operator is
+    /// told ([`space_net::ClusterTrust::pin`]).
+    ///
+    /// `Some` exactly when [`Self::secret_required`] and the cluster secret is
+    /// not empty; `None` on a loopback control port with nothing configured,
+    /// where the links are not pinned.
+    #[must_use]
+    pub fn cluster_trust(&self) -> Option<&space_net::ClusterTrust> {
+        self.trust.as_ref()
+    }
+
+    /// The cluster secret (see the field docs); empty when there is none.
+    #[must_use]
+    pub fn cluster_secret(&self) -> &Secret {
+        &self.cluster_secret
+    }
+
+    /// Whether a `ShardHello` must carry the cluster secret.
+    #[must_use]
+    pub fn secret_required(&self) -> bool {
+        self.secret_required
+    }
+
+    /// Use `secret` as the cluster secret when none was configured: what
+    /// [`crate::boot::boot`] does with the one it generates, so that the
+    /// shards the orchestrator starts have one to present when a hello needs
+    /// it (it is not handed to them otherwise). A configured secret is never
+    /// replaced. The cluster trust is derived again.
+    pub fn set_generated_secret(&mut self, secret: Secret) {
+        if self.config.cluster_secret.is_none() {
+            self.cluster_secret = secret;
+        }
+        self.trust = self.derive_trust();
+    }
+
+    /// The way in for every `ShardHello`: when a secret is required it must
+    /// carry the cluster secret, and the cluster it names must be this one.
+    /// Both refusals are final.
+    ///
+    /// **The secret is checked first.** Whoever does not hold it is told
+    /// [`HelloRefusal::Unauthorized`] and nothing else — in particular not
+    /// what this cluster is called, which the refusal for a wrong cluster
+    /// names. (Where no secret is required — a loopback control port with
+    /// none configured — every local process is trusted with that anyway.)
+    ///
+    /// The secret is compared in constant time and never appears in the
+    /// refusal (or anywhere else).
+    ///
+    /// # Errors
+    ///
+    /// [`HelloRefusal::Unauthorized`] for a missing or wrong secret,
+    /// [`HelloRefusal::Refused`] for another cluster.
+    pub fn check_credentials(&self, hello: &ShardHello) -> Result<(), HelloRefusal> {
+        if self.secret_required
+            && !space_net::constant_time_eq(
+                hello.secret.as_bytes(),
+                self.cluster_secret.expose().as_bytes(),
+            )
+        {
+            return Err(HelloRefusal::Unauthorized);
+        }
+        if hello.cluster != self.config.cluster {
+            return Err(HelloRefusal::Refused(format!(
+                "hello names cluster {:?}, this is {:?}",
+                hello.cluster, self.config.cluster
+            )));
+        }
+        Ok(())
     }
 
     /// Record `shard` as the pre-allocated root owner no live shard has claimed
@@ -99,26 +208,39 @@ impl ControlPlane {
         self.publisher.published()
     }
 
-    /// Handle a `ShardHello`: allocate or confirm the id, place the region, and
-    /// answer with the id, region, current map and peer token.
+    /// Handle a `ShardHello` that **claims** what the published map already
+    /// says, and answer with the id, region, current map and peer token.
     ///
-    /// A hello naming a different cluster is refused (the caller drops the
-    /// connection); a hello claiming a region already owned by another shard is
-    /// refused (the first claim wins) — that includes a region-less hello, which
-    /// means "the root"; a hello with `ShardId::NONE` for a node the published
-    /// map does not name is refused too (a region is created by a split, whose
-    /// child arrives with the id allocated for it — an anonymous claim would
-    /// get an id and a region no map ever carried). The one exception is the
-    /// pre-allocated root owner ([`Self::set_unclaimed_root_owner`]): the first
-    /// anonymous (or by-id) hello for the root adopts that id, since no shard
-    /// was ever launched for it. No hello allocates an id.
+    /// Three hellos are welcomed here:
     ///
-    /// A `NONE` hello for an owned node is idempotent when it advertises the
-    /// owner's own endpoint (the same process restarting): it gets the same id
-    /// back. A different endpoint is refused. A non-`NONE` claimed id is only
-    /// honoured when it already owns a region or the allocator has already
-    /// issued it, so a hello cannot push the persistent counter to an
-    /// implausible value.
+    /// * the first hello for the root — region-less and id-less, naming the
+    ///   root node, or naming the reserved id — adopts the pre-allocated root
+    ///   owner ([`Self::set_unclaimed_root_owner`]), since no shard was ever
+    ///   launched for it;
+    /// * a hello naming an id that **owns the node it names** (the root when
+    ///   it names none) is confirmed as that owner.
+    ///
+    /// Everything else is refused, and every refusal here is final: a hello
+    /// naming another cluster; a claim on a node somebody else owns (the first
+    /// claim wins) — that includes a region-less hello, which at this level
+    /// means "the root"; a claim on a node the published map does not name,
+    /// with or without an id (a region comes into being through an epoch
+    /// change the orchestrator proposes for a shard that registered without
+    /// one — never through a claim, which would get a region no map ever
+    /// carried). No hello allocates an id here, and none moves the persistent
+    /// counter beyond confirming an id the map already holds.
+    ///
+    /// What this handler does **not** decide is what a shard that registers
+    /// with neither id nor region gets once the root is taken: that is
+    /// [`crate::orchestrator::Orchestrator::handle_shard_hello`] (a dead
+    /// shard's regions, the node a split asked for, or the next layout cell),
+    /// which also turns a shard coming back at an owner's address into that
+    /// owner's replacement **under a new id** — it used to get the same id
+    /// back here, and with it a guid counter that starts over.
+    ///
+    /// # Errors
+    ///
+    /// Why the hello is refused, for the shard to print.
     pub fn handle_shard_hello(&mut self, hello: &ShardHello) -> Result<ShardWelcome, String> {
         if hello.cluster != self.config.cluster {
             return Err(format!(
@@ -143,106 +265,64 @@ impl ControlPlane {
                     .iter()
                     .any(|r| r.node == node && r.shard == *owner)
         });
+        let owner_of_node = self
+            .map()
+            .regions
+            .iter()
+            .find(|r| r.node == node)
+            .map(|r| r.shard);
         let shard = if let Some(owner) = adoptable {
-            // The owner was allocated at startup, so this is normally a no-op;
-            // it keeps the "every confirmed id is reserved" invariant local.
-            self.ids
-                .reserve(owner)
-                .map_err(|e| format!("could not persist the reservation of {}: {e}", owner.0))?;
-            self.unclaimed_root_owner = None;
-            let mut endpoints = std::collections::BTreeMap::new();
-            endpoints.insert(owner, hello.endpoint);
-            self.publisher.set_endpoints(&endpoints);
-            owner
-        } else if let Some(owner) = self.incumbent_for_restart(hello, node) {
-            // The same process re-saying hello (it crashed and restarted with
-            // no id): a NONE hello whose endpoint is the one the node's owner
-            // already holds *is* that owner. Same id back, no allocation, no
-            // reservation; the endpoint is refreshed (a no-op by construction,
-            // but it keeps the published map the single source of truth).
-            let mut endpoints = std::collections::BTreeMap::new();
-            endpoints.insert(owner, hello.endpoint);
-            self.publisher.set_endpoints(&endpoints);
             owner
         } else {
-            // The first claim on a node wins; a conflicting claim (including a
-            // second region-less hello for the root) is refused, and refused
-            // before any id is allocated or reserved.
-            if self
-                .map()
-                .regions
-                .iter()
-                .any(|r| r.node == node && r.shard != hello.shard)
-            {
-                return Err(format!("region at depth {} is already owned", node.depth));
+            match owner_of_node {
+                // The node is not in the published map. Welcoming such a claim
+                // used to hand back a region that was never published: the
+                // shard's own map (the welcome's) did not name it, so it
+                // handed every ship it was given straight back to the map's
+                // real owner, and two shards could "own" the same node.
+                None => {
+                    return Err(format!(
+                        "the node at depth {} index {:?} is not in the published map; a region \
+                         is given to a shard that registers without one, not claimed",
+                        node.depth, node.index
+                    ));
+                }
+                // The first claim on a node wins; a conflicting claim
+                // (including a second region-less hello for the root) is
+                // refused before anything is reserved.
+                Some(owner) if owner != hello.shard => {
+                    return Err(format!("region at depth {} is already owned", node.depth));
+                }
+                Some(owner) => owner,
             }
-            if hello.shard == ShardId::NONE {
-                // An anonymous hello that reached this point names a node the
-                // published map does not contain (the root-adoption, restart
-                // and already-owned cases are all handled above). Welcoming it
-                // used to allocate an id and hand back a region that was never
-                // published: the shard's own map (the welcome's) did not name
-                // it, so it handed every ship it was given straight back to the
-                // map's real owner, two shards could "own" the same node, and
-                // every restart burned another id. A region comes into being
-                // through a split (whose child says hello with the id the
-                // orchestrator allocated for it), never through a claim.
-                return Err(format!(
-                    "the node at depth {} index {:?} is not in the published map; \
-                     a new region is created by a split, not by claiming it",
-                    node.depth, node.index
-                ));
-            }
-            // A relaunch (or an orchestrated child booting with the id the
-            // orchestrator allocated for it): confirm the id and make sure the
-            // allocator never hands it out again. The endpoint may legitimately
-            // differ from a placeholder the split staged, so the known-id path
-            // always confirms and lets the region endpoint be refreshed below.
-            //
-            // Only a *plausible* id may move the persistent counter: one that
-            // already owns a region, or one the allocator has already issued.
-            // Anything higher would let a single packet poison the counter
-            // (e.g. claiming u32::MAX - 1 exhausts the id space).
-            let known = self.map().regions.iter().any(|r| r.shard == hello.shard)
-                || u64::from(hello.shard.0) < self.ids.peek();
-            if !known {
-                return Err(format!(
-                    "shard id {} was never issued by this orchestrator",
-                    hello.shard.0
-                ));
-            }
-            self.ids.reserve(hello.shard).map_err(|e| {
-                format!(
-                    "could not persist the reservation of {}: {e}",
-                    hello.shard.0
-                )
-            })?;
-            hello.shard
         };
-        let region = ShardRegion::new(node, shard, hello.endpoint);
+        // The id owns a region of the map, so it was issued; reserving it is
+        // normally a no-op and keeps the "every confirmed id is reserved"
+        // invariant local (a map built by hand may name an id the counter has
+        // not passed).
+        self.ids
+            .reserve(shard)
+            .map_err(|e| format!("could not persist the reservation of {}: {e}", shard.0))?;
+        if adoptable.is_some() {
+            // Claimed (a refused hello leaves the reservation intact). The map
+            // held a placeholder for the root's address until now: the live
+            // shard's goes in at once, so the very first welcome and every
+            // client's map name it.
+            self.unclaimed_root_owner = None;
+            let endpoints = std::collections::BTreeMap::from([(shard, hello.endpoint)]);
+            let client_endpoints =
+                std::collections::BTreeMap::from([(shard, client_endpoint_of(hello))]);
+            self.publisher.set_endpoints(&endpoints, &client_endpoints);
+        }
+        let region = ShardRegion::new(node, shard, hello.endpoint)
+            .with_client_endpoint(client_endpoint_of(hello));
         Ok(ShardWelcome {
             shard,
             region,
             shard_map: self.map().clone(),
-            peer_token: self.peer_token.clone(),
+            peer_token: self.peer_token.expose().to_owned(),
+            tick_origin_us: self.config.tick_origin_us,
         })
-    }
-
-    /// The owner of `node` when `hello` is that owner restarting: a `NONE`
-    /// hello advertising the very endpoint the owner already holds.
-    fn incumbent_for_restart(
-        &self,
-        hello: &ShardHello,
-        node: space_world::NodeRef,
-    ) -> Option<ShardId> {
-        if hello.shard != ShardId::NONE {
-            return None;
-        }
-        self.map()
-            .regions
-            .iter()
-            .find(|r| r.node == node && r.endpoint == hello.endpoint)
-            .map(|r| r.shard)
     }
 
     /// Handle a `LoadReport`: feed the autoscaler and return its decision.
@@ -299,6 +379,85 @@ impl ControlPlane {
     }
 }
 
+/// Where the players of the shard saying `hello` are sent: the client
+/// endpoint it asks for, else the address it advertises
+/// ([`ShardRegion::client_endpoint`]; an unspecified IP there means "the host
+/// the player dialed").
+#[must_use]
+pub fn client_endpoint_of(hello: &ShardHello) -> SocketAddr {
+    hello.client_endpoint.unwrap_or(hello.endpoint)
+}
+
+/// `hello` as the orchestrator records it when its control connection comes
+/// from `seen_from`: an advertised endpoint **without an IP**
+/// (`0.0.0.0:<port>`, `[::]:<port>` — a shard in a container that does not
+/// know its own address) is given the IP the orchestrator sees the shard at.
+/// The client endpoint is left as it is: there the unspecified IP has a
+/// meaning of its own. A hello that names a real address is returned
+/// unchanged, whatever `seen_from` is.
+#[must_use]
+pub fn as_seen_from(hello: &ShardHello, seen_from: std::net::IpAddr) -> ShardHello {
+    let mut hello = hello.clone();
+    if hello.endpoint.ip().is_unspecified() && !seen_from.is_unspecified() {
+        hello.endpoint.set_ip(seen_from.to_canonical());
+        if let Some(claim) = hello.region.as_mut() {
+            if claim.endpoint.ip().is_unspecified() {
+                claim.endpoint.set_ip(seen_from.to_canonical());
+            }
+        }
+    }
+    hello
+}
+
+/// Why a `ShardHello` was not answered with a welcome.
+///
+/// One refusal is not final: [`HelloRefusal::Wait`]. The orchestrator changes
+/// the map one step at a time, so a shard that registers while a change is in
+/// flight is told to ask again — as a [`RejectReason::Draining`] on the wire.
+/// Everything else ends the shard that asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelloRefusal {
+    /// Not yet, and why: ask again after a pause.
+    Wait(String),
+    /// The cluster secret was missing or wrong. Final.
+    Unauthorized,
+    /// The cluster has as many shards (or the map as many regions) as it may.
+    /// Final.
+    Full(String),
+    /// Refused for the reason given (another cluster, a claim the map does
+    /// not support, no region left to give). Final.
+    Refused(String),
+}
+
+impl HelloRefusal {
+    /// Whether the shard should give up (everything but [`Self::Wait`]).
+    #[must_use]
+    pub const fn is_final(&self) -> bool {
+        !matches!(self, HelloRefusal::Wait(_))
+    }
+
+    /// The refusal as it goes on the wire.
+    #[must_use]
+    pub fn reject_reason(&self) -> RejectReason {
+        match self {
+            HelloRefusal::Wait(_) => RejectReason::Draining,
+            HelloRefusal::Unauthorized => RejectReason::Unauthorized,
+            HelloRefusal::Full(_) => RejectReason::Full,
+            HelloRefusal::Refused(why) => RejectReason::Other(why.clone()),
+        }
+    }
+}
+
+impl core::fmt::Display for HelloRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HelloRefusal::Wait(why) => write!(f, "not yet ({why}); ask again"),
+            HelloRefusal::Unauthorized => f.write_str("the cluster secret is missing or wrong"),
+            HelloRefusal::Full(why) | HelloRefusal::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The async control front end (plan §3.5).
 // ---------------------------------------------------------------------------
@@ -320,28 +479,115 @@ const OUT_QUEUE: usize = 256;
 /// connection for as long as it liked.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long after a `ShardHello` arrived the run loop still answers it
+/// ([`hello_is_stale`]).
+///
+/// A shard waits [`space_net::HANDSHAKE_TIMEOUT`] (5 s) for the answer to its
+/// hello, then closes the connection and asks again on a new one. An answer
+/// that sets out later than a second before that is not going to be read:
+/// the hello is **stale**, and serving it would give an id, a region and an
+/// epoch to a connection nobody is on.
+pub const HELLO_STALE_AFTER: Duration = Duration::from_secs(4);
+
+/// Whether a `ShardHello` the run loop gets to `age` after it arrived, on a
+/// connection that is `closed` or still open, is one **nobody waits for any
+/// more**: the shard that sent it has given up on it (or is about to) and
+/// asks again on a new connection.
+///
+/// The run loop normally answers a hello within a beat. It gets to one this
+/// late only when it was held up for seconds — a starved host, a slow disk
+/// under the id counter. Such a hello is told "not yet" and changes nothing
+/// ([`crate::orchestrator::Orchestrator::note_abandoned_hello`] says what
+/// welcoming it used to cost).
+#[must_use]
+pub fn hello_is_stale(age: Duration, closed: bool) -> bool {
+    closed || age >= HELLO_STALE_AFTER
+}
+
 /// Application close code for a control connection that never sent its hello.
 const NO_HELLO_CLOSE_CODE: u32 = 0x21;
 
+/// Application close code for a control connection the orchestrator closes
+/// because it has stopped the shard (merged away, replaced, its epoch aborted).
+/// The shard sees its link lost and stops itself.
+const SHARD_STOPPED_CLOSE_CODE: u32 = 0x22;
+
+/// Application close code for a control connection whose `ShardHello` the run
+/// loop never answered (it is stopping).
+const NO_VERDICT_CLOSE_CODE: u32 = 0x23;
+
+/// What the run loop decided about a connection's `ShardHello`: the id the
+/// connection is admitted as — for its whole life — or the refusal to deliver
+/// before the connection is closed.
+pub type Admission = Result<ShardId, RejectReason>;
+
 /// An event the front end hands to the run loop.
+///
+/// # Who may say what
+///
+/// The cluster secret gates the hello, and **the hello gates everything
+/// else**. A connection's task hands its `ShardHello` to the run loop and then
+/// waits for the verdict ([`Admission`]). Refused, the connection is told why
+/// and closed; nothing else it sent is ever read. Admitted, it is admitted as
+/// **one shard id**, and from then on a report or an ack is passed on only if
+/// it names that id — `from` below is that id, taken from the connection and
+/// never from the message. (These messages name their own sender; believing
+/// that let anybody who could reach the control port report load for a shard,
+/// acknowledge an epoch on its behalf, or confirm a scene for it.)
 #[derive(Debug)]
 pub enum Inbound {
     /// A shard wants an id + region + map. `reply` is the shard's outbound
     /// channel: the run loop sends the [`ShardWelcome`] on it and registers it
     /// for future epoch traffic.
     Hello {
-        /// The hello.
-        hello: ShardHello,
+        /// The hello (boxed: it is by far the largest thing an event
+        /// carries, and reports and acks are what the queue mostly holds).
+        hello: Box<ShardHello>,
         /// The shard's outbound sender (the run loop registers it under the id
-        /// the welcome names).
+        /// the welcome names). Nothing put into it is written before the
+        /// connection is admitted.
         reply: mpsc::Sender<Message>,
+        /// The connection the hello arrived on: its remote address is where
+        /// the shard is seen from, and the run loop keeps it with the sender so
+        /// it can close the link of a shard it stops
+        /// ([`ControlServer::close_link`]).
+        conn: space_net::Conn,
+        /// Where the run loop says what became of the hello. Dropping it
+        /// without an answer closes the connection.
+        verdict: oneshot::Sender<Admission>,
+        /// When the hello arrived: the run loop does not serve one it gets
+        /// to too late ([`hello_is_stale`]).
+        received: std::time::Instant,
     },
     /// A shard's periodic load report.
-    Report(LoadReport),
+    Report {
+        /// The shard the connection it arrived on was admitted as.
+        from: ShardId,
+        /// The report; it names `from`.
+        report: LoadReport,
+    },
     /// A shard acknowledged a prepared epoch.
-    Ack(EpochAck),
+    Ack {
+        /// The shard the connection it arrived on was admitted as.
+        from: ShardId,
+        /// The ack; it names `from`.
+        ack: EpochAck,
+    },
     /// A shard said which scene it runs (its answer to a `SceneSet`).
-    SceneAck(SceneAck),
+    SceneAck {
+        /// The shard the connection it arrived on was admitted as.
+        from: ShardId,
+        /// The ack; it names `from`.
+        ack: SceneAck,
+    },
+}
+
+/// A registered shard's way out: its FIFO sender and, when it registered over
+/// a real connection, that connection.
+#[derive(Debug)]
+struct Registered {
+    sender: mpsc::Sender<Message>,
+    conn: Option<space_net::Conn>,
 }
 
 /// The orchestrator's QUIC front end.
@@ -350,22 +596,51 @@ pub enum Inbound {
 /// connects (the ordinary [`space_net`] hello handshake), sends a [`ShardHello`],
 /// and receives a [`ShardWelcome`] carrying its id, region, map and peer token.
 /// Thereafter the shard sends [`LoadReport`]s, [`EpochAck`]s and [`SceneAck`]s
-/// and receives epoch messages and the cluster's scene. The front end **only
-/// moves frames**: every decision is a call
+/// and receives epoch messages and the cluster's scene. A connection whose
+/// hello is refused is told why and closed; one that is welcomed speaks for
+/// the id it was welcomed as and for no other ([`Inbound`]). The front end
+/// **only moves frames**: every decision is a call
 /// into [`ControlPlane`] on the run loop. It mirrors `space_server::net::ShardNet`
 /// (one task per connection, a FIFO sender per shard) so reviewers see one idiom.
 #[derive(Debug)]
 pub struct ControlServer {
     endpoint: quinn::Endpoint,
-    /// One FIFO sender per registered shard (epoch messages go out through it).
-    registry: Arc<Mutex<HashMap<ShardId, mpsc::Sender<Message>>>>,
+    /// One FIFO sender per registered shard (epoch messages go out through
+    /// it), and the connection it writes to when the shard registered over one.
+    registry: Arc<Mutex<HashMap<ShardId, Registered>>>,
     /// The run loop's inbound receiver.
     inbound: Arc<Mutex<mpsc::Receiver<Inbound>>>,
     /// A clone of the inbound sender, handed to each connection task.
     tx: mpsc::Sender<Inbound>,
     /// How long a connection may take to send its `ShardHello`.
     hello_timeout: Duration,
+    /// Reports and acks that named another shard than the one their
+    /// connection was admitted as, and were dropped for it
+    /// ([`Self::misattributed`]).
+    misattributed: AtomicU64,
+    /// How many of those are written to standard error (a registered shard
+    /// can send as many as it likes).
+    misattributed_lines: space_net::LogBudget,
+    /// Hellos that were a player's, not a shard's, and were refused
+    /// ([`Self::players_refused`]).
+    players_refused: AtomicU64,
+    /// How many of those are written to standard error (anybody who reaches
+    /// the port can send as many as they like).
+    player_lines: space_net::LogBudget,
 }
+
+/// What a player who dials the control port is told ([`RejectReason::Other`]).
+pub const NOT_THE_PLAYER_PORT: &str =
+    "this is the cluster's control port, which is for shards; players connect to the \
+     orchestrator's player port";
+
+/// How many dropped reports and acks ([`ControlServer::misattributed`]) are
+/// written to standard error per [`MISATTRIBUTED_WINDOW`]; the rest are
+/// counted and summed up in the next line that is.
+pub const MISATTRIBUTED_LINES: u32 = 3;
+
+/// The window [`MISATTRIBUTED_LINES`] applies to.
+pub const MISATTRIBUTED_WINDOW: Duration = Duration::from_secs(10);
 
 impl ControlServer {
     /// Bind the control endpoint on `bind`.
@@ -374,7 +649,24 @@ impl ControlServer {
     ///
     /// [`io::Error`] when the socket cannot be bound.
     pub fn bind(bind: SocketAddr) -> io::Result<Self> {
-        let (config, _cert) = space_net::crypto::make_server_config();
+        Self::bind_trusted(bind, None)
+    }
+
+    /// Bind the control endpoint on `bind`, presenting certificates issued by
+    /// the cluster CA of `trust`; `None` presents a throwaway self-signed one
+    /// ([`Self::bind`]).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the socket cannot be bound.
+    pub fn bind_trusted(
+        bind: SocketAddr,
+        trust: Option<&space_net::ClusterTrust>,
+    ) -> io::Result<Self> {
+        let config = match trust {
+            Some(trust) => trust.server_config(),
+            None => space_net::crypto::make_server_config().0,
+        };
         let endpoint = space_net::server_endpoint(bind, config)?;
         let (tx, rx) = mpsc::channel::<Inbound>(OUT_QUEUE);
         Ok(Self {
@@ -383,7 +675,29 @@ impl ControlServer {
             inbound: Arc::new(Mutex::new(rx)),
             tx,
             hello_timeout: HELLO_TIMEOUT,
+            misattributed: AtomicU64::new(0),
+            misattributed_lines: space_net::LogBudget::new(
+                MISATTRIBUTED_LINES,
+                MISATTRIBUTED_WINDOW,
+            ),
+            players_refused: AtomicU64::new(0),
+            player_lines: space_net::LogBudget::new(MISATTRIBUTED_LINES, MISATTRIBUTED_WINDOW),
         })
+    }
+
+    /// How many hellos on the control port were a player's — a client pointed
+    /// at the wrong port — and were refused with [`NOT_THE_PLAYER_PORT`].
+    #[must_use]
+    pub fn players_refused(&self) -> u64 {
+        self.players_refused.load(Ordering::Relaxed)
+    }
+
+    /// How many reports and acks were dropped because they named another
+    /// shard than the one the connection they arrived on was admitted as.
+    /// Zero in a cluster of honest shards.
+    #[must_use]
+    pub fn misattributed(&self) -> u64 {
+        self.misattributed.load(Ordering::Relaxed)
     }
 
     /// Use `limit` instead of [`HELLO_TIMEOUT`] as the bound on a connection's
@@ -424,9 +738,53 @@ impl ControlServer {
         self.inbound.lock().await.recv().await
     }
 
-    /// Register `shard`'s outbound sender (called by the run loop after a hello).
+    /// Register `shard`'s outbound sender, with no connection behind it (a
+    /// test wiring a queue by hand).
     pub async fn register(&self, shard: ShardId, sender: mpsc::Sender<Message>) {
-        self.registry.lock().await.insert(shard, sender);
+        self.registry
+            .lock()
+            .await
+            .insert(shard, Registered { sender, conn: None });
+    }
+
+    /// Register `shard`'s outbound sender and the connection it registered
+    /// over (called by the run loop after a hello it welcomed).
+    pub async fn register_link(
+        &self,
+        shard: ShardId,
+        sender: mpsc::Sender<Message>,
+        conn: space_net::Conn,
+    ) {
+        self.registry.lock().await.insert(
+            shard,
+            Registered {
+                sender,
+                conn: Some(conn),
+            },
+        );
+    }
+
+    /// Forget `shard` and **close its control connection**: the orchestrator
+    /// has stopped it (its region was merged away, it was replaced, or the
+    /// change that would have given it a region aborted). A shard does not run
+    /// without its orchestrator, so closing the link is what stops a shard no
+    /// launcher of ours can reach — one started by hand, or by a container
+    /// runtime that will start a fresh one.
+    pub async fn close_link(&self, shard: ShardId) {
+        let registered = self.registry.lock().await.remove(&shard);
+        if let Some(conn) = registered.and_then(|r| r.conn) {
+            conn.close(SHARD_STOPPED_CLOSE_CODE, "stopped by the orchestrator");
+        }
+    }
+
+    /// Where `shard`'s control connection comes from (the address the
+    /// orchestrator sees the shard at), if it registered over one.
+    pub async fn remote_addr(&self, shard: ShardId) -> Option<SocketAddr> {
+        self.registry
+            .lock()
+            .await
+            .get(&shard)
+            .and_then(|r| r.conn.as_ref().map(space_net::Conn::remote_address))
     }
 
     /// Offer `message` to `shard`'s FIFO sender, if it is registered. Returns
@@ -444,7 +802,12 @@ impl ControlServer {
     /// of stopping the orchestrator's clock and every other shard's epoch
     /// traffic behind it.
     pub async fn send_to(&self, shard: ShardId, message: Message) -> bool {
-        let sender = self.registry.lock().await.get(&shard).cloned();
+        let sender = self
+            .registry
+            .lock()
+            .await
+            .get(&shard)
+            .map(|r| r.sender.clone());
         let Some(tx) = sender else {
             return false;
         };
@@ -462,7 +825,8 @@ impl ControlServer {
         }
     }
 
-    /// Forget a shard's sender (after a kill).
+    /// Forget a shard's sender without closing its connection (see
+    /// [`Self::close_link`] for the usual end of a registration).
     pub async fn unregister(&self, shard: ShardId) {
         self.registry.lock().await.remove(&shard);
     }
@@ -471,16 +835,17 @@ impl ControlServer {
     ///
     /// A shard's sender closes when its connection task ends (the peer closed,
     /// the transport timed out, or the writer failed), so "registered and not
-    /// closed" is what the front end knows about liveness. It is an
-    /// observation for the operator view and the event log; no control
-    /// decision is taken on it. Like [`Self::send_to`] this never waits on a
-    /// peer: the registry lock is only ever held for a map operation.
+    /// closed" is what the front end knows about liveness. The run loop hands
+    /// it to [`crate::orchestrator::Orchestrator::note_connected`], which takes
+    /// a registered shard whose link has closed for dead (a shard does not
+    /// outlive its link). Like [`Self::send_to`] this never waits on a peer:
+    /// the registry lock is only ever held for a map operation.
     pub async fn connected(&self) -> Vec<ShardId> {
         self.registry
             .lock()
             .await
             .iter()
-            .filter(|(_, sender)| !sender.is_closed())
+            .filter(|(_, registered)| !registered.sender.is_closed())
             .map(|(shard, _)| *shard)
             .collect()
     }
@@ -491,11 +856,48 @@ impl ControlServer {
             .close(0u32.into(), b"orchestrator shutting down");
     }
 
-    /// Drive one shard's control connection.
+    /// Count — and, a few times a window, say — that a report or an ack
+    /// naming `named` arrived on the connection admitted as `admitted` and was
+    /// dropped.
+    fn drop_misattributed(&self, what: &str, named: ShardId, admitted: ShardId, conn: &Conn) {
+        self.misattributed.fetch_add(1, Ordering::Relaxed);
+        if let Some(held_back) = self.misattributed_lines.admit() {
+            eprintln!(
+                "space-orchestrator: dropped {what} naming {named} that arrived on the control \
+                 connection of {admitted} ({}): a shard speaks for itself only{}",
+                conn.remote_address(),
+                space_net::held_back_note(held_back)
+            );
+        }
+    }
+
+    /// Drive one shard's control connection (see [`Inbound`], "Who may say
+    /// what"): hello, verdict, and only then — and only for the id it was
+    /// admitted as — reports and acks.
     async fn handle_connection(self: Arc<Self>, incoming: quinn::Incoming) {
-        let Ok((conn, _hello)) = space_net::accept_incoming(incoming).await else {
+        let Ok((conn, hello)) = space_net::accept_incoming(incoming).await else {
             return; // refused at the version gate
         };
+        // A shard's transport hello names it a shard (`shard:<id>`, the form
+        // `space_server::net::peer_hello` builds). Anything else is a player
+        // — a client pointed at the control port by mistake — and is told so,
+        // instead of the placeholder welcome below, which a client took for a
+        // shard's and then sat on a world that never came. Nothing is given
+        // away: the port a player is sent to is not named here.
+        if space_server::net::peer_shard_id(&hello.player_token).is_none() {
+            self.players_refused.fetch_add(1, Ordering::Relaxed);
+            if let Some(held_back) = self.player_lines.admit() {
+                eprintln!(
+                    "space-orchestrator: a player's hello arrived on the control port (from {}) \
+                     and was refused: the control port is for shards{}",
+                    conn.remote_address(),
+                    space_net::held_back_note(held_back)
+                );
+            }
+            conn.reject(RejectReason::Other(NOT_THE_PLAYER_PORT.to_owned()))
+                .await;
+            return;
+        }
         // `space_net::connect` blocks until it sees a Welcome; answer the
         // handshake with a placeholder so the shard's connect() completes, then
         // read the real ShardHello on the control stream.
@@ -517,9 +919,47 @@ impl ControlServer {
                 return;
             }
         };
-        // This shard's outbound channel: the run loop registers it and writes
-        // the welcome + every epoch message through it, in order.
+        let received = std::time::Instant::now();
+        // This shard's outbound channel. The run loop gets its only sender: it
+        // registers it under the id it admits the connection as and writes
+        // the welcome and every epoch message through it, in order.
         let (tx, mut rx) = mpsc::channel::<Message>(OUT_QUEUE);
+        let (verdict, admission) = oneshot::channel::<Admission>();
+        let hello = Inbound::Hello {
+            hello: Box::new(hello),
+            reply: tx,
+            conn: conn.clone(),
+            verdict,
+            received,
+        };
+        if self.tx.send(hello).await.is_err() {
+            return; // the run loop is gone
+        }
+        // Nothing else this connection says is read before the verdict is in:
+        // the cluster secret gates the hello, and the hello gates the rest.
+        let admitted = match admission.await {
+            Ok(Ok(shard)) => shard,
+            Ok(Err(reason)) => {
+                // Refused. The reason has to *arrive* — "not yet" is what
+                // makes a shard ask again instead of giving up — so it is
+                // written, finished and given a moment to be read before the
+                // connection is closed (`Conn::reject`; the shard closes as
+                // soon as it has read it). A shard that asks again dials a
+                // new connection, so there is nothing more to read on this
+                // one: whatever else it sent is never looked at.
+                conn.reject(reason).await;
+                return;
+            }
+            Err(_) => {
+                // The run loop let go of the hello without an answer (it is
+                // stopping).
+                conn.close(NO_VERDICT_CLOSE_CODE, "no answer to the ShardHello");
+                return;
+            }
+        };
+        // Admitted, as `admitted` and nobody else, for as long as the
+        // connection lives. What the run loop queued — the welcome first — is
+        // written from here on.
         let writer = {
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -530,19 +970,8 @@ impl ControlServer {
                 }
             })
         };
-        if self
-            .tx
-            .send(Inbound::Hello {
-                hello,
-                reply: tx.clone(),
-            })
-            .await
-            .is_err()
-        {
-            writer.abort();
-            return;
-        }
-        // Read loop: load reports and epoch acks, forwarded to the run loop.
+        // Read loop: load reports and acks, forwarded to the run loop under
+        // the id of this connection. One that names another shard is dropped.
         loop {
             if conn.is_closed() {
                 break;
@@ -552,24 +981,40 @@ impl ControlServer {
                 m = conn.recv_stream() => m,
                 m = conn.recv_datagram() => m,
             };
-            match next {
-                Ok(Some(Message::LoadReport(report))) => {
-                    if self.tx.send(Inbound::Report(report)).await.is_err() {
-                        break;
+            let forward = match next {
+                Ok(Some(Message::LoadReport(report))) if report.shard == admitted => {
+                    Inbound::Report {
+                        from: admitted,
+                        report,
                     }
+                }
+                Ok(Some(Message::EpochAck(ack))) if ack.shard == admitted => Inbound::Ack {
+                    from: admitted,
+                    ack,
+                },
+                Ok(Some(Message::SceneAck(ack))) if ack.shard == admitted => Inbound::SceneAck {
+                    from: admitted,
+                    ack,
+                },
+                Ok(Some(Message::LoadReport(report))) => {
+                    self.drop_misattributed("a load report", report.shard, admitted, &conn);
+                    continue;
                 }
                 Ok(Some(Message::EpochAck(ack))) => {
-                    if self.tx.send(Inbound::Ack(ack)).await.is_err() {
-                        break;
-                    }
+                    self.drop_misattributed("an epoch ack", ack.shard, admitted, &conn);
+                    continue;
                 }
                 Ok(Some(Message::SceneAck(ack))) => {
-                    if self.tx.send(Inbound::SceneAck(ack)).await.is_err() {
-                        break;
-                    }
+                    self.drop_misattributed("a scene ack", ack.shard, admitted, &conn);
+                    continue;
                 }
-                Ok(Some(_)) => {}
+                // A second hello, or anything else: a connection is admitted
+                // once, and a shard's vocabulary here is reports and acks.
+                Ok(Some(_)) => continue,
                 _ => break,
+            };
+            if self.tx.send(forward).await.is_err() {
+                break;
             }
         }
         writer.abort();
@@ -613,6 +1058,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         let welcome = plane.handle_shard_hello(&hello).expect("welcome");
         assert_eq!(welcome.shard, ShardId::new(1), "adopted the root owner");
@@ -647,6 +1094,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(port),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         let (first, second) = (hello(9_000), hello(9_001));
         plane.handle_shard_hello(&first).expect("first adopts");
@@ -668,6 +1117,8 @@ mod tests {
             shard: ShardId::new(2),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&hello).is_err());
         assert_eq!(
@@ -685,6 +1136,8 @@ mod tests {
             shard: ShardId::new(1),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         plane.handle_shard_hello(&hello).expect("owner confirms");
         assert_eq!(plane.ids.peek(), 2, "id 1 can never be allocated again");
@@ -709,6 +1162,8 @@ mod tests {
             shard: ShardId::new(100),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         let welcome = plane.handle_shard_hello(&claim).expect("claim confirmed");
         assert_eq!(welcome.shard, ShardId::new(100));
@@ -735,6 +1190,8 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                client_endpoint: None,
+                secret: String::new(),
             })
             .expect("adopts the root");
         let (counter, map) = (plane.ids.peek(), plane.map().clone());
@@ -744,6 +1201,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
+            secret: String::new(),
         };
         let err = plane
             .handle_shard_hello(&claim)
@@ -756,31 +1215,48 @@ mod tests {
         assert_eq!(plane.ids.peek(), counter);
     }
 
-    /// The split's child is not anonymous: it arrives with the id the
-    /// orchestrator allocated for it, for a node the map does not name yet, and
-    /// is welcomed.
+    /// A claim on a node the published map does not name is refused **with an
+    /// id too** — even one the allocator has issued. This used to be the way a
+    /// split's child came in (launched with the id and the node allocated for
+    /// it, welcomed for a region no map carried yet); a region is now given at
+    /// the hello, with the id allocated then, so nothing legitimate arrives
+    /// like this any more.
+    ///
+    /// Mutation this catches: welcoming such a claim — the shard would be told
+    /// it has a region that the map (its own included) does not name.
     #[test]
-    fn a_split_child_claiming_its_allocated_id_on_a_new_node_is_welcomed() {
+    fn a_claim_with_an_issued_id_on_a_node_outside_the_map_is_refused_too() {
         let mut plane = plane();
-        let child_id = plane
+        let issued = plane
             .ids
             .allocate()
-            .expect("the split allocates the child's id");
+            .expect("an id the allocator handed out");
+        let (counter, map) = (plane.ids.peek(), plane.map().clone());
         let child = space_world::octree::children(plane.config.root_node()).expect("splits")[0];
-        let welcome = plane
+        let err = plane
             .handle_shard_hello(&ShardHello {
                 cluster: plane.config.cluster.clone(),
-                shard: child_id,
+                shard: issued,
                 endpoint: addr(9_001),
-                region: Some(ShardRegion::new(child, child_id, addr(9_001))),
+                region: Some(ShardRegion::new(child, issued, addr(9_001))),
+                client_endpoint: None,
+                secret: String::new(),
             })
-            .expect("the child registers");
-        assert_eq!(welcome.shard, child_id);
-        assert_eq!(welcome.region.node, child);
+            .expect_err("no region is created by claiming it");
+        assert!(err.contains("not in the published map"), "{err}");
+        assert_eq!(plane.ids.peek(), counter, "the counter did not move");
+        assert_eq!(plane.map(), &map, "and the published map is untouched");
     }
 
+    /// A shard that comes back with no id at the address the root's owner
+    /// holds is **not** handed that id again here (it used to be: "the same
+    /// process restarting"). A process that restarts starts its guid counter
+    /// over, so under the same id it would mint the same guids twice; the
+    /// orchestrator gives it the owner's regions under a new id instead
+    /// (`Orchestrator::handle_shard_hello`). At this level the root is simply
+    /// owned.
     #[test]
-    fn a_none_re_hello_with_the_owners_endpoint_gets_the_same_id_back() {
+    fn a_none_re_hello_for_an_owned_root_is_not_handed_the_owners_id() {
         let mut plane = plane();
         plane.set_unclaimed_root_owner(ShardId::new(1));
         let hello = ShardHello {
@@ -788,15 +1264,19 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
-        let first = plane.handle_shard_hello(&hello).expect("adopts");
+        plane.handle_shard_hello(&hello).expect("adopts");
         let counter = plane.ids.peek();
-        // The shard crashes and restarts with no id: same process, same endpoint.
-        let again = plane.handle_shard_hello(&hello).expect("idempotent");
-        assert_eq!(again.shard, first.shard, "same id back");
-        assert_eq!(again.region.endpoint, addr(9_000));
+        // The very same hello again: refused here.
+        let err = plane
+            .handle_shard_hello(&hello)
+            .expect_err("the id is not handed out twice");
+        assert!(err.contains("already owned"), "{err}");
         assert_eq!(plane.ids.peek(), counter, "no allocation, no reservation");
         assert_eq!(plane.map().regions.len(), 1);
+        assert_eq!(plane.map().regions[0].endpoint, addr(9_000));
     }
 
     #[test]
@@ -808,6 +1288,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(port),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         let (first, other) = (hello(9_000), hello(9_001));
         plane.handle_shard_hello(&first).expect("adopts");
@@ -828,6 +1310,8 @@ mod tests {
                 shard: ShardId::NONE,
                 endpoint: addr(9_000),
                 region: None,
+                client_endpoint: None,
+                secret: String::new(),
             })
             .expect("adopts the root");
         let counter = plane.ids.peek();
@@ -837,6 +1321,8 @@ mod tests {
             shard: ShardId::new(u32::MAX - 1),
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
+            secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&poison).is_err(), "never issued");
         assert_eq!(plane.ids.peek(), counter, "the counter did not move");
@@ -845,10 +1331,283 @@ mod tests {
         assert_eq!(u64::from(next.0), counter);
     }
 
+    /// The way in: the cluster secret when one is required, then the cluster
+    /// the hello names. On a loopback control port with no configured secret
+    /// a hello needs none; with a configured secret, or off loopback, a hello
+    /// without exactly it is refused, and the refusal never contains it — nor
+    /// anything else about this cluster.
+    ///
+    /// Mutation this catches: comparing only when the hello carries a secret
+    /// (an empty one would pass), accepting a prefix, or checking the cluster
+    /// before the secret (anybody who can reach the port would be told what
+    /// the cluster is called).
     #[test]
-    fn a_claim_of_an_already_issued_id_is_still_confirmed() {
-        // Counter at 5: ids 1..=4 were issued; a restart-with-known-id claim for
-        // 3 on a free node is the legitimate case and must still work.
+    fn a_hello_needs_the_cluster_secret_when_one_is_required() {
+        use crate::config::Secret;
+        let hello = |cluster: &str, secret: &str| ShardHello {
+            cluster: cluster.to_owned(),
+            shard: ShardId::NONE,
+            endpoint: addr(9_000),
+            region: None,
+            client_endpoint: None,
+            secret: secret.to_owned(),
+        };
+        let plane_for = |config: OrchestratorConfig| {
+            let map = ShardMap::new(
+                1,
+                vec![ShardRegion::new(
+                    config.root_node(),
+                    ShardId::new(1),
+                    addr(7_001),
+                )],
+            );
+            let ids =
+                PersistentShardIdAllocator::with_sink(1, Box::new(MemoryCounterSink::default()));
+            ControlPlane::new(config, ids, EpochPublisher::new(map), "peer".into())
+        };
+        const SECRET: &str = "the-cluster-secret-0123";
+
+        // Loopback, nothing configured: no secret is needed, and one that is
+        // presented anyway is not looked at (a launched shard presents the
+        // generated one).
+        let mut open = plane_for(OrchestratorConfig::default());
+        assert!(!open.secret_required());
+        assert_eq!(open.check_credentials(&hello("space-local", "")), Ok(()));
+        open.set_generated_secret(Secret::new("generated-secret-456"));
+        assert_eq!(open.cluster_secret().expose(), "generated-secret-456");
+        assert!(open.cluster_trust().is_none(), "nothing requires a secret");
+        assert_eq!(open.check_credentials(&hello("space-local", "")), Ok(()));
+        assert_eq!(
+            open.check_credentials(&hello("space-local", "anything")),
+            Ok(())
+        );
+        // Another cluster is refused whatever else it says.
+        let refused = open
+            .check_credentials(&hello("other", ""))
+            .expect_err("another cluster");
+        assert!(refused.is_final());
+        assert!(refused.to_string().contains("names cluster"), "{refused}");
+
+        // A configured secret, and a control port that is not on loopback.
+        let configured = OrchestratorConfig {
+            cluster_secret: Some(Secret::new(SECRET)),
+            ..OrchestratorConfig::default()
+        };
+        let off_loopback = OrchestratorConfig {
+            bind: "0.0.0.0:7900".parse().expect("an address"),
+            cluster_secret: Some(Secret::new(SECRET)),
+            ..OrchestratorConfig::default()
+        };
+        for config in [configured, off_loopback] {
+            let mut plane = plane_for(config);
+            assert!(plane.secret_required());
+            // A configured secret is never replaced by a generated one.
+            plane.set_generated_secret(Secret::new("generated-secret-456"));
+            assert_eq!(plane.cluster_secret().expose(), SECRET);
+            assert_eq!(
+                plane.cluster_trust().map(space_net::ClusterTrust::pin),
+                space_net::ClusterTrust::from_secret(SECRET).map(|t| t.pin()),
+            );
+            assert_eq!(
+                plane.check_credentials(&hello("space-local", SECRET)),
+                Ok(())
+            );
+            for wrong in [
+                "",
+                "the-cluster-secret-012",
+                "the-cluster-secret-01234",
+                "x",
+            ] {
+                let refused = plane
+                    .check_credentials(&hello("space-local", wrong))
+                    .expect_err(wrong);
+                assert_eq!(refused, HelloRefusal::Unauthorized, "{wrong:?}");
+                assert!(refused.is_final());
+                assert_eq!(refused.reject_reason(), RejectReason::Unauthorized);
+                assert!(!refused.to_string().contains(SECRET));
+            }
+            // The secret is checked first: whoever does not hold it learns
+            // nothing — not even that it named the wrong cluster, let alone
+            // what this one is called.
+            for wrong in ["", "the-cluster-secret-012", "x"] {
+                let refused = plane
+                    .check_credentials(&hello("other", wrong))
+                    .expect_err("no secret");
+                assert_eq!(refused, HelloRefusal::Unauthorized, "{wrong:?}");
+                assert!(!refused.to_string().contains("space-local"), "{refused}");
+            }
+            // Whoever holds it is told which cluster this is.
+            let refused = plane
+                .check_credentials(&hello("other", SECRET))
+                .expect_err("another cluster");
+            assert!(
+                matches!(&refused, HelloRefusal::Refused(why) if why.contains("space-local")),
+                "{refused:?}"
+            );
+        }
+
+        // Off loopback with only a generated secret (the orchestrator starts
+        // the shards): that one is what a hello must carry.
+        let mut managed = plane_for(OrchestratorConfig {
+            bind: "0.0.0.0:7900".parse().expect("an address"),
+            min_shards: 2,
+            ..OrchestratorConfig::default()
+        });
+        assert!(managed.secret_required());
+        assert_eq!(
+            managed.check_credentials(&hello("space-local", "")),
+            Err(HelloRefusal::Unauthorized),
+            "no secret yet: nobody gets in, not even with an empty one"
+        );
+        managed.set_generated_secret(Secret::new("generated-secret-456"));
+        assert_eq!(
+            managed.check_credentials(&hello("space-local", "generated-secret-456")),
+            Ok(())
+        );
+        assert_eq!(
+            managed.check_credentials(&hello("space-local", "")),
+            Err(HelloRefusal::Unauthorized)
+        );
+    }
+
+    /// The control plane holds both of the cluster's secrets and derives
+    /// `Debug` (and the orchestrator around it does): neither may show in a
+    /// print of it.
+    ///
+    /// Mutation this catches: `peer_token` as a plain `String` again.
+    #[test]
+    fn the_control_plane_never_prints_a_secret() {
+        use crate::config::Secret;
+        let config = OrchestratorConfig {
+            cluster_secret: Some(Secret::new("do-not-print-the-cluster-secret")),
+            ..OrchestratorConfig::default()
+        };
+        let map = ShardMap::new(
+            1,
+            vec![ShardRegion::new(
+                config.root_node(),
+                ShardId::new(1),
+                addr(7_001),
+            )],
+        );
+        let ids = PersistentShardIdAllocator::with_sink(1, Box::new(MemoryCounterSink::default()));
+        let plane = ControlPlane::new(
+            config,
+            ids,
+            EpochPublisher::new(map),
+            "do-not-print-the-peer-token".into(),
+        );
+        assert_eq!(plane.peer_token.expose(), "do-not-print-the-peer-token");
+        let printed = format!("{plane:?}");
+        assert!(!printed.contains("do-not-print"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    /// A generated secret makes a trust only where a hello needs a secret.
+    #[test]
+    fn a_generated_secret_gives_a_trust_off_loopback_only() {
+        let mut plane = ControlPlane::new(
+            OrchestratorConfig {
+                bind: "0.0.0.0:7000".parse().expect("addr"),
+                ..OrchestratorConfig::default()
+            },
+            PersistentShardIdAllocator::with_sink(1, Box::new(MemoryCounterSink::default())),
+            EpochPublisher::new(ShardMap::new(
+                1,
+                vec![ShardRegion::new(
+                    OrchestratorConfig::default().root_node(),
+                    ShardId::new(1),
+                    addr(7_001),
+                )],
+            )),
+            "peer".into(),
+        );
+        assert!(plane.secret_required());
+        assert!(plane.cluster_trust().is_none(), "no secret yet");
+        plane.set_generated_secret(Secret::new("generated-secret-456"));
+        let want = space_net::ClusterTrust::from_secret("generated-secret-456").map(|t| t.pin());
+        assert!(want.is_some());
+        assert_eq!(plane.cluster_trust().map(|t| t.pin()), want);
+        assert!(!format!("{plane:?}").contains("generated-secret-456"));
+    }
+
+    /// A pinned client completes the handshake with a trusted control port and
+    /// is told `Untrusted` by a plain one.
+    #[tokio::test]
+    async fn a_pinned_client_trusts_a_control_port_bound_with_the_cluster_trust() {
+        let trust = space_net::ClusterTrust::from_secret("the-cluster-secret-0123").expect("trust");
+        let pin = trust.pin();
+        let trusted = Arc::new(ControlServer::bind_trusted(addr(0), Some(&trust)).expect("bind"));
+        let plain = Arc::new(ControlServer::bind(addr(0)).expect("bind"));
+        let t_addr = trusted.local_addr().expect("addr");
+        let p_addr = plain.local_addr().expect("addr");
+        let t_accept = Arc::clone(&trusted).spawn_accept();
+        let p_accept = Arc::clone(&plain).spawn_accept();
+
+        let endpoint = space_net::client_endpoint_pinned(t_addr, Some(&pin)).expect("endpoint");
+        space_net::connect(&endpoint, t_addr, SERVER_NAME, &space_net::hello("shard:1"))
+            .await
+            .expect("pinned client trusts the trusted server");
+        let endpoint = space_net::client_endpoint_pinned(p_addr, Some(&pin)).expect("endpoint");
+        let err = space_net::connect(&endpoint, p_addr, SERVER_NAME, &space_net::hello("shard:1"))
+            .await
+            .expect_err("a plain server is not the cluster's");
+        assert!(matches!(err, space_net::NetError::Untrusted(_)), "{err:?}");
+        t_accept.abort();
+        p_accept.abort();
+        trusted.close();
+        plain.close();
+    }
+
+    /// How each refusal goes on the wire, and which one a shard may ask again
+    /// after.
+    /// Mutation this catches: answering a hello however old it is, or one
+    /// whose connection has closed (see `note_abandoned_hello` in the
+    /// orchestrator for what that cost).
+    #[test]
+    fn a_hello_is_stale_once_its_shard_has_given_up_or_is_about_to() {
+        let fresh = Duration::from_millis(40);
+        assert!(!hello_is_stale(Duration::ZERO, false));
+        assert!(
+            !hello_is_stale(fresh, false),
+            "answered within a beat or two"
+        );
+        assert!(hello_is_stale(fresh, true), "its connection is closed");
+        assert!(!hello_is_stale(
+            HELLO_STALE_AFTER - Duration::from_millis(1),
+            false
+        ));
+        assert!(hello_is_stale(HELLO_STALE_AFTER, false));
+        assert!(hello_is_stale(space_net::HANDSHAKE_TIMEOUT, false));
+        // The limit leaves the answer time to arrive before the shard stops
+        // waiting for it.
+        assert!(HELLO_STALE_AFTER + Duration::from_secs(1) <= space_net::HANDSHAKE_TIMEOUT);
+    }
+
+    #[test]
+    fn only_a_wait_is_not_final_and_it_travels_as_draining() {
+        let wait = HelloRefusal::Wait("epoch 3 is still in flight".into());
+        assert!(!wait.is_final());
+        assert_eq!(wait.reject_reason(), RejectReason::Draining);
+        assert!(wait.to_string().contains("ask again"), "{wait}");
+        let full = HelloRefusal::Full("the cluster already has 8 shard(s)".into());
+        assert!(full.is_final());
+        assert_eq!(full.reject_reason(), RejectReason::Full);
+        let refused = HelloRefusal::Refused("region at depth 40 is already owned".into());
+        assert!(refused.is_final());
+        assert_eq!(
+            refused.reject_reason(),
+            RejectReason::Other("region at depth 40 is already owned".into())
+        );
+        assert_eq!(refused.to_string(), "region at depth 40 is already owned");
+    }
+
+    /// An id the allocator has issued does not make a node outside the map
+    /// claimable either — it used to ("a restart with a known id"), which
+    /// welcomed the shard onto a region no map carried.
+    #[test]
+    fn a_claim_of_an_already_issued_id_on_a_free_node_is_refused() {
+        // Counter at 5: ids 1..=4 were issued.
         let config = OrchestratorConfig::default();
         let root = config.root_node();
         let map = ShardMap::new(
@@ -863,16 +1622,13 @@ mod tests {
             shard: ShardId::new(3),
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
+            secret: String::new(),
         };
-        assert_eq!(
-            plane.handle_shard_hello(&claim).expect("ok").shard,
-            ShardId::new(3)
-        );
-        assert_eq!(
-            plane.ids.peek(),
-            5,
-            "an issued id does not move the counter"
-        );
+        let err = plane.handle_shard_hello(&claim).expect_err("refused");
+        assert!(err.contains("not in the published map"), "{err}");
+        assert_eq!(plane.ids.peek(), 5, "the counter did not move");
+        assert_eq!(plane.map().regions.len(), 1);
     }
 
     /// A sink that cannot write: every persist fails.
@@ -905,6 +1661,8 @@ mod tests {
             shard: ShardId::new(100),
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         let err = plane
             .handle_shard_hello(&claim)
@@ -918,6 +1676,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_001),
             region: Some(ShardRegion::new(child, ShardId::NONE, addr(9_001))),
+            client_endpoint: None,
+            secret: String::new(),
         };
         let err = plane.handle_shard_hello(&anonymous).expect_err("refused");
         assert!(err.contains("not in the published map"), "{err}");
@@ -931,6 +1691,8 @@ mod tests {
             shard: ShardId::NONE,
             endpoint: addr(9_000),
             region: None,
+            client_endpoint: None,
+            secret: String::new(),
         };
         assert!(plane.handle_shard_hello(&hello).is_err());
     }
@@ -949,6 +1711,8 @@ mod tests {
                 ShardId::new(2),
                 addr(9_000),
             )),
+            client_endpoint: None,
+            secret: String::new(),
         };
         assert!(
             plane.handle_shard_hello(&hello).is_err(),
@@ -1058,6 +1822,7 @@ mod tests {
             players: 90,
             tick_p95_ms: 1.0,
             load: 0.0,
+            ..Default::default()
         };
         // Below the dwell: no action yet.
         assert_eq!(plane.handle_load_report(&report, 10), None);

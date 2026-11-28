@@ -3,24 +3,100 @@
 | File | Image | Runs |
 |---|---|---|
 | `../Dockerfile` | `space/ci` | the full CI (`cargo run -p xtask -- ci`) plus the wasm viewer build, as build steps |
-| `Dockerfile.shard` | `space/shard` | `space-server`, orchestrated shard (QUIC/UDP 7870) |
-| `Dockerfile.orchestrator` | `space/orchestrator` | `space-orchestrator --launcher local` (QUIC/UDP 7900) |
-| `Dockerfile.client` | `space/client` | `space-client --stream` (ws://, TCP 8099), optionally `--server <shard>` |
-| `docker-compose.yaml` | | orchestrator + one shard; the client behind profile `stream` |
+| `Dockerfile.shard` | `space/shard` | `space-server`, orchestrated shard; started by the orchestrator, one container per shard (QUIC/UDP, one port of 7870-7899 each) |
+| `Dockerfile.orchestrator` | `space/orchestrator` | `space-orchestrator --launcher docker --min-shards 4 --max-shards 8` (control port QUIC/UDP 7900, player port QUIC/UDP 7777) |
+| `Dockerfile.client` | `space/client` | `space-client --stream` (ws://, TCP 8099), optionally `--server <player port>` |
+| `docker-compose.yaml` | | **the orchestrator alone**: it starts its shard containers itself; the client behind profile `stream` |
 | `proxy/` | `ghcr.io/eliasstepanik/space-*` | production compose + `redeploy.sh` for the proxy host |
 
 All builds use the **repository root** as context.
 
 ```sh
 docker build -t space/ci .                                         # runs CI
-docker build -f deploy/Dockerfile.shard -t space/shard .
-docker compose -f deploy/docker-compose.yaml up --build            # orchestrator + shard-a
+docker build -f deploy/Dockerfile.shard -t space/shard:dev .       # the image the orchestrator starts shards from
+export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"              # required: no default
+docker compose -f deploy/docker-compose.yaml up --build            # the orchestrator; it starts four shards
 docker compose -f deploy/docker-compose.yaml --profile stream up --build   # + client
+space-client --server 127.0.0.1:7777                               # a client on the host: the player port
+cargo run -p xtask -- e2e                                          # all of it as one check, on its own ports (see below)
 ```
 
-Fixed IPs on the `172.31.0.0/24` bridge (addresses are parsed as socket
-addresses, not resolved): orchestrator `.10:7900`, shard-a `.11:7870`, client
-`.12:8099`.
+`up --build` builds the orchestrator image only. The shard image has to exist
+under the name the orchestrator starts shards from (`SPACE_SHARD_IMAGE`,
+default `space/shard:dev`): build it once, and again after every change. An
+image that is not on the host is pulled, and `space/shard:dev` is in no
+registry: without the build the launch fails and says so. `docker ps` then
+shows the orchestrator and `space-shard-<port>` per shard.
+
+What is published on the host: the **player port** `7777/udp`
+(`SPACE_PLAYER_PORT`), the one address players type; the **shards' ports**
+`7870-7899/udp` (`SPACE_SHARD_PORTS`), each by the shard container that has it
+— a player is sent on to `<the host it dialed>:<that port>`; the web UI on the
+host's loopback. The orchestrator's control port, `7900/udp`, is **not
+published on the host** by either compose file: only the shards use it, and
+they reach it over the compose network. There are no fixed container IPs any
+more: the orchestrator finds its own network and address by inspecting its
+container - **by name** (`SPACE_ORCHESTRATOR_DOCKER_SELF`, which the compose
+files set: `<project>-orchestrator-1` here, `space-orchestrator` in `proxy/`),
+and only failing that by `$HOSTNAME`. The Engine finds a container by name or
+id, not by host name; `$HOSTNAME` is the id only until the container is
+recreated from an older one's configuration, which is what Watchtower does. If
+it cannot find itself it says what to set: that name, or
+`SPACE_ORCHESTRATOR_DOCKER_NETWORK` and `SPACE_ORCHESTRATOR_DOCKER_CONTROL_ADDR`
+(with both given it inspects nothing).
+
+`docker compose down` (or `stop`) sends the orchestrator SIGTERM: it removes
+its shard containers (one bound of 20 s; `stop_grace_period: 30s` gives it the
+time) and exits 0. Should it be killed instead, its shards notice within about
+ten seconds and exit, and the next start first removes what is left of them:
+the containers labelled `space.cluster=<cluster>`, `space.role=shard` **and
+`space.instance=<instance>`**.
+
+**Two stacks on one host.** The instance is what tells one stack's shard
+containers from another's: the compose project's name here
+(`SPACE_ORCHESTRATOR_DOCKER_INSTANCE`), and without that variable an id the
+orchestrator makes once and keeps next to its state (`orchestrator.id.instance`
+on the state volume). The cluster name alone does not: two stacks left at the
+default `SPACE_CLUSTER` would otherwise remove each other's running shards at
+every start. A second stack is another compose project with its own ports and
+container names:
+
+```sh
+SPACE_CLUSTER=space-two SPACE_PLAYER_PORT=7877 WEBUI_PORT=7981 \
+SPACE_SHARD_PORTS=7970-7999 SPACE_SHARD_NAME_PREFIX=space-two-shard- \
+  docker compose -p space-two -f deploy/docker-compose.yaml up -d
+```
+
+**What a shard container is given.** No mount, no socket, no capability,
+`no-new-privileges`, a read-only root filesystem (a shard writes no file), at
+most 1024 processes and threads, a memory limit (`SPACE_SHARD_MEMORY` in MiB,
+default 2048, `0` = none; no swap on top) and the user `10001:10001` - the one
+`Dockerfile.shard` creates, set by number so that an image without a `USER`
+line does not run a shard as root either. The labels `space.launch` and
+`space.port` are for you (`docker ps --filter label=space.port=7870`); the
+orchestrator does not read them.
+
+**The shard image.** Made sure of at start, and again by any launch the daemon
+refuses because the image is gone (somebody pruned it while the orchestrator
+ran): it is pulled once more, then the shard is created. The orchestrator
+never removes an image; `proxy/README.md` has the command that removes old
+shard images on the production host.
+
+## The end-to-end check (`xtask e2e`)
+
+`cargo run -p xtask -- e2e` needs a Docker daemon and the compose plugin (without them
+it exits 2 and says that nothing was checked). It builds `space/shard:e2e`, starts this
+compose file as the project `space-e2e` — player port `7877/udp`, shard ports
+`7970-7999/udp`, web UI `127.0.0.1:7981`, a generated throwaway `SPACE_CLUSTER_SECRET`,
+`DOCKER_GID` read from the socket as the daemon sees it (or taken from the environment)
+— waits for four running shard containers, and runs the ignored test of
+`crates/space-client/tests/live_stack.rs`: a player without a renderer joins through
+the player port, flies across the border at x = -6, is handed to the next shard
+container and parks there. Then `compose down`; a shard container left behind fails
+the run. A stack on the default ports is not touched. With a remote daemon
+(`DOCKER_HOST=tcp://host:port`) the player port is dialed on that host;
+`--server-host HOST` names another, `--dry-run` prints the commands. CI runs it as the
+`docker-e2e` job of `ci.yml`.
 
 ## Publishing pipeline
 
@@ -30,11 +106,17 @@ several commits pushed together, the head is the one that is built.
 
 - **Images**: `.github/workflows/release-images.yml` builds and pushes
   `ghcr.io/eliasstepanik/space-shard`, `space-orchestrator` and `space-client`
-  as `:sha-<shortsha>`, then moves `:latest` to that image (the `space/*:dev`
-  names above are local compose builds only). `:latest` only moves while the
-  commit is still the head of `main`, so a slow build of an older push cannot
-  put it back. The repo owner must make a package public after its first push.
-  `ci.yml`'s `docker` job still only builds.
+  as `:sha-<shortsha>` in its matrix job — the orchestrator's build is given
+  `SPACE_SHARD_IMAGE=ghcr.io/eliasstepanik/space-shard:sha-<shortsha>`, the
+  shard image of its own commit, which is what it starts its shards from —
+  and then moves `:latest` in a **second job, `latest`**, that needs all
+  three builds: shard, client, **the orchestrator last**. So the shard image
+  of a commit is in the registry before the orchestrator's `:latest` points
+  at that commit. (The `space/*:dev` names above are local builds only.)
+  `:latest` only moves while the commit is still the head of `main`, so a
+  slow build of an older push cannot put it back. The repo owner must make a
+  package public after its first push. `ci.yml`'s `docker` job still only
+  builds; its `docker-e2e` job runs the local compose stack (`xtask e2e`, above).
 - **Release**: `.github/workflows/release.yml` takes the next patch version
   after the highest `vX.Y.Z` tag, tags the pushed commit with it, builds
   `space-client` (`--release --locked`) on Linux and Windows plus the wasm
@@ -49,12 +131,100 @@ several commits pushed together, the head is the one that is built.
 - **Proxy**: `deploy/proxy/` is the production bundle (compose pulling the ghcr
   images, `.env.example`, `redeploy.sh`). It does not serve the browser viewer:
   that page is a local development and agent-testing tool (`AGENTS.md`). Watchtower on the host (label opt-in,
-  60s poll) redeploys on new images; `.github/workflows/deploy.yml` is the manual
+  60s poll) replaces the orchestrator (and the stream client) on new images;
+  the shard containers are not its business — the new orchestrator starts
+  them from its own commit's shard image. `.github/workflows/deploy.yml` is the manual
   SSH path (secrets `DEPLOY_SSH_HOST/USER/KEY`, not yet created). See
   `deploy/proxy/README.md`.
 - **Workflow lint**: `ci.yml`'s `lint` job parses every workflow and deploy YAML
   (`.github/scripts/check_yaml.py`), because GitHub silently drops a workflow
   with invalid YAML.
+
+## Shards and the cluster secret
+
+A shard registers with neither id nor region and is given both: the first the
+root, each further one the next layout cell beside the scene's spawn point (up
+to `--max-shards`, default 8). A shard that restarts at the same address is its
+own replacement, under a **new id**; one that loses the orchestrator exits.
+
+**The orchestrator starts the shards.** Its image runs `--launcher docker
+--min-shards 4 --max-shards 8` (image defaults `SPACE_ORCHESTRATOR_LAUNCHER`,
+`_MIN_SHARDS`, `_MAX_SHARDS`; the compose variables `SPACE_MIN_SHARDS`,
+`SPACE_MAX_SHARDS`): no shard is listed in either compose file. Through the
+Docker socket it creates one container per shard from the shard image
+(`SPACE_ORCHESTRATOR_SHARD_IMAGE`: baked into the orchestrator image as the
+shard image of its own commit; the local compose file sets `space/shard:dev`),
+named `space-shard-<port>`, on its own network, with one host UDP port of
+`SPACE_SHARD_PORTS` (7870-7899) published under the same number, the cluster
+secret in its environment, no mount, no capability and no restart policy. Four
+to begin with — the demo area in four areas; a fifth to an eighth when a shard
+is loaded (its hot cell is carved for the new one); a shard whose load stays
+low is merged away, hands over what it holds and is stopped when it is empty
+(exit status 0, container removed); one that dies is replaced under a new id
+in a new container. The autoscaler's numbers are flags and environment
+variables (`SPACE_ORCHESTRATOR_SHARD_CAPACITY`, `_SCALE_OUT_LOAD`,
+`_SCALE_OUT_AFTER`, `_SCALE_IN_LOAD`, `_SCALE_IN_AFTER`, `_SCALE_COOLDOWN`,
+`_DRAIN_TIMEOUT`; the local compose file passes `SPACE_SHARD_CAPACITY`,
+`SPACE_SCALE_OUT_AFTER`, `SPACE_SCALE_IN_AFTER`, `SPACE_SCALE_COOLDOWN`
+through); the rules are in `docs/plan-sharding.md` §3. `--launcher process`
+(one `space-server` process per shard) is for a host without containers and
+is what `scripts/dev.*` use: the dev loop does not need Docker. `--launcher
+docker` is Linux only; on Windows the orchestrator refuses to start with it.
+
+**Players dial the player port** (`7777/udp`, published by both compose files)
+and are sent on to the shard that owns the spawn point, at `<the host they
+dialed>:<that shard's port>`. So the shards' ports must be reachable wherever
+the player port is: open both in the firewall. A shard started **by hand**
+from the shard image still works next to an orchestrator (`ORCHESTRATOR_ADDR`,
+which may be `name:port`; `SHARD_ADVERTISE`, default `0.0.0.0:7870` — the
+orchestrator fills in the address it sees the container at; optional
+`SHARD_CLIENT_ENDPOINT`), and `ORCHESTRATOR_CONTROL_ADDR` on the orchestrator
+is only for such shards: the docker launcher finds its own.
+
+**The Docker socket makes the orchestrator's container root-equivalent on the
+host.** Whoever can talk to `/var/run/docker.sock` can start a privileged
+container and mount the host's disk, non-root user inside or not — the
+orchestrator is not root in its container, and `group_add: DOCKER_GID` (the
+socket's group: default 0 locally, right for Docker Desktop; on a Linux host
+`stat -c %g /var/run/docker.sock`, required in `proxy/`) is what gives it the
+socket. What is done about it: nothing a player or a shard sends reaches a
+Docker call, shard containers get no socket, no mount and no privilege, only
+containers carrying this cluster's labels are ever removed, the control port
+is not published and the web UI stays off in production. What is not: no
+socket proxy narrows the API, and the shard image's name is trusted. All of
+it: `docs/security-notes.md`, "The Docker socket".
+
+In a container the control port binds `0.0.0.0`, and **a control port that is
+not on loopback takes a shard's hello only with the cluster secret, and the
+orchestrator refuses to start without one**. Both compose files therefore give
+the orchestrator `SPACE_CLUSTER_SECRET`, which it hands to the shards it
+starts in their environment (never on a command line), and **neither has a
+default: the repository holds no secret.** Set at least 16 random characters:
+
+- **local stack** (`docker-compose.yaml`): in your shell
+  (`export SPACE_CLUSTER_SECRET="$(openssl rand -hex 24)"`, PowerShell:
+  `$env:SPACE_CLUSTER_SECRET = ...`) or in a `deploy/.env` file that you do not
+  check in (`SPACE_CLUSTER_SECRET=...`). Without it `docker compose` stops
+  before it starts anything and says which variable is missing.
+- **`proxy/`**: in `.env` (see `.env.example`); with it empty `docker compose`
+  refuses to start the stack there too, and says which variable is missing.
+
+The secret gates the hello, and the hello gates the rest: a connection whose
+hello is refused is told why and closed, and one that is welcomed may report
+and acknowledge only for the shard it was welcomed as. **The control port is
+not published** by either file (it was, on every host interface, before this
+change): nothing outside the compose network has any business with it. If you
+do publish it for shards on another host, the cluster secret is all that stands
+between that port and anybody who can reach it - see
+`docs/security-notes.md`.
+
+**A host that runs the proxy stack has to get the new `.env` lines
+(`SPACE_CLUSTER_SECRET`, `DOCKER_GID`), the new compose file and the open
+firewall ports before it pulls images built from this change** (Watchtower
+only swaps the image: with the old compose file the new orchestrator image
+would start the docker launcher without a socket and refuse to start — safe,
+but down). The steps and their order: `proxy/README.md`, "Before the
+shard-manager images arrive".
 
 ## Scene and the orchestrator web UI
 
@@ -69,7 +239,7 @@ scene: one chosen at run time is saved next to the id counter
 volume and delete that file to make `--scene` apply again. A shard run without
 an orchestrator takes `space-server --scene NAME`; give hand-wired `--peer`
 shards the same one. Client, shard and orchestrator must come from the same
-build (wire protocol 4) - the pipelines above build them from one commit.
+build (wire protocol 7) - the pipelines above build them from one commit.
 
 **The web UI** is part of the `space-orchestrator` binary (server-rendered HTML,
 no JavaScript): cluster, map, shards, autoscaler, id allocator, recent events,
@@ -96,8 +266,13 @@ Details and known gaps: `docs/security-notes.md`.
 ## Streaming client and the wasm viewer
 
 `Dockerfile.client` starts `space-client --stream $STREAM_BIND [--server
-$SPACE_SERVER] $CLIENT_ARGS`. Compose sets `SPACE_SERVER=172.31.0.11:7870`
-(shard-a); `CLIENT_ARGS` is for extra flags such as `--size` (the scene is not a
+$SPACE_SERVER] $CLIENT_ARGS`. Compose sets
+`SPACE_SERVER=host.docker.internal:<player port>` (with `extra_hosts:
+host-gateway`): the client is a player like any other and dials the player
+port **on the host**, because a client that dialed the orchestrator's
+in-network address would be sent on to `<that address>:<shard port>`, where no
+shard listens. (That path has not been executed: see below.) `CLIENT_ARGS` is
+for extra flags such as `--size` (the scene is not a
 client flag any more: the shard announces it). It renders on lavapipe (software Vulkan);
 bookworm's Mesa 22.3 lavapipe lacks `VK_KHR_ray_query`, so GI is off in that
 image (the renderer logs it and carries on). Pass `/dev/dri` through or use
@@ -134,10 +309,71 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
   `scripts/dev.sh` (Linux/WSL, software Vulkan): connect screen, demo area,
   scene switching, a second client, the Lua smoke script, the harness API.
 
+The list above is the state before the compose files were given the cluster
+secret and the orchestrator became the shard manager; what it says about the
+compose stack (one hand-started shard, the client over the bridge, the
+`stream` profile) describes files that no longer exist in that form.
+
+**The shard manager (wire protocol 7): executed** on Windows 11 with Docker
+Desktop 28.5.1 (Linux engine in WSL2), 2026-11-24
+- `docker-compose.yaml` as it is, with a project name, ports moved by
+  environment (player port 8077, shards 8170-8199, web UI 8280), a generated
+  throwaway `SPACE_CLUSTER_SECRET`, `DOCKER_GID=0`, lowered autoscaler
+  thresholds (capacity 2, out after 5 s, in after 15 s, cooldown 10 s) and
+  local image tags.
+- Compose started the orchestrator alone and it created four shard containers:
+  the first registered 0.9 s after the orchestrator started, all four owned
+  their regions after 3.5 s.
+- A headless client on the host joined through `127.0.0.1:8077` and was sent
+  to a shard container's published port (35 bodies listed, frames looked at).
+  Four flying crossings between two shard containers at 15-40 m/s: drawn step
+  3.1-4.6 mm, corrections 0.
+- `docker kill` of one shard container: noticed and replaced under a new id in
+  a new container within about a second (lost at tick 2385, the replacement's
+  epoch committed at tick 2416), the scene re-issued once.
+- Scale-out: two players in the spawn cell, a fifth container; then both in
+  the next cell, a sixth (0.9 s from "wanted" to registered). Scale-in: the far
+  cell's shard merged, drained in 1.1 s, `exit status 0`, container removed.
+- `docker compose stop` (SIGTERM): all five shard containers removed and the
+  orchestrator exited 0 in under 5 s; `down -v` left no container, network or
+  volume. The cluster secret appears in none of the captured logs.
+- That long scenario ran on images built from a throwaway Dockerfile (a single
+  build stage with a cache) with the same runtime stages and the same
+  binaries. The images from `Dockerfile.orchestrator` and `Dockerfile.shard`
+  themselves were built and run through a start, a client's join, a killed
+  orchestrator with the leftovers removed at the next start, and `compose
+  down`.
+
+**Only parsed** (`docker compose config`)
+- `proxy/docker-compose.yaml`, with `.env.example` plus a throwaway secret and
+  `DOCKER_GID`.
+
 **Not run**
-- `proxy/docker-compose.yaml` on the host (checked with `docker compose config`
-  against `.env.example` only) and `redeploy.sh`; the web UI behind a real TLS
-  proxy; the root `Dockerfile` (CI's `docker` job builds it).
+- `cargo run -p xtask -- e2e` against a daemon, and the `docker-e2e` CI job: checked
+  without a daemon only — the command lines by `--dry-run` and unit tests, the
+  player's flight against an in-process four-shard cluster
+  (`crates/space-client/tests/live_stack.rs`). Move this line up once the job has run green.
+- Anything on a Linux host: a socket group other than 0, a firewall, real
+  published ports to another machine.
+- The pull of an image that was removed while the orchestrator ran (the
+  daemon's 404 on create): a unit test against a daemon in memory only
+  (`launcher/docker.rs`). The rest of the review's fixes was run on Docker
+  Desktop with the images of the two real Dockerfiles: the instance label on
+  real containers, a second compose project with the same cluster name beside
+  the first (neither removed the other's shards at a recreate or after a
+  kill), the orchestrator finding itself by name in a container recreated
+  with a stale host name, and `ReadonlyRootfs` / `PidsLimit` / the memory
+  limit / `User` on a real shard container (`docs/plan-sharding.md` section 8).
+- Watchtower's stop timeout (`WATCHTOWER_TIMEOUT`, `proxy/README.md`), and the
+  image clean-up command there.
+- Watchtower replacing the orchestrator; a pull of the `sha-` tagged shard
+  image from ghcr; a private registry.
+- The `client` stream service in either compose file since it dials the player
+  port through the host; `Dockerfile.client` (unchanged).
+- `release-images.yml` with its `latest` job (YAML-checked with
+  `.github/scripts/check_yaml.py` only).
+- `redeploy.sh`; the web UI behind a real TLS proxy; the root `Dockerfile`
+  (CI's `docker` job builds it).
 - The BuildKit cache mounts in `Dockerfile.shard`, `Dockerfile.orchestrator`
   and `Dockerfile.client` (cargo registry and one shared release `target`;
   the binary is copied to `/usr/local/bin` in the build stage): written, **not
@@ -147,8 +383,20 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
 - GPU tests on the hosted CI runner: its Mesa is too old for the renderer, so
   that step is `continue-on-error: true` and fails visibly rather than
   reporting tests that rendered nothing.
-- Cross-shard visibility in containers: players and physics bodies near a
-  border are ghosted to the neighbouring shard (seen live with two shards
-  outside containers: two players 24 m apart on either side of the border see
-  each other as characters), but no container setup with two shards has been
-  run.
+- Two players seeing each other across a border between two shard
+  containers: nothing is recorded about it for the run above. (Seen live
+  outside containers: two players on either side of a border see each other
+  as characters.)
+
+**What still looks wrong, seen on Docker Desktop**
+- In the WSL2 VM the shards' census lines showed a `clock offset` between 0
+  and **-84 ms**: the hypervisor's time sync steps the VM's wall clock (a
+  process stack on the same machine shows 0.0 ms throughout). All shards share
+  that clock, but each slews by itself, so for seconds at a time two shards
+  were a tick or two apart: two of the later crossings there showed a drawn
+  step of 0.40 m and 0.76 m and corrections of 0.05 to 1.2 m (the four
+  measured right after the start: 3.1-4.6 mm, 0). Not a defect of the Docker
+  launcher: it is the cluster clock's stated limit (`docs/plan-sharding.md`
+  §5: hosts whose clocks differ, a wall clock that is stepped) made visible by
+  that VM. Not verified on a real Linux host, where one kernel clock serves
+  every container.

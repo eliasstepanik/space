@@ -10,6 +10,9 @@ description = "Cluster orchestrator: shard-id allocation, split/merge topology, 
 space-world = { workspace = true }
 space-protocol = { workspace = true }
 space-sim = { workspace = true }
+# The scene's spawn point (`scene_anchor`): the player port sends a new player
+# to the shard that owns it, and the layout cells are checked against it.
+space-scene = { workspace = true }
 space-net = { path = "../space-net" }
 # `ids` composes `space_server::alloc::ShardIdAllocator` with persistence
 # (plan §1.2: the allocator type stays in space-server; the counter moves here).
@@ -17,7 +20,19 @@ space-net = { path = "../space-net" }
 # split/merge loop is verifiable in-sandbox (plan §3.4).
 space-server = { path = "../space-server" }
 quinn = { workspace = true }
-tokio = { workspace = true }
+# `signal`: the orchestrator stops and removes the shards it started when it is
+# told to stop (SIGTERM from `docker stop` / compose, Ctrl-C). std has no signal
+# API and this crate forbids `unsafe`, so there is no way to hear one without
+# it; the feature adds one pure-Rust crate on Unix (`signal-hook-registry`, on
+# `libc`, which the lockfile already has) and none on Windows.
+tokio = { workspace = true, features = ["signal"] }
+# The Docker launcher speaks JSON to the Docker Engine API over its socket
+# (hand-rolled HTTP/1.1, `launcher/docker.rs`). Already in the lockfile (xtask,
+# space-mcp): no new crate.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+space-test-support = { workspace = true }
 
 [lints]
 workspace = true

@@ -58,9 +58,10 @@ pub enum OperatorCommand {
         /// applied to a map the operator has not seen.
         expected_epoch: Option<u64>,
     },
-    /// Merge `shard`'s region back into its parent's owner, through the epoch
-    /// protocol. Only a shard whose fresh load report says it has no players
-    /// is merged (H13).
+    /// Merge `shard`'s region back into the region around it (its parent
+    /// node after an octant split, the nearest enclosing region for a carved
+    /// cell), through the epoch protocol. Only a shard whose fresh load report
+    /// says it has no players is merged (H13).
     Merge {
         /// The shard whose region is merged away.
         shard: ShardId,
@@ -101,7 +102,9 @@ impl core::fmt::Display for OperatorCommand {
                 octant: None,
                 ..
             } => write!(f, "split {shard}, first free octant from the centre"),
-            OperatorCommand::Merge { shard, .. } => write!(f, "merge {shard} into its parent"),
+            OperatorCommand::Merge { shard, .. } => {
+                write!(f, "merge {shard} into the region around it")
+            }
             OperatorCommand::PauseAutoscaler => f.write_str("pause the autoscaler"),
             OperatorCommand::ResumeAutoscaler => f.write_str("resume the autoscaler"),
             OperatorCommand::PushMap => f.write_str("re-send the committed map"),
@@ -291,7 +294,7 @@ mod tests {
             shard: ShardId::new(2),
             expected_epoch: None,
         };
-        assert_eq!(merge.to_string(), "merge shard 2 into its parent");
+        assert_eq!(merge.to_string(), "merge shard 2 into the region around it");
         let scene = OperatorCommand::SetScene {
             scene: Scene::Galaxy,
         };

@@ -25,9 +25,9 @@
 //!
 //! The server knows ships at world positions; the client draws a scene
 //! ([`World`]) around a spawn point. The two are tied together by the map:
-//! the scene's spawn point lies on the map's **anchor** — the centre of its
-//! root region ([`crate::link::map_anchor`]), which is where the root shard
-//! spawns its players — so a ship `d` metres from the anchor is drawn `d`
+//! the scene's spawn point lies on the map's **anchor** — a point of its
+//! root region ([`crate::link::map_anchor`]), which is where the shard that
+//! owns it spawns its players — so a ship `d` metres from the anchor is drawn `d`
 //! metres from the spawn point. Every client derives the same anchor from the
 //! map its shard sent, so everybody sees the scene in the same place: one
 //! world, whichever shard a player joined through. A ship's position is its
@@ -88,12 +88,13 @@ use space_world::WorldPos;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::adaptive::{Adaptive, AdaptiveMode};
 use crate::address::{dial, ServerAddress, DEFAULT_ADDRESS};
-use crate::bodies::{pose_at, BodyRenderer, Drawn, INTERPOLATION_DELAY};
+use crate::bodies::{draw_time, pose_at, BodyRenderer, Drawn, When, INTERPOLATION_DELAY};
 use crate::connect::Prompt;
 use crate::input::{CameraMode, Controls, Request, ScreenKind, KEY_HELP};
 use crate::kestrel::Detail;
-use crate::link::{OtherShip, Replica, ServerLink};
+use crate::link::{OtherShip, Replica, ServerLink, Source};
 use crate::predict::{Clock, OwnShip, Shown};
 use crate::scenes::{
     character_mesh, metres, relative, ship_mesh, Prop, SkyTime, World, EYE_HEIGHT,
@@ -102,6 +103,20 @@ use crate::ui::{self, ConnectView, HudView, Status};
 
 /// The most bodies [`ClientState::bodies`] lists (the nearest ones).
 pub const MAX_LISTED_BODIES: usize = 64;
+
+/// What one of the other players or ships the last frame drew is (for the
+/// harness: `ClientState::others`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OtherAbout {
+    /// A player flies it.
+    player: bool,
+    /// Which copy of it the shard sends.
+    source: Source,
+    /// How far it is from the own ship, metres.
+    distance: f64,
+    /// How old its newest sample is, ticks.
+    sample_age: f64,
+}
 
 /// The renderer draws at most this many point lights.
 const MAX_LIGHTS: usize = 8;
@@ -237,6 +252,23 @@ pub struct AppConfig {
     pub escape_quits: bool,
 }
 
+/// The own ship as a frame drew it ([`App::drawn_ship`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnShip {
+    /// The instant the frame was drawn for: the one reading of the monotonic
+    /// clock the frame's draw clock and prediction were advanced to. The time
+    /// between two frames' is exactly the time the app let pass between
+    /// them, whenever whoever drives it gets to look.
+    pub at: Instant,
+    /// The fractional tick of the shard's clock it was drawn at.
+    pub tick: f64,
+    /// Where, metres from the scene's spawn point (what the HUD's `pos`
+    /// measures from).
+    pub position: [f64; 3],
+    /// Its velocity there, m/s.
+    pub velocity: [f32; 3],
+}
+
 /// A connection attempt in flight.
 struct Attempt {
     /// The address in canonical form, for the screen and the state.
@@ -259,12 +291,15 @@ struct Session {
     own: Option<OwnShip>,
     /// The own ship as drawn this frame.
     shown: Option<Shown>,
+    /// The instant this frame was advanced to ([`DrawnShip::at`]).
+    shown_at: Option<Instant>,
 }
 
 impl Session {
     /// The frame's bookkeeping: the clock, and the own ship's prediction
     /// (rebuilt for a new ship, shard, scene or anchor).
     fn advance(&mut self, scene: space_protocol::Scene, now: Instant) {
+        self.shown_at = Some(now);
         self.clock.update(&self.replica, now);
         let sent = self.link.take_sent();
         let stale = self
@@ -410,6 +445,13 @@ pub struct App {
     bodies: BodyRenderer,
     /// The bodies the last frame drew.
     drawn_bodies: Vec<Drawn>,
+    /// The other ships and players of the last frame as drawn: guid, and
+    /// where in the scene (around the spawn point).
+    drawn_others: Vec<(EntityGuid, WorldPos)>,
+    /// What each of `drawn_others` is, in the same order.
+    others_about: Vec<OtherAbout>,
+    /// Ray budget and render scale that follow the measured GPU time.
+    adaptive: Adaptive,
 }
 
 impl std::fmt::Debug for App {
@@ -453,6 +495,9 @@ impl App {
             base: None,
             bodies: BodyRenderer::new(),
             drawn_bodies: Vec::new(),
+            drawn_others: Vec::new(),
+            others_about: Vec::new(),
+            adaptive: Adaptive::new(AdaptiveMode::default(), Duration::from_secs_f64(1.0 / 60.0)),
         };
         if config.server.is_some() {
             app.connect();
@@ -661,6 +706,8 @@ impl App {
         self.base = None;
         self.bodies.forget();
         self.drawn_bodies.clear();
+        self.drawn_others.clear();
+        self.others_about.clear();
         match error {
             Some(error) => {
                 log::warn!("space-client: {error}");
@@ -694,6 +741,7 @@ impl App {
             clock: Clock::new(),
             own: None,
             shown: None,
+            shown_at: None,
         }));
     }
 
@@ -801,9 +849,36 @@ impl App {
     #[must_use]
     pub fn render_options(&self) -> RenderOptions {
         match self.net {
-            Net::Online(_) => self.world.options(self.quality),
+            Net::Online(_) => self.adaptive.apply(self.world.options(self.quality)),
             _ => World::default().options(QualityPreset::Ci),
         }
+    }
+
+    /// Chooses how the ray budget and render scale are steered
+    /// ([`AdaptiveMode`]) and the frame time the GPU's share is taken of.
+    pub fn set_adaptive(&mut self, mode: AdaptiveMode, frame_target: Duration) {
+        self.adaptive = Adaptive::new(mode, frame_target);
+    }
+
+    /// Takes the GPU time of the frame just rendered, when the device
+    /// measured one. Only a real GPU playing online steers the level.
+    pub fn observe_gpu_time(&mut self, time: Option<Duration>) {
+        if let Some(t) = time {
+            let adapt = matches!(self.net, Net::Online(_)) && self.detail != Detail::Software;
+            self.adaptive.observe(t, adapt);
+        }
+    }
+
+    /// The current adaptive level, 0 (as chosen) to 6 (cheapest).
+    #[must_use]
+    pub fn render_level(&self) -> usize {
+        self.adaptive.level()
+    }
+
+    /// The last GPU time observed.
+    #[must_use]
+    pub fn gpu_time(&self) -> Option<Duration> {
+        self.adaptive.gpu_time()
     }
 
     /// Whether somebody is waiting for a picture ([`Hub::frame_wanted`]): a
@@ -878,6 +953,46 @@ impl App {
         let replica = self.replica()?;
         let (anchor, ship) = (replica.anchor()?, replica.state?);
         Some(WorldPos::delta(anchor, ship.pos))
+    }
+
+    /// The own ship as the last frame drew it: predicted ahead of the shard
+    /// and interpolated between ticks ([`crate::predict::OwnShip`]). `None`
+    /// while not playing and until there is a prediction.
+    #[must_use]
+    pub fn drawn_ship(&self) -> Option<DrawnShip> {
+        let Net::Online(session) = &self.net else {
+            return None;
+        };
+        let (shown, anchor) = (session.shown?, session.replica.anchor()?);
+        Some(DrawnShip {
+            at: session.shown_at?,
+            tick: shown.tick,
+            position: WorldPos::delta(anchor, shown.state.pos),
+            velocity: shown.state.vel,
+        })
+    }
+
+    /// The other ships and players of the last frame as drawn: each one's
+    /// guid and where it is, metres from the scene's spawn point.
+    #[must_use]
+    pub fn drawn_others(&self) -> Vec<(EntityGuid, [f64; 3])> {
+        let spawn = self.world.spawn();
+        self.drawn_others
+            .iter()
+            .map(|(guid, place)| (*guid, WorldPos::delta(spawn, *place)))
+            .collect()
+    }
+
+    /// The physics bodies of the last frame as drawn (all of them: the
+    /// harness state lists the nearest only): each one's guid and where its
+    /// root part is, metres from the scene's spawn point.
+    #[must_use]
+    pub fn drawn_bodies(&self) -> Vec<(EntityGuid, [f64; 3])> {
+        let spawn = self.world.spawn();
+        self.drawn_bodies
+            .iter()
+            .map(|b| (b.guid, WorldPos::delta(spawn, b.place)))
+            .collect()
     }
 
     /// Where the player's eye point is in the scene: the ship's place as
@@ -1000,8 +1115,17 @@ impl App {
         };
         let mut headings = std::mem::take(&mut self.headings);
         let mut seen: Vec<EntityGuid> = Vec::new();
+        let mut drawn_others = std::mem::take(&mut self.drawn_others);
+        drawn_others.clear();
+        // Where the own ship is drawn, in the server's world.
+        let own = session.ship().map(|ship| ship.pos);
+        let mut others_about = std::mem::take(&mut self.others_about);
+        others_about.clear();
         for tracked in replica.other_ships() {
             let other = &tracked.ship;
+            // Further off, further in the past: far things are sent less
+            // often (`bodies::draw_time`).
+            let behind = behind.map(|t| draw_time(&tracked.history, t, own));
             let pos = behind
                 .and_then(|t| pose_at(&tracked.history, t))
                 .map_or(other.state.pos, |poses| poses[0].pos);
@@ -1009,6 +1133,13 @@ impl App {
             let pos = WorldPos::from_f64_metres_around(pos, c);
             let place = scene_place(spawn, anchor, pos);
             seen.push(other.guid);
+            drawn_others.push((other.guid, place));
+            others_about.push(OtherAbout {
+                player: tracked.is_player(),
+                source: tracked.source(),
+                distance: replica.distance_to(tracked),
+                sample_age: replica.sample_age(tracked),
+            });
             // A player (here or, as a ghost, on a neighbouring shard) is a
             // character; a ship nobody flies is the ship model.
             if !tracked.is_player() {
@@ -1029,15 +1160,20 @@ impl App {
         }
         headings.retain(|(guid, _)| seen.contains(guid));
         self.headings = headings;
+        self.drawn_others = drawn_others;
+        self.others_about = others_about;
         // The physics bodies, at the same moment.
         let t = behind.unwrap_or(replica.tick as f64);
         self.drawn_bodies = self.bodies.draw(
             replica,
-            t,
+            When {
+                t,
+                own,
+                carry: &|at, place| carry(at)(place),
+            },
             spawn,
             Instant::now(),
             &mut self.scene,
-            &carry(t),
         );
     }
 
@@ -1052,8 +1188,16 @@ impl App {
             .shard
             .map_or_else(|| "?".to_owned(), |shard| shard.0.to_string());
         let players = 1 + replica.other_ships().filter(|t| t.is_player()).count();
+        let first = match self.adaptive.gpu_time() {
+            Some(gpu) => format!(
+                "{fps:.0} fps  {ms:.1} ms  gpu {:.1} ms  level {}",
+                gpu.as_secs_f64() * 1000.0,
+                self.adaptive.level()
+            ),
+            None => format!("{fps:.0} fps  {ms:.1} ms"),
+        };
         let mut lines = vec![
-            format!("{fps:.0} fps  {ms:.1} ms"),
+            first,
             format!(
                 "shard {shard}  handoffs {}  players {players}",
                 replica.handoffs
@@ -1125,6 +1269,33 @@ impl App {
                 speed: f64::from(b.speed),
                 parts: u32::try_from(b.parts).unwrap_or(u32::MAX),
                 in_view: b.in_view,
+                source: b.source.name().to_owned(),
+                step: u32::from(space_protocol::far::step_for(b.distance)),
+                sample_age_s: b.sample_age * f64::from(space_sim::dt()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        out.truncate(MAX_LISTED_BODIES);
+        out
+    }
+
+    /// The other players and ships of the last frame as the harness lists
+    /// them: nearest first, at most [`MAX_LISTED_BODIES`].
+    fn other_states(&self, session: &Session) -> Vec<space_harness::OtherState> {
+        let eye = self.eye(session);
+        let spawn = self.world.spawn();
+        let mut out: Vec<space_harness::OtherState> = self
+            .drawn_others
+            .iter()
+            .zip(&self.others_about)
+            .map(|((guid, place), about)| space_harness::OtherState {
+                guid: format!("{guid}"),
+                player: about.player,
+                position: WorldPos::delta(spawn, *place),
+                distance: WorldPos::distance(eye, *place),
+                source: about.source.name().to_owned(),
+                step: u32::from(space_protocol::far::step_for(about.distance)),
+                sample_age_s: about.sample_age * f64::from(space_sim::dt()),
             })
             .collect();
         out.sort_by(|a, b| a.distance.total_cmp(&b.distance));
@@ -1145,6 +1316,8 @@ impl App {
             fps: self.fps.fps,
             ..ClientState::default()
         };
+        state.gpu_ms = self.gpu_time().map(|t| t.as_secs_f32() * 1000.0);
+        state.render_level = u32::try_from(self.render_level()).unwrap_or(u32::MAX);
         match &self.net {
             Net::Idle => {
                 state.error = self.controls.prompt.error().map(str::to_owned);
@@ -1154,7 +1327,9 @@ impl App {
             Net::Connecting(attempt) => state.address.clone_from(&attempt.label),
             Net::Online(session) => {
                 let replica = &session.replica;
+                // The address that was dialed, and the shard it led to.
                 state.address.clone_from(&session.label);
+                state.shard_address = Some(session.link.shard_address().to_string());
                 state.shard = replica.shard.map(|shard| shard.0);
                 state.session = Some(replica.session);
                 state.tick = replica.tick;
@@ -1174,6 +1349,24 @@ impl App {
                 }
                 state.bodies = self.body_states(session);
                 state.fast = self.controls.fast;
+                if let Some(drawn) = self.drawn_ship() {
+                    state.drawn_position = Some(drawn.position);
+                    state.drawn_velocity = Some(drawn.velocity.map(f64::from));
+                    state.drawn_tick = Some(drawn.tick);
+                }
+                state.others_drawn = u32::try_from(self.drawn_others.len()).unwrap_or(u32::MAX);
+                state.others = self.other_states(session);
+                let far = self
+                    .drawn_bodies
+                    .iter()
+                    .filter(|b| b.source == Source::Far)
+                    .count()
+                    + self
+                        .others_about
+                        .iter()
+                        .filter(|o| o.source == Source::Far)
+                        .count();
+                state.far_drawn = u32::try_from(far).unwrap_or(u32::MAX);
                 let bodies = self.world.sky_bodies(&session.sky_time());
                 let eye = self.eye(session);
                 if let Some((body, surface)) = crate::scenes::nearest(&bodies, eye) {

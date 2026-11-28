@@ -389,6 +389,7 @@ impl Shell {
                 None
             };
             self.extent = extent;
+            self.app.observe_gpu_time(self.ctx.last_gpu_time());
             self.app.finish_frame(extent.0, extent.1, pixels);
         }
         Ok(presented)
@@ -406,6 +407,7 @@ impl Shell {
         let options = self.app.render_options();
         let scene = self.app.scene(width, height);
         let out = self.ctx.render_offscreen(scene, width, height, &options)?;
+        self.app.observe_gpu_time(out.gpu_time);
         self.app.finish_frame(width, height, Some(out.pixels));
         Ok(())
     }

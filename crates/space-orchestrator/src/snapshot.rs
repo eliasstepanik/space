@@ -9,7 +9,8 @@
 //! Every time in a snapshot is an orchestrator **tick** (the loop runs at
 //! [`crate::config::TICK_HZ`]); `tick` is "now" on the same clock.
 //!
-//! The shared peer token is deliberately **not** part of a snapshot.
+//! The peer token and the cluster secret are deliberately **not** part of a
+//! snapshot.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,6 +35,12 @@ pub struct Snapshot {
     pub bind: SocketAddr,
     /// The control address launched shards are told to dial.
     pub control_addr: SocketAddr,
+    /// The player port — the one address players type — if the orchestrator
+    /// serves one (`--player-bind`).
+    pub player_port: Option<PlayerPortView>,
+    /// The shard a new player starts on: the owner of the scene's spawn
+    /// point in the committed map.
+    pub spawn_owner: Option<ShardId>,
     /// Which launcher starts the shards a split creates.
     pub launcher: LauncherKind,
     /// The file the shard-id counter is persisted in.
@@ -56,6 +63,18 @@ pub struct Snapshot {
     pub regions: Vec<RegionView>,
     /// The most regions the map may hold; a split at the limit is refused.
     pub max_regions: usize,
+    /// How many shards the orchestrator keeps running by itself (0: none).
+    pub min_shards: usize,
+    /// The most shards the cluster may have.
+    pub max_shards: usize,
+    /// Whether a shard's hello must carry the cluster's credential (which
+    /// is itself never part of a snapshot).
+    pub hello_auth_required: bool,
+    /// Launches that have not become a registered shard yet.
+    pub starting: usize,
+    /// The node a split or a carve asked for that is waiting for a shard to
+    /// register and take it.
+    pub wanted: Option<NodeRef>,
     /// Every shard the orchestrator knows of, by id.
     pub shards: Vec<ShardView>,
     /// The epoch change in flight, if any.
@@ -66,6 +85,25 @@ pub struct Snapshot {
     pub scene: SceneView,
     /// The recent-events log, newest first.
     pub events: Vec<Event>,
+}
+
+/// The player port ([`crate::player`]): where it listens and what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerPortView {
+    /// Where it listens.
+    pub addr: SocketAddr,
+    /// The shard a client that says hello is sent to right now. `None`: it
+    /// is told "the cluster is starting" — no connected shard owns the spawn
+    /// point (nobody has claimed the root yet, or its owner is being
+    /// replaced).
+    pub sends_to: Option<ShardId>,
+    /// Hellos answered with a redirect since the orchestrator started.
+    pub redirected: u64,
+    /// Hellos answered with "starting".
+    pub turned_away: u64,
+    /// Connections refused unanswered because too many were being served at
+    /// once.
+    pub refused: u64,
 }
 
 /// The cluster's scene: what every shard is told to show.
@@ -215,25 +253,32 @@ pub struct RegionView {
     pub node: NodeRef,
     /// The shard that owns it.
     pub shard: ShardId,
-    /// Where the map says that shard is reachable. `None` while the map only
-    /// holds a placeholder: a new child that has not said hello yet, or the
-    /// root before any shard has claimed it.
+    /// Where the map says that shard is reachable by other shards. `None`
+    /// while the map only holds a placeholder: a new child that has not said
+    /// hello yet, or the root before any shard has claimed it.
     pub endpoint: Option<SocketAddr>,
+    /// Where the map sends that shard's **players** (`None` like `endpoint`).
+    /// An unspecified IP (`0.0.0.0:<port>`) means "the host the player
+    /// dialed, this port".
+    pub client_endpoint: Option<SocketAddr>,
     /// How many regions of the map contain this one (0 for a top-level region).
     pub nesting: u8,
-    /// The enclosing region this one was carved out of, when its octree parent
-    /// is itself a region of the map.
+    /// The enclosing region this one was carved out of, and the one a merge
+    /// gives it back to: the nearest ancestor node that is a region of the
+    /// map — the octree parent after an octant split, any number of levels up
+    /// for a carved cell (`None` for a top-level region).
     pub parent: Option<NodeRef>,
-    /// Which octant of `parent` this region is (`None` when it has no such
-    /// parent). Bit 0 = +x, bit 1 = +y, bit 2 = +z.
+    /// Which octant of `parent` this region is, when `parent` is its direct
+    /// octree parent (`None` for a top-level region and for a region carved
+    /// more than one level down). Bit 0 = +x, bit 1 = +y, bit 2 = +z.
     pub octant: Option<u8>,
     /// The octants of this region that can still be carved out for a new shard.
     pub free_octants: Vec<u8>,
     /// Why a split of this region would be refused right now (`None`: it
     /// would be accepted).
     pub split_refusal: Option<String>,
-    /// Why a merge of this region into its parent would be refused right now
-    /// (`None`: it would be accepted).
+    /// Why a merge of this region into the one around it (`parent`) would be
+    /// refused right now (`None`: it would be accepted).
     pub merge_refusal: Option<String>,
 }
 
@@ -248,8 +293,14 @@ pub struct ShardView {
     pub connected: bool,
     /// Whether it has said hello since this orchestrator started.
     pub registered: bool,
-    /// The address it advertised in its hello.
+    /// The address it advertised in its hello (an unspecified IP filled in
+    /// with the one its control connection comes from): where other shards
+    /// dial it.
     pub advertised: Option<SocketAddr>,
+    /// Where its players are sent: the client endpoint its hello asked for,
+    /// else `advertised`. An unspecified IP means "the host the player
+    /// dialed".
+    pub client_endpoint: Option<SocketAddr>,
     /// The regions of the committed map it owns.
     pub regions: Vec<NodeRef>,
     /// When it was last heard from, and how.
@@ -263,6 +314,9 @@ pub struct ShardView {
     /// registered). Compare with [`Snapshot::scene`] through
     /// [`SceneView::sync_of`].
     pub scene: Option<SceneState>,
+    /// Whether the orchestrator started it (and so watches and stops its
+    /// process); `false` for a shard started by hand.
+    pub launched: bool,
 }
 
 /// What a shard is to the cluster.
@@ -272,24 +326,32 @@ pub enum ShardRole {
     Owner,
     /// The root owner reserved at startup; no live shard has claimed it yet.
     ReservedRoot,
-    /// The child of the split in flight: launched, owns nothing until the
-    /// epoch commits.
-    SplitChild,
+    /// The shard the change in flight gives its region: registered, owns
+    /// nothing until the epoch commits.
+    Joining,
+    /// Known to be dead and still the owner of regions: they go to the next
+    /// shard that registers.
+    Dead,
     /// The shard the merge in flight removes once its epoch commits.
     Merging,
+    /// Its region was merged away: it owns nothing and is handing over what
+    /// it simulates, and is stopped when it is empty.
+    Draining,
     /// Known (it said hello) but it owns no region of the committed map.
     Unowned,
 }
 
 impl ShardRole {
-    /// A short lower-case name (`"owner"`, `"split-child"`, …).
+    /// A short lower-case name (`"owner"`, `"joining"`, …).
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             ShardRole::Owner => "owner",
             ShardRole::ReservedRoot => "reserved-root",
-            ShardRole::SplitChild => "split-child",
+            ShardRole::Joining => "joining",
+            ShardRole::Dead => "dead",
             ShardRole::Merging => "merging",
+            ShardRole::Draining => "draining",
             ShardRole::Unowned => "unowned",
         }
     }
@@ -343,8 +405,18 @@ pub struct ReportView {
     /// The load figure the shard itself put in the report.
     pub reported_load: f32,
     /// The metric the autoscaler computes from the report
-    /// ([`crate::autoscale::load_metric`]).
+    /// ([`crate::autoscale::ScaleConfig::load_of`]).
     pub load_metric: f64,
+    /// Ships and bodies the shard simulates.
+    pub entities: u32,
+    /// Its mean tick time over the last second, in milliseconds.
+    pub tick_mean_ms: f32,
+    /// Its worst tick time over the last second, in milliseconds.
+    pub tick_max_ms: f32,
+    /// Ticks it has jumped since it started.
+    pub skipped: u64,
+    /// The cell holding most of its players and how many, if it has any.
+    pub hot_cell: Option<([i64; 3], u32)>,
 }
 
 /// An epoch change that has been prepared and not yet committed or aborted.
@@ -373,6 +445,8 @@ pub struct AutoscalerView {
     pub busy_until: u64,
     /// Its most recent decision and what became of it.
     pub last_decision: Option<Decision>,
+    /// The settings it decides by.
+    pub config: crate::autoscale::ScaleConfig,
 }
 
 /// One autoscaler decision.

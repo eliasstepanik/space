@@ -156,6 +156,69 @@ fn a_clock_jump_carries_what_the_moon_holds() {
     );
 }
 
+/// A world that jumps three seconds ahead (a shard that could not keep up:
+/// `SimWorld::skip_to`) moves the moon by those three seconds on its next
+/// step — 19 000 km — and the ship that stands on it with it; and the
+/// inputs filed for ticks after the jump are still applied on their ticks.
+///
+/// Mutation this catches: jumping with `reset_clock` — scene time restarts at
+/// the new tick, so the step after the jump carries the ship by one tick of
+/// the moon's motion while the moon has moved by ninety-one (the ship is left
+/// 19 000 km behind, in empty space), and every buffered input is dropped
+/// (the ship does not lift off below).
+#[test]
+fn a_jump_ahead_carries_what_the_moon_holds_and_keeps_later_inputs() {
+    let mut sim = moon_world(SceneClock::default());
+    let guid = EntityGuid::new(ShardId(1), 4);
+    let start =
+        WorldPos::from_f64_metres_around(moon_center(&sim).to_world_pos(), [0.0, R + 0.9, 0.0]);
+    sim.spawn_ship(guid, 1, ShipState::at_rest(start));
+    for _ in 0..90 {
+        sim.step();
+    }
+    let before = above(&sim, guid);
+    let moon_before = moon_center(&sim).to_world_pos();
+    let now = sim.tick();
+    // Inputs for the next twelve ticks (full thrust up, away from the moon):
+    // four of them are for ticks the jump passes, eight for later ones.
+    let jump = 90;
+    let inputs: Vec<PlayerInput> = (1..=12)
+        .map(|i| fast(guid, now + jump - 4 + i, [0.0, 1.0, 0.0], false))
+        .collect();
+    // (Filed as a shard files them: within the input lead of the present.)
+    sim.skip_to(now + jump - 8);
+    sim.apply_inputs(sim.tick(), &inputs);
+    assert_eq!(sim.buffered_input_count(), 12);
+    sim.skip_to(now + jump);
+    assert_eq!(sim.tick(), now + jump);
+    assert_eq!(
+        sim.buffered_input_count(),
+        8,
+        "the inputs for ticks after the jump are kept, the others dropped"
+    );
+    sim.step();
+    let moved = WorldPos::distance(moon_before, moon_center(&sim).to_world_pos());
+    assert!(moved > 1.0e7, "the premise: the moon went on, {moved} m");
+    assert_eq!(
+        sim.scene_time(),
+        SceneClock::default().time_us_at(now + jump + 1),
+        "scene time is the clock's time of the tick"
+    );
+    let after = above(&sim, guid);
+    assert!(
+        (0..3).all(|k| (after[k] - before[k]).abs() < 0.5),
+        "the ship is where it stood on the moon: {before:?} -> {after:?}"
+    );
+    // The kept inputs act: seven more ticks of thrust up.
+    for _ in 0..7 {
+        sim.step();
+    }
+    assert_eq!(sim.buffered_input_count(), 0);
+    let v = sim.ship_state(guid).expect("alive").vel;
+    assert!(v[1] > 0.5, "the ship is lifting off: {v:?}");
+    assert_eq!(sim.input_ack(1), now + jump + 8);
+}
+
 fn fast(guid: EntityGuid, tick: u64, thrust: [f32; 3], on: bool) -> PlayerInput {
     PlayerInput {
         entity: guid,

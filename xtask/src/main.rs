@@ -4,6 +4,7 @@ use std::process::{exit, Command, Stdio};
 
 use clap::{Parser, Subcommand};
 
+mod e2e;
 mod viewer;
 
 #[derive(Parser)]
@@ -33,8 +34,8 @@ enum Task {
         #[arg(long)]
         dry_run: bool,
     },
-    /// End-to-end tests (implemented in a later phase)
-    E2e,
+    /// Docker end-to-end check: the compose stack, one player, one change of shard
+    E2e(e2e::E2eArgs),
     /// Load benchmarks (implemented in a later phase)
     Load,
     /// Cross-platform parity checks (implemented in a later phase)
@@ -89,7 +90,8 @@ fn main() {
             gpu_setup(&prefix, force, print_env)
         }
         Task::Viewer(args) => viewer::run(args, &invoked_from),
-        Task::E2e | Task::Load | Task::Parity | Task::WebSmoke | Task::Accept => stub(),
+        Task::E2e(args) => e2e::run(args, &invoked_from),
+        Task::Load | Task::Parity | Task::WebSmoke | Task::Accept => stub(),
     }
 }
 
@@ -140,10 +142,11 @@ fn test_target_dir(env: impl Fn(&str) -> Option<OsString>, invoked_from: &Path) 
 }
 
 /// Packages whose tests create a Vulkan device when one is usable. GPU tests
-/// must not run in parallel (skills/space-dev/SKILL.md): on CI they skip, but
+/// must not run in parallel (.warren/skills/space-dev/SKILL.md): on CI they skip, but
 /// on a machine with a real GPU a parallel run would start many devices at
 /// once. `.config/nextest.toml` puts the same packages in a `max-threads = 1`
-/// test group for the nextest path.
+/// test group for the nextest path. (The wall-clock-sensitive tests among
+/// them have a group of their own there: `TIMING_TESTS` in the tests below.)
 const GPU_PACKAGES: [&str; 3] = ["space-render", "space-client", "space-mcp-client"];
 
 fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -167,15 +170,28 @@ fn lint_commands() -> Vec<Vec<OsString>> {
 
 /// `cargo nextest run` for the whole workspace. The GPU packages are
 /// serialised by the `gpu` test group in `.config/nextest.toml`.
+///
+/// `--no-fail-fast`: **every test runs, whatever fails** — one run of the CI
+/// says everything that is wrong. (Stopping at the first failure left half
+/// the workspace untested per run, and a second failure was only found by
+/// the push that fixed the first.) The run still fails if any test did.
 fn nextest_command(target_dir: &Path) -> Vec<OsString> {
-    let mut args = os_args(&["nextest", "run", "--workspace", "--locked", "--target-dir"]);
+    let mut args = os_args(&[
+        "nextest",
+        "run",
+        "--workspace",
+        "--locked",
+        "--no-fail-fast",
+        "--target-dir",
+    ]);
     args.push(target_dir.into());
     args
 }
 
 /// The `cargo test` fallback, as two runs: everything except the GPU packages
 /// with cargo's normal test parallelism, then the GPU packages with one test
-/// thread.
+/// thread. Both with `--no-fail-fast` (every test target runs, whatever
+/// fails), and [`test`] runs the second also when the first failed.
 fn cargo_test_commands(target_dir: &Path) -> Vec<Vec<OsString>> {
     let mut rest = os_args(&["test", "--workspace"]);
     let mut gpu = os_args(&["test"]);
@@ -184,11 +200,17 @@ fn cargo_test_commands(target_dir: &Path) -> Vec<Vec<OsString>> {
         gpu.extend(os_args(&["-p", package]));
     }
     for args in [&mut rest, &mut gpu] {
-        args.extend(os_args(&["--locked", "--target-dir"]));
+        args.extend(os_args(&["--locked", "--no-fail-fast", "--target-dir"]));
         args.push(target_dir.into());
     }
     gpu.extend(os_args(&["--", "--test-threads=1"]));
     vec![rest, gpu]
+}
+
+/// The exit status of a task that ran several commands to the end: the
+/// status of the first one that failed, `None` when none did.
+fn first_failure(statuses: impl IntoIterator<Item = Option<i32>>) -> Option<i32> {
+    statuses.into_iter().flatten().next()
 }
 
 fn lint(runner: Runner) {
@@ -202,8 +224,14 @@ fn test(runner: Runner, target_dir: &Path) {
         runner.cargo(&nextest_command(target_dir));
     } else {
         eprintln!("xtask: cargo-nextest not found, falling back to `cargo test`");
-        for args in cargo_test_commands(target_dir) {
-            runner.cargo(&args);
+        // Both runs, whatever the first one says: one run of the CI reports
+        // every failure. The task still fails if either did.
+        let statuses: Vec<Option<i32>> = cargo_test_commands(target_dir)
+            .iter()
+            .map(|args| runner.cargo_status(args))
+            .collect();
+        if let Some(code) = first_failure(statuses) {
+            exit(code);
         }
     }
 }
@@ -244,10 +272,18 @@ impl Runner {
         Self { dry_run }
     }
 
-    /// Run `cargo <args>`; exit with its status if it fails. Arguments are
-    /// passed as OS strings, so a path with spaces or non-ASCII characters
-    /// reaches cargo unchanged.
+    /// Run `cargo <args>`; exit with its status if it fails.
     fn cargo(self, args: &[OsString]) {
+        if let Some(code) = self.cargo_status(args) {
+            exit(code);
+        }
+    }
+
+    /// Run `cargo <args>` and say how it failed: `None` when it succeeded
+    /// (or was only printed), else the exit status to end with — never 0.
+    /// Arguments are passed as OS strings, so a path with spaces or
+    /// non-ASCII characters reaches cargo unchanged.
+    fn cargo_status(self, args: &[OsString]) -> Option<i32> {
         let mut shown = String::from("cargo");
         for arg in args {
             shown.push(' ');
@@ -255,17 +291,19 @@ impl Runner {
         }
         if self.dry_run {
             println!("xtask: would run `{shown}`");
-            return;
+            return None;
         }
         println!("xtask: running `{shown}`");
         let status = Command::new("cargo")
             .args(args)
             .status()
             .unwrap_or_else(|err| panic!("xtask: failed to spawn `cargo`: {err}"));
-        if !status.success() {
-            eprintln!("xtask: `{shown}` failed: {status}");
-            exit(status.code().unwrap_or(1));
+        if status.success() {
+            return None;
         }
+        eprintln!("xtask: `{shown}` failed: {status}");
+        // (Ended by a signal there is no code; and a failure is never 0.)
+        Some(status.code().filter(|code| *code != 0).unwrap_or(1))
     }
 }
 
@@ -876,12 +914,41 @@ mod tests {
                 "run",
                 "--workspace",
                 "--locked",
+                "--no-fail-fast",
                 "--target-dir",
                 &*dir.to_string_lossy()
             ]
         );
         // The path is one argument, not re-split on its space.
         assert_eq!(command.last().map(PathBuf::from), Some(dir));
+    }
+
+    /// One run reports every failure: no test command stops at the first
+    /// failing test (`--no-fail-fast`, as cargo's own option — before any
+    /// `--`), the fallback's second run does not depend on the first, and
+    /// the task still ends with a failure's status.
+    ///
+    /// Mutation this catches: dropping the flag from either path (the CI
+    /// stopped at its first failure with 672 of 1361 tests never run), or
+    /// ending with success when only the first of two runs failed.
+    #[test]
+    fn every_test_runs_whatever_fails_and_a_failure_still_fails_the_task() {
+        let dir = Path::new("t").join("xtask-test");
+        let mut commands = cargo_test_commands(&dir);
+        commands.push(nextest_command(&dir));
+        for command in commands.iter().map(|c| args(c)) {
+            let flag = command.iter().position(|a| a == "--no-fail-fast");
+            let test_args = command.iter().position(|a| a == "--");
+            assert!(flag.is_some(), "{command:?}");
+            assert!(
+                test_args.is_none_or(|dashes| flag < Some(dashes)),
+                "{command:?}"
+            );
+        }
+        assert_eq!(first_failure([None, None]), None);
+        assert_eq!(first_failure([Some(101), None]), Some(101));
+        assert_eq!(first_failure([None, Some(101)]), Some(101));
+        assert_eq!(first_failure([Some(100), Some(101)]), Some(100));
     }
 
     /// Without nextest the GPU packages must not be run by a plain
@@ -919,27 +986,105 @@ mod tests {
         }
     }
 
+    /// The wall-clock-sensitive tests: `(package, test target)`. They fly a real
+    /// client through real shard loops in real time, so they are run one at a
+    /// time and with the machine to themselves as far as that can be had:
+    /// `.config/nextest.toml` puts them in a `timing` group of their own
+    /// (`max-threads = 1`, four test slots each), and the `cargo test` fallback
+    /// runs their package — a GPU package — after everything else with one test
+    /// thread (`cargo_test_commands`). The CI's second, renderer-only pass over
+    /// the package skips `seamless` (`SPACE_SKIP_TIMING=1`,
+    /// `.github/workflows/ci.yml`).
+    const TIMING_TESTS: [(&str, &str); 2] =
+        [("space-client", "seamless"), ("space-client", "handoff")];
+
+    /// The overrides of `.config/nextest.toml`, in order: each one's
+    /// `filter`, `test-group` and whether it asks for several test slots.
+    fn nextest_overrides() -> Vec<(String, String, bool)> {
+        let config = include_str!("../../.config/nextest.toml");
+        let value = |block: &str, key: &str| {
+            block
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_once('='))
+                .map(|(_, v)| v.trim().trim_matches('\'').to_owned())
+        };
+        config
+            .split("[[profile.default.overrides]]")
+            .skip(1)
+            .map(|block| {
+                (
+                    value(block, "filter").expect("an override has a filter"),
+                    value(block, "test-group").expect("an override has a test group"),
+                    value(block, "threads-required").is_some(),
+                )
+            })
+            .collect()
+    }
+
     /// The nextest path serialises the same packages through a test group;
     /// the list there and `GPU_PACKAGES` here must not drift apart.
     #[test]
     fn nextest_config_serialises_the_same_gpu_packages() {
         let config = include_str!("../../.config/nextest.toml");
-        let setting = |key: &str| {
-            config
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.starts_with('#') && line.starts_with(key))
-                .unwrap_or_else(|| panic!("no `{key}` line in .config/nextest.toml"))
-        };
-        assert!(setting("gpu").contains("max-threads = 1"));
-        assert!(setting("test-group").contains("'gpu'"));
-        let filter = setting("filter");
+        assert!(config
+            .lines()
+            .any(|line| line.trim() == "gpu = { max-threads = 1 }"));
+        let overrides = nextest_overrides();
+        let (filter, _, _) = overrides
+            .iter()
+            .find(|(_, group, _)| group == "gpu")
+            .expect("an override for the gpu group");
         assert_eq!(filter.matches("package(").count(), GPU_PACKAGES.len());
         for package in GPU_PACKAGES {
             assert!(filter.contains(&format!("package({package})")), "{filter}");
             let manifest = checkout().join("crates").join(package).join("Cargo.toml");
             assert!(manifest.is_file(), "{package} is not a workspace crate");
         }
+    }
+
+    /// The wall-clock-sensitive tests have a serial group of their own that
+    /// is decided **before** the gpu group (the first matching override
+    /// wins, and their package is a GPU package), ask for more than one
+    /// test slot, exist, and — for the `cargo test` fallback — belong to a
+    /// package that is run with one test thread after everything else.
+    #[test]
+    fn nextest_config_runs_the_timing_tests_alone() {
+        let config = include_str!("../../.config/nextest.toml");
+        assert!(config
+            .lines()
+            .any(|line| line.trim() == "timing = { max-threads = 1 }"));
+        let overrides = nextest_overrides();
+        let timing = overrides
+            .iter()
+            .position(|(_, group, _)| group == "timing")
+            .expect("an override for the timing group");
+        let gpu = overrides
+            .iter()
+            .position(|(_, group, _)| group == "gpu")
+            .expect("an override for the gpu group");
+        assert!(timing < gpu, "the first matching override decides");
+        let (filter, _, several_slots) = &overrides[timing];
+        assert!(several_slots, "the timing tests ask for several test slots");
+        assert_eq!(filter.matches("binary(").count(), TIMING_TESTS.len());
+        for (package, test) in TIMING_TESTS {
+            assert!(filter.contains(&format!("package({package})")), "{filter}");
+            assert!(filter.contains(&format!("binary({test})")), "{filter}");
+            let file = checkout()
+                .join("crates")
+                .join(package)
+                .join("tests")
+                .join(format!("{test}.rs"));
+            assert!(file.is_file(), "{} does not exist", file.display());
+            assert!(
+                GPU_PACKAGES.contains(&package),
+                "{package} is not run single-threaded by the cargo test fallback"
+            );
+        }
+        // The CI's second pass over the package leaves the crossing tests out.
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        assert!(ci.contains("SPACE_SKIP_TIMING: \"1\""), "ci.yml");
     }
 
     #[test]

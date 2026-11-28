@@ -8,7 +8,10 @@
 use serde::{Deserialize, Serialize};
 use space_ecs::ComponentId;
 
-use crate::control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+use crate::control::{
+    AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport, ShardRetire,
+};
+use crate::far::{FarInterest, FarUpdate};
 use crate::guid::EntityGuid;
 use crate::scene::{SceneAck, SceneClock, SceneState};
 use crate::shard::{
@@ -148,14 +151,29 @@ pub struct Snapshot {
     /// sent inputs 10..=14 and gets `input_ack = 12` keeps exactly 13 and 14,
     /// whatever order the server received them in.
     pub input_ack: u64,
+    /// More chunks of this snapshot follow (protocol 7).
+    ///
+    /// An interest set that does not fit one frame goes out as several
+    /// `Snapshot` messages, one per tick, on the reliable ordered stream:
+    /// every chunk but the last says `true`. "What a snapshot does not name
+    /// is gone" is a statement about the **whole** snapshot: the recipient
+    /// collects the entities of every chunk and drops what none of them
+    /// named when the chunk that says `false` arrives — never per chunk (it
+    /// used to, and kept only the last chunk's entities, while the shard
+    /// counted all of them as known). A snapshot that fits one frame is one
+    /// message that says `false`.
+    pub more: bool,
 }
 
 /// A delta: the entities whose components changed since the recipient's last
 /// acknowledged tick.
 ///
-/// Same shape as [`Snapshot`] plus the base tick it applies to: the recipient
-/// applies it only if `base_tick` matches what it holds, otherwise it asks for a
-/// fresh snapshot. This is the network half of `space-ecs`'s change-tick model
+/// Same shape as [`Snapshot`] plus a `base_tick`. The client applies every
+/// delta directly (merges it into its state) and does not gate on `base_tick`;
+/// the field is informational. Loss recovery is server-side: the server tracks
+/// which frames each client has acknowledged (`InputTick::ack_tick`) and
+/// re-sends the content of frames presumed lost (see `space-server`'s
+/// `replicate` module). This is the network half of `space-ecs`'s change-tick model
 /// (`World::tick` + `Query::changed_since`): the server's replication pass
 /// collects exactly the rows whose change tick moved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,7 +377,10 @@ pub struct IslandKey {
 /// Tell a client to open a connection to a neighbouring shard for `entity`.
 ///
 /// The new shard map is included so the client never has to ask for it again
-/// before following the redirect.
+/// before following the redirect: it dials `new_shard`'s **client endpoint**
+/// in that map ([`ShardRegion::client_endpoint`], an unspecified IP there
+/// meaning the host the player dialed first — the rule a [`JoinRedirect`]
+/// follows too).
 ///
 /// `activation_tick` is the tick the *new* shard starts being authoritative at.
 /// The client must report back with a [`NeighbourStatus`] once its connection to
@@ -404,10 +425,22 @@ pub enum RejectReason {
     Unauthorized,
     /// The shard is at capacity; retry elsewhere.
     Full,
-    /// The shard is draining for a split/merge or shutdown.
+    /// Not now: the shard is draining for a split/merge or shutdown — or, from
+    /// the orchestrator to a shard's [`ShardHello`], a map change is in flight
+    /// and the hello cannot be served yet. The one refusal that is **not
+    /// final**: a shard told this asks again after a short pause.
     Draining,
     /// Anything else; for logs only.
     Other(String),
+    /// The cluster has no shard for a new player right now: it is starting,
+    /// or the shard that owns the spawn point is being replaced. Said to a
+    /// player's [`Hello`] by the orchestrator's player port, and by a shard
+    /// that would send the player on but does not know where to yet. Not
+    /// final: a client that keeps its connection up by itself tries again.
+    ///
+    /// (Appended in protocol 7, behind `Other`: the variant index is the wire
+    /// tag.)
+    Starting,
 }
 
 /// A connection was refused, with the reason.
@@ -418,12 +451,51 @@ pub struct Reject {
 }
 
 /// First message on every connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` does not print the token (see the impl): a hello ends up in log
+/// lines — "the first message must be a Hello, got ..." — and its token is a
+/// credential, a player's or, between shards, the cluster's peer token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     /// Protocol version the client speaks.
     pub protocol: u32,
-    /// Opaque player token the server authenticates.
+    /// Opaque player token the server authenticates. A shard dialling another
+    /// shard puts `shard:<id>` here, followed by `:<peer token>` when its
+    /// cluster has one.
     pub player_token: String,
+}
+
+impl core::fmt::Debug for Hello {
+    /// Everything but the secret part of the token: a player's token is not
+    /// printed at all, a peer hello keeps the shard id it names
+    /// (`shard:7:<redacted>`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Hello")
+            .field("protocol", &self.protocol)
+            .field("player_token", &RedactedToken(&self.player_token))
+            .finish()
+    }
+}
+
+/// A hello's token as `Debug` prints it (see [`Hello`]'s impl).
+struct RedactedToken<'a>(&'a str);
+
+impl core::fmt::Debug for RedactedToken<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `shard:<digits>[:<peer token>]` is a peer hello; the id is not a
+        // secret, what follows it is.
+        let peer = self.0.strip_prefix("shard:").and_then(|rest| {
+            let (id, secret) = rest
+                .split_once(':')
+                .map_or((rest, None), |(id, secret)| (id, Some(secret)));
+            (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some((id, secret))
+        });
+        match peer {
+            Some((id, None)) => write!(f, "shard:{id}"),
+            Some((id, Some(secret))) => write!(f, "shard:{id}:{}", redacted(secret)),
+            None => f.write_str(redacted(self.0)),
+        }
+    }
 }
 
 /// The connection is accepted.
@@ -438,48 +510,139 @@ pub struct Welcome {
     pub shard_map: ShardMap,
 }
 
+/// "Not here: a new player starts on that shard" — the answer to a player's
+/// [`Hello`] from whoever is not the shard to play on (protocol 7).
+///
+/// Two senders:
+///
+/// * the **orchestrator's player port**, the one address players type: it
+///   answers every hello with the owner of the scene's spawn point and closes;
+/// * a **shard that does not own the spawn point**, to a fresh join: a new
+///   player always starts on the spawn point, so it is sent to its owner
+///   instead of being put somewhere in this shard's region.
+///
+/// The client dials `shard`'s **client endpoint** in `shard_map`
+/// ([`ShardRegion::client_endpoint`], through
+/// [`crate::shard::resolve_client_endpoint`]) and says hello again there —
+/// two such hops at most per attempt. The connection the redirect arrived on
+/// is finished: the sender closes it once the answer has been read.
+///
+/// Not to be confused with [`Redirect`], which moves a player that is
+/// *playing* to the shard its ship is being handed to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinRedirect {
+    /// The shard to dial: the owner of the spawn point as the sender's map
+    /// has it.
+    pub shard: ShardId,
+    /// The sender's map, which names that shard's client endpoint.
+    pub shard_map: ShardMap,
+}
+
 /// Shard → orchestrator: "give me an id and my map" (Phase 3, P3.1).
 ///
 /// The first message on a shard↔orchestrator control connection, after the
-/// ordinary [`Hello`] handshake. `shard` is [`ShardId::NONE`] when the shard
-/// has no id yet and wants one allocated (the normal orchestrated launch —
-/// Phase-2 MAJOR 3 is closed by the orchestrator owning the counter); a shard
-/// that restarts with a known id sends it and asks for its region back.
-/// `region` is `None` when the orchestrator should place the shard at its
-/// configured root region.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// ordinary [`Hello`] handshake. The normal hello names **neither an id nor a
+/// region** (`shard` is [`ShardId::NONE`], `region` is `None`): the
+/// orchestrator allocates the id and assigns the region — the root while
+/// nobody owns it, otherwise a node it carves for the shard through an epoch
+/// change. A hello that names an id or a region is a claim on what the
+/// published map already says (the reserved root owner's first registration);
+/// it never creates a region.
+///
+/// The answer is a [`ShardWelcome`], or a [`Reject`]: [`RejectReason::Draining`]
+/// means "not yet, ask again" (one map change at a time), anything else is
+/// final.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardHello {
     /// Cluster the shard is joining; must match the orchestrator's own id.
     pub cluster: String,
     /// The shard's id, or [`ShardId::NONE`] to request a fresh allocation.
     pub shard: ShardId,
-    /// Where the shard is listening for peers and clients.
+    /// Where the shard is listening: the **internal** endpoint the cluster's
+    /// other shards dial. An unspecified IP (`0.0.0.0:port`: a shard in a
+    /// container that does not know its own address) is filled in by the
+    /// orchestrator with the IP the control connection comes from.
     pub endpoint: std::net::SocketAddr,
-    /// Region the shard claims, or `None` for "place me at the root".
+    /// Region the shard claims, or `None` for "assign me one".
     pub region: Option<ShardRegion>,
+    /// Where **players** are to dial this shard, if not at `endpoint`
+    /// (protocol 7): what the orchestrator puts into the map as the shard's
+    /// [`ShardRegion::client_endpoint`]. An unspecified IP there means "the
+    /// host the player dialed". `None` = the endpoint.
+    pub client_endpoint: Option<std::net::SocketAddr>,
+    /// The cluster secret (protocol 7), empty when the shard was given none.
+    /// An orchestrator whose control port is not on loopback — or that was
+    /// given a secret explicitly — refuses a hello without the right one.
+    /// The **last** field of the message.
+    pub secret: String,
+}
+
+impl core::fmt::Debug for ShardHello {
+    /// Everything but the secret itself: a hello may end up in a log line.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShardHello")
+            .field("cluster", &self.cluster)
+            .field("shard", &self.shard)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("client_endpoint", &self.client_endpoint)
+            .field("secret", &redacted(&self.secret))
+            .finish()
+    }
+}
+
+/// What a `Debug` impl prints in place of a secret.
+fn redacted(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<none>"
+    } else {
+        "<redacted>"
+    }
 }
 
 /// Orchestrator → shard: the id, region, map and peer token the shard runs on.
 ///
-/// The answer to [`ShardHello`]. `peer_token` is a secret the orchestrator
-/// *issues*, but **nothing enforces it today**: shards do not present it on peer
-/// connections, the orchestrator does not check it on `shard:<id>` hello tokens,
-/// and `Shard::peer_message` checks only that the claimed shard id is in its map.
-/// Peer transport is QUIC with a self-signed certificate and no pinning, and the
-/// hello handshake checks the protocol version only (the orchestrator
-/// additionally checks the cluster name). The field is the wire slot a future
-/// enforcement will use; see `docs/security-notes.md`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The answer to [`ShardHello`]. `region` is the region the shard is given;
+/// **it owns it only once the map says so**: for the root that is the map in
+/// this welcome, for a carved node the map of the epoch the orchestrator
+/// proposes right behind the welcome — until that commits `shard_map` names
+/// the node's previous owner and the shard owns nothing.
+///
+/// `peer_token` is the secret every shard of the cluster presents in its hello
+/// to another shard (`shard:<id>:<token>`); a shard that holds one refuses a
+/// peer hello without it. Empty = the orchestrator issues none and peers are
+/// accepted on map membership alone, as between standalone shards.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardWelcome {
     /// The id the orchestrator allocated (or confirmed).
     pub shard: ShardId,
-    /// The region the shard owns, with the endpoint the orchestrator recorded.
+    /// The region the shard is given, with the endpoint the orchestrator
+    /// recorded.
     pub region: ShardRegion,
     /// The current shard map, so the shard never runs on a stale routing table.
     pub shard_map: ShardMap,
-    /// Issued secret for shard↔shard and shard↔orchestrator authentication.
-    /// **Not enforced anywhere today** (see the type docs).
+    /// The secret shards present to each other (see the type docs).
     pub peer_token: String,
+    /// The cluster's **tick origin** (protocol 7): the instant of tick 0, µs
+    /// of UTC since the Unix epoch. Every shard of the cluster counts its
+    /// ticks from it — tick `n` is due at `origin + n / 30 s`
+    /// ([`SceneClock::cluster`](crate::SceneClock::cluster)) — so a tick
+    /// number names the same instant on every shard, whenever each was
+    /// started, a replacement included. The **last** field of the message.
+    pub tick_origin_us: i64,
+}
+
+impl core::fmt::Debug for ShardWelcome {
+    /// Everything but the peer token itself.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShardWelcome")
+            .field("shard", &self.shard)
+            .field("region", &self.region)
+            .field("shard_map", &self.shard_map)
+            .field("peer_token", &redacted(&self.peer_token))
+            .field("tick_origin_us", &self.tick_origin_us)
+            .finish()
+    }
 }
 
 /// Every message that crosses a socket.
@@ -566,6 +729,19 @@ pub enum Message {
     /// moves the scene's planets by it (see [`crate::scene`], "The scene
     /// clock").
     SceneClock(SceneClock),
+    /// Orchestrator's player port, or a shard → client: a new player starts on
+    /// that shard, dial it ([`JoinRedirect`]). The answer to a [`Hello`] in
+    /// place of a [`Welcome`]; never sent unasked to a peer that is playing.
+    JoinRedirect(JoinRedirect),
+    /// Shard -> shard: where my players are, so you can send me what they
+    /// should see of yours ([`FarInterest`], protocol 7).
+    FarInterest(FarInterest),
+    /// Shard -> shard: far replicas, what I simulate in view of your players
+    /// ([`FarUpdate`], protocol 7).
+    FarUpdate(FarUpdate),
+    /// Orchestrator -> shard: you are drained, stop ([`ShardRetire`],
+    /// protocol 7). Only ever sent on a shard's control link.
+    ShardRetire(ShardRetire),
 }
 
 impl Message {
@@ -575,7 +751,7 @@ impl Message {
     /// [`CodecError::UnknownTag`](crate::codec::CodecError::UnknownTag) before
     /// decoding. Bump it together with a new variant appended below; the
     /// `message_tags_are_dense_and_covered` test fails if the two drift apart.
-    pub const VARIANT_COUNT: u32 = 29;
+    pub const VARIANT_COUNT: u32 = 33;
 
     /// The wire tag (bincode variant index) of this message.
     ///
@@ -613,6 +789,10 @@ impl Message {
             Message::SceneAck(_) => 26,
             Message::SceneUpdate(_) => 27,
             Message::SceneClock(_) => 28,
+            Message::JoinRedirect(_) => 29,
+            Message::FarInterest(_) => 30,
+            Message::FarUpdate(_) => 31,
+            Message::ShardRetire(_) => 32,
         }
     }
 
@@ -634,6 +814,7 @@ impl Message {
             Message::DirectoryReply(r) => Some(r.shard_map.epoch),
             Message::Redirect(r) => Some(r.shard_map.epoch),
             Message::Welcome(w) => Some(w.shard_map.epoch),
+            Message::JoinRedirect(r) => Some(r.shard_map.epoch),
             _ => None,
         }
     }

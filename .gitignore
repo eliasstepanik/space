@@ -8,18 +8,28 @@
 # Phase-0 spike builds
 /spikes/*/target
 
-# Render/validation artifacts (convention: artifacts/*.png)
-artifacts/*.png
-
-# Warren sandbox scratch (TMPDIR and the sandbox's Rust installation); the
-# sandbox setup itself, .warren/sandbox.toml, is tracked
-/.warren/tmp/
-/.warren/rustup/
+# Render/validation artifacts: LOOK pictures and logs, never committed
+artifacts/
 
 # Local GPU/Vulkan userspace prefix (never commit; ~64 MB of .debs extracted)
 /.local/
+
+# Compose environment files: they hold the cluster secret (never commit)
+/deploy/.env
+/deploy/proxy/.env
 
 # Local run artefacts: offline client renders and the orchestrator state file
 /*.ppm
 /*.glb
 /space-orchestrator.id*
+
+# Warren: only its working folders under .warren/ are local; the rest of
+# .warren/ (skills, agents, warren-config.toml) is committed. rustup/tmp are
+# the toolchain and temp dirs the space-dev skill's CI command uses.
+/.warren/rustup/
+/.warren/tmp/
+/.warren/out/
+/.warren/refs/
+/.warren/uploads/
+/.warren/blender/
+/.warren/cache/

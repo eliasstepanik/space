@@ -173,24 +173,30 @@ impl EpochParticipant {
 /// region at the same node would leave the old owner in charge, because
 /// [`ShardMap::lookup`] keeps the first of two regions of equal depth.
 ///
-/// The endpoint is copied from an existing region already owned by `new_owner`
-/// (the common case for a rebalance or merge); when the owner is new to the map
-/// the endpoint is the un-dialable [`ShardRegion::UNRESOLVED_ENDPOINT`] sentinel
-/// (never a parent's address, which would misroute peer traffic to the wrong
-/// shard); the orchestrator's map push (plan F9) replaces it with the real
-/// address once the owner registers. Ownership, which is what `lookup` and the
-/// handoff boundary test depend on, is exact either way.
+/// The endpoints — the internal one and the one players dial — are copied from
+/// an existing region already owned by `new_owner` (the common case for a
+/// rebalance or merge); when the owner is new to the map both are the
+/// un-dialable [`ShardRegion::UNRESOLVED_ENDPOINT`] sentinel (never a parent's
+/// address, which would misroute peer traffic — or a joining player — to the
+/// wrong shard); the orchestrator's map push (plan F9) replaces them with the
+/// real addresses once the owner registers. Ownership, which is what `lookup`
+/// and the handoff boundary test depend on, is exact either way.
 fn apply_changes(current: &ShardMap, epoch: u64, changes: &[EpochChange]) -> ShardMap {
     let mut regions = current.regions.clone();
     for (node, new_owner) in changes {
-        let endpoint = regions
+        let unresolved = ShardRegion::UNRESOLVED_ENDPOINT;
+        let (endpoint, client_endpoint) = regions
             .iter()
             .find(|r| r.shard == *new_owner)
-            .map_or(ShardRegion::UNRESOLVED_ENDPOINT, |r| r.endpoint);
+            .map_or((unresolved, unresolved), |r| {
+                (r.endpoint, r.client_endpoint)
+            });
         // One region per node. A node the map already names changes hands in
         // place (and any duplicate a malformed map carried goes with it).
         regions.retain(|r| r.node != *node);
-        regions.push(ShardRegion::new(*node, *new_owner, endpoint));
+        regions.push(
+            ShardRegion::new(*node, *new_owner, endpoint).with_client_endpoint(client_endpoint),
+        );
     }
     ShardMap::new(epoch, regions)
 }

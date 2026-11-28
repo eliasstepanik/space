@@ -19,6 +19,8 @@
 //! uploads nothing.
 
 use ash::vk;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::alloc::{Buffer, Image, SharedAllocator};
 use crate::gpu::{RenderError, RenderOptions};
@@ -185,6 +187,9 @@ pub(crate) struct Pipelines {
     pub overlay_layout: vk::PipelineLayout,
     pub overlay_pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
+    /// Like `sampler` but linear: the tone map's lookup when the scene is
+    /// rendered smaller than the frame.
+    pub sampler_linear: vk::Sampler,
     /// Model textures: trilinear, repeating, anisotropic where available.
     pub texture_sampler: vk::Sampler,
 }
@@ -1000,6 +1005,22 @@ impl Pipelines {
                 )
                 .map_err(|e| RenderError::new(format!("sampler: {e}")))?
         };
+        // Upscale lookup of the tone map when the scene is rendered smaller
+        // than the frame.
+        let sampler_linear = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .map_err(|e| RenderError::new(format!("linear sampler: {e}")))?
+        };
         // Model textures: trilinear over the whole mip chain, repeating, and
         // anisotropic where the device has the feature (it keeps a floor
         // texture sharp at grazing angles).
@@ -1054,6 +1075,7 @@ impl Pipelines {
             overlay_layout,
             overlay_pipeline,
             sampler,
+            sampler_linear,
             texture_sampler,
         })
     }
@@ -1097,6 +1119,7 @@ impl Pipelines {
         device.destroy_pipeline(self.tone_pipeline, None);
         device.destroy_pipeline(self.rq_pipeline, None);
         device.destroy_sampler(self.sampler, None);
+        device.destroy_sampler(self.sampler_linear, None);
         device.destroy_sampler(self.texture_sampler, None);
     }
 }
@@ -2479,6 +2502,9 @@ pub(crate) struct MeshDraw {
 pub(crate) struct FrameKey {
     pub width: u32,
     pub height: u32,
+    /// Size the 3D scene is rendered at (the frame's unless scaled).
+    pub render_width: u32,
+    pub render_height: u32,
     /// Probe grid edge length when GI is on.
     pub gi_grid: Option<u32>,
     /// The SSR / refraction post pass runs.
@@ -2489,12 +2515,26 @@ pub(crate) struct FrameKey {
 
 impl FrameKey {
     pub fn new(width: u32, height: u32, options: &RenderOptions) -> Self {
-        let features = options.preset.features();
+        let features = options.features();
         // The post pass never runs for the raw ray-query probe frame.
         let post = features.needs_post() && !options.ray_probe;
+        let (render_width, render_height) = if options.ray_probe {
+            (width, height)
+        } else {
+            let s = options.render_scale;
+            let s = if s.is_finite() {
+                s.clamp(0.25, 1.0)
+            } else {
+                1.0
+            };
+            let scaled = |n: u32| ((n as f32 * s).round() as u32).clamp(1, n.max(1));
+            (scaled(width), scaled(height))
+        };
         Self {
             width,
             height,
+            render_width,
+            render_height,
             gi_grid: options.gi_enabled.then_some(options.quality.grid),
             post,
             glass: post && features.flags() & FEATURE_REFRACT != 0,
@@ -2513,6 +2553,8 @@ impl FrameKey {
 pub(crate) struct FrameGpu {
     width: u32,
     height: u32,
+    render_width: u32,
+    render_height: u32,
     // `hdr`/`depth`/`material` are never read directly: they are held so their
     // dedicated allocations outlive the framebuffer and views that reference
     // them.
@@ -2550,6 +2592,10 @@ pub(crate) struct FrameGpu {
     cmd_pool: vk::CommandPool,
     /// Signalled whenever no submission of `cmd` is pending (created signalled).
     fence: vk::Fence,
+    /// Two timestamps (start, end of the command buffer); `None` untimed.
+    query_pool: Option<vk::QueryPool>,
+    /// Set once the command buffer has been submitted at least once.
+    submitted: AtomicBool,
     device: ash::Device,
 }
 
@@ -2708,6 +2754,7 @@ struct Partial<'a> {
     framebuffers: Vec<vk::Framebuffer>,
     pool: vk::DescriptorPool,
     cmd: Option<(vk::CommandPool, vk::CommandBuffer)>,
+    query_pool: Option<vk::QueryPool>,
     armed: bool,
 }
 
@@ -2729,6 +2776,9 @@ impl Drop for Partial<'_> {
             if let Some((pool, cmd)) = self.cmd {
                 self.device.free_command_buffers(pool, &[cmd]);
             }
+            if let Some(pool) = self.query_pool {
+                self.device.destroy_query_pool(pool, None);
+            }
         }
     }
 }
@@ -2742,14 +2792,22 @@ impl FrameGpu {
         pipelines: &Pipelines,
         cmd_pool: vk::CommandPool,
         key: FrameKey,
+        timed: bool,
     ) -> Result<Self, RenderError> {
-        let FrameKey { width, height, .. } = key;
+        let FrameKey {
+            width,
+            height,
+            render_width,
+            render_height,
+            ..
+        } = key;
         let mut partial = Partial {
             device,
             views: Vec::new(),
             framebuffers: Vec::new(),
             pool: vk::DescriptorPool::null(),
             cmd: None,
+            query_pool: None,
             armed: true,
         };
         let image = |w: u32,
@@ -2765,6 +2823,8 @@ impl FrameGpu {
         };
         let framebuffer = |render_pass: vk::RenderPass,
                            attachments: &[vk::ImageView],
+                           fb_width: u32,
+                           fb_height: u32,
                            partial: &mut Partial<'_>|
          -> Result<vk::Framebuffer, RenderError> {
             let fb = unsafe {
@@ -2773,8 +2833,8 @@ impl FrameGpu {
                         &vk::FramebufferCreateInfo::default()
                             .render_pass(render_pass)
                             .attachments(attachments)
-                            .width(width)
-                            .height(height)
+                            .width(fb_width)
+                            .height(fb_height)
                             .layers(1),
                         None,
                     )
@@ -2785,32 +2845,32 @@ impl FrameGpu {
         };
 
         let (hdr, hdr_view) = image(
-            width,
-            height,
+            render_width,
+            render_height,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             "hdr-image",
             &mut partial,
         )?;
         let (depth, depth_view) = image(
-            width,
-            height,
+            render_width,
+            render_height,
             vk::Format::D32_SFLOAT,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             "depth-image",
             &mut partial,
         )?;
         let (material, material_view) = image(
-            width,
-            height,
+            render_width,
+            render_height,
             MATERIAL_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             "material-image",
             &mut partial,
         )?;
         let (specular, specular_view) = image(
-            width,
-            height,
+            render_width,
+            render_height,
             SPECULAR_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             "specular-image",
@@ -2831,17 +2891,24 @@ impl FrameGpu {
         let main_framebuffer = framebuffer(
             pipelines.render_pass,
             &[hdr_view, material_view, specular_view, depth_view],
+            render_width,
+            render_height,
             &mut partial,
         )?;
-        let overlay_framebuffer =
-            framebuffer(pipelines.render_pass_overlay, &[out_view], &mut partial)?;
+        let overlay_framebuffer = framebuffer(
+            pipelines.render_pass_overlay,
+            &[out_view],
+            width,
+            height,
+            &mut partial,
+        )?;
 
         // Post pass resources (SSR + refraction): only when the preset needs
         // them.
         let post_images = if key.post {
             let (img, view) = image(
-                width,
-                height,
+                render_width,
+                render_height,
                 vk::Format::R16G16B16A16_SFLOAT,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
                 "post-image",
@@ -2849,8 +2916,8 @@ impl FrameGpu {
             )?;
             let glass = if key.glass {
                 let (gimg, gview) = image(
-                    width,
-                    height,
+                    render_width,
+                    render_height,
                     vk::Format::R16G16B16A16_SFLOAT,
                     vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                     "glass-image",
@@ -2859,6 +2926,8 @@ impl FrameGpu {
                 let fb = framebuffer(
                     pipelines.render_pass_glass,
                     &[gview, material_view, depth_view],
+                    render_width,
+                    render_height,
                     &mut partial,
                 )?;
                 Some((gimg, gview, fb))
@@ -2996,6 +3065,13 @@ impl FrameGpu {
                 .image_layout(layout)
         };
         let sampler_info = [vk::DescriptorImageInfo::default().sampler(pipelines.sampler)];
+        let tone_sampler_info = [vk::DescriptorImageInfo::default().sampler(
+            if (render_width, render_height) == (width, height) {
+                pipelines.sampler
+            } else {
+                pipelines.sampler_linear
+            },
+        )];
 
         // Everything except the scene's own buffers (the instance array, the
         // mesh part records and the TLAS, see `bind_scene`).
@@ -3048,7 +3124,7 @@ impl FrameGpu {
                         .dst_set(tone_set)
                         .dst_binding(1)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(&sampler_info),
+                        .image_info(&tone_sampler_info),
                     vk::WriteDescriptorSet::default()
                         .dst_set(tone_set)
                         .dst_binding(2)
@@ -3144,6 +3220,22 @@ impl FrameGpu {
 
         let cmd = allocate_command_buffer(device, cmd_pool)?;
         partial.cmd = Some((cmd_pool, cmd));
+        let query_pool = if timed {
+            let pool = unsafe {
+                device
+                    .create_query_pool(
+                        &vk::QueryPoolCreateInfo::default()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(2),
+                        None,
+                    )
+                    .map_err(|e| RenderError::new(format!("create_query_pool: {e}")))?
+            };
+            partial.query_pool = Some(pool);
+            Some(pool)
+        } else {
+            None
+        };
         // Signalled: nothing is pending, so the first `wait` returns at once.
         let fence = unsafe {
             device
@@ -3159,6 +3251,8 @@ impl FrameGpu {
         Ok(Self {
             width,
             height,
+            render_width,
+            render_height,
             _hdr: hdr,
             hdr_view,
             _depth: depth,
@@ -3188,6 +3282,8 @@ impl FrameGpu {
             cmd,
             cmd_pool,
             fence,
+            query_pool,
+            submitted: AtomicBool::new(false),
             device: device.clone(),
         })
     }
@@ -3321,8 +3417,43 @@ impl FrameGpu {
                 .map_err(|e| RenderError::new(format!("reset_fences: {e}")))?;
             self.device
                 .queue_submit(queue, std::slice::from_ref(&submit), self.fence)
-                .map_err(|e| RenderError::new(format!("queue_submit: {e}")))
+                .map_err(|e| RenderError::new(format!("queue_submit: {e}")))?;
         }
+        self.submitted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Write the frame's end timestamp (no-op when untimed).
+    unsafe fn write_end_timestamp(&self, device: &ash::Device) {
+        if let Some(pool) = self.query_pool {
+            device.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
+        }
+    }
+
+    /// GPU execution time of the last completed submission, from the two
+    /// timestamps `record` wrote. `None` without a query pool, before the
+    /// first submit or when the results are not available. Call only after
+    /// [`FrameGpu::wait`] succeeded.
+    pub fn gpu_time(&self, period_ns: f32, valid_bits: u32) -> Option<Duration> {
+        let pool = self.query_pool?;
+        if !self.submitted.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut t = [0u64; 2];
+        unsafe {
+            self.device
+                .get_query_pool_results(pool, 0, &mut t, vk::QueryResultFlags::TYPE_64)
+                .ok()?;
+        }
+        let mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        let ticks = t[1].wrapping_sub(t[0]) & mask;
+        Some(Duration::from_secs_f64(
+            ticks as f64 * f64::from(period_ns) * 1e-9,
+        ))
     }
 
     /// Bind `pipeline`, set the full-frame viewport/scissor and draw every
@@ -3346,13 +3477,13 @@ impl FrameGpu {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: self.width as f32,
-                    height: self.height as f32,
+                    width: self.render_width as f32,
+                    height: self.render_height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
             );
-            device.cmd_set_scissor(self.cmd, 0, &[self.full_rect()]);
+            device.cmd_set_scissor(self.cmd, 0, &[self.render_rect()]);
             device.cmd_bind_descriptor_sets(
                 self.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -3434,9 +3565,30 @@ impl FrameGpu {
         }
     }
 
+    /// The rect the 3D scene is rendered in (the frame's unless scaled).
+    fn render_rect(&self) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: self.render_width,
+                height: self.render_height,
+            },
+        }
+    }
+
     /// Dispatch the bound compute pipeline over every 8x8 tile of the frame.
     unsafe fn dispatch_full_frame(&self, device: &ash::Device) {
         device.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+    }
+
+    /// Like [`FrameGpu::dispatch_full_frame`], over the render size.
+    unsafe fn dispatch_render_size(&self, device: &ash::Device) {
+        device.cmd_dispatch(
+            self.cmd,
+            self.render_width.div_ceil(8),
+            self.render_height.div_ceil(8),
+            1,
+        );
     }
 
     /// Record the whole frame into the command buffer:
@@ -3463,6 +3615,10 @@ impl FrameGpu {
         // The pool is RESET_COMMAND_BUFFER, so `begin` resets the buffer.
         begin(cmd, device)?;
         unsafe {
+            if let Some(pool) = self.query_pool {
+                device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, pool, 0);
+            }
             // 0a. The scene's TLAS, with the barrier that makes it visible to
             //     the compute-shader ray queries below.
             if let Some(tlas) = draw.tlas {
@@ -3649,6 +3805,7 @@ impl FrameGpu {
                 self.dispatch_full_frame(device);
                 let overlaid = self.record_overlay(device, pipelines, draw);
                 self.record_target(device, target, overlaid);
+                self.write_end_timestamp(device);
                 return end(cmd, device);
             }
 
@@ -3658,7 +3815,7 @@ impl FrameGpu {
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(pipelines.render_pass)
                     .framebuffer(self.framebuffer)
-                    .render_area(self.full_rect())
+                    .render_area(self.render_rect())
                     .clear_values(&[
                         // Black, and alpha 0: every surface writes alpha 1, so
                         // the post pass can tell "nothing here" (the refracted
@@ -3719,7 +3876,7 @@ impl FrameGpu {
                     &vk::RenderPassBeginInfo::default()
                         .render_pass(pipelines.render_pass_glass)
                         .framebuffer(glass_fb)
-                        .render_area(self.full_rect())
+                        .render_area(self.render_rect())
                         .clear_values(&[
                             vk::ClearValue {
                                 color: vk::ClearColorValue {
@@ -3783,7 +3940,7 @@ impl FrameGpu {
                     std::slice::from_ref(&post.set),
                     &[],
                 );
-                self.dispatch_full_frame(device);
+                self.dispatch_render_size(device);
                 // Post output GENERAL -> SHADER_READ_ONLY for the tone map.
                 device.cmd_pipeline_barrier(
                     cmd,
@@ -3817,6 +3974,7 @@ impl FrameGpu {
 
             // 5. Hand the finished image to its target.
             self.record_target(device, target, overlaid);
+            self.write_end_timestamp(device);
         }
         end(cmd, device)
     }
@@ -3994,6 +4152,9 @@ impl Drop for FrameGpu {
         // gpu-allocator does not own the dedicated VkImage/VkBuffer).
         let d = &self.device;
         unsafe {
+            if let Some(pool) = self.query_pool {
+                d.destroy_query_pool(pool, None);
+            }
             d.destroy_framebuffer(self.framebuffer, None);
             d.destroy_framebuffer(self.overlay_framebuffer, None);
             d.destroy_image_view(self.hdr_view, None);
@@ -4020,5 +4181,37 @@ impl Drop for FrameGpu {
             // (the pool outlives every frame).
             d.free_command_buffers(self.cmd_pool, &[self.cmd]);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_key_tests {
+    use super::*;
+
+    fn size(width: u32, height: u32, scale: f32, ray_probe: bool) -> (u32, u32) {
+        let options = RenderOptions {
+            render_scale: scale,
+            ray_probe,
+            ..RenderOptions::default()
+        };
+        let key = FrameKey::new(width, height, &options);
+        (key.render_width, key.render_height)
+    }
+
+    #[test]
+    fn the_scene_size_follows_the_clamped_scale() {
+        assert_eq!(size(640, 480, 1.0, false), (640, 480));
+        assert_eq!(size(640, 480, f32::NAN, false), (640, 480));
+        assert_eq!(size(640, 480, f32::INFINITY, false), (640, 480));
+        assert_eq!(size(640, 480, 0.1, false), (160, 120));
+        assert_eq!(size(640, 480, 2.0, false), (640, 480));
+        assert_eq!(size(3, 3, 0.5, false), (2, 2));
+        assert_eq!(size(1, 1, 0.25, false), (1, 1));
+    }
+
+    #[test]
+    fn the_ray_probe_ignores_the_scale() {
+        assert_eq!(size(640, 480, 0.5, true), (640, 480));
+        assert_eq!(size(3, 3, 0.25, true), (3, 3));
     }
 }

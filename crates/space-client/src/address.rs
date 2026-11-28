@@ -12,10 +12,12 @@ use std::time::Duration;
 use space_net::NetError;
 use space_protocol::RejectReason;
 
-use crate::link::ServerLink;
+use crate::link::{JoinError, JoinFailure, ServerLink};
 
-/// The port a shard listens on unless told otherwise (`space-server --bind`
-/// defaults to `127.0.0.1:7777`), and so the port assumed when none is typed.
+/// The port players connect to unless told otherwise — the orchestrator's
+/// player port in a cluster (`space-orchestrator --player-bind`), the shard
+/// itself where there is only one (`space-server --bind` defaults to
+/// `127.0.0.1:7777`) — and so the port assumed when none is typed.
 pub const DEFAULT_PORT: u16 = 7777;
 
 /// What the connect screen's address field starts with.
@@ -216,6 +218,30 @@ impl fmt::Display for ServerAddress {
     }
 }
 
+/// Why a join failed, in words for the connect screen: what went wrong at
+/// the address that was being dialed ([`explain`]) — and, when that was not
+/// the address the player typed, that `entry` had sent the client there.
+#[must_use]
+pub fn explain_join(entry: SocketAddr, error: &JoinError) -> String {
+    let what = match &error.failure {
+        JoinFailure::Net(net) => explain(error.at, net),
+        JoinFailure::TooManyRedirects(_) => format!(
+            "{} kept sending this client on to another shard (more than {} times); giving up",
+            error.at,
+            crate::link::MAX_JOIN_REDIRECTS
+        ),
+        JoinFailure::NoAddress(shard) => format!(
+            "{} sent this client to {shard}, but named no address for it",
+            error.at
+        ),
+    };
+    if error.at == entry {
+        what
+    } else {
+        format!("{what} (sent there by {entry})")
+    }
+}
+
 /// Why a connection attempt failed, in words for the connect screen.
 #[must_use]
 pub fn explain(addr: SocketAddr, error: &NetError) -> String {
@@ -228,8 +254,18 @@ pub fn explain(addr: SocketAddr, error: &NetError) -> String {
         NetError::Rejected(RejectReason::Draining) => {
             format!("the server at {addr} is not taking players right now; try again shortly")
         }
+        // The orchestrator's player port while no shard owns the spawn point
+        // (or a shard that does not know yet where to send a new player).
+        NetError::Rejected(RejectReason::Starting) => {
+            format!("the cluster is starting: {addr} has no shard for a new player yet")
+        }
         NetError::Rejected(RejectReason::Unauthorized) => {
             format!("the server at {addr} did not accept this client")
+        }
+        // The server's own words (the control port telling a player what it
+        // dialed, for one).
+        NetError::Rejected(RejectReason::Other(why)) => {
+            format!("the server at {addr} refused: {why}")
         }
         NetError::Rejected(reason) => format!("the server at {addr} refused: {reason:?}"),
         // QUIC runs over UDP: a port nobody listens on does not refuse, it
@@ -238,18 +274,22 @@ pub fn explain(addr: SocketAddr, error: &NetError) -> String {
             format!("no answer from {addr} (is a shard running there?)")
         }
         NetError::Handshake(why) => format!("cannot connect to {addr}: {why}"),
+        NetError::Untrusted(why) => format!("cannot connect to {addr}: {why}"),
         NetError::Protocol(why) => format!("{addr} is not a space shard: {why}"),
         NetError::Io(why) => format!("cannot reach {addr}: {why}"),
     }
 }
 
-/// Resolve `address` and join the first shard that answers.
+/// Resolve `address` and join the world through the first of its addresses
+/// that answers: a shard, or an entry that sends the client on to one
+/// ([`ServerLink::join`]).
 ///
 /// Every candidate address gets one bounded handshake
-/// ([`space_net::HANDSHAKE_TIMEOUT`]); a server that answers with a refusal
-/// (wrong protocol version, full) ends the attempt at once, since the other
-/// addresses of the same name are the same server. Must be called inside a
-/// tokio runtime.
+/// ([`space_net::HANDSHAKE_TIMEOUT`]; so does each shard a redirect names). A
+/// server that **answers** — with a refusal (wrong protocol version, full,
+/// starting), or with a redirect that leads nowhere — ends the attempt at
+/// once, since the other addresses of the same name are the same server.
+/// Must be called inside a tokio runtime.
 ///
 /// # Errors
 ///
@@ -258,12 +298,21 @@ pub async fn dial(address: &ServerAddress) -> Result<ServerLink, String> {
     let candidates = address.resolve().await?;
     let mut last = String::new();
     for addr in candidates {
-        match ServerLink::connect(addr).await {
+        match ServerLink::join(addr).await {
             Ok(link) => return Ok(link),
             Err(e) => {
-                let refused = matches!(e, NetError::VersionMismatch { .. } | NetError::Rejected(_));
-                last = explain(addr, &e);
-                if refused {
+                // Somebody answered at `addr`: a refusal, or a redirect (the
+                // failure is then at another address, or is the redirecting
+                // itself).
+                let answered = e.at != addr
+                    || matches!(
+                        e.failure,
+                        JoinFailure::Net(NetError::VersionMismatch { .. } | NetError::Rejected(_))
+                            | JoinFailure::TooManyRedirects(_)
+                            | JoinFailure::NoAddress(_)
+                    );
+                last = explain_join(addr, &e);
+                if answered {
                     break;
                 }
             }

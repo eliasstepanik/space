@@ -11,7 +11,7 @@
 //! [`bincode`] 2.x through its `serde` bridge, behind one function pair,
 //! [`encode_frame`] / [`decode_frame`]. It is pure Rust like the rest of the
 //! workspace (no C code), reuses the `serde` derive the messages already carry,
-//! and is compact (varint integers). A hand-rolled codec would be a second
+//! and is compact (fixed-width integers, chosen on purpose: see `codec.rs`). A hand-rolled codec would be a second
 //! format to test and to keep bug-compatible across four consumers, and
 //! bincode 2.0.1 is the released 2.x, so there is no alpha/beta churn. The
 //! bincode `Config` is pinned here ([`codec`]), which makes the byte layout a
@@ -38,6 +38,8 @@
 //! * [`control`] — orchestrator load reports, directory and admin messages
 //! * [`scene`] — the scene catalogue ([`Scene`], [`SceneId`]) and the
 //!   revisioned [`SceneState`] the scene messages carry
+//! * [`far`] — the view range, the distance steps and the far-replica
+//!   messages ([`FarInterest`], [`FarUpdate`], [`Origin`])
 //! * [`codec`] — [`encode_frame`], [`decode_frame`], [`CodecError`]
 //! * [`snapshot`] — [`SnapshotBuilder`], the per-client byte budget
 //!
@@ -48,6 +50,7 @@
 
 pub mod codec;
 pub mod control;
+pub mod far;
 pub mod guid;
 pub mod messages;
 pub mod pos;
@@ -59,16 +62,21 @@ pub use codec::{
     check_hello, decode_frame, encode_frame, try_encode_frame, CodecError, FRAME_HEADER_LEN,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
-pub use control::{AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport};
+pub use control::{
+    AdminCommand, AdminReply, DirectoryQuery, DirectoryReply, LoadReport, ShardRetire,
+};
+pub use far::{FarInterest, FarPlayer, FarUpdate, Origin, OriginKind, FAR_RANGE, ORIGIN_COMPONENT};
 pub use guid::EntityGuid;
 pub use messages::{
     Delta, EntitySnapshot, GhostUpdate, HandoffAbort, HandoffAccept, HandoffCommit, HandoffOffer,
-    HandoffReason, Hello, InputTick, IslandKey, Message, NeighbourStatus, PlayerInput, Redirect,
-    Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch, Welcome,
+    HandoffReason, Hello, InputTick, IslandKey, JoinRedirect, Message, NeighbourStatus,
+    PlayerInput, Redirect, Reject, RejectReason, ShardHello, ShardWelcome, Snapshot, StaleEpoch,
+    Welcome,
 };
 pub use pos::{decode_world_pos, encode_world_pos, WORLD_POS_LEN};
 pub use scene::{Scene, SceneAck, SceneClock, SceneId, SceneState, UnknownScene};
 pub use shard::{
-    AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId, ShardMap, ShardRegion,
+    resolve_client_endpoint, AbortReason, EpochAbort, EpochAck, EpochCommit, EpochPrepare, ShardId,
+    ShardMap, ShardRegion,
 };
 pub use snapshot::{entity_snapshot, SnapshotBuilder, DEFAULT_BUDGET};

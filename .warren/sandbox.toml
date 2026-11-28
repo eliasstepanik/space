@@ -6,8 +6,8 @@
 # Keys: apt, npm, pip, cargo, network_allow, script, [env]. Nothing else: memory,
 # CPU and GPU limits are NOT set here (they are [sandbox.resources] in the Warren
 # server's warren.toml), and unknown keys are refused.
-# How the sandbox is used: skills/space-dev/SKILL.md ("Sandbox", "GPU tests") and
-# skills/space-visual-test/SKILL.md.
+# How the sandbox is used: .warren/skills/space-dev/SKILL.md ("Sandbox", "GPU
+# tests") and .warren/skills/space-visual-test/SKILL.md.
 
 # Only names that exist in every Debian release: a bad name here breaks every
 # session of this project. curl and xz-utils fetch and unpack the Vulkan
@@ -107,7 +107,7 @@ true
 
 # The variables the skills otherwise ask for in front of every command.
 # RUSTUP_TOOLCHAIN and RUSTUP_HOME are the sandbox's own Rust installation
-# (skills/space-dev/SKILL.md, "CI"); the VK_* and LD_LIBRARY_PATH values are what
+# (.warren/skills/space-dev/SKILL.md, "CI"); the VK_* and LD_LIBRARY_PATH values are what
 # `cargo xtask gpu-setup --print-env` prints for this prefix. VK_DRIVER_FILES
 # lists the real GPU first and lavapipe second; set it to one of the two files
 # to pick a device.

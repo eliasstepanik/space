@@ -1,0 +1,10 @@
+space-client: harness API on http://127.0.0.1:8098/ (no token: loopback only)
+[2026-11-27T22:26:21Z INFO  space_client::app] space-client: connecting to 127.0.0.1:7777
+[2026-11-27T22:26:21Z INFO  space_client::tofu] space-client: 127.0.0.1:7777 presents no cluster CA; connected without a pin
+[2026-11-27T22:26:21Z INFO  space_client::tofu] space-client: 127.0.0.1:7870 presents no cluster CA; connected without a pin
+[2026-11-27T22:26:21Z INFO  space_client::link] space-client: 127.0.0.1:7777 sent this client to shard 13 at 127.0.0.1:7870
+space-client: device "AMD Radeon Graphics (RADV GFX1151)" ray_query=true; headless 1920x1080 at up to 60 fps
+[2026-11-27T22:26:21Z INFO  space_client::link] space-client: the server's scene is demo-area (revision 1)
+[2026-11-27T22:26:21Z INFO  space_client::app] space-client: connected to 127.0.0.1:7777 as session 2 on shard 13
+[2026-11-27T22:26:21Z INFO  space_client::kestrel] space-client: Kestrel full model: 417546 triangles in 16 parts, loaded in 87 ms
+space-client: rendered 953 frames in 26.1 s, 0 validation messages

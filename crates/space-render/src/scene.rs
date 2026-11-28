@@ -22,6 +22,25 @@ pub const SHAPE_BOX: u32 = 1;
 /// Depth at/below which an LOD node is drawn as a box instead of a sphere.
 pub const BOX_LOD_DEPTH: u8 = 55;
 
+/// Within this distance (metres) a model that is off screen still takes part
+/// in the ray-traced scene: it can shadow or light what is on screen.
+pub const OCCLUDER_RANGE: f32 = 500.0;
+/// Beyond [`OCCLUDER_RANGE`] an off-screen model stays in the ray-traced scene
+/// only when it subtends at least this angle (radius / distance, radians).
+pub const OCCLUDER_ANGLE: f32 = 2.0e-3;
+
+/// Can an off-screen sphere (camera-relative `center`, `radius`) still matter
+/// to the rays? Near or large ones do; far small ones do not. Non-finite
+/// input is kept (true).
+#[must_use]
+pub fn occludes_off_screen(center: [f32; 3], radius: f32) -> bool {
+    let d = dot(center, center).sqrt();
+    if !d.is_finite() || !radius.is_finite() {
+        return true;
+    }
+    d - radius <= OCCLUDER_RANGE || radius >= OCCLUDER_ANGLE * d
+}
+
 /// A camera pose in world coordinates (camera-relative maths happens in
 /// [`Scene::build`]).
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +60,42 @@ pub struct CameraPose {
     /// plane ([`mat4_perspective_reversed`]), so nothing is clipped here; the
     /// field is a hint for callers that build or cull scenes.
     pub far: f32,
+}
+
+impl CameraPose {
+    /// Conservative test: can any part of the sphere (camera-relative
+    /// `center`, `radius`) be inside the view frustum (infinite far plane)?
+    /// Never culls (true) for a degenerate pose or non-finite values.
+    #[must_use]
+    pub fn sees_sphere(&self, center: [f32; 3], radius: f32) -> bool {
+        let fl = dot(self.forward, self.forward).sqrt();
+        if !(fl.is_finite() && fl > 0.0) {
+            return true;
+        }
+        let f = normalize(self.forward);
+        let rv = cross(f, self.up);
+        let rl = dot(rv, rv).sqrt();
+        let ul = dot(self.up, self.up).sqrt();
+        if !(rl.is_finite() && ul.is_finite() && ul > 0.0) || rl <= 1.0e-6 * ul {
+            return true;
+        }
+        let r = normalize(rv);
+        let u = cross(r, f);
+        let tan_y = (self.fov_y * 0.5).tan();
+        let tan_x = tan_y * self.aspect;
+        let cz = dot(center, f);
+        let reach = cz + radius;
+        let x = dot(center, r).abs();
+        let y = dot(center, u).abs();
+        let values = [cz, reach, x, y, tan_x, tan_y];
+        if !values.iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        if reach < 0.0 {
+            return false;
+        }
+        x <= reach * tan_x + radius && y <= reach * tan_y + radius
+    }
 }
 
 impl Default for CameraPose {
@@ -334,8 +389,8 @@ impl Scene {
             // Camera-relative f32 position (precision-safe near the camera).
             let d = WorldPos::delta(camera.position, world);
             let rel = [d[0] as f32, d[1] as f32, d[2] as f32];
-            // Skip instances far outside the near frustum envelope to keep the
-            // instance buffer bounded (the LOD band already bounds this).
+            // Skip instances whose camera-relative position is not finite
+            // (the LOD band already bounds how far the others can be).
             if !rel.iter().all(|v| v.is_finite()) {
                 continue;
             }
@@ -612,6 +667,53 @@ impl Scene {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Camera at the origin looking down -Z, 90 degrees vertical, square.
+    fn view() -> CameraPose {
+        CameraPose {
+            fov_y: std::f32::consts::FRAC_PI_2,
+            aspect: 1.0,
+            ..CameraPose::default()
+        }
+    }
+
+    #[test]
+    fn sees_sphere_ahead_behind_and_beside() {
+        let cam = view();
+        assert!(cam.sees_sphere([0.0, 0.0, -10.0], 1.0));
+        assert!(!cam.sees_sphere([0.0, 0.0, 10.0], 1.0));
+        // 45 degree planes: at z = -10 the edge is 10 m out.
+        assert!(!cam.sees_sphere([-13.0, 0.0, -10.0], 1.0));
+        assert!(!cam.sees_sphere([13.0, 0.0, -10.0], 1.0));
+        assert!(!cam.sees_sphere([0.0, 13.0, -10.0], 1.0));
+        assert!(!cam.sees_sphere([0.0, -13.0, -10.0], 1.0));
+        // straddling a plane
+        assert!(cam.sees_sphere([-10.0, 0.0, -10.0], 1.0));
+        assert!(cam.sees_sphere([0.0, 10.0, -10.0], 1.0));
+        // the camera inside the sphere
+        assert!(cam.sees_sphere([0.0, 0.0, 1.0], 5.0));
+        assert!(cam.sees_sphere([3.0, 0.0, 1.0], 5.0));
+    }
+
+    #[test]
+    fn sees_sphere_never_culls_a_degenerate_pose() {
+        let mut cam = view();
+        cam.forward = [0.0; 3];
+        assert!(cam.sees_sphere([0.0, 0.0, 100.0], 1.0));
+        let mut cam = view();
+        cam.forward = [0.0, 1.0, 0.0];
+        assert!(cam.sees_sphere([0.0, 0.0, 100.0], 1.0));
+        assert!(view().sees_sphere([f32::NAN, 0.0, 0.0], 1.0));
+    }
+
+    #[test]
+    fn far_small_models_do_not_occlude_from_off_screen() {
+        assert!(occludes_off_screen([10.0, 0.0, 0.0], 0.5));
+        assert!(!occludes_off_screen([600.0, 0.0, 0.0], 0.5));
+        assert!(occludes_off_screen([600.0, 0.0, 0.0], 5.0));
+        assert!(occludes_off_screen([1.0e9, 0.0, 0.0], 6.4e6));
+        assert!(occludes_off_screen([f32::NAN, 0.0, 0.0], 1.0));
+    }
 
     /// Undirected edges of a flat triangle list, with how many triangles use
     /// each, keyed by the vertices' bit patterns.

@@ -26,6 +26,7 @@
 
 #![warn(missing_docs)]
 
+pub mod adaptive;
 pub mod address;
 pub mod app;
 pub mod bodies;
@@ -38,4 +39,5 @@ pub mod link;
 pub mod meshes;
 pub mod predict;
 pub mod scenes;
+pub mod tofu;
 pub mod ui;

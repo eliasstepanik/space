@@ -90,6 +90,21 @@
 //! with large-body gravity (4 m/s² on its surface, none beyond 16 m), crates
 //! resting on it and three balls in orbit, drawn from the same definition,
 //! with a `PLANETOID 4 M/S2` sign under it.
+//!
+//! # Far content
+//!
+//! Three things lie far outside the area, one in each of the three shard
+//! areas beside the spawn point's (`space_scene::demo`, "Far content"): what
+//! a player on the spawn point sees of other shards beyond their border
+//! ghosts, at the three coarser update rates. The **drifters**, 171 m out
+//! ahead to the right, just right of Earth: two big crates swinging on a
+//! spring and three tumbling (ten samples a second). The **far rock**, 706 m
+//! out behind to the left: a rock 32 m across with three moons (five a
+//! second). The **giant rock**, 1.2 km out ahead to the left: 80 m across,
+//! three moons (one a second). The two rocks are statics of the scene
+//! definition and drawn here like the planetoid; the crates and moons are the
+//! shard's, drawn from replication. Each has a sign under it
+//! ([`DemoArea::far_content_signs`]).
 
 use std::sync::{Arc, OnceLock};
 
@@ -99,6 +114,7 @@ use space_render::{
 };
 
 use space_scene::demo::{
+    DRIFT_CENTER, FAR_ROCK_CENTER, FAR_ROCK_RADIUS, GIANT_ROCK_CENTER, GIANT_ROCK_RADIUS,
     GRAVITY_ROOM_CENTER, GRAVITY_ROOM_HALF, PLANETOID_CENTER, PLANETOID_RADIUS,
 };
 
@@ -128,7 +144,8 @@ fn fixed(mesh: &Arc<MeshData>, position: [f64; 3]) -> Prop {
 }
 
 /// Everything a player walks among lies within this distance of the spawn
-/// point, metres; only the backdrop is further out.
+/// point, metres; only the backdrop and the far content (module docs) are
+/// further out.
 pub const AREA_RADIUS: f64 = 45.0;
 
 /// The top of the Kestrel's apron: a step above the floor.
@@ -363,6 +380,47 @@ impl DemoArea {
             to_spawn,
             [2.4, 1.3, 0.5],
         );
+        self.far_content_signs();
+    }
+
+    /// A sign under each piece of the far content (`space_scene::demo`, "Far
+    /// content"), turned to the spawn point: letters a metre or two high, to
+    /// be read on the way there — from the spawn point each is a glowing
+    /// dash under its thing. The rocks themselves are statics of the scene
+    /// definition and drawn with the rest of it; what moves there comes from
+    /// the shard.
+    fn far_content_signs(&mut self) {
+        // (text, the thing's centre, how far under it, dot size, glow). Each
+        // sign stays inside the innermost orbit of its rock: no moon ever
+        // passes through one.
+        let signs = [
+            ("DRIFTERS", DRIFT_CENTER, 16.0, 0.2, [0.4, 2.2, 1.6]),
+            (
+                "FAR ROCK 4 M/S2",
+                FAR_ROCK_CENTER,
+                FAR_ROCK_RADIUS + 2.5,
+                0.22,
+                [2.4, 1.3, 0.5],
+            ),
+            (
+                "GIANT ROCK 3 M/S2",
+                GIANT_ROCK_CENTER,
+                GIANT_ROCK_RADIUS + 3.0,
+                0.3,
+                [2.4, 0.7, 0.4],
+            ),
+        ];
+        for (text, [x, y, z], below, dot, radiance) in signs {
+            let to_spawn = (-x).atan2(-z) as f32;
+            if let Some(mesh) = sign_mesh(text, dot, dot, radiance) {
+                self.showcase.push(Prop {
+                    mesh: Arc::new(mesh),
+                    position: at([x, y - below, z]),
+                    rotation: rotation_y(to_spawn),
+                    scale: 1.0,
+                });
+            }
+        }
     }
 
     /// A floor mat over the rectangle `(min x z, max x z)` and glowing edges

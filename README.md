@@ -14,12 +14,13 @@ shows — the *scene* — is chosen on the server side, for everyone at once.
 | `space-net`, `space-server`, `space-orchestrator` | QUIC transport, the shard, the shard map / autoscaler / scene owner with its built-in web UI |
 | `space-render`, `space-client` | ash/Vulkan renderer (ray-traced shadows, textures, GLB models, 2D overlay), the client (window, headless, pixel stream) |
 | `space-harness` | drive a client without a human: HTTP API for state, frames and input, sandboxed Lua test scripts |
+| `space-test-support` | helpers shared by the tests (seeded PRNG, temp paths, loopback address); depends on no workspace crate, dev-dependency only |
 | `space-stream`, `space-viewer` | JPEG-over-WebSocket streaming and the wasm browser viewer (a local development tool) |
 | `space-mcp*`, `xtask` | MCP servers for agentic testing; CI driver and `xtask viewer` |
 
 Working on it: [`AGENT.md`](AGENT.md) is the rulebook and the workflow (it
-applies to people and to AI agents), [`skills/space-dev/SKILL.md`](skills/space-dev/SKILL.md)
-has the invariants and CI, [`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md)
+applies to people and to AI agents), [`.warren/skills/space-dev/SKILL.md`](.warren/skills/space-dev/SKILL.md)
+has the invariants and CI, [`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md)
 the visual test loop. Deployment: [`deploy/README.md`](deploy/README.md).
 
 ## Play
@@ -31,9 +32,12 @@ Every push to `main` is released, so the newest prebuilt Windows client is
 always
 [`space-client.exe`](https://github.com/eliasstepanik/space/releases/latest/download/space-client.exe).
 Run it with no arguments: a window opens on the **connect screen**. Type the
-address of a shard (`host`, `host:port` or `[ipv6]:port`; the port defaults to
-7777) and press Enter. The client and the servers must come from the same
-release; a mismatch is refused with a readable message.
+server's address (`host`, `host:port` or `[ipv6]:port`; the port defaults to
+7777) and press Enter. That one address is all a player needs: a cluster's is
+its orchestrator's **player port**, which sends the client on to the shard a
+new player starts on (a single shard's own address works the same way). The
+client and the servers must come from the same release; a mismatch is refused
+with a readable message.
 
 | | |
 |---|---|
@@ -55,13 +59,15 @@ map, so all players agree on where things are.
 Needs the Rust toolchain from `rust-toolchain.toml`.
 
 ```powershell
-.\scripts\dev.ps1                          # orchestrator + web UI + one shard + the window client
+.\scripts\dev.ps1                          # orchestrator (player port, web UI) + the four shards it starts + the window client
+.\scripts\dev.ps1 -MinShards 1             # the same on one shard: no borders anywhere
 .\scripts\dev.ps1 -Topology two-shards     # two neighbouring shards: fly across the border
 .\scripts\dev.ps1 -Client headless -Script scripts\harness\smoke.lua   # a scripted test run
 ```
 
 ```sh
 bash scripts/dev.sh                        # the same on Linux
+bash scripts/dev.sh --min-shards 1
 ```
 
 The scripts build the binaries (profile `quick`: optimised like release, but
@@ -71,26 +77,142 @@ background (logs in `target/dev/`), run the client, and stop the servers when
 the client ends. `Get-Help .\scripts\dev.ps1 -Full` (or the header of
 `scripts/dev.sh`) lists the options.
 
+The scripts start **four shards** behind the one address (`-MinShards` /
+`--min-shards`, 1 to 8): the demo area lies in four shard areas that meet at
+`pos` x = -6 / z = -4, and what a player does there — walk across, push a
+crate over a border, knock a stack over it — is what it would be on one
+shard. That is the scripts' default only: `space-orchestrator` itself starts
+no shard unless told to (`--min-shards`, default 0). The compose files run
+the orchestrator alone with `--launcher docker --min-shards 4`: it starts its
+shards as containers ([`deploy/README.md`](deploy/README.md)). The dev scripts
+do not need Docker.
+
 By hand:
 
 ```powershell
 cargo build --profile quick -p space-client -p space-server -p space-orchestrator
-.\target\quick\space-orchestrator.exe --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
-.\target\quick\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+.\target\quick\space-orchestrator.exe --bind 127.0.0.1:7900 --player-bind 127.0.0.1:7777 --state orchestrator.id --webui 127.0.0.1:7980
+.\target\quick\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7870
 .\target\quick\space-client.exe --server 127.0.0.1:7777
 ```
+
+### One address
+
+A client connects to **one address**: the orchestrator's player port
+(`--player-bind`, off unless given; 7777 in the dev scripts). It answers the
+client's hello with the shard that owns the scene's spawn point and closes;
+the client dials that shard and plays there — game traffic never passes
+through the orchestrator. While no shard owns the spawn point yet (the cluster
+is starting, or that shard is being replaced) the client is told so and tries
+again. A shard that is dialed directly does the same thing when the spawn
+point is not its own, so every address leads to the same place: **a new player
+always starts on the spawn point.** A client started with `--server` that
+loses its shard comes back through that address by itself.
+
+Where a shard's players reach it is part of the shard map: `space-server
+--client-endpoint ADDR`, and `0.0.0.0:<port>` there means "the host the player
+dialed, this port" — which is what the orchestrator gives the shards it starts,
+so no public host name is configured anywhere. The player port is the public
+entry and needs no token; the control port (`--bind`) is for shards only.
+
+### Shards
+
+A shard starts without a region and is given one when it registers with the
+orchestrator: the first gets the root (the whole world, and the scene's spawn
+point), each further one the next *layout cell* beside the spawn point — so
+four shards are the four quadrants of the demo area, meeting at `pos` x = -6 /
+z = -4 — up to `--max-shards` (default 8). Start more by hand with the same
+`space-server --orchestrator ...` line and another `--bind`, or let the
+orchestrator do it:
+
+```powershell
+.\target\release\space-orchestrator.exe --player-bind 127.0.0.1:7777 --webui 127.0.0.1:7980 --launcher process --min-shards 4
+```
+
+`--launcher process` starts the `space-server` lying next to the orchestrator,
+one process per shard on a port from `--host-port-range` (default 7870-7899;
+keep it out of the operating system's dynamic port range), logging to
+`shard-<port>.log` in `--shard-log-dir`; `launched-shards.pid` there lists the
+pids of the shards that are running, and nothing else. `--min-shards` can be 8
+at most (the root and the seven layout cells) and not more than `--max-shards`
+or `--max-regions`. A shard that dies — its process exits, its connection to
+the orchestrator closes, or it stops acknowledging map changes — is replaced:
+its region goes to a new shard under a new id and the scene's bodies are built
+again. The replacement listens on the next free port of the range; a client
+that was on the dead shard and was started with `--server <player port>` comes
+back through the player port and is sent there (it starts on the spawn point
+again: where a player was is not kept). A shard that loses its orchestrator
+exits by itself. The web UI and `/api/state` show the player port, which shard
+it sends players to, and where each shard's players dial it.
+
+`--launcher docker` does the same with **one container per shard**, through
+the Docker Engine's socket (Linux only; on Windows the orchestrator refuses to
+start with it and names `--launcher process`): created from `--shard-image`
+(the orchestrator image names the shard image of its own commit), named
+`space-shard-<port>`, its UDP port published on the host under the same
+number, the cluster secret in its environment, no mount, no capability, no
+restart policy, a read-only root filesystem, a process limit and a memory
+limit (`--shard-memory`, 2048 MiB); removed when it is no longer needed, when
+the orchestrator is told to stop (SIGTERM, Ctrl-C), and — what an
+orchestrator that was killed left behind — at the next start. "Its own" is
+decided by three labels, `space.cluster`, `space.role=shard` and
+`space.instance` (an id kept next to the state file, or the compose project):
+two stacks on one host never remove each other's shards, also when both use
+the default cluster name. Both compose files hold the orchestrator alone. **Whoever holds the Docker socket is root on the host**: read
+[`docs/security-notes.md`](docs/security-notes.md), "The Docker socket",
+before mounting it anywhere.
+
+**Scaling.** Every shard reports its load once a second: players, the ships
+and bodies it simulates, its tick times, and its *hot cell* — the 1024 m cell
+holding most of its players. Load is `max(players / capacity, tick p95 /
+33.3 ms)`. A shard at 0.8 or more for 10 s has its hot cell carved for a new
+shard, up to `--max-shards`. A shard that, together with the shard it would
+merge into, stays at 0.35 or less for 60 s is merged away: its region goes
+back, it **drains** — hands its ships and bodies to the shards that own the
+ground now, by the ordinary handoff, its players included — and is told to
+stop when it reports nothing left (it exits 0), or stopped as it is after
+`--drain-timeout` — and then, if it still held bodies, the scene is re-issued
+under a new revision so that they are built again. While a shard drains the
+map does not change again (a split, a merge or a new shard waits, at most
+the drain timeout). The autoscaler removes only shards the orchestrator
+started itself — one started by hand stays until an operator merges it —
+never the layout cells `--min-shards` stands for, never goes below
+`--min-shards`, merges nothing into a shard that has not reported or has no
+room for the players of both (a shard takes 100, and `--shard-capacity` may
+not be above that), and leaves a shard alone for 30 s after any change that
+involved it. A crowd inside one cell cannot be split: a region is never
+smaller than a cell, so a crowd on the spawn point does not grow the cluster,
+and the event log says so. Every number is a flag
+(`--shard-capacity`, `--scale-out-load`, `--scale-out-after`,
+`--scale-in-load`, `--scale-in-after`, `--scale-cooldown`, `--drain-timeout`,
+each with a `SPACE_ORCHESTRATOR_...` variable), so a test can make a cluster
+scale with two clients; the rules and what was measured are in
+[`docs/plan-sharding.md`](docs/plan-sharding.md) §3.
+
+The orchestrator's control port takes any shard on a loopback address. On any
+other address a shard needs the **cluster secret** (`SPACE_CLUSTER_SECRET` on
+both, or `--cluster-secret` / `--cluster-secret-file` on the orchestrator), and
+the orchestrator refuses to start there without one. A connection whose hello
+is refused is closed; one that is welcomed speaks for its own shard only.
+Shards of one cluster prove themselves to each other with a **peer token** the
+orchestrator hands out: generated at start, or given with
+`SPACE_ORCHESTRATOR_PEER_TOKEN` / `--peer-token-file` / `--peer-token` (at
+least 16 characters). Neither secret is printed, and a shard the orchestrator
+starts does not inherit the orchestrator's own settings
+(`SPACE_ORCHESTRATOR_*`, the web UI token among them).
 
 ### Scenes and the orchestrator web UI
 
 Open `http://127.0.0.1:7980/`. The page is part of the orchestrator (server-
-rendered, no JavaScript) and shows the cluster, the map, the shards, the
-autoscaler and recent events; the same state is JSON at `/api/state`. From it
+rendered, no JavaScript) and shows the cluster, the map, the shards with their
+load reports, the autoscaler with its settings and recent events; the same
+state is JSON at `/api/state`. From it
 you can split and merge regions, pause the autoscaler and **switch the scene on
 every shard**. Connected clients follow within a second.
 
 | scene | |
 |---|---|
-| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit. The area rides along with **Earth** (eight Earth radii ahead and above the spawn point): the Moon, the Sun and the planets move around it on their real orbits, sped up 8766× (a year per real hour, the Moon round in 4.5 min), at real size, each a solid ball you can land on, pulling with its real `GM` within a finite reach that ends far from the demo area |
+| `demo-area` (default) | one place that shows everything the renderer does: textures, a mirror floor, glass, a PBR chart, coloured lights and shadows, models, the character, the IC-4 Kestrel on its apron (solid; its full model and LOD1 proxy are embedded in `space-client`, about 17 MB of its 31 MB) — and the physics: a gravity room (stacks, a ramp, a bowl, a seesaw, spring pendulums, a chain), a zero-g corner (floating crates, a spring pair, a door) and a planetoid with its own gravity, crates on it and balls in orbit — and, further out, one thing in each of the three neighbouring shard areas, to be seen across shards at the three coarser update rates: the *drifters* 171 m out (crates swinging on a spring and tumbling), the *far rock* 706 m out and the *giant rock* 1.2 km out, each with gravity and three moons (you can fly there and land). The area rides along with **Earth** (eight Earth radii ahead and above the spawn point): the Moon, the Sun and the planets move around it on their real orbits, sped up 8766× (a year per real hour, the Moon round in 4.5 min), at real size, each a solid ball you can land on, pulling with its real `GM` within a finite reach that ends far from the demo area |
 | `materials` | PBR chart: gold, plastic and steel from mirror-smooth to rough |
 | `galaxy` | the deterministic galaxy through the LOD selector |
 
@@ -98,10 +220,11 @@ every shard**. Connected clients follow within a second.
 reserved and resolves to the default, so an orchestrator whose saved scene was
 `solar` comes back up showing the demo area.)
 
-The planets move by **scene time** (UTC microseconds): every shard maps its
-ticks onto the wall clock, re-anchors when it drifts more than 30 ms, and
-tells its clients the mapping (`SceneClock`, protocol 6), so all shards and
-clients agree on where the Moon is.
+The planets move by **scene time** (UTC microseconds): every shard counts its
+ticks from the cluster's tick origin (tick `n` is `origin + n/30 s`, a mapping
+that is set once and never re-anchored; the shard's tick loop is what is kept
+on the wall clock) and tells its clients the mapping (`SceneClock`, protocol
+6), so all shards and clients agree on where the Moon is.
 
 `space-orchestrator --scene NAME` sets the scene a new cluster starts with; a
 scene chosen in the web UI is remembered next to the orchestrator's state file
@@ -116,17 +239,30 @@ address, and refuses to start on any other address without a token. See
 
 ```
 space-client [--server ADDR] [--headless | --stream ADDR] [--size WxH]
-             [--quality high|medium|low|ci] [--no-vsync] [--frames N] [--fps N]
+             [--quality high|medium|low|ci] [--adaptive auto|off|0-6] [--no-vsync]
+             [--frames N] [--fps N]
              [--glb FILE [--glb-scale S]]
              [--harness ADDR] [--script FILE [--script-timeout S]] [--out-dir DIR]
+             [--pin HEX] [--reset-pins]
 ```
 
+- **Server identity (trust on first use).** The first time the client dials a
+  `host:port` of a cluster it trusts and stores the cluster pin the server
+  presents (logged; compare it with the pin the orchestrator prints) in
+  `<config dir>/space/pins.json` (`SPACE_PIN_FILE` overrides the path); later
+  dials must match or are refused. `--pin HEX` holds the run's servers to a pin
+  you give instead; `--reset-pins` deletes the file and exits. A server without
+  a cluster secret is dialed unpinned. See `docs/security-notes.md`.
+- `--adaptive auto|off|0-6` (default `auto`) picks the adaptive render level: `auto` steers it from the GPU time, `off` is level 0 (full quality), a number fixes it. It lives in `crates/space-client/src/adaptive.rs` and acts through `RenderOptions::{ray_budget, render_scale}`; `/state` shows `gpu_ms` and `render_level`.
 - **window** (default), **`--headless`** (no window, renders offscreen) or
   **`--stream ADDR`** (headless, and streams the picture to the browser viewer).
-- `--server ADDR` connects at once and keeps reconnecting (after 2, 3, 5, then
-  every 8 s) when the shard is not there yet or goes away, until the address is
-  edited or Esc is pressed; connection events are logged to stderr. Without it
-  the connect screen is shown and waits, in every front end.
+- `--server ADDR` connects at once and keeps reconnecting **to that address**
+  (after 2, 3, 5, then every 8 s) when nothing is there yet or the shard goes
+  away, until the address is edited or Esc is pressed; connection events are
+  logged to stderr. Without it the connect screen is shown and waits, in every
+  front end. `ADDR` may be a shard or an orchestrator's player port: the
+  client follows up to two redirects to the shard it plays on, and the harness
+  `/state` says both (`address`, `shard_address`).
 - A headless or streamed client never quits on user input (a viewer cannot take
   it down): it ends through the harness, `--frames`, a finished `--script` or a
   signal.
@@ -143,17 +279,18 @@ scripts that act as a user.
 ```sh
 space-client --headless --harness 127.0.0.1:8098
 curl http://127.0.0.1:8098/                          # the routes
-curl http://127.0.0.1:8098/state                     # screen, scene, position, speed, fps, gravity, bodies ...
+curl http://127.0.0.1:8098/state                     # screen, address, shard, shard_address, scene, position, speed, fps, gravity, bodies ...
 curl -o frame.png http://127.0.0.1:8098/frame.png    # or frame.jpg (much smaller)
 curl -X POST http://127.0.0.1:8098/connect -d '{"address":"127.0.0.1:7777"}'
 
 space-client --headless --server 127.0.0.1:7777 --script scripts/harness/smoke.lua   # exit code = result
 space-client --headless --server 127.0.0.1:7777 --script scripts/harness/physics.lua --script-timeout 300
+space-client --headless --server 127.0.0.1:7777 --script scripts/harness/sharding.lua --script-timeout 180   # the four shard areas and the far content
 ```
 
 The harness is loopback-only without credentials; any other address needs a
 bearer token in `SPACE_HARNESS_TOKEN`. Details in
-[`skills/space-visual-test/SKILL.md`](skills/space-visual-test/SKILL.md).
+[`.warren/skills/space-visual-test/SKILL.md`](.warren/skills/space-visual-test/SKILL.md).
 
 ### In a browser
 
@@ -171,10 +308,46 @@ shards. Fly across (`+X`: hold `D`, about 15 s) and the first shard hands the
 ship to its neighbour: the client opens the second connection, the shards
 commit, and the HUD changes to `shard 2  handoffs 1` without the view jumping.
 
+The shards of a cluster count the same ticks — from the cluster's tick
+origin, which the orchestrator hands every shard it welcomes and a standalone
+shard takes from `--tick-origin` (both default to one fixed instant; one that
+lies in the future is refused) — so a
+tick number names the same instant on every shard. The accepting shard
+installs the ship on the tick its committed state describes, with the inputs
+the client has been sending to both shards since it was redirected, and the
+client's clock, prediction and view carry on: on the four shard areas of
+`-MinShards 4` the borders at `pos` x = -6 and z = -4 show in the HUD's shard
+number (about a second after the ship is a metre across) and in nothing else.
+Standing on a border or walking along it is no handoff, and a player is
+handed over for where it is, not because another flew past.
+
 Physics bodies cross the same way, with nobody to redirect: near a border each
-shard shows its neighbour's bodies as ghosts, bodies that may touch are moved
-onto one shard before they do, and a body that leaves a region is handed to
-the next (the rules: `crates/space-server/src/border.rs`).
+shard shows its neighbour's bodies as ghosts, bodies that may touch — that are
+close, or moving *towards* each other — are moved onto one shard before they
+do, and a body that leaves a region is handed to the next (the rules:
+`crates/space-server/src/border.rs`). A body changes shard for where it is or
+for what it is about to touch, not because a player is near or flies past.
+Against the same scene on one shard (`crates/space-server/tests/four_cells.rs`):
+a body handed over in free flight goes on bit-identically; one handed over in
+contact — sliding, resting in a stack — within a millimetre, because the
+contact solver starts afresh on the shard that takes it.
+
+A border makes no difference to what a player **sees** either: every ship and
+body within 10 km is in the picture, whichever shard simulates it. What lies
+beyond the reach of a neighbour's ghosts (64 m from a border) arrives as a
+**far replica**: the shard that simulates it tells the other shards, each
+relays it to its own clients — a client keeps one play connection — and
+nothing collides with it. How often something's motion is sent falls with its
+distance, for far replicas and for everything else: every tick within 100 m,
+then 10, 5 and 1 times a second out to 250 m, 1 km and 10 km; what does not
+move is not sent. The client draws distant things a little further in the
+past and joins their sparse samples along their velocities
+(`crates/space-protocol/src/far.rs`, `crates/space-server/src/far.rs`). The
+harness says which copy of a thing a client holds: `source` (`local`, `ghost`,
+`far`), `step` and `sample_age_s` per body and per other player in `/state`.
+The demo area has something to see at each rate: from the spawn point its
+drifters, far rock and giant rock (11 of its 46 bodies) are far replicas of
+the three other shards, at 10, 5 and 1 samples a second.
 
 ## Test
 

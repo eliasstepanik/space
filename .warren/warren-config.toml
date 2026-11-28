@@ -1,0 +1,17 @@
+# Warren project config for this repository. Warren layers it over the
+# config source a session runs with (the config repo); see "Project config"
+# in Warren's docs/CONFIG-REPOS.md. Everything here only narrows or adds
+# knowledge, so it needs no trust prompt.
+
+# The project's skills (.warren/skills/). These lists are ADDED to each
+# agent's own skills from the config repo; nothing is taken away.
+[agents.skills]
+# Changes and checks code: the invariants, CI and the visual test loop.
+developer = ["space-dev", "space-visual-test"]
+reviewer  = ["space-dev", "space-visual-test"]
+senior    = ["space-dev", "space-visual-test"]
+# Finds things out and plans: the layout, the invariants, the pipeline.
+researcher = ["space-dev"]
+planner    = ["space-dev"]
+# Looks at the running game.
+browser   = ["space-visual-test"]

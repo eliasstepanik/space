@@ -22,6 +22,58 @@ pub struct LoadReport {
     pub tick_p95_ms: f32,
     /// The derived load metric, `0.0`..
     pub load: f32,
+    /// Ships and bodies this shard simulates (protocol 7): its own, not the
+    /// ghosts and far replicas of its neighbours'. A shard whose region was
+    /// merged away is told to stop when this and `players` are both 0.
+    pub entities: u32,
+    /// Mean tick time over the reporting window, in milliseconds (protocol 7).
+    pub tick_mean_ms: f32,
+    /// Worst tick time over the reporting window, in milliseconds (protocol 7).
+    pub tick_max_ms: f32,
+    /// Ticks this shard has jumped over since it started because it could not
+    /// keep up with the cluster clock (protocol 7).
+    pub skipped: u64,
+    /// The cell (depth-64 octree index) holding most of this shard's players
+    /// (protocol 7); meaningless while `hot_cell_players` is 0. It is where
+    /// the orchestrator carves a region for a new shard when this one is
+    /// loaded.
+    pub hot_cell: [i64; 3],
+    /// How many of `players` are in `hot_cell` (protocol 7). The **last**
+    /// field of the message.
+    pub hot_cell_players: u32,
+}
+
+impl Default for LoadReport {
+    /// A report of nothing, from nobody ([`ShardId::NONE`]): the base a
+    /// caller fills in (`LoadReport { shard, players, ..Default::default() }`).
+    fn default() -> Self {
+        Self {
+            shard: ShardId::NONE,
+            players: 0,
+            tick_p95_ms: 0.0,
+            load: 0.0,
+            entities: 0,
+            tick_mean_ms: 0.0,
+            tick_max_ms: 0.0,
+            skipped: 0,
+            hot_cell: [0; 3],
+            hot_cell_players: 0,
+        }
+    }
+}
+
+/// Orchestrator -> shard: **stop** (protocol 7). The shard's region was merged
+/// away, it has handed everything it simulated to the shards that own the
+/// ground now, and it holds no player: its work is done. The shard stops
+/// serving and ticking and its process exits **0** - the one orderly end of
+/// an orchestrated shard; every other end (a lost control link) is a failure
+/// and exits non-zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardRetire {
+    /// The shard that is to stop (a shard ignores one that names another).
+    pub shard: ShardId,
+    /// Why, for the shard's log.
+    pub reason: String,
 }
 
 /// Ask the directory for the current shard map.

@@ -143,6 +143,7 @@ pub fn run_headless(
             stream.push_jpeg(jpeg.bytes, flags);
             report.streamed += 1;
         }
+        app.observe_gpu_time(out.gpu_time);
         app.finish_frame(out.width, out.height, Some(out.pixels));
         report.frames += 1;
         if let Some(rest) = budget.checked_sub(start.elapsed()) {

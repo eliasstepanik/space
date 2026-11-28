@@ -10,3 +10,4 @@ description = "World model: positions, implicit octree, LOD selection, determini
 workspace = true
 
 [dev-dependencies]
+space-test-support = { workspace = true }

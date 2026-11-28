@@ -1,0 +1,4 @@
+# cargo-audit configuration. Add advisories that cannot be fixed yet to
+# `ignore`, each with a comment saying why.
+[advisories]
+ignore = []

@@ -428,14 +428,7 @@ mod tests {
     use super::*;
 
     fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "space-orch-scene-{tag}-{}-{}.id",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ))
+        space_test_support::temp_path("space-orch-scene", tag).with_extension("id")
     }
 
     fn remove(state_path: &Path) {

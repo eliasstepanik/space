@@ -237,9 +237,34 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         o.string("form_token", form_token);
     });
 
+    // The one address players type (null: the orchestrator serves none), the
+    // shard a new player starts on, and what a hello is answered with now.
+    root.opt_object("player_port", snapshot.player_port, |o, port| {
+        o.display("bind", port.addr);
+        o.string(
+            "answer",
+            if port.sends_to.is_some() {
+                "redirect"
+            } else {
+                "starting"
+            },
+        );
+        o.opt_uint(
+            "sends_to_shard",
+            port.sends_to.map(|shard| u64::from(shard.0)),
+        );
+        o.uint("redirected", port.redirected);
+        o.uint("told_starting", port.turned_away);
+        o.uint("refused_busy", port.refused);
+    });
+
     root.object("map", |o| {
         o.uint("epoch", snapshot.epoch);
         o.uint("max_regions", snapshot.max_regions as u64);
+        o.opt_uint(
+            "spawn_owner",
+            snapshot.spawn_owner.map(|shard| u64::from(shard.0)),
+        );
         match snapshot.last_commit_tick {
             Some(tick) => o.tick("last_commit_tick", tick, now),
             None => o.null("last_commit_tick"),
@@ -248,6 +273,7 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             node(o, "node", region.node);
             o.uint("shard", u64::from(region.shard.0));
             o.opt_display("endpoint", region.endpoint);
+            o.opt_display("client_endpoint", region.client_endpoint);
             o.uint("nesting", u64::from(region.nesting));
             o.opt_string("parent", region.parent.map(node_path).as_deref());
             match region.octant {
@@ -265,12 +291,23 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
         });
     });
 
+    // The shards the orchestrator runs by itself, and what is still missing.
+    root.object("fleet", |o| {
+        o.uint("min_shards", snapshot.min_shards as u64);
+        o.uint("max_shards", snapshot.max_shards as u64);
+        o.uint("starting", snapshot.starting as u64);
+        o.opt_string("wanted", snapshot.wanted.map(node_path).as_deref());
+        o.boolean("hello_auth_required", snapshot.hello_auth_required);
+    });
+
     root.objects("shards", &snapshot.shards, |o, shard| {
         o.uint("id", u64::from(shard.shard.0));
         o.string("role", shard.role.label());
         o.boolean("connected", shard.connected);
         o.boolean("registered", shard.registered);
+        o.boolean("launched", shard.launched);
         o.opt_display("advertised", shard.advertised);
+        o.opt_display("client_endpoint", shard.client_endpoint);
         o.array("regions", &shard.regions, |out, region| {
             write_string(out, &node_path(*region));
         });
@@ -283,6 +320,14 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             o.float("tick_p95_ms", f64::from(report.tick_p95_ms));
             o.float("reported_load", f64::from(report.reported_load));
             o.float("load_metric", report.load_metric);
+            o.uint("entities", u64::from(report.entities));
+            o.float("tick_mean_ms", f64::from(report.tick_mean_ms));
+            o.float("tick_max_ms", f64::from(report.tick_max_ms));
+            o.uint("ticks_jumped", report.skipped);
+            o.opt_object("hot_cell", report.hot_cell, |o, (cell, players)| {
+                o.string("cell", &format!("{}:{}:{}", cell[0], cell[1], cell[2]));
+                o.uint("players", u64::from(players));
+            });
             o.tick("tick", report.tick, now);
         });
         o.opt_object("autoscaler", shard.scale, |o, scale| {
@@ -377,15 +422,14 @@ pub fn state_json(snapshot: &Snapshot, info: &ServerInfo, form_token: &str) -> S
             },
         );
         o.object("config", |o| {
-            o.float("split_threshold", crate::autoscale::SPLIT_THRESHOLD);
-            o.float("merge_threshold", crate::autoscale::MERGE_THRESHOLD);
-            o.uint("split_dwell_ticks", crate::autoscale::SPLIT_DWELL_TICKS);
-            o.uint("merge_dwell_ticks", crate::autoscale::MERGE_DWELL_TICKS);
-            o.uint("cooldown_ticks", crate::autoscale::SCALE_COOLDOWN_TICKS);
-            o.float(
-                "max_players_per_shard",
-                crate::autoscale::MAX_PLAYERS_PER_SHARD,
-            );
+            let scale = scaler.config;
+            o.float("split_threshold", scale.out_load);
+            o.float("merge_threshold", scale.in_load);
+            o.uint("split_dwell_ticks", scale.out_dwell_ticks);
+            o.uint("merge_dwell_ticks", scale.in_dwell_ticks);
+            o.uint("cooldown_ticks", scale.cooldown_ticks);
+            o.uint("drain_timeout_ticks", scale.drain_timeout_ticks);
+            o.float("max_players_per_shard", f64::from(scale.capacity));
             o.float("tick_budget_ms", crate::autoscale::TICK_BUDGET_MS);
         });
     });

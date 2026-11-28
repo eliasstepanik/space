@@ -11,6 +11,7 @@ space-protocol = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
+ring = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 

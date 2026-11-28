@@ -32,15 +32,17 @@
 //! # Benchmarks
 //!
 //! The benchmark tests in `tests/acceptance.rs` assert *debug* timings
-//! (1 000 000 [`InterestGrid::insert`] + 1 000 [`InterestGrid::query_sphere`]
-//! calls with `r = 10 km`, `cap = 1000` in under 2 s). Measured on the
-//! development machine (AMD gfx1151 laptop iGPU host, `x86_64`, `--release`,
-//! `lto = "thin"`):
+//! (1 000 000 [`InterestGrid::insert`] and 1 000 [`InterestGrid::query_sphere`]
+//! calls with `r = 10 km`, `cap = 1000`, each under a generous per-test budget
+//! that guards against algorithmic regressions). Release numbers on the
+//! development machine (`x86_64`, `--release`, `lto = "thin"`), as measured
+//! and documented in [`interest`] (the query workload has ~1000 entities per
+//! cell):
 //!
 //! | workload (release)                                | time   |
 //! |---------------------------------------------------|--------|
-//! | 1 000 000 × [`InterestGrid::insert`]              | ~0.35 s |
-//! | 1 000 × [`InterestGrid::query_sphere`] (r=10 km, cap=1000) | ~0.05 s |
+//! | 1 000 000 × [`InterestGrid::insert`]              | ~0.74 s |
+//! | 1 000 × [`InterestGrid::query_sphere`] (r=10 km, cap=1000) | ~1.38 s |
 //!
 //! Run them with `cargo test --release -p space-world bench_`.
 
