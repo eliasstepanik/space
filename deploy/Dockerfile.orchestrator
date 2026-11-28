@@ -15,13 +15,24 @@ FROM rust:1.100-bookworm AS build
 WORKDIR /src
 ENV RUSTUP_TOOLCHAIN=1.100.0
 COPY . .
-RUN cargo build --release --locked -p space-orchestrator --bin space-orchestrator
+# The two cache mounts keep cargo's downloads and the whole target directory in
+# BuildKit's cache instead of in an image layer. `COPY . .` invalidates the
+# layer on every commit, so without them every build compiles all dependencies
+# again; with them only what changed is rebuilt. The three deploy images share
+# one target cache (same profile, same flags; `sharing=locked` lets one build
+# use it at a time). The binary is copied out because a cache mount is not part
+# of the image. A builder without that cache just builds from scratch.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=space-target-release,target=/src/target,sharing=locked \
+    cargo build --release --locked -p space-orchestrator --bin space-orchestrator \
+ && cp target/release/space-orchestrator /usr/local/bin/space-orchestrator
 
 # ---- runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 RUN useradd --create-home --uid 10001 orchestrator \
  && mkdir -p /var/lib/space && chown orchestrator /var/lib/space
-COPY --from=build /src/target/release/space-orchestrator /usr/local/bin/space-orchestrator
+COPY --from=build /usr/local/bin/space-orchestrator /usr/local/bin/space-orchestrator
 USER orchestrator
 
 # The control port is QUIC (UDP). It binds the wildcard inside the container;

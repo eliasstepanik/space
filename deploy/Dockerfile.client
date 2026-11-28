@@ -19,7 +19,18 @@ FROM rust:1.100-bookworm AS build
 WORKDIR /src
 ENV RUSTUP_TOOLCHAIN=1.100.0
 COPY . .
-RUN cargo build --release --locked -p space-client --bin space-client
+# The two cache mounts keep cargo's downloads and the whole target directory in
+# BuildKit's cache instead of in an image layer. `COPY . .` invalidates the
+# layer on every commit, so without them every build compiles all dependencies
+# again; with them only what changed is rebuilt. The three deploy images share
+# one target cache (same profile, same flags; `sharing=locked` lets one build
+# use it at a time). The binary is copied out because a cache mount is not part
+# of the image. A builder without that cache just builds from scratch.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=space-target-release,target=/src/target,sharing=locked \
+    cargo build --release --locked -p space-client --bin space-client \
+ && cp target/release/space-client /usr/local/bin/space-client
 
 # ---- runtime stage --------------------------------------------------------
 FROM debian:trixie-slim AS runtime
@@ -37,7 +48,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 client
-COPY --from=build /src/target/release/space-client /usr/local/bin/space-client
+COPY --from=build /usr/local/bin/space-client /usr/local/bin/space-client
 USER client
 
 # STREAM_BIND  wildcard ws:// listen address inside the container (viewers dial it).

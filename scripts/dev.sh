@@ -40,7 +40,11 @@
 #   --stream ADDR        where the stream client serves viewers
 #   --size WxH  --quality high|medium|low|ci  --glb FILE  --no-vsync
 #   --port-offset N      add N to every port (a second stack beside the first)
-#   --no-build           use the release binaries that are already built
+#   --no-build           use the binaries that are already built
+#
+# The binaries are built with the `quick` profile (Cargo.toml): optimised like
+# release, but without LTO and incrementally, so a rebuild after an edit takes
+# seconds. They land in target/quick. What ships is built with --release.
 #   --servers-only       start the server side and return (stop with --stop)
 #   --stop               stop servers a previous --servers-only run left behind
 #
@@ -58,7 +62,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Where cargo puts its output: target/, unless CARGO_TARGET_DIR says otherwise.
 target="${CARGO_TARGET_DIR:-$root/target}"
-bin="$target/release"
+bin="$target/quick"
 dev_dir="$target/dev"
 pid_file="$dev_dir/servers.pid"
 exe=""
@@ -208,8 +212,8 @@ mkdir -p "$dev_dir"
 stop_servers
 
 if [ "$no_build" = 0 ]; then
-    echo 'building release binaries (space-client, space-server, space-orchestrator)...'
-    (cd "$root" && cargo build --release --locked -p space-client -p space-server -p space-orchestrator)
+    echo 'building (profile quick: space-client, space-server, space-orchestrator)...'
+    (cd "$root" && cargo build --profile quick --locked -p space-client -p space-server -p space-orchestrator)
 fi
 
 # Every server address is a literal IPv4 socket address: the servers do not

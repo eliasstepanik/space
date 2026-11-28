@@ -53,11 +53,33 @@ after the merged demo area (orbits, scene clock, fast travel, protocol 6): 1097 
 Wasm build (also a CI job):
 `cargo build --release --locked --target wasm32-unknown-unknown -p space-viewer`.
 Lockfile edits need a non-`--locked` cargo command first (e.g. `cargo metadata`).
+**Build speed.** Profiles (root `Cargo.toml`): dependencies carry no debug info in dev/test builds;
+`quick` (= release without LTO, 256 codegen units, incremental; output `target/quick`) is what the dev
+scripts build - measured on Windows for client + server + orchestrator: rebuild after a client edit 3 s
+(release: 17 s), after a `space-sim` edit 4.5 s (release: 32 s). Everything that ships stays on `--release`.
+A build script must only `rerun-if-changed` paths that exist: a missing one counts as changed and
+recompiles the crate on every build (`space-render` did, via a bare `Cargo.lock`).
+CI: the self-hosted Linux jobs keep their target directory between runs outside the workspace
+(`.github/scripts/ci_target_dir.sh NAME`: `~/.cache/space-ci/<runner>/<NAME>`, started again past 25 GB,
+`SPACE_CI_CACHE_LIMIT_GB`); the hosted Windows jobs use `Swatinem/rust-cache`; the Dockerfiles build
+with BuildKit cache mounts (registry + one shared release target); ci.yml's `docker` job builds the three
+deploy images on pull requests only (on a push `release-images.yml` builds them anyway).
 CI is not the end: `AGENT.md` step 4 (look at it on a running stack) comes after.
+
+## Sandbox
+The Warren agent sandbox is set up by `.warren/sandbox.toml` at every sandbox start: apt packages, the
+allowed hosts (crates.io, the Rust toolchain, the Debian pool), a script that unpacks the pinned Vulkan
+packages into `/opt/space/vulkan` (the list `xtask gpu-setup` uses; a test keeps the two equal), and the
+environment: `TMPDIR`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `SPACE_VULKAN_PREFIX`, `LD_LIBRARY_PATH`,
+`VK_DRIVER_FILES` (RADV first, lavapipe second), `VK_LAYER_PATH`. In such a sandbox the prefixes in the
+commands below are already set, and the Vulkan prefix is `$SPACE_VULKAN_PREFIX`, not
+`/workspace/.local/vulkan`. Every step of the script only warns when it fails (a failing setup fails the
+session start); if the Vulkan stack is missing, `cargo xtask gpu-setup` installs it. The script was run in
+a clean `debian:bookworm` container (lavapipe with ray query loads); it has not been run by Warren itself.
 
 ## GPU tests
 Without a Vulkan device the render tests skip loudly. The userspace stack lives in
-`/workspace/.local/vulkan` (`cargo xtask gpu-setup` installs it; needs deb.debian.org).
+`/workspace/.local/vulkan`, or `$SPACE_VULKAN_PREFIX` when that is set (`cargo xtask gpu-setup` installs it; needs deb.debian.org).
 ```sh
 P=/workspace/.local/vulkan/usr
 export LD_LIBRARY_PATH=$P/lib/x86_64-linux-gnu

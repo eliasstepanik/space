@@ -165,3 +165,21 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+
+# Dependencies carry no debug info in dev and test builds: nobody steps through
+# them, and without it they compile faster, link faster and take far less disk.
+# Workspace members keep full debug info ("*" does not match them); a backtrace
+# through a dependency still names its functions, without line numbers.
+[profile.dev.package."*"]
+debug = false
+
+# `quick`: optimised like release, but built to be REBUILT. No LTO, many
+# codegen units and incremental compilation, so after an edit only the changed
+# crate is recompiled and the link takes seconds. This is what the dev scripts
+# build (`scripts/dev.*`, output in `target/quick`); everything that ships
+# (release workflow, Docker images) stays on `release`.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true

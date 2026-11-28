@@ -106,7 +106,7 @@ param(
     [switch]$ConnectScreen,
     # Present as fast as frames render instead of waiting for vsync.
     [switch]$NoVsync,
-    # Use the release binaries that are already built instead of rebuilding.
+    # Use the binaries that are already built (target\quick) instead of rebuilding.
     [switch]$NoBuild,
     # Start the server side and return, leaving it running (stop with -Stop).
     [switch]$ServersOnly,
@@ -122,7 +122,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 # Where cargo puts its output: target\, unless CARGO_TARGET_DIR says otherwise.
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
-$bin = Join-Path $target 'release'
+# The `quick` profile (Cargo.toml): optimised like release, but without LTO and
+# incremental, so a rebuild after an edit takes seconds. What ships is built
+# with --release.
+$bin = Join-Path $target 'quick'
 $devDir = Join-Path $target 'dev'
 $pidFile = Join-Path $devDir 'servers.pid'
 
@@ -169,10 +172,10 @@ New-Item -ItemType Directory -Force $devDir | Out-Null
 Stop-DevServers
 
 if (-not $NoBuild) {
-    Write-Host 'building release binaries (space-client, space-server, space-orchestrator)...'
+    Write-Host 'building (profile quick: space-client, space-server, space-orchestrator)...'
     Push-Location $root
     try {
-        cargo build --release --locked -p space-client -p space-server -p space-orchestrator
+        cargo build --profile quick --locked -p space-client -p space-server -p space-orchestrator
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)" }
     } finally {
         Pop-Location

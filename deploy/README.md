@@ -138,6 +138,12 @@ State at the online-only rework (wire protocol 4), on Windows 11 with an RTX
 - `proxy/docker-compose.yaml` on the host (checked with `docker compose config`
   against `.env.example` only) and `redeploy.sh`; the web UI behind a real TLS
   proxy; the root `Dockerfile` (CI's `docker` job builds it).
+- The BuildKit cache mounts in `Dockerfile.shard`, `Dockerfile.orchestrator`
+  and `Dockerfile.client` (cargo registry and one shared release `target`;
+  the binary is copied to `/usr/local/bin` in the build stage): written, **not
+  yet built** - build all three once (`docker build -f deploy/Dockerfile.shard
+  .`) before a push to `main`, where `release-images.yml` builds and deploys
+  them.
 - GPU tests on the hosted CI runner: its Mesa is too old for the renderer, so
   that step is `continue-on-error: true` and fails visibly rather than
   reporting tests that rendered nothing.

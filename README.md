@@ -64,7 +64,9 @@ Needs the Rust toolchain from `rust-toolchain.toml`.
 bash scripts/dev.sh                        # the same on Linux
 ```
 
-The scripts build the release binaries, start the server side in the
+The scripts build the binaries (profile `quick`: optimised like release, but
+without LTO and incremental, so a rebuild takes seconds; output in
+`target/quick`), start the server side in the
 background (logs in `target/dev/`), run the client, and stop the servers when
 the client ends. `Get-Help .\scripts\dev.ps1 -Full` (or the header of
 `scripts/dev.sh`) lists the options.
@@ -72,10 +74,10 @@ the client ends. `Get-Help .\scripts\dev.ps1 -Full` (or the header of
 By hand:
 
 ```powershell
-cargo build --release -p space-client -p space-server -p space-orchestrator
-.\target\release\space-orchestrator.exe --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
-.\target\release\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
-.\target\release\space-client.exe --server 127.0.0.1:7777
+cargo build --profile quick -p space-client -p space-server -p space-orchestrator
+.\target\quick\space-orchestrator.exe --bind 127.0.0.1:7900 --state orchestrator.id --webui 127.0.0.1:7980
+.\target\quick\space-server.exe --orchestrator 127.0.0.1:7900 --bind 127.0.0.1:7777
+.\target\quick\space-client.exe --server 127.0.0.1:7777
 ```
 
 ### Scenes and the orchestrator web UI

@@ -26,7 +26,9 @@ bash scripts/dev.sh --servers-only          .\scripts\dev.ps1 -ServersOnly
 bash scripts/dev.sh --stop                  .\scripts\dev.ps1 -Stop
 ```
 
-That builds the release binaries and starts, in the background:
+That builds the binaries (profile `quick`, in `target/quick`: optimised like
+release, but no LTO and incremental, so a rebuild after an edit takes seconds)
+and starts, in the background:
 
 | what | where |
 |---|---|

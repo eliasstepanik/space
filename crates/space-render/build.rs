@@ -185,7 +185,16 @@ fn dump_struct(
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=Cargo.lock");
+    // The lock file `naga_version` reads: the workspace's, two directories up.
+    // It must be a file that exists: cargo treats a watched path that is
+    // missing as changed, and a bare `Cargo.lock` (this crate's directory has
+    // none) made every build recompile this crate and all that depend on it.
+    let lock = ["../../Cargo.lock", "Cargo.lock"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file());
+    if let Some(lock) = lock {
+        println!("cargo:rerun-if-changed={lock}");
+    }
     let version = naga_version();
     assert_naga_at_least_30(&version);
     println!("cargo:warning=naga version: {version}");
