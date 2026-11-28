@@ -2,7 +2,11 @@ target
 **/target
 .git
 spikes/*/target
-.warren
+# Warren's folders are not needed in an image, except the sandbox setup: an
+# xtask test reads it (`the_sandbox_setup_pins_the_same_vulkan_debs`), and the
+# CI image builds every test.
+.warren/*
+!.warren/sandbox.toml
 .local
 
 # Asset sources and review renders are not needed to build or test. The GLBs and
