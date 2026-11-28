@@ -728,6 +728,24 @@ mod tests {
         );
     }
 
+    /// `.warren/sandbox.toml` unpacks the same packages at sandbox start, from
+    /// its own copy of the list (the setup script runs before anything is
+    /// built). The two lists must not drift apart.
+    #[test]
+    fn the_sandbox_setup_pins_the_same_vulkan_debs() {
+        let sandbox = include_str!("../../.warren/sandbox.toml");
+        let pinned: Vec<&str> = sandbox
+            .lines()
+            .filter(|line| line.contains(".deb ") && !line.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(pinned.len(), VULKAN_DEBS.len(), "{pinned:?}");
+        for (name, subdir, sha) in VULKAN_DEBS {
+            let line = format!("{subdir}/{name} {sha}");
+            assert!(pinned.contains(&line.as_str()), "missing `{line}`");
+        }
+        assert!(sandbox.contains(&format!("{DEBIAN_POOL}/$deb")));
+    }
+
     fn temp_deb(tag: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("xtask-deb-{tag}-{}", std::process::id()));
         std::fs::write(&path, b"not really a deb").unwrap();

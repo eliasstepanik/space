@@ -11,6 +11,11 @@
 # Render/validation artifacts (convention: artifacts/*.png)
 artifacts/*.png
 
+# Warren sandbox scratch (TMPDIR and the sandbox's Rust installation); the
+# sandbox setup itself, .warren/sandbox.toml, is tracked
+/.warren/tmp/
+/.warren/rustup/
+
 # Local GPU/Vulkan userspace prefix (never commit; ~64 MB of .debs extracted)
 /.local/
 

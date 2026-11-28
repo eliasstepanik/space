@@ -1,0 +1,121 @@
+# Project sandbox setup for the space engine (Rust workspace, Vulkan renderer).
+# Runs as root in a setup container at every sandbox start; a failure fails the
+# session start, so every step of the script below is allowed to fail with a
+# warning and nothing here may be made fatal.
+# Format: docs/CONFIG-REPOS.md ("Sandbox setup") in the Warren repository.
+# Keys: apt, npm, pip, cargo, network_allow, script, [env]. Nothing else: memory,
+# CPU and GPU limits are NOT set here (they are [sandbox.resources] in the Warren
+# server's warren.toml), and unknown keys are refused.
+# How the sandbox is used: skills/space-dev/SKILL.md ("Sandbox", "GPU tests") and
+# skills/space-visual-test/SKILL.md.
+
+# Only names that exist in every Debian release: a bad name here breaks every
+# session of this project. curl and xz-utils fetch and unpack the Vulkan
+# packages below, python3 is what the skills' web-UI one-liners use, and
+# build-essential is the C linker rustc calls. Version-bound packages
+# (libllvm15) are installed by the script, where a miss is only a warning.
+apt = [
+    "ca-certificates",
+    "curl",
+    "xz-utils",
+    "python3",
+    "build-essential",
+]
+
+# crates.io for the workspace's dependencies, the Rust toolchain for rustup
+# (rust-toolchain.toml pins 1.100.0 with rustfmt, clippy and the wasm32 target)
+# and the Debian pool for the Vulkan packages. github.com and
+# *.githubusercontent.com are allowed by default.
+network_allow = [
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "static.rust-lang.org",
+    "sh.rustup.rs",
+    "deb.debian.org",
+]
+
+# The userspace Vulkan stack the renderer and the headless client need: the
+# loader, Mesa 25 (RADV for the passed-through GPU, lavapipe with
+# VK_KHR_acceleration_structure for software rendering) and the Khronos
+# validation layer. The base image's own Mesa is too old (spikes/ENVIRONMENT.md),
+# so the same pinned Debian packages as `cargo xtask gpu-setup` are unpacked into
+# /opt/space/vulkan, each checked against its SHA-256 first. The list must stay
+# the one in xtask/src/main.rs (VULKAN_DEBS); an xtask test compares them.
+# If anything here fails, the session still starts and `cargo xtask gpu-setup`
+# installs the same thing into the same place.
+script = """
+PREFIX=/opt/space/vulkan
+mkdir -p /opt/space || true
+if [ "$(uname -m)" != x86_64 ]; then
+  echo "space: the pinned Vulkan packages are amd64 only; skipped on $(uname -m)"
+elif [ -f "$PREFIX/usr/lib/x86_64-linux-gnu/libvulkan.so.1" ] \
+  && [ -f "$PREFIX/usr/share/vulkan/icd.d/lvp_icd.json" ] \
+  && [ -f "$PREFIX/usr/share/vulkan/icd.d/radeon_icd.json" ] \
+  && [ -f "$PREFIX/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" ]; then
+  echo "space: Vulkan stack already in $PREFIX"
+else
+  work=$(mktemp -d) && mkdir -p "$work/root" && ok=1 || ok=0
+  while [ "$ok" = 1 ] && read -r deb sha; do
+    [ -n "$deb" ] || continue
+    file="$work/${deb##*/}"
+    if curl -fsSL --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 2 -o "$file" "http://deb.debian.org/debian/pool/main/$deb" \
+      && echo "$sha  $file" | sha256sum -c - > /dev/null \
+      && dpkg-deb -x "$file" "$work/root"; then
+      echo "space: unpacked ${deb##*/}"
+    else
+      echo "space: warning: ${deb##*/} could not be downloaded, verified or unpacked"
+      ok=0
+    fi
+  done << 'DEBS'
+v/vulkan-loader/libvulkan1_1.3.239.0-1_amd64.deb 622f28b807ba55a1f5ad1622ff83aa2c5b11fedbec074850e04c10a8f28b43d3
+m/mesa/mesa-vulkan-drivers_25.0.7-2~bpo12+1_amd64.deb 3899f1800424c60a05df5d6913076a526ca8fdbabec43672cd397563d1ca3263
+libd/libdrm/libdrm-amdgpu1_2.4.123-1~bpo12+1_amd64.deb 334e2ae389af0e9cb607c2ccfbbf7ae9feb34131ff998550baeffeeae6cda296
+libd/libdrm/libdrm2_2.4.123-1~bpo12+1_amd64.deb 9cc2f341964286295124a32d3625edb76730500625e54a1e682761f883064d7b
+v/vulkan-validationlayers/vulkan-validationlayers_1.3.239.0-2_amd64.deb b88ccb5c5925bc05d4a6c50f1784fbd4e92a523c4dd5779fb539c128ba5c2526
+DEBS
+  if [ "$ok" = 1 ] && rm -rf "$PREFIX" && mv "$work/root" "$PREFIX"; then
+    echo "space: Vulkan stack installed in $PREFIX"
+  else
+    echo "space: warning: no Vulkan stack installed; run 'cargo xtask gpu-setup' in the session"
+  fi
+  rm -rf "$work" || true
+fi
+# The unpacked drivers need shared libraries from the system: LLVM 15, libxcb-*,
+# libwayland, libelf, libzstd ... (a bare Debian bookworm has none of them and
+# the loader then reports "Found no drivers"). The distribution's own Mesa
+# package depends on exactly that set, so it is installed for its dependencies;
+# its drivers are not used (VK_DRIVER_FILES below names the unpacked ones). Not
+# in the apt list above: libllvm15 is bound to one Debian release.
+if ! ldconfig -p 2> /dev/null | grep -q 'libxcb-randr'; then
+  apt-get install -y --no-install-recommends mesa-vulkan-drivers \
+    || echo "space: warning: mesa-vulkan-drivers not installed; lavapipe and RADV may lack libraries"
+fi
+if ! ldconfig -p 2> /dev/null | grep -q 'libLLVM-15'; then
+  apt-get install -y --no-install-recommends libllvm15 \
+    || echo "space: warning: libllvm15 not installed; lavapipe and RADV may not load"
+fi
+# /tmp is noexec, so cargo's build scripts and tests need a TMPDIR that is not
+# (set in [env] below). The agent must also be able to write the prefix, for
+# `cargo xtask gpu-setup --force`.
+mkdir -p /workspace/.warren/tmp 2> /dev/null || true
+for dir in /workspace/.warren/tmp /opt/space; do
+  chown -R --reference=/workspace "$dir" 2> /dev/null || chmod -R a+rwX "$dir" 2> /dev/null || true
+done
+true
+"""
+
+# The variables the skills otherwise ask for in front of every command.
+# RUSTUP_TOOLCHAIN and RUSTUP_HOME are the sandbox's own Rust installation
+# (skills/space-dev/SKILL.md, "CI"); the VK_* and LD_LIBRARY_PATH values are what
+# `cargo xtask gpu-setup --print-env` prints for this prefix. VK_DRIVER_FILES
+# lists the real GPU first and lavapipe second; set it to one of the two files
+# to pick a device.
+[env]
+TMPDIR = "/workspace/.warren/tmp"
+RUSTUP_HOME = "/workspace/.warren/rustup"
+RUSTUP_TOOLCHAIN = "stable"
+SPACE_VULKAN_PREFIX = "/opt/space/vulkan"
+LD_LIBRARY_PATH = "/opt/space/vulkan/usr/lib/x86_64-linux-gnu"
+VK_DRIVER_FILES = "/opt/space/vulkan/usr/share/vulkan/icd.d/radeon_icd.json:/opt/space/vulkan/usr/share/vulkan/icd.d/lvp_icd.json"
+VK_LAYER_PATH = "/opt/space/vulkan/usr/share/vulkan/explicit_layer.d"
